@@ -1,0 +1,9 @@
+[package]
+name = "osh-tui"
+version = "0.1.0"
+edition = "2021"
+description = "ratatui front end for the OpenShell CLI"
+
+[dependencies]
+ratatui = "0.30.2"
+serde_json = "1.0.154"

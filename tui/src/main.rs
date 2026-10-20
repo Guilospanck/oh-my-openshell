@@ -1,0 +1,183 @@
+//! osh: ratatui front end for OpenShell. Dashboard of sandboxes with live
+//! status, plus creating, attaching, providers, profiles and images.
+mod app;
+mod cli;
+mod logview;
+mod ui;
+
+use app::{App, Done, Step};
+use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use std::{
+    io::{self, Write},
+    path::{Path, PathBuf},
+    process::Command,
+    sync::{mpsc, Arc, Mutex},
+    time::Duration,
+};
+
+fn config_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("OSH_DIR") {
+        return PathBuf::from(d);
+    }
+    // Fall back to the symlinked config directory.
+    let base = std::env::var("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
+    base.join("openshell")
+}
+
+fn pause() {
+    print!("\nPress Enter to return to osh...");
+    let _ = io::stdout().flush();
+    let mut s = String::new();
+    let _ = io::stdin().read_line(&mut s);
+}
+
+/// Hand the terminal to child processes, then take it back.
+fn run_steps(steps: Vec<Step>) {
+    ratatui::restore();
+    for s in steps {
+        println!("$ {} {}", s.prog, s.args.join(" "));
+        match Command::new(&s.prog).args(&s.args).status() {
+            Ok(st) if st.success() => {}
+            Ok(st) => {
+                println!("\n{} exited with {st}", s.prog);
+                break;
+            }
+            Err(e) => {
+                println!("\n{}: {e}", s.prog);
+                break;
+            }
+        }
+    }
+    pause();
+}
+
+/// Offer to install OpenShell before the dashboard opens. Returns false to quit.
+fn ensure_installed(dir: &Path) -> bool {
+    while !cli::have("openshell") {
+        print!("openshell is not installed. Install it now? [Y/n] ");
+        let _ = io::stdout().flush();
+        let mut a = String::new();
+        let _ = io::stdin().read_line(&mut a);
+        if matches!(a.trim().to_lowercase().as_str(), "n" | "no") {
+            return false;
+        }
+        if !cli::have("just") {
+            println!("`just` is required to run the installer (brew install just).");
+            return false;
+        }
+        let st = Command::new("just")
+            .arg("--justfile")
+            .arg(dir.join(".justfile"))
+            .arg("install")
+            .status();
+        if !st.map(|s| s.success()).unwrap_or(false) {
+            println!("Install failed; see the output above.");
+        }
+    }
+    true
+}
+
+fn main() -> io::Result<()> {
+    let dir = config_dir();
+    if !ensure_installed(&dir) {
+        return Ok(());
+    }
+    let (snap_tx, snap_rx) = mpsc::channel();
+    let (wake_tx, wake_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel::<Done>();
+    let selected = Arc::new(Mutex::new(None));
+    cli::spawn_poller(dir.clone(), snap_tx, selected.clone(), wake_rx);
+
+    let mut app = App::new(dir, selected, wake_tx, done_tx);
+    let mut terminal = ratatui::init();
+    let result = (|| -> io::Result<()> {
+        while !app.quit {
+            if let Some(lv) = &mut app.logview {
+                lv.sync();
+            }
+            terminal.draw(|f| ui::draw(f, &app))?;
+            if event::poll(Duration::from_millis(150))? {
+                if let Event::Key(k) = event::read()? {
+                    if k.kind == KeyEventKind::Press {
+                        app.on_key(k);
+                    }
+                }
+            }
+            while let Ok(s) = snap_rx.try_recv() {
+                if app.status == "Loading..." || app.status == "Refreshing..." {
+                    app.status = if s.gateway_ok {
+                        "Ready".into()
+                    } else {
+                        "Gateway unreachable: brew services start openshell (vm) or just gateway-docker".into()
+                    };
+                }
+                if let Some(e) = &s.error {
+                    app.status = e.clone();
+                }
+                app.on_snapshot(s);
+            }
+            while let Ok(d) = done_rx.try_recv() {
+                app.on_done(d);
+            }
+            if let Some(steps) = app.job.take() {
+                run_steps(steps);
+                terminal = ratatui::init();
+                terminal.clear()?;
+                app.finish_job();
+                app.refresh();
+            }
+        }
+        Ok(())
+    })();
+    ratatui::restore();
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Cond, Image, Profile, Provider, Sandbox, Snapshot};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn every_tab_and_modal_renders() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        app.on_snapshot(Snapshot {
+            gateway_ok: true,
+            version: "openshell 0".into(),
+            sandboxes: vec![Sandbox {
+                name: "a".into(),
+                phase: "Ready".into(),
+                created: "now".into(),
+                conditions: vec![Cond { kind: "Ready".into(), status: "True".into(), message: "ok".into() }],
+            }],
+            providers: vec![Provider { name: "p".into(), ty: "p".into(), keys: vec!["K".into()] }],
+            profiles: vec![Profile { id: "p".into(), version: 1 }],
+            images: vec![Image { tag: "x:latest".into(), file: "Dockerfile-x".into(), built: false, freshness: Default::default() }],
+            logs: Some(("a".into(), "line1\nline2".into())),
+            ..Default::default()
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        for tab in 0..4u8 {
+            app.on_key(KeyEvent::from(KeyCode::Char((b'1' + tab) as char)));
+            term.draw(|f| ui::draw(f, &app)).unwrap();
+        }
+        app.on_key(KeyEvent::from(KeyCode::Char('1')));
+        app.on_key(KeyEvent::from(KeyCode::Char('n')));
+        assert!(app.modal.is_some());
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn profile_keys_follow_aliases() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        assert_eq!(cli::profile_env_keys(&dir, "github"), vec!["GITHUB_TOKEN"]);
+        assert_eq!(cli::profile_env_keys(&dir, "forgejo"), vec!["FORGEJO_HOST", "FORGEJO_TOKEN"]);
+        assert_eq!(cli::dockerfile_tag(&PathBuf::from("images/Dockerfile-claude_code")), "claude-code:latest");
+    }
+}

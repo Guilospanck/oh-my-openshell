@@ -1,0 +1,16 @@
+# Second gateway, Docker (Colima) driver. Unlike the vm gateway (gateway.toml),
+# it honours per-sandbox --cpu and --memory. Run by `gateway-docker-service`.
+[openshell]
+version = 2
+
+[openshell.gateway]
+name = "openshell-docker"
+bind_address = "127.0.0.1:17671"
+health_bind_address = "127.0.0.1:17681"
+metrics_bind_address = "127.0.0.1:17691"
+compute_driver = "docker"
+
+[openshell.drivers.docker]
+# Containers in the Colima VM reach the host loopback through this name,
+# which is in the shared server certificate's SANs.
+grpc_endpoint = "https://host.docker.internal:17671"

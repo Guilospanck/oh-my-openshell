@@ -1,0 +1,44 @@
+# Forgejo REST API and HTTPS Git template; render before lint/import.
+# Set FORGEJO_HOST to your hostname (no scheme/path/port).
+# OpenShell does not expand ${FORGEJO_HOST}; use the README rendering command.
+# Adapt port and rules if the instance uses a nonstandard port or URL prefix.
+# Verify executable paths inside your Linux sandbox image before importing.
+# Create a least-privilege read-only token in Forgejo settings;
+# expose FORGEJO_TOKEN in the host environment, never store it in this YAML.
+# Static auth metadata does not automatically add an Authorization header:
+# API clients must send the sandbox's FORGEJO_TOKEN placeholder as Bearer.
+# Git does not read FORGEJO_TOKEN automatically. Public HTTPS clone/fetch works;
+# private Git needs a separately verified credential-helper/HTTP auth setup.
+# Do not embed real tokens in Git URLs or upload a host credential store.
+# SSH Git, push, API writes, external LFS/object hosts and package registries
+# are deliberately not enabled. No wildcard hosts or shell/Node grants.
+# Render, lint and import using the README commands, then:
+#   openshell provider create --name forgejo --type forgejo --credential FORGEJO_TOKEN
+# In an attached sandbox, test GET /api/v1/user with a Bearer placeholder.
+# Public Git smoke test: git clone https://YOUR_HOST/OWNER/REPO.git
+id: forgejo
+display_name: Forgejo
+description: Read-only Forgejo API and HTTPS clone/fetch on one explicit host
+category: source_control
+credentials:
+  - name: api_token
+    description: Least-privilege Forgejo API token
+    env_vars: [FORGEJO_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [api_token]
+endpoints:
+  # Forgejo API and Git share a host. Explicit rules permit API reads and
+  # Git smart-HTTP clone/fetch POSTs, but no API mutation or receive-pack POST.
+  - host: "${FORGEJO_HOST}"
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "/api/v1/**" }
+      - allow: { method: HEAD, path: "/api/v1/**" }
+      - allow: { method: GET, path: "/**/info/refs" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
+binaries: [/usr/bin/curl, /usr/local/bin/curl, /usr/bin/git, /usr/local/bin/git]

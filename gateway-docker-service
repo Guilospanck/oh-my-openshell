@@ -1,0 +1,23 @@
+#!/bin/sh
+# gateway-docker-service: run the Docker-driver gateway in the foreground.
+# Launched by the launchd agent that `just gateway-docker` installs. It reuses
+# the TLS material the Homebrew `openshell` service writes, so that service must
+# have run once; the database is separate so the two gateways share no state.
+set -eu
+
+self=$(readlink -f "$0" 2>/dev/null || realpath "$0")
+dir=$(dirname "$self")
+config_home="${XDG_CONFIG_HOME:-$HOME/.config}/openshell"
+
+if [ -f "$config_home/gateway.env" ]; then
+  set -a
+  . "$config_home/gateway.env"
+  set +a
+fi
+
+state="$HOME/.local/state/openshell"
+mkdir -p "$state/gateway-docker"
+export OPENSHELL_LOCAL_TLS_DIR="${OPENSHELL_LOCAL_TLS_DIR:-$state/homebrew/tls}"
+export OPENSHELL_DB_URL="sqlite:$state/gateway-docker/openshell.db?mode=rwc"
+
+exec /opt/homebrew/opt/openshell/bin/openshell-gateway --config "$dir/gateway-docker.toml"

@@ -1,0 +1,20 @@
+# Local template: anonymous downloads from the public npm registry only.
+# Review Linux sandbox executable paths, then lint/import explicitly.
+# npm is a Node script: authorize its interpreter, not /usr/local/bin/npm.
+# This grants every program using the listed Node runtimes read-only registry access.
+# No npm publishing/login/token, Git dependencies, third-party install-script
+# downloads, nodejs.org runtime downloads are allowed here.
+# Prefer preinstalling tools in your sandbox image. --ignore-scripts reduces install risk.
+# Smoke test (Node + npm must already be installed):
+#   openshell sandbox create --provider npm -- npm view @anthropic-ai/claude-code version
+id: npm
+display_name: npm (public downloads)
+description: Anonymous read-only public npm registry access
+category: data
+endpoints:
+  - host: registry.npmjs.org
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries: [/usr/bin/node, /usr/local/bin/node]

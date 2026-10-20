@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Claude Code subscription authentication, not an Anthropic API key.
+# On the host, run `claude setup-token`, then export its output privately as
+# CLAUDE_CODE_OAUTH_TOKEN. See ../README.md for creation and rotation.
+# Static auth metadata does not insert headers: Claude reads the environment
+# placeholder and sends it as a bearer token; OpenShell resolves it at the API.
+# No telemetry endpoints: keep the credential boundary limited to inference.
+# platform.claude.com is read-only: Claude's startup connectivity check fails with
+# "Unable to connect to Anthropic services" (exit 1) when it is unreachable.
+# Verify binary paths in your image; the npm install can resolve into bin/claude.exe.
+# Smoke test: claude -p 'reply with OK' (without --bare).
+id: claude-code
+display_name: Claude Code (subscription)
+description: Claude Code CLI with a Claude subscription setup token
+category: agent
+inference_capable: true
+credentials:
+  - name: oauth_token
+    description: Long-lived OAuth token from claude setup-token
+    env_vars: [CLAUDE_CODE_OAUTH_TOKEN]
+    required: true
+    auth_style: bearer
+    header_name: authorization
+discovery:
+  credentials: [oauth_token]
+endpoints:
+  - host: api.anthropic.com
+    port: 443
+    protocol: rest
+    access: read-write
+    enforcement: enforce
+  - host: platform.claude.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries:
+  - /usr/bin/claude
+  - /usr/local/bin/claude
+  - /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+  - /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe

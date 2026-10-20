@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# osh: launch the OpenShell TUI, building it with cargo on first use or when
+# its sources change. Needs cargo (rustup) and, for installs/builds, just/docker.
+set -euo pipefail
+
+SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}")
+DIR=$(dirname "$SELF")
+BIN="$DIR/tui/target/release/osh-tui"
+
+if [[ ! -x "$BIN" || -n "$(find "$DIR/tui/src" "$DIR/tui/Cargo.toml" -newer "$BIN" -print -quit)" ]]; then
+  command -v cargo >/dev/null 2>&1 || { echo "osh: cargo is required to build the TUI (rustup)" >&2; exit 1; }
+  echo "osh: building TUI..." >&2
+  cargo build --release --quiet --manifest-path "$DIR/tui/Cargo.toml"
+fi
+
+export OSH_DIR="$DIR"
+exec "$BIN" "$@"

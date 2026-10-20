@@ -1,0 +1,6 @@
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "vm"
+
