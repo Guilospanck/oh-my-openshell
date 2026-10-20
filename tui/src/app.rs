@@ -3,7 +3,7 @@ use crate::cli::{self, Snapshot};
 use crate::logview::LogView;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{mpsc::Sender, Arc, Mutex},
     thread,
 };
@@ -110,6 +110,10 @@ pub struct Done {
 
 pub struct App {
     pub dir: PathBuf,
+    /// Whether an `osh` on PATH resolves to this checkout's launcher.
+    pub linked: bool,
+    /// Installed gateway.toml differs from the repo copy (`just install` copies it).
+    pub config_stale: bool,
     pub tab: Tab,
     pub snap: Snapshot,
     pub cursor: [usize; 5],
@@ -143,6 +147,29 @@ fn limit(text: &str) -> Option<String> {
     (!t.starts_with('-') && !t.contains(char::is_whitespace)).then(|| t.to_string())
 }
 
+/// True when an `osh` found on PATH is this checkout's launcher.
+fn on_path(dir: &Path) -> bool {
+    let Ok(ours) = dir.join("osh").canonicalize() else { return false };
+    std::env::var_os("PATH").is_some_and(|p| {
+        std::env::split_paths(&p).any(|d| d.join("osh").canonicalize().is_ok_and(|c| c == ours))
+    })
+}
+
+/// True when `gateway.toml` in the user config dir exists and differs from the repo's.
+fn config_stale(dir: &Path) -> bool {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+    match (
+        std::fs::read(dir.join("gateway.toml")),
+        std::fs::read(base.join("openshell/gateway.toml")),
+    ) {
+        (Ok(repo), Ok(installed)) => repo != installed,
+        (Ok(_), Err(_)) => true,
+        _ => false,
+    }
+}
+
 impl App {
     pub fn new(
         dir: PathBuf,
@@ -151,6 +178,8 @@ impl App {
         done_tx: Sender<Done>,
     ) -> Self {
         App {
+            linked: on_path(&dir),
+            config_stale: config_stale(&dir),
             dir,
             tab: Tab::Sandboxes,
             snap: Snapshot::default(),
@@ -208,6 +237,7 @@ impl App {
 
     pub fn on_snapshot(&mut self, snap: Snapshot) {
         self.snap = snap;
+        self.config_stale = config_stale(&self.dir);
         for i in 0..4 {
             let len = [
                 self.snap.sandboxes.len(),
