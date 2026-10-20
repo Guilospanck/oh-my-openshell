@@ -11,8 +11,14 @@ here, not in the dotfiles checkout.
 ## osh
 
 ```sh
-./osh        # or ~/.config/openshell/osh when linked by dotfiles
+just --justfile .justfile link   # once: symlinks osh into ~/.local/bin
+osh                              # then run it from anywhere
 ```
+
+`just install` also links it. Without linking, run `./osh` from the checkout
+(or `~/.config/openshell/osh` when linked by dotfiles). The link points at the
+checkout, so edits and rebuilds apply with no re-link. Remove it with
+`just unlink`.
 
 Builds the ratatui TUI (`tui/`) with cargo on first run and whenever its
 sources change. Offers to install OpenShell if missing. Needs `cargo`; Docker
