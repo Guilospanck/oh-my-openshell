@@ -152,7 +152,7 @@ _create-provider provider:
     openshell provider profile import -f "$profile"
     openshell provider create --name "$provider" --type "$provider" "${credentials[@]}"
     case "$provider" in
-      claude-code) echo 'Setup token has no automatic refresh; rotate before expiry. See openshell/README.md.' ;;
+      claude-code) echo 'Setup token has no automatic refresh; rotate before expiry. See README.md.' ;;
     esac
 
 # Interactive menu: install, sandboxes, providers, images.

@@ -1,13 +1,18 @@
-# OpenShell
+# oh-my-openshell
 
 Portable gateway config, image definitions, and explicitly imported provider
-profiles. Run recipes with `just --justfile openshell/.justfile <recipe>` from
-this repo (or `just --justfile ~/.config/openshell/.justfile <recipe>`).
+profiles. Run recipes with `just --justfile .justfile <recipe>` from this repo
+(or `just --justfile ~/.config/openshell/.justfile <recipe>`).
+
+This repo is consumed as a git submodule by
+[dotfiles](https://github.com/Guilospanck/dotfiles) at `openshell/`, which links
+it into `~/.config/openshell/` (see "Config links" in the dotfiles README).
+Change it here, not in the dotfiles checkout.
 
 ## Interactive TUI
 
-`just --justfile openshell/.justfile tui` (or `~/.config/openshell/osh`) opens
-a ratatui dashboard, built from `openshell/tui/` with cargo on first run and
+`just --justfile .justfile tui` (or `~/.config/openshell/osh`) opens
+a ratatui dashboard, built from `tui/` with cargo on first run and
 whenever its sources change. Needs cargo; `just` for installing OpenShell and
 Docker for building images.
 
@@ -88,7 +93,7 @@ On the host, run `claude setup-token`. Store the returned token privately and
 export it as `CLAUDE_CODE_OAUTH_TOKEN` without putting it in shell history, then:
 
 ```sh
-just --justfile openshell/.justfile provider-claude-code
+just --justfile .justfile provider-claude-code
 openshell sandbox create --from <claude-image> --provider claude-code --detach
 ```
 
