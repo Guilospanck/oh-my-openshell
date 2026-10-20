@@ -3,7 +3,7 @@ use crate::app::{App, Modal, Tab, TABS};
 use crate::cli::Freshness;
 use crate::logview::LogView;
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState, Wrap},
@@ -70,15 +70,18 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
     };
     spans.push(Span::styled(txt, Style::default().fg(color)));
     let (link, link_color) = if app.linked {
-        ("  linked in PATH", Color::Green)
+        ("linked in PATH ", Color::Green)
     } else {
-        ("  not linked (just link)", Color::Yellow)
+        ("not linked (just link) ", Color::Yellow)
     };
-    spans.push(Span::styled(link, Style::default().fg(link_color)));
     if app.config_stale {
         spans.push(Span::styled("  gateway.toml out of date (just install)", Style::default().fg(Color::Yellow)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(
+        Paragraph::new(Line::styled(link, Style::default().fg(link_color))).alignment(Alignment::Right),
+        area,
+    );
 }
 
 fn table_state(i: usize) -> TableState {
