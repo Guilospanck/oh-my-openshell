@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Block secrets and common PII before every commit.
+exec "$(git rev-parse --show-toplevel)/git-hooks/check-secrets"

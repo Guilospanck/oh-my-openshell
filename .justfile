@@ -158,3 +158,7 @@ _create-provider provider:
 # Interactive menu: install, sandboxes, providers, images.
 tui:
 	@{{justfile_directory()}}/osh
+
+# enable the tracked pre-commit secret/PII hook (run once per clone)
+install-hooks:
+	sh "{{justfile_directory()}}/.githooks/install.sh"

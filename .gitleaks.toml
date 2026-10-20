@@ -1,0 +1,45 @@
+title = "oh-my-openshell secrets and common PII"
+
+[extend]
+useDefault = true
+
+# Catch literal credentials even when they are too short/low-entropy for the
+# default rules. Variable references ($TOKEN, ${TOKEN}) do not match.
+[[rules]]
+id = "literal-credential"
+description = "Literal token/password assignment; use untracked local config"
+regex = '''(?i)(?:[a-z0-9_]*(?:token|password|passwd|api[_-]?key|client[_-]?secret|access[_-]?key)[a-z0-9_]*)["']?\s*[:=]\s*["']?([a-z0-9+/][a-z0-9_./+@=!:-]{3,})'''
+secretGroup = 1
+
+# Rust identifiers like `token_flow: Option<..>` are code, not credentials.
+[[rules.allowlists]]
+paths = ['''(^|/)tui/src/.*\.rs$''']
+
+[[rules.allowlists]]
+regexTarget = "secret"
+regexes = ['''(?i)^(?:true|false|null|none|example|placeholder|changeme|your[_-].*|test[_-].*)$''']
+
+[[rules]]
+id = "personal-email"
+description = "Email address (other than explicitly public repository identities)"
+regex = '''\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b'''
+
+[[rules.allowlists]]
+regexTarget = "match"
+regexes = [
+  '''^guilospanck@protonmail\.com$''',
+  '''^git@github\.com$''',
+  '''^[A-Za-z0-9-]+@secretive\.[A-Za-z0-9-]+\.local$''',
+  '''^[A-Za-z0-9._%+-]+@(?:example\.(?:com|org|net)|example\.invalid)$''',
+]
+
+[[rules]]
+id = "us-social-security-number"
+description = "Possible US Social Security number"
+regex = '''\b[0-9]{3}-[0-9]{2}-[0-9]{4}\b'''
+
+[[rules]]
+id = "personal-phone"
+description = "Literal labeled phone number"
+regex = '''(?i)(?:phone|mobile|telephone)["']?\s*[:=]\s*["']?(\+?[0-9][0-9 ()-]{7,}[0-9])'''
+secretGroup = 1
