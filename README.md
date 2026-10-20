@@ -50,8 +50,12 @@ in Providers.
 
 ## Setup without osh
 
-`just install` (OpenShell), `just gateway-docker` (second gateway),
-`just install-hooks` (below). Run recipes with `just --justfile .justfile <recipe>`.
+`just install` (OpenShell, and links `osh` into `~/.local/bin` so it runs from
+anywhere), `just link` / `just unlink` (only the `osh` link),
+`just gateway-docker` (second gateway), `just install-hooks` (below),
+`just uninstall` (removes OpenShell, both gateway services,
+`~/.config/openshell`, state and runtime dirs, and the `osh` link; asks for
+confirmation first). Run recipes with `just --justfile .justfile <recipe>`.
 
 ## Secret and PII hook
 

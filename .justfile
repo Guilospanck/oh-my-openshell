@@ -1,5 +1,5 @@
-# Installs OpenShell
-install:
+# Installs OpenShell and links osh into PATH
+install: link
 	#!/usr/bin/env bash
 	set -euo pipefail
 
@@ -162,3 +162,54 @@ tui:
 # enable the tracked pre-commit secret/PII hook (run once per clone)
 install-hooks:
 	sh "{{justfile_directory()}}/.githooks/install.sh"
+
+# Symlink osh into ~/.local/bin so `osh` runs from anywhere
+link:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	bin="${OSH_BIN_DIR:-$HOME/.local/bin}"
+	mkdir -p "$bin"
+	ln -sfn "{{justfile_directory()}}/osh" "$bin/osh"
+	echo "linked $bin/osh"
+	case ":$PATH:" in *":$bin:"*) ;; *) echo "warning: $bin is not on PATH" >&2 ;; esac
+
+# Remove the osh symlink (only if it points at this checkout)
+unlink:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	target="${OSH_BIN_DIR:-$HOME/.local/bin}/osh"
+	if [[ -L "$target" && "$(readlink "$target")" == "{{justfile_directory()}}/osh" ]]; then
+	    rm "$target"
+	    echo "removed $target"
+	fi
+
+# Remove all OpenShell files, services and the osh link (asks first; sandboxes are lost)
+uninstall:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/openshell"
+	state_dir="$HOME/.local/state/openshell"
+	share_dir="$HOME/.local/share/openshell"
+	label="dev.guilospanck.openshell-docker"
+	plist="$HOME/Library/LaunchAgents/$label.plist"
+
+	echo "This will remove:"
+	echo "  launchd agent  $label"
+	echo "  brew service + formula  openshell"
+	echo "  $config_dir"
+	echo "  $state_dir"
+	echo "  $share_dir"
+	echo "  osh link in ~/.local/bin"
+	read -r -p "Type 'uninstall' to continue: " answer
+	[[ "$answer" == uninstall ]] || { echo "aborted"; exit 1; }
+
+	launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+	rm -f "$plist"
+	if command -v brew >/dev/null 2>&1; then
+	    brew services stop openshell 2>/dev/null || true
+	    brew uninstall openshell 2>/dev/null || true
+	fi
+	# rm -rf does not follow the symlinks in the config dir (images, providers).
+	rm -rf "$config_dir" "$state_dir" "$share_dir"
+	just --justfile "{{justfile_directory()}}/.justfile" unlink
+	echo "OpenShell removed. Repo checkout left in place."
