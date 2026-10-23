@@ -30,8 +30,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// Scrollback lines kept per shell; older ones are dropped, so memory stays bounded.
-pub const SCROLLBACK: usize = 10_000;
+/// Scrollback kept per shell, in bytes: Ghostty's `max_scrollback` is a byte budget for
+/// its page list (the C header says lines; the Zig source says bytes). 10_000 kept only
+/// about 400 lines. 16 MiB is roughly 10,000 rows at 160 columns; older rows are dropped,
+/// so memory stays bounded.
+pub const SCROLLBACK: usize = 16 << 20;
 /// PTY output chunks queued before the reader blocks, which throttles the shell.
 const QUEUE: usize = 64;
 /// Output bytes parsed per session per loop iteration, so input stays responsive.
@@ -833,6 +836,22 @@ mod tests {
     }
 
     #[test]
+    fn scrollback_keeps_thousands_of_lines_but_stays_bounded() {
+        let mut v = Vt::new(80, 24, mpsc::channel().0).unwrap();
+        let line = |i: usize| format!("{i:>6} {}\r\n", "x".repeat(70));
+        for i in 0..12_000 {
+            v.feed(line(i).as_bytes());
+        }
+        let kept = v.term.scrollbar().unwrap().total;
+        assert!(kept > 10_000, "kept {kept} rows");
+        for i in 0..200_000 {
+            v.feed(line(i).as_bytes());
+        }
+        let capped = v.term.scrollbar().unwrap().total;
+        assert!(capped < 200_000 && capped > 10_000, "kept {capped} rows");
+    }
+
+    #[test]
     fn selection_follows_new_output_and_clears_once_pruned() {
         let mut v = vt();
         v.feed(b"keep me\r\n");
@@ -846,7 +865,7 @@ mod tests {
         assert!(!reversed(&v, 0, 0));
         v.scroll(-3);
         assert!(shown(&v)[0] == "keep me" && reversed(&v, 0, 0), "{:?}", shown(&v));
-        // With a small scrollback the row is dropped, and the selection with it.
+        // With a small scrollback (bytes) the row is dropped, and the selection with it.
         let mut small = Vt::with_scrollback(20, 5, 10, mpsc::channel().0).unwrap();
         small.feed(b"gone soon\r\n");
         small.select_start(0, 0);
