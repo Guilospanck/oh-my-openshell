@@ -23,7 +23,10 @@ pub struct Blocked {
 pub enum Denial {
     Blocked(Blocked),
     /// A denial adding the host would not fix (an L7 rule, or an unknown reason).
-    Notice { what: String, reason: String },
+    Notice {
+        what: String,
+        reason: String,
+    },
 }
 
 impl Blocked {
@@ -70,16 +73,24 @@ pub fn parse(line: &str) -> Option<Denial> {
     let at = line.find("OCSF")?;
     let rest = &line[at..];
     let d = rest.find(" DENIED ")?;
-    let event = rest[..d].split_whitespace().find(|w| w.contains(':') && !w.starts_with('['))?;
+    let event = rest[..d]
+        .split_whitespace()
+        .find(|w| w.contains(':') && !w.starts_with('['))?;
     let body = rest[d + 8..].trim();
     let reason = reason(body);
-    let engine = fields(body).into_iter().find(|(k, _)| *k == "engine").map(|(_, v)| v);
+    let engine = fields(body)
+        .into_iter()
+        .find(|(k, _)| *k == "engine")
+        .map(|(_, v)| v);
     if reason == "policy_dns_ineligible" {
         return None;
     }
     let head = body.split(" [").next().unwrap_or_default().trim();
     if event.starts_with("HTTP:") || engine == Some("l7") {
-        return Some(Denial::Notice { what: head.to_string(), reason });
+        return Some(Denial::Notice {
+            what: head.to_string(),
+            reason,
+        });
     }
     let (binary, target) = match head.split_once(" -> ") {
         Some((b, t)) => (Some(b.split('(').next().unwrap_or(b).trim()), t.trim()),
@@ -94,9 +105,17 @@ pub fn parse(line: &str) -> Option<Denial> {
     }
     match (binary, port) {
         (Some(b), Some(port)) if b.starts_with('/') && reason.ends_with("policy_denied") => {
-            Some(Denial::Blocked(Blocked { binary: b.into(), host: host.into(), port, reason }))
+            Some(Denial::Blocked(Blocked {
+                binary: b.into(),
+                host: host.into(),
+                port,
+                reason,
+            }))
         }
-        _ => Some(Denial::Notice { what: head.to_string(), reason }),
+        _ => Some(Denial::Notice {
+            what: head.to_string(),
+            reason,
+        }),
     }
 }
 
@@ -124,8 +143,17 @@ pub struct Seen {
 /// What to put in front of the user next.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Prompt {
-    Blocked { sandbox: String, gateway: String, b: Blocked, count: u32 },
-    Notice { sandbox: String, what: String, reason: String },
+    Blocked {
+        sandbox: String,
+        gateway: String,
+        b: Blocked,
+        count: u32,
+    },
+    Notice {
+        sandbox: String,
+        what: String,
+        reason: String,
+    },
 }
 
 /// Decisions, the denials seen so far, and the prompts still to show (one at a time).
@@ -146,7 +174,9 @@ fn key(sandbox: &str, b: &Blocked) -> Key {
 
 impl Watch {
     fn seen_mut(&mut self, sandbox: &str, d: &Denial) -> Option<&mut Seen> {
-        self.seen.iter_mut().find(|s| s.sandbox == sandbox && same(&s.denial, d))
+        self.seen
+            .iter_mut()
+            .find(|s| s.sandbox == sandbox && same(&s.denial, d))
     }
 
     /// Record a denial. A blocked one is queued unless ignored, already queued, or just
@@ -158,18 +188,34 @@ impl Watch {
                 Some(s.state.clone())
             }
             None => {
-                self.seen.push(Seen { sandbox: sandbox.into(), denial: d.clone(), state: State::Pending, count: 1 });
+                self.seen.push(Seen {
+                    sandbox: sandbox.into(),
+                    denial: d.clone(),
+                    state: State::Pending,
+                    count: 1,
+                });
                 None
             }
         };
         match d {
             Denial::Blocked(b) => {
                 let k = key(sandbox, &b);
-                if self.ignored.contains(&k) || self.allowed_at.get(&k).is_some_and(|t| t.elapsed() < SETTLE) {
+                if self.ignored.contains(&k)
+                    || self
+                        .allowed_at
+                        .get(&k)
+                        .is_some_and(|t| t.elapsed() < SETTLE)
+                {
                     return;
                 }
                 for p in &mut self.queue {
-                    if let Prompt::Blocked { sandbox: s, b: q, count, .. } = p {
+                    if let Prompt::Blocked {
+                        sandbox: s,
+                        b: q,
+                        count,
+                        ..
+                    } = p
+                    {
                         if key(s, q) == k {
                             *count += 1;
                             return;
@@ -177,12 +223,28 @@ impl Watch {
                     }
                 }
                 self.set(sandbox, &Denial::Blocked(b.clone()), State::Pending);
-                self.queue.push_back(Prompt::Blocked { sandbox: sandbox.into(), gateway: gateway.into(), b, count: 1 });
+                self.queue.push_back(Prompt::Blocked {
+                    sandbox: sandbox.into(),
+                    gateway: gateway.into(),
+                    b,
+                    count: 1,
+                });
             }
             Denial::Notice { what, reason } => {
                 if prev.is_none() {
-                    self.set(sandbox, &Denial::Notice { what: what.clone(), reason: reason.clone() }, State::Notice);
-                    self.queue.push_back(Prompt::Notice { sandbox: sandbox.into(), what, reason });
+                    self.set(
+                        sandbox,
+                        &Denial::Notice {
+                            what: what.clone(),
+                            reason: reason.clone(),
+                        },
+                        State::Notice,
+                    );
+                    self.queue.push_back(Prompt::Notice {
+                        sandbox: sandbox.into(),
+                        what,
+                        reason,
+                    });
                 }
             }
         }
@@ -215,7 +277,8 @@ impl Watch {
         if matches!(state, State::Allowed(_)) {
             self.allowed_at.insert(k.clone(), Instant::now());
         }
-        self.queue.retain(|p| !matches!(p, Prompt::Blocked { sandbox: s, b: q, .. } if key(s, q) == k));
+        self.queue
+            .retain(|p| !matches!(p, Prompt::Blocked { sandbox: s, b: q, .. } if key(s, q) == k));
         self.set(sandbox, &Denial::Blocked(b.clone()), state);
     }
 
@@ -224,9 +287,15 @@ impl Watch {
         let k = key(sandbox, &b);
         self.ignored.remove(&k);
         self.allowed_at.remove(&k);
-        self.queue.retain(|p| !matches!(p, Prompt::Blocked { sandbox: s, b: q, .. } if key(s, q) == k));
+        self.queue
+            .retain(|p| !matches!(p, Prompt::Blocked { sandbox: s, b: q, .. } if key(s, q) == k));
         self.set(sandbox, &Denial::Blocked(b.clone()), State::Pending);
-        self.queue.push_front(Prompt::Blocked { sandbox: sandbox.into(), gateway: gateway.into(), b, count: 1 });
+        self.queue.push_front(Prompt::Blocked {
+            sandbox: sandbox.into(),
+            gateway: gateway.into(),
+            b,
+            count: 1,
+        });
     }
 
     /// The shell in `sandbox` closed: forget its ignores and queued prompts.
@@ -247,8 +316,19 @@ impl Watch {
 /// Same denial, ignoring the reason text of blocked ones (it varies by path).
 fn same(a: &Denial, b: &Denial) -> bool {
     match (a, b) {
-        (Denial::Blocked(x), Denial::Blocked(y)) => (&x.binary, &x.host, x.port) == (&y.binary, &y.host, y.port),
-        (Denial::Notice { what: w1, reason: r1 }, Denial::Notice { what: w2, reason: r2 }) => w1 == w2 && r1 == r2,
+        (Denial::Blocked(x), Denial::Blocked(y)) => {
+            (&x.binary, &x.host, x.port) == (&y.binary, &y.host, y.port)
+        }
+        (
+            Denial::Notice {
+                what: w1,
+                reason: r1,
+            },
+            Denial::Notice {
+                what: w2,
+                reason: r2,
+            },
+        ) => w1 == w2 && r1 == r2,
         _ => false,
     }
 }
@@ -279,7 +359,12 @@ impl Follow {
         if !gateway.is_empty() {
             args.extend(["-g".into(), gateway.clone()]);
         }
-        args.extend(["logs", &sandbox, "--tail", "--since", "1s", "--source", "sandbox"].map(String::from));
+        args.extend(
+            [
+                "logs", &sandbox, "--tail", "--since", "1s", "--source", "sandbox",
+            ]
+            .map(String::from),
+        );
         let mut child = Command::new("openshell")
             .args(args)
             .stdin(Stdio::null())
@@ -294,7 +379,12 @@ impl Follow {
         if let Some(e) = child.stderr.take() {
             pump(e, tx);
         }
-        Ok(Follow { sandbox, gateway, child: Some(child), rx })
+        Ok(Follow {
+            sandbox,
+            gateway,
+            child: Some(child),
+            rx,
+        })
     }
 
     /// Lines so far; `Err` with the last line seen once the stream has ended.
@@ -337,10 +427,16 @@ pub fn endpoint(b: &Blocked, all: bool) -> String {
 /// Add exactly `host:port` for exactly one binary to the running sandbox.
 pub fn allow(gateway: &str, sandbox: &str, b: &Blocked, all: bool) -> Result<String, String> {
     if !cli::valid_host(&b.host) || is_ip(&b.host) {
-        return Err(format!("refusing to allow {}: not a plain host name", b.host));
+        return Err(format!(
+            "refusing to allow {}: not a plain host name",
+            b.host
+        ));
     }
     if !b.binary.starts_with('/') || b.binary.contains(|c: char| c.is_whitespace() || c == '*') {
-        return Err(format!("refusing to allow {}: not an exact binary path", b.binary));
+        return Err(format!(
+            "refusing to allow {}: not an exact binary path",
+            b.binary
+        ));
     }
     let ep = endpoint(b, all);
     let mut args: Vec<String> = Vec::new();
@@ -348,12 +444,27 @@ pub fn allow(gateway: &str, sandbox: &str, b: &Blocked, all: bool) -> Result<Str
         args.extend(["-g".into(), gateway.into()]);
     }
     args.extend(
-        ["policy", "update", sandbox, "--add-endpoint", &ep, "--binary", &b.binary, "--wait", "--timeout", "60"]
-            .map(String::from),
+        [
+            "policy",
+            "update",
+            sandbox,
+            "--add-endpoint",
+            &ep,
+            "--binary",
+            &b.binary,
+            "--wait",
+            "--timeout",
+            "60",
+        ]
+        .map(String::from),
     );
     cli::run("openshell", &args, &[])?;
     let what = if all { "all methods" } else { "read-only" };
-    Ok(format!("Allowed {} to reach {} ({what}) in {sandbox}", b.program(), b.target()))
+    Ok(format!(
+        "Allowed {} to reach {} ({what}) in {sandbox}",
+        b.program(),
+        b.target()
+    ))
 }
 
 #[cfg(test)]
@@ -410,7 +521,10 @@ mod tests {
         let odd = CURL.replace("transparent_tcp_policy_denied", "something_new");
         assert!(matches!(parse(&odd), Some(Denial::Notice { .. })));
         assert_eq!(curl().program(), "curl");
-        assert_eq!(endpoint(&curl(), false), "example.com:443:read-only:rest:enforce");
+        assert_eq!(
+            endpoint(&curl(), false),
+            "example.com:443:read-only:rest:enforce"
+        );
         assert_eq!(endpoint(&curl(), true), "example.com:443:full");
     }
 
@@ -421,7 +535,10 @@ mod tests {
         for _ in 0..3 {
             w.push("sb", "gw", d.clone());
         }
-        let other = Blocked { host: "example.org".into(), ..curl() };
+        let other = Blocked {
+            host: "example.org".into(),
+            ..curl()
+        };
         w.push("sb", "gw", Denial::Blocked(other.clone()));
         match w.next() {
             Some(Prompt::Blocked { b, count, .. }) => assert_eq!((b, count), (curl(), 3)),

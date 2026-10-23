@@ -56,19 +56,38 @@ pub enum SelKind {
     /// Whether to take a GitHub token from `gh auth token` or paste one; carries the flow to resume.
     GhToken(InKind),
     /// Which attached provider to detach so that `profile` can be attached.
-    Conflict { sync: SyncPlan, profile: String, round: u8 },
+    Conflict {
+        sync: SyncPlan,
+        profile: String,
+        round: u8,
+    },
     /// How to grant the network access a blocked sync is missing.
-    SyncAccess { sync: SyncPlan, check: cli::SyncCheck },
+    SyncAccess {
+        sync: SyncPlan,
+        check: cli::SyncCheck,
+    },
     /// Which agents to add skills for, in this sandbox.
     SyncAgents(String),
     /// Items to add; `labels` are the list entries in manifest order.
-    SyncItems { sandbox: String, agent: String, manifest: cli::SyncManifest, labels: Vec<String> },
+    SyncItems {
+        sandbox: String,
+        agent: String,
+        manifest: cli::SyncManifest,
+        labels: Vec<String>,
+    },
     /// Ctrl-] menu over the focused shell.
     SessionMenu,
     /// What to do about a program the sandbox policy blocked.
-    Blocked { sandbox: String, gateway: String, b: Blocked },
+    Blocked {
+        sandbox: String,
+        gateway: String,
+        b: Blocked,
+    },
     /// Denials seen in a sandbox (`p`); choosing a blocked one asks again.
-    Review { sandbox: String, denials: Vec<Denial> },
+    Review {
+        sandbox: String,
+        denials: Vec<Denial>,
+    },
 }
 
 #[derive(Clone)]
@@ -98,11 +117,21 @@ pub enum ConfKind {
     ResetGateway(String),
     Sync(SyncPlan),
     /// Set up a provider that needs a secret, then attach it and check again.
-    SyncSecret { sync: SyncPlan, profile: String },
+    SyncSecret {
+        sync: SyncPlan,
+        profile: String,
+    },
     /// Import, create and attach a generated profile, then check again.
-    SyncGen { sync: SyncPlan, name: String, yaml: String },
+    SyncGen {
+        sync: SyncPlan,
+        name: String,
+        yaml: String,
+    },
     /// Detach and delete the install-access provider once the installs are done.
-    DropAccess { sandbox: String, name: String },
+    DropAccess {
+        sandbox: String,
+        name: String,
+    },
 }
 
 pub enum Modal {
@@ -126,7 +155,12 @@ pub enum Modal {
     },
     Info(String),
     /// Read-only scrollable text; `back` is shown again when it closes.
-    Viewer { title: String, text: String, scroll: u16, back: Box<Modal> },
+    Viewer {
+        title: String,
+        text: String,
+        scroll: u16,
+        back: Box<Modal>,
+    },
 }
 
 /// A command run with the terminal handed back to it (build, create, setup-token).
@@ -139,7 +173,9 @@ impl Step {
     /// What the step does, for messages: the in-sandbox command without its PATH prefix.
     pub fn label(&self) -> String {
         match self.args.last() {
-            Some(c) if self.args.iter().any(|a| a == "-c") => c.strip_prefix(SANDBOX_PATH).unwrap_or(c).to_string(),
+            Some(c) if self.args.iter().any(|a| a == "-c") => {
+                c.strip_prefix(SANDBOX_PATH).unwrap_or(c).to_string()
+            }
             _ => format!("{} {}", self.prog, self.args.join(" ")),
         }
     }
@@ -219,17 +255,38 @@ pub struct Done {
 
 /// Result of a background step of the "add skills to a sandbox" flow.
 pub enum SyncStage {
-    Manifest { sandbox: String, agent: String, manifest: cli::SyncManifest },
+    Manifest {
+        sandbox: String,
+        agent: String,
+        manifest: cli::SyncManifest,
+    },
     /// `offered`: fix rounds already done (0 none, 1 anonymous profiles, 2 secret profiles).
-    Check { sync: SyncPlan, check: cli::SyncCheck, offered: u8 },
+    Check {
+        sync: SyncPlan,
+        check: cli::SyncCheck,
+        offered: u8,
+    },
     /// A provider that needs a secret now exists: attach it and check again.
     Attach { sync: SyncPlan, profile: String },
     /// A generated profile for the user to review.
-    Generated { sync: SyncPlan, name: String, yaml: String },
+    Generated {
+        sync: SyncPlan,
+        name: String,
+        yaml: String,
+    },
     /// A conflicting provider was detached: attach `profile` again.
-    Retry { sync: SyncPlan, profile: String, round: u8 },
+    Retry {
+        sync: SyncPlan,
+        profile: String,
+        round: u8,
+    },
     /// The gateway would not attach `profile` next to the providers already `attached`.
-    Conflict { sync: SyncPlan, profile: String, attached: Vec<String>, round: u8 },
+    Conflict {
+        sync: SyncPlan,
+        profile: String,
+        attached: Vec<String>,
+        round: u8,
+    },
 }
 
 /// What the user chose to put into one sandbox.
@@ -296,7 +353,11 @@ pub struct ProfileRow {
 }
 
 const PRESETS: [(&str, &str, &str); 3] = [
-    ("Claude Code (subscription)", "claude-code:latest", "claude-code"),
+    (
+        "Claude Code (subscription)",
+        "claude-code:latest",
+        "claude-code",
+    ),
     ("pi (attach a model provider afterwards)", "pi:latest", ""),
     ("Custom...", "", ""),
 ];
@@ -326,7 +387,11 @@ fn profile_summary(yaml: &str) -> String {
 
 fn sync_label(i: &cli::SyncItem) -> String {
     let agents: Vec<&str> = i.agents.iter().map(|(a, _)| a.as_str()).collect();
-    let tag = if i.kind == "host-only" { " (host-only)" } else { "" };
+    let tag = if i.kind == "host-only" {
+        " (host-only)"
+    } else {
+        ""
+    };
     format!("{:<11} {}  [{}]{tag}", i.group, i.name, agents.join(", "))
 }
 
@@ -360,10 +425,23 @@ pub fn sync_steps(plan: &SyncPlan) -> Vec<Step> {
         _ => &["claude-code"],
     };
     let mut steps = Vec::new();
-    for item in plan.manifest.items.iter().filter(|i| plan.ids.contains(&i.id)) {
-        for (_, spec) in item.agents.iter().filter(|(a, _)| wanted.contains(&a.as_str())) {
+    for item in plan
+        .manifest
+        .items
+        .iter()
+        .filter(|i| plan.ids.contains(&i.id))
+    {
+        for (_, spec) in item
+            .agents
+            .iter()
+            .filter(|(a, _)| wanted.contains(&a.as_str()))
+        {
             if let Some(cmds) = spec.as_array() {
-                steps.extend(cmds.iter().filter_map(|c| c.as_str()).map(|c| in_sandbox(&plan.sandbox, c)));
+                steps.extend(
+                    cmds.iter()
+                        .filter_map(|c| c.as_str())
+                        .map(|c| in_sandbox(&plan.sandbox, c)),
+                );
             } else if let (Some(src), Some(dest)) = (spec["src"].as_str(), spec["dest"].as_str()) {
                 steps.push(Step {
                     prog: "openshell".into(),
@@ -442,7 +520,9 @@ fn review_label(s: &watch::Seen) -> String {
 
 /// True when an `osh` found on PATH is this checkout's launcher.
 fn on_path(dir: &Path) -> bool {
-    let Ok(ours) = dir.join("osh").canonicalize() else { return false };
+    let Ok(ours) = dir.join("osh").canonicalize() else {
+        return false;
+    };
     std::env::var_os("PATH").is_some_and(|p| {
         std::env::split_paths(&p).any(|d| d.join("osh").canonicalize().is_ok_and(|c| c == ours))
     })
@@ -452,7 +532,9 @@ fn on_path(dir: &Path) -> bool {
 fn config_stale(dir: &Path) -> bool {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+        });
     match (
         std::fs::read(dir.join("gateway.toml")),
         std::fs::read(base.join("openshell/gateway.toml")),
@@ -515,7 +597,12 @@ impl App {
         ids.into_iter()
             .map(|id| ProfileRow {
                 in_repo: cli::profile_path(&self.dir, &id).exists(),
-                gateway_version: self.snap.profiles.iter().find(|p| p.id == id).map(|p| p.version),
+                gateway_version: self
+                    .snap
+                    .profiles
+                    .iter()
+                    .find(|p| p.id == id)
+                    .map(|p| p.version),
                 id,
             })
             .collect()
@@ -570,7 +657,11 @@ impl App {
 
     /// Note a status change, so a focused shell can flash it.
     pub fn tick(&mut self) {
-        if self.status_at.as_ref().is_none_or(|(s, _)| *s != self.status) {
+        if self
+            .status_at
+            .as_ref()
+            .is_none_or(|(s, _)| *s != self.status)
+        {
             self.status_at = Some((self.status.clone(), Instant::now()));
         }
     }
@@ -593,13 +684,19 @@ impl App {
 
     /// Whether `sandbox` on the shown gateway has a running shell.
     pub fn has_session(&self, sandbox: &str) -> bool {
-        self.sessions.iter().any(|s| s.sandbox == sandbox && s.gateway == self.snap.gateway)
+        self.sessions
+            .iter()
+            .any(|s| s.sandbox == sandbox && s.gateway == self.snap.gateway)
     }
 
     /// Focus the shell of `sandbox`, starting one sized to the screen if none runs.
     fn open_session(&mut self, sandbox: String) {
         let gw = cli::gateway();
-        if let Some(i) = self.sessions.iter().position(|s| s.sandbox == sandbox && s.gateway == gw) {
+        if let Some(i) = self
+            .sessions
+            .iter()
+            .position(|s| s.sandbox == sandbox && s.gateway == gw)
+        {
             self.active = Some(i);
             return;
         }
@@ -611,7 +708,9 @@ impl App {
                 self.active = Some(self.sessions.len() - 1);
                 match Follow::spawn(sandbox.clone(), gw) {
                     Ok(f) => self.follows.push(f),
-                    Err(e) => self.status = format!("Blocked-request watcher off for {sandbox}: {e}"),
+                    Err(e) => {
+                        self.status = format!("Blocked-request watcher off for {sandbox}: {e}")
+                    }
                 }
             }
             Err(e) => self.status = format!("Error: {e}"),
@@ -620,16 +719,24 @@ impl App {
 
     fn close_session(&mut self, i: usize) -> Session {
         let s = self.sessions.remove(i);
-        self.follows.retain(|f| !(f.sandbox == s.sandbox && f.gateway == s.gateway));
+        self.follows
+            .retain(|f| !(f.sandbox == s.sandbox && f.gateway == s.gateway));
         if !self.sessions.iter().any(|o| o.sandbox == s.sandbox) {
             self.watch.end_session(&s.sandbox);
-            if matches!(&self.modal, Some(Modal::Select { kind: SelKind::Blocked { sandbox, .. }, .. }) if *sandbox == s.sandbox) {
+            if matches!(&self.modal, Some(Modal::Select { kind: SelKind::Blocked { sandbox, .. }, .. }) if *sandbox == s.sandbox)
+            {
                 self.modal = None;
             }
         }
         self.active = match self.active {
             Some(a) if a == i => {
-                if matches!(self.modal, Some(Modal::Select { kind: SelKind::SessionMenu, .. })) {
+                if matches!(
+                    self.modal,
+                    Some(Modal::Select {
+                        kind: SelKind::SessionMenu,
+                        ..
+                    })
+                ) {
                     self.modal = None;
                 }
                 None
@@ -675,9 +782,16 @@ impl App {
     /// Host clipboard: OSC 52 through the terminal, plus `pbcopy` on macOS.
     fn copy(&mut self, text: &str) {
         let mut out = std::io::stdout();
-        let _ = out.write_all(term::osc52(text).as_bytes()).and_then(|_| out.flush());
+        let _ = out
+            .write_all(term::osc52(text).as_bytes())
+            .and_then(|_| out.flush());
         if cfg!(target_os = "macos") {
-            if let Ok(mut c) = Command::new("pbcopy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+            if let Ok(mut c) = Command::new("pbcopy")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
                 if let Some(mut i) = c.stdin.take() {
                     let _ = i.write_all(text.as_bytes());
                 }
@@ -707,7 +821,11 @@ impl App {
             let f = self.follows.remove(i);
             self.status = format!("Blocked-request watcher for {} stopped: {last}", f.sandbox);
         }
-        if self.watch.has_queued() && self.modal.is_none() && self.logview.is_none() && self.job.is_none() {
+        if self.watch.has_queued()
+            && self.modal.is_none()
+            && self.logview.is_none()
+            && self.job.is_none()
+        {
             self.show_prompt();
         }
     }
@@ -717,7 +835,12 @@ impl App {
         self.prompt_at = Some(Instant::now());
         let here = self.session().map(|s| s.sandbox.clone());
         match p {
-            Prompt::Blocked { sandbox, gateway, b, count } => {
+            Prompt::Blocked {
+                sandbox,
+                gateway,
+                b,
+                count,
+            } => {
                 let prog = b.program().to_string();
                 let mut title = format!("{prog} was blocked from reaching {}", b.target());
                 if here.as_deref() != Some(sandbox.as_str()) {
@@ -734,9 +857,22 @@ impl App {
                 items.push(format!("Allow all methods for {prog}"));
                 items.push("Ignore this time".into());
                 items.push("Ignore until the session ends".into());
-                self.select(&title, items, false, SelKind::Blocked { sandbox, gateway, b });
+                self.select(
+                    &title,
+                    items,
+                    false,
+                    SelKind::Blocked {
+                        sandbox,
+                        gateway,
+                        b,
+                    },
+                );
             }
-            Prompt::Notice { sandbox, what, reason } => {
+            Prompt::Notice {
+                sandbox,
+                what,
+                reason,
+            } => {
                 self.modal = Some(Modal::Info(notice_text(&sandbox, &what, &reason)));
             }
         }
@@ -746,8 +882,14 @@ impl App {
     fn review(&mut self, sandbox: String) {
         let seen = self.watch.for_sandbox(&sandbox);
         if seen.is_empty() {
-            let how = if self.has_session(&sandbox) { "" } else { " The watcher runs while its shell is open (Enter)." };
-            self.modal = Some(Modal::Info(format!("No blocked requests seen in {sandbox}.{how}")));
+            let how = if self.has_session(&sandbox) {
+                ""
+            } else {
+                " The watcher runs while its shell is open (Enter)."
+            };
+            self.modal = Some(Modal::Info(format!(
+                "No blocked requests seen in {sandbox}.{how}"
+            )));
             return;
         }
         let items = seen.iter().map(|s| review_label(s)).collect();
@@ -793,7 +935,13 @@ impl App {
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
     {
-        self.bg(move || f().map(|msg| Done { msg, next: None, sync: None }));
+        self.bg(move || {
+            f().map(|msg| Done {
+                msg,
+                next: None,
+                sync: None,
+            })
+        });
     }
 
     pub fn on_done(&mut self, d: Done) {
@@ -804,14 +952,45 @@ impl App {
         self.refresh();
         if let Some(stage) = d.sync {
             match stage {
-                SyncStage::Manifest { sandbox, agent, manifest } => self.pick_sync_items(sandbox, agent, manifest),
-                SyncStage::Check { sync, check, offered } => self.confirm_sync(sync, check, offered),
-                SyncStage::Attach { sync, profile } => self.attach_and_check(sync, vec![profile], vec![], 2),
-                SyncStage::Retry { sync, profile, round } => self.attach_and_check(sync, vec![profile], vec![], round),
-                SyncStage::Conflict { sync, profile, attached, round } => {
-                    let title = format!("{profile} cannot be attached next to what {} has", sync.sandbox);
+                SyncStage::Manifest {
+                    sandbox,
+                    agent,
+                    manifest,
+                } => self.pick_sync_items(sandbox, agent, manifest),
+                SyncStage::Check {
+                    sync,
+                    check,
+                    offered,
+                } => self.confirm_sync(sync, check, offered),
+                SyncStage::Attach { sync, profile } => {
+                    self.attach_and_check(sync, vec![profile], vec![], 2)
+                }
+                SyncStage::Retry {
+                    sync,
+                    profile,
+                    round,
+                } => self.attach_and_check(sync, vec![profile], vec![], round),
+                SyncStage::Conflict {
+                    sync,
+                    profile,
+                    attached,
+                    round,
+                } => {
+                    let title = format!(
+                        "{profile} cannot be attached next to what {} has",
+                        sync.sandbox
+                    );
                     let items = conflict_items(&attached, &profile);
-                    self.select(&title, items, false, SelKind::Conflict { sync, profile, round });
+                    self.select(
+                        &title,
+                        items,
+                        false,
+                        SelKind::Conflict {
+                            sync,
+                            profile,
+                            round,
+                        },
+                    );
                 }
                 SyncStage::Generated { sync, name, yaml } => {
                     self.modal = Some(Modal::Confirm {
@@ -866,12 +1045,7 @@ impl App {
         });
     }
 
-    fn start_creds(
-        &mut self,
-        provider: String,
-        update: bool,
-        next: Option<(Plan, Vec<String>)>,
-    ) {
+    fn start_creds(&mut self, provider: String, update: bool, next: Option<(Plan, Vec<String>)>) {
         let keys = if update {
             self.snap
                 .providers
@@ -882,12 +1056,27 @@ impl App {
         } else {
             cli::profile_env_keys(&self.dir, &provider)
         };
-        self.cred_step(InKind::Cred { provider, keys, values: vec![], update, next });
+        self.cred_step(InKind::Cred {
+            provider,
+            keys,
+            values: vec![],
+            update,
+            next,
+        });
     }
 
     /// Ask for the next key, or run the create/update once all are collected.
     fn cred_step(&mut self, kind: InKind) {
-        let InKind::Cred { provider, keys, mut values, update, next } = kind else { return };
+        let InKind::Cred {
+            provider,
+            keys,
+            mut values,
+            update,
+            next,
+        } = kind
+        else {
+            return;
+        };
         // Take values already exported in the TUI's environment instead of prompting.
         while let Some(key) = keys.get(values.len()) {
             match std::env::var(key) {
@@ -905,7 +1094,13 @@ impl App {
                     "Claude Code token",
                     items,
                     false,
-                    SelKind::ClaudeToken(InKind::Cred { provider, keys, values, update, next }),
+                    SelKind::ClaudeToken(InKind::Cred {
+                        provider,
+                        keys,
+                        values,
+                        update,
+                        next,
+                    }),
                 );
                 return;
             }
@@ -918,7 +1113,13 @@ impl App {
                     "GitHub token",
                     items,
                     false,
-                    SelKind::GhToken(InKind::Cred { provider, keys, values, update, next }),
+                    SelKind::GhToken(InKind::Cred {
+                        provider,
+                        keys,
+                        values,
+                        update,
+                        next,
+                    }),
                 );
                 return;
             }
@@ -928,12 +1129,29 @@ impl App {
             } else {
                 ""
             };
-            let title = format!("{provider}: {key}{}{hint}", if mask { " (hidden)" } else { "" });
-            self.input(&title, mask, InKind::Cred { provider, keys, values, update, next });
+            let title = format!(
+                "{provider}: {key}{}{hint}",
+                if mask { " (hidden)" } else { "" }
+            );
+            self.input(
+                &title,
+                mask,
+                InKind::Cred {
+                    provider,
+                    keys,
+                    values,
+                    update,
+                    next,
+                },
+            );
             return;
         }
         let dir = self.dir.clone();
-        let attach = if update { None } else { self.sync_secret.take() };
+        let attach = if update {
+            None
+        } else {
+            self.sync_secret.take()
+        };
         self.status = format!("Working on provider {provider}...");
         self.bg(move || {
             let msg = if update {
@@ -941,7 +1159,10 @@ impl App {
             } else {
                 cli::create_provider(&dir, &provider, &values)?
             };
-            let sync = attach.map(|sync| SyncStage::Attach { sync, profile: provider.clone() });
+            let sync = attach.map(|sync| SyncStage::Attach {
+                sync,
+                profile: provider.clone(),
+            });
             Ok(Done { msg, next, sync })
         });
     }
@@ -949,7 +1170,10 @@ impl App {
     /// Run `claude setup-token` with the terminal handed over; `finish_job`
     /// then asks for the printed token (the command has no machine-readable output).
     fn generate_token(&mut self, flow: InKind) {
-        self.job = Some(vec![Step { prog: "claude".into(), args: vec!["setup-token".into()] }]);
+        self.job = Some(vec![Step {
+            prog: "claude".into(),
+            args: vec!["setup-token".into()],
+        }]);
         self.token_flow = Some(flow);
     }
 
@@ -973,7 +1197,12 @@ impl App {
         };
         let title = format!("Add to {sandbox} ({agent}); Space marks, {secrets}");
         let defaults: Vec<bool> = manifest.items.iter().map(|i| i.default).collect();
-        let kind = SelKind::SyncItems { sandbox, agent, manifest, labels: labels.clone() };
+        let kind = SelKind::SyncItems {
+            sandbox,
+            agent,
+            manifest,
+            labels: labels.clone(),
+        };
         self.select(&title, labels, true, kind);
         if let Some(Modal::Select { marked, .. }) = &mut self.modal {
             *marked = defaults;
@@ -997,11 +1226,20 @@ impl App {
                 hosts.dedup();
                 let mut items = Vec::new();
                 if !check.fixes.is_empty() {
-                    items.push(format!("Add the built-in profile(s): {}", check.fixes.join(", ")));
+                    items.push(format!(
+                        "Add the built-in profile(s): {}",
+                        check.fixes.join(", ")
+                    ));
                 }
-                items.push("Generate a custom profile for exactly this (review it first)".to_string());
+                items.push(
+                    "Generate a custom profile for exactly this (review it first)".to_string(),
+                );
                 items.push("Cancel".to_string());
-                let title = format!("{} blocks installs; missing: {}", sync.sandbox, hosts.join(", "));
+                let title = format!(
+                    "{} blocks installs; missing: {}",
+                    sync.sandbox,
+                    hosts.join(", ")
+                );
                 self.select(&title, items, false, SelKind::SyncAccess { sync, check });
                 return;
             }
@@ -1020,7 +1258,10 @@ impl App {
                 });
                 self.modal = Some(Modal::Confirm {
                     text,
-                    kind: ConfKind::SyncSecret { sync, profile: profile.clone() },
+                    kind: ConfKind::SyncSecret {
+                        sync,
+                        profile: profile.clone(),
+                    },
                 });
                 return;
             }
@@ -1037,7 +1278,9 @@ impl App {
             return;
         }
         let steps_list = sync_steps(&sync);
-        let uploads = steps_list.iter().any(|s| s.args.iter().any(|a| a == "upload"));
+        let uploads = steps_list
+            .iter()
+            .any(|s| s.args.iter().any(|a| a == "upload"));
         if uploads && sync.manifest.findings.unwrap_or(0) > 0 {
             let n = sync.manifest.findings.unwrap_or(0);
             self.cleanup_sync_stage();
@@ -1058,7 +1301,13 @@ impl App {
 
     /// Create (the ones in `create`) and attach `profiles`, then check the policy again.
     /// `round` is stored in the result so the same offer is not made twice.
-    fn attach_and_check(&mut self, sync: SyncPlan, profiles: Vec<String>, create: Vec<String>, round: u8) {
+    fn attach_and_check(
+        &mut self,
+        sync: SyncPlan,
+        profiles: Vec<String>,
+        create: Vec<String>,
+        round: u8,
+    ) {
         let dir = self.dir.clone();
         self.status = format!("Adding {} to {}...", profiles.join(", "), sync.sandbox);
         self.bg(move || {
@@ -1066,7 +1315,16 @@ impl App {
                 if create.contains(p) {
                     cli::create_provider(&dir, p, &[])?;
                 }
-                if let Err(e) = cli::os(&["sandbox", "provider", "attach", &sync.sandbox, p, "--wait", "--timeout", "30"]) {
+                if let Err(e) = cli::os(&[
+                    "sandbox",
+                    "provider",
+                    "attach",
+                    &sync.sandbox,
+                    p,
+                    "--wait",
+                    "--timeout",
+                    "30",
+                ]) {
                     if !e.contains(cli::ATTACH_CONFLICT) {
                         return Err(e);
                     }
@@ -1075,7 +1333,12 @@ impl App {
                     return Ok(Done {
                         msg: format!("Could not attach {p} to {}", sync.sandbox),
                         next: None,
-                        sync: Some(SyncStage::Conflict { sync, profile: p.clone(), attached, round }),
+                        sync: Some(SyncStage::Conflict {
+                            sync,
+                            profile: p.clone(),
+                            attached,
+                            round,
+                        }),
                     });
                 }
             }
@@ -1083,7 +1346,11 @@ impl App {
             Ok(Done {
                 msg: format!("Added {}", profiles.join(", ")),
                 next: None,
-                sync: Some(SyncStage::Check { sync, check, offered: round }),
+                sync: Some(SyncStage::Check {
+                    sync,
+                    check,
+                    offered: round,
+                }),
             })
         });
     }
@@ -1091,7 +1358,9 @@ impl App {
     /// Ask whether to remove the generated install access, if any is still attached;
     /// `before` is shown above the question.
     fn offer_drop(&mut self, before: &str) -> bool {
-        let Some((sandbox, name)) = self.temp_access.take() else { return false };
+        let Some((sandbox, name)) = self.temp_access.take() else {
+            return false;
+        };
         self.modal = Some(Modal::Confirm {
             text: format!("{before}Detach {name} from {sandbox} and delete it and its profile? Its network access is only needed while installing."),
             kind: ConfKind::DropAccess { sandbox, name },
@@ -1108,7 +1377,11 @@ impl App {
             self.status = format!("Step failed: {} ({})", f.label, f.status);
         }
         if let (Some(f), Some(mut sync)) = (failed, self.running_sync.take()) {
-            let output = if f.tail.is_empty() { String::new() } else { format!("\n\nLast output:\n{}", f.tail.join("\n")) };
+            let output = if f.tail.is_empty() {
+                String::new()
+            } else {
+                format!("\n\nLast output:\n{}", f.tail.join("\n"))
+            };
             if auth_failure(&f.tail) {
                 sync.skip += f.index;
                 self.modal = Some(Modal::Confirm {
@@ -1121,7 +1394,10 @@ impl App {
                 return;
             }
             self.cleanup_sync_stage();
-            let text = format!("The installs stopped at a failed step ({}):\n  {}{output}", f.status, f.label);
+            let text = format!(
+                "The installs stopped at a failed step ({}):\n  {}{output}",
+                f.status, f.label
+            );
             if !self.offer_drop(&format!("{text}\n\n")) {
                 self.modal = Some(Modal::Info(text));
             }
@@ -1130,14 +1406,31 @@ impl App {
         self.running_sync = None;
         self.cleanup_sync_stage();
         self.offer_drop("");
-        let Some(flow) = self.token_flow.take() else { return };
-        let InKind::Cred { provider, keys, values, .. } = &flow else { return };
-        let title = format!("Paste the token claude printed: {provider}: {} (hidden)", keys[values.len()]);
+        let Some(flow) = self.token_flow.take() else {
+            return;
+        };
+        let InKind::Cred {
+            provider,
+            keys,
+            values,
+            ..
+        } = &flow
+        else {
+            return;
+        };
+        let title = format!(
+            "Paste the token claude printed: {provider}: {} (hidden)",
+            keys[values.len()]
+        );
         self.input(&title, true, flow);
     }
 
     fn ask_name(&mut self, plan: Plan) {
-        self.input("Sandbox name (empty = generated)", false, InKind::Name(plan));
+        self.input(
+            "Sandbox name (empty = generated)",
+            false,
+            InKind::Name(plan),
+        );
     }
 
     fn start_wizard(&mut self) {
@@ -1166,7 +1459,12 @@ impl App {
 
     fn sandbox_steps(&self, plan: &Plan) -> Vec<Step> {
         let mut steps = Vec::new();
-        if let Some(img) = self.snap.images.iter().find(|i| i.tag == plan.image && !i.built) {
+        if let Some(img) = self
+            .snap
+            .images
+            .iter()
+            .find(|i| i.tag == plan.image && !i.built)
+        {
             steps.push(Step {
                 prog: "docker".into(),
                 args: cli::build_args(&self.dir, &img.file, &img.tag),
@@ -1192,9 +1490,18 @@ impl App {
             // The detached shell stays the main process; sessions come from `exec`.
             args.push("--detach".into());
         } else {
-            args.extend(["--no-keep".into(), "--".into(), "sh".into(), "-c".into(), plan.command.clone()]);
+            args.extend([
+                "--no-keep".into(),
+                "--".into(),
+                "sh".into(),
+                "-c".into(),
+                plan.command.clone(),
+            ]);
         }
-        steps.push(Step { prog: "openshell".into(), args: cli::with_gateway(args) });
+        steps.push(Step {
+            prog: "openshell".into(),
+            args: cli::with_gateway(args),
+        });
         steps
     }
 
@@ -1202,7 +1509,9 @@ impl App {
         let first = picks.first().cloned().unwrap_or_default();
         match kind {
             SelKind::Preset => {
-                let Some(p) = PRESETS.iter().find(|p| p.0 == first) else { return };
+                let Some(p) = PRESETS.iter().find(|p| p.0 == first) else {
+                    return;
+                };
                 if p.1.is_empty() {
                     let mut items: Vec<String> =
                         self.snap.images.iter().map(|i| i.tag.clone()).collect();
@@ -1212,7 +1521,11 @@ impl App {
                 } else {
                     let plan = Plan {
                         image: p.1.into(),
-                        providers: if p.2.is_empty() { vec![] } else { vec![p.2.into()] },
+                        providers: if p.2.is_empty() {
+                            vec![]
+                        } else {
+                            vec![p.2.into()]
+                        },
                         ..Plan::default()
                     };
                     self.proceed(plan);
@@ -1221,9 +1534,14 @@ impl App {
             SelKind::Image => {
                 let plan = Plan::default();
                 match first.as_str() {
-                    "Other image reference..." => self.input("Image reference", false, InKind::OtherImage),
+                    "Other image reference..." => {
+                        self.input("Image reference", false, InKind::OtherImage)
+                    }
                     "Gateway default image" => self.pick_providers(plan),
-                    _ => self.pick_providers(Plan { image: first, ..plan }),
+                    _ => self.pick_providers(Plan {
+                        image: first,
+                        ..plan
+                    }),
                 }
             }
             SelKind::Providers(mut plan) => {
@@ -1232,14 +1550,32 @@ impl App {
             }
             SelKind::AttachProvider(sb) => {
                 self.bg_msg(move || {
-                    cli::os(&["sandbox", "provider", "attach", &sb, &first, "--wait", "--timeout", "30"])
-                        .map(|_| format!("Attached {first} to {sb}"))
+                    cli::os(&[
+                        "sandbox",
+                        "provider",
+                        "attach",
+                        &sb,
+                        &first,
+                        "--wait",
+                        "--timeout",
+                        "30",
+                    ])
+                    .map(|_| format!("Attached {first} to {sb}"))
                 });
             }
             SelKind::DetachProvider(sb) => {
                 self.bg_msg(move || {
-                    cli::os(&["sandbox", "provider", "detach", &sb, &first, "--wait", "--timeout", "30"])
-                        .map(|_| format!("Detached {first} from {sb}"))
+                    cli::os(&[
+                        "sandbox",
+                        "provider",
+                        "detach",
+                        &sb,
+                        &first,
+                        "--wait",
+                        "--timeout",
+                        "30",
+                    ])
+                    .map(|_| format!("Detached {first} from {sb}"))
                 });
             }
             SelKind::Gateway => {
@@ -1254,7 +1590,15 @@ impl App {
             }
             SelKind::ClaudeToken(flow) => {
                 if first.starts_with("Paste") {
-                    let InKind::Cred { provider, keys, values, .. } = &flow else { return };
+                    let InKind::Cred {
+                        provider,
+                        keys,
+                        values,
+                        ..
+                    } = &flow
+                    else {
+                        return;
+                    };
                     let key = &keys[values.len()];
                     let title = format!("{provider}: {key} (hidden)");
                     self.input(&title, true, flow);
@@ -1262,7 +1606,11 @@ impl App {
                     self.generate_token(flow);
                 }
             }
-            SelKind::Conflict { sync, profile, round } => {
+            SelKind::Conflict {
+                sync,
+                profile,
+                round,
+            } => {
                 let Some(other) = conflict_pick(&first).map(String::from) else {
                     self.cleanup_sync_stage();
                     self.offer_drop("");
@@ -1272,10 +1620,31 @@ impl App {
                 let sandbox = sync.sandbox.clone();
                 let tx = self.done_tx.clone();
                 thread::spawn(move || {
-                    let r = cli::os(&["sandbox", "provider", "detach", &sandbox, &other, "--wait", "--timeout", "30"]);
+                    let r = cli::os(&[
+                        "sandbox",
+                        "provider",
+                        "detach",
+                        &sandbox,
+                        &other,
+                        "--wait",
+                        "--timeout",
+                        "30",
+                    ]);
                     let d = match r {
-                        Ok(_) => Done { msg: format!("Detached {other}"), next: None, sync: Some(SyncStage::Retry { sync, profile, round }) },
-                        Err(e) => Done { msg: format!("Error: {e}"), next: None, sync: None },
+                        Ok(_) => Done {
+                            msg: format!("Detached {other}"),
+                            next: None,
+                            sync: Some(SyncStage::Retry {
+                                sync,
+                                profile,
+                                round,
+                            }),
+                        },
+                        Err(e) => Done {
+                            msg: format!("Error: {e}"),
+                            next: None,
+                            sync: None,
+                        },
                     };
                     let _ = tx.send(d);
                 });
@@ -1291,7 +1660,10 @@ impl App {
                     self.attach_and_check(sync, check.fixes, create, 1);
                 } else if first.starts_with("Generate") {
                     self.input(
-                        &format!("Name for the generated provider (empty = install-{})", sync.sandbox),
+                        &format!(
+                            "Name for the generated provider (empty = install-{})",
+                            sync.sandbox
+                        ),
                         false,
                         InKind::GenName(sync),
                     );
@@ -1300,23 +1672,52 @@ impl App {
                 }
             }
             SelKind::GhToken(flow) => {
-                let InKind::Cred { provider, keys, mut values, update, next } = flow else { return };
+                let InKind::Cred {
+                    provider,
+                    keys,
+                    mut values,
+                    update,
+                    next,
+                } = flow
+                else {
+                    return;
+                };
                 let key = keys[values.len()].clone();
                 match cli::gh_token().filter(|_| first.starts_with("Use")) {
                     Some(token) => {
                         values.push((key, token));
-                        self.cred_step(InKind::Cred { provider, keys, values, update, next });
+                        self.cred_step(InKind::Cred {
+                            provider,
+                            keys,
+                            values,
+                            update,
+                            next,
+                        });
                     }
                     None => {
                         let title = format!(
                             "{provider}: {key} (hidden). Use a fine-grained, read-only token: github.com/settings/personal-access-tokens/new"
                         );
-                        self.input(&title, true, InKind::Cred { provider, keys, values, update, next });
+                        self.input(
+                            &title,
+                            true,
+                            InKind::Cred {
+                                provider,
+                                keys,
+                                values,
+                                update,
+                                next,
+                            },
+                        );
                     }
                 }
             }
             SelKind::SyncAgents(sandbox) => {
-                let agent = if first == "both" { "both".to_string() } else { first };
+                let agent = if first == "both" {
+                    "both".to_string()
+                } else {
+                    first
+                };
                 let dir = self.dir.clone();
                 self.status = "Reading the host's skills and plugins...".into();
                 self.bg(move || {
@@ -1324,11 +1725,20 @@ impl App {
                     Ok(Done {
                         msg: format!("Found {} item(s)", manifest.items.len()),
                         next: None,
-                        sync: Some(SyncStage::Manifest { sandbox, agent, manifest }),
+                        sync: Some(SyncStage::Manifest {
+                            sandbox,
+                            agent,
+                            manifest,
+                        }),
                     })
                 });
             }
-            SelKind::SyncItems { sandbox, agent, manifest, labels } => {
+            SelKind::SyncItems {
+                sandbox,
+                agent,
+                manifest,
+                labels,
+            } => {
                 let ids: Vec<String> = labels
                     .iter()
                     .zip(&manifest.items)
@@ -1347,26 +1757,59 @@ impl App {
                     Ok(Done {
                         msg: "Policy checked".into(),
                         next: None,
-                        sync: Some(SyncStage::Check { sync: SyncPlan { sandbox, agent, manifest, ids, skip: 0 }, check, offered: 0 }),
+                        sync: Some(SyncStage::Check {
+                            sync: SyncPlan {
+                                sandbox,
+                                agent,
+                                manifest,
+                                ids,
+                                skip: 0,
+                            },
+                            check,
+                            offered: 0,
+                        }),
                     })
                 });
             }
-            SelKind::Blocked { sandbox, gateway, b } => {
+            SelKind::Blocked {
+                sandbox,
+                gateway,
+                b,
+            } => {
                 if let Some(rest) = first.strip_prefix("Allow ") {
                     let all = rest.starts_with("all");
                     self.watch.decide(&sandbox, &b, State::Allowed(all));
-                    self.status = format!("Allowing {} to reach {} in {sandbox}...", b.program(), b.target());
+                    self.status = format!(
+                        "Allowing {} to reach {} in {sandbox}...",
+                        b.program(),
+                        b.target()
+                    );
                     self.bg_msg(move || watch::allow(&gateway, &sandbox, &b, all));
                 } else {
                     let until_end = first.contains("session ends");
-                    let state = if until_end { State::Ignored } else { State::IgnoredOnce };
+                    let state = if until_end {
+                        State::Ignored
+                    } else {
+                        State::IgnoredOnce
+                    };
                     self.watch.decide(&sandbox, &b, state);
-                    let how = if until_end { "until the session ends" } else { "this time" };
+                    let how = if until_end {
+                        "until the session ends"
+                    } else {
+                        "this time"
+                    };
                     self.status = format!("Ignored {} -> {} {how}", b.program(), b.target());
                 }
             }
             SelKind::Review { sandbox, denials } => {
-                let Some(i) = self.watch.for_sandbox(&sandbox).iter().position(|s| review_label(s) == first) else { return };
+                let Some(i) = self
+                    .watch
+                    .for_sandbox(&sandbox)
+                    .iter()
+                    .position(|s| review_label(s) == first)
+                else {
+                    return;
+                };
                 match denials.get(i).cloned() {
                     Some(Denial::Blocked(b)) => {
                         let gateway = self.snap.gateway.clone();
@@ -1412,18 +1855,30 @@ impl App {
             }
         }
         names.sort();
-        self.select("Providers (space to mark, Enter to confirm)", names, true, SelKind::Providers(plan));
+        self.select(
+            "Providers (space to mark, Enter to confirm)",
+            names,
+            true,
+            SelKind::Providers(plan),
+        );
     }
 
     fn on_input(&mut self, kind: InKind, text: String) {
         match kind {
             InKind::OtherImage => {
                 if !text.trim().is_empty() {
-                    self.pick_providers(Plan { image: text.trim().into(), ..Plan::default() });
+                    self.pick_providers(Plan {
+                        image: text.trim().into(),
+                        ..Plan::default()
+                    });
                 }
             }
             InKind::GenName(sync) => {
-                let raw = if text.trim().is_empty() { format!("install-{}", sync.sandbox) } else { text };
+                let raw = if text.trim().is_empty() {
+                    format!("install-{}", sync.sandbox)
+                } else {
+                    text
+                };
                 let name: String = raw
                     .trim()
                     .to_lowercase()
@@ -1432,13 +1887,16 @@ impl App {
                     .collect();
                 if self.snap.providers.iter().any(|p| p.name == name) {
                     self.cleanup_sync_stage();
-                    self.modal = Some(Modal::Info(format!("A provider named {name} already exists. Pick another name.")));
+                    self.modal = Some(Modal::Info(format!(
+                        "A provider named {name} already exists. Pick another name."
+                    )));
                     return;
                 }
                 let dir = self.dir.clone();
                 self.status = "Generating the profile...".into();
                 self.bg(move || {
-                    let yaml = cli::sync_gen_profile(&dir, &sync.sandbox, &sync.agent, &sync.ids, &name)?;
+                    let yaml =
+                        cli::sync_gen_profile(&dir, &sync.sandbox, &sync.agent, &sync.ids, &name)?;
                     Ok(Done {
                         msg: "Profile generated".into(),
                         next: None,
@@ -1449,18 +1907,30 @@ impl App {
             InKind::Name(mut plan) => {
                 plan.name = text.trim().into();
                 if self.limits_supported() {
-                    self.input("CPU limit, e.g. 500m, 2 (empty = unlimited)", false, InKind::Cpu(plan));
+                    self.input(
+                        "CPU limit, e.g. 500m, 2 (empty = unlimited)",
+                        false,
+                        InKind::Cpu(plan),
+                    );
                 } else {
                     self.ask_command(plan);
                 }
             }
             InKind::Cpu(mut plan) => {
-                let Some(v) = limit(&text) else { return self.bad_limit("CPU") };
+                let Some(v) = limit(&text) else {
+                    return self.bad_limit("CPU");
+                };
                 plan.cpu = v;
-                self.input("Memory limit, e.g. 512Mi, 4Gi (empty = unlimited)", false, InKind::Memory(plan));
+                self.input(
+                    "Memory limit, e.g. 512Mi, 4Gi (empty = unlimited)",
+                    false,
+                    InKind::Memory(plan),
+                );
             }
             InKind::Memory(mut plan) => {
-                let Some(v) = limit(&text) else { return self.bad_limit("Memory") };
+                let Some(v) = limit(&text) else {
+                    return self.bad_limit("Memory");
+                };
                 plan.memory = v;
                 self.ask_command(plan);
             }
@@ -1477,7 +1947,13 @@ impl App {
                     kind: ConfKind::CreateSandbox(plan),
                 });
             }
-            InKind::Cred { provider, keys, mut values, update, next } => {
+            InKind::Cred {
+                provider,
+                keys,
+                mut values,
+                update,
+                next,
+            } => {
                 let text = text.trim().to_string();
                 if text.is_empty() {
                     self.status = "Cancelled: empty value".into();
@@ -1485,7 +1961,13 @@ impl App {
                 }
                 let key = keys[values.len()].clone();
                 values.push((key, text));
-                self.cred_step(InKind::Cred { provider, keys, values, update, next });
+                self.cred_step(InKind::Cred {
+                    provider,
+                    keys,
+                    values,
+                    update,
+                    next,
+                });
             }
         }
     }
@@ -1509,7 +1991,11 @@ impl App {
             .gateways
             .iter()
             .map(|g| {
-                let cur = if g.name == self.snap.gateway { "  (current)" } else { "" };
+                let cur = if g.name == self.snap.gateway {
+                    "  (current)"
+                } else {
+                    ""
+                };
                 format!("{}  {}{cur}", g.name, g.endpoint)
             })
             .collect();
@@ -1545,11 +2031,17 @@ impl App {
                     Ok(Done {
                         msg: format!("Attached {name}"),
                         next: None,
-                        sync: Some(SyncStage::Check { sync, check, offered: 1 }),
+                        sync: Some(SyncStage::Check {
+                            sync,
+                            check,
+                            offered: 1,
+                        }),
                     })
                 });
             }
-            ConfKind::DropAccess { sandbox, name } => self.bg_msg(move || cli::drop_generated(&sandbox, &name)),
+            ConfKind::DropAccess { sandbox, name } => {
+                self.bg_msg(move || cli::drop_generated(&sandbox, &name))
+            }
             ConfKind::SyncSecret { sync, profile } => {
                 if self.snap.providers.iter().any(|g| g.name == profile) {
                     self.attach_and_check(sync, vec![profile], vec![], 2);
@@ -1609,18 +2101,32 @@ impl App {
 
     /// Keys while a shell has focus: the chord, then an open modal, then the shell.
     fn session_key(&mut self, key: KeyEvent) {
-        let menu = matches!(self.modal, Some(Modal::Select { kind: SelKind::SessionMenu, .. }));
+        let menu = matches!(
+            self.modal,
+            Some(Modal::Select {
+                kind: SelKind::SessionMenu,
+                ..
+            })
+        );
         if term::is_chord(&key) {
             if menu {
                 self.modal = None;
             } else if self.modal.is_none() {
-                let name = self.session().map(|s| s.sandbox.clone()).unwrap_or_default();
+                let name = self
+                    .session()
+                    .map(|s| s.sandbox.clone())
+                    .unwrap_or_default();
                 let items = vec![
                     "Back to the session".into(),
                     "Dashboard (keep the session running)".into(),
                     "Close the session".into(),
                 ];
-                self.select(&format!("Shell in {name}"), items, false, SelKind::SessionMenu);
+                self.select(
+                    &format!("Shell in {name}"),
+                    items,
+                    false,
+                    SelKind::SessionMenu,
+                );
             }
             return;
         }
@@ -1671,7 +2177,10 @@ impl App {
             return;
         }
         let Some(name) = self.selected_sandbox().map(|s| s.name.clone()) else {
-            if matches!(code, KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p') | KeyCode::Enter) {
+            if matches!(
+                code,
+                KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p') | KeyCode::Enter
+            ) {
                 self.modal = Some(Modal::Info(
                     "No sandbox selected. This gateway has none: press n to create one (g switches gateway).".into(),
                 ));
@@ -1699,22 +2208,39 @@ impl App {
             }),
             KeyCode::Char('K') => {
                 let items = vec!["claude-code".into(), "pi".into(), "both".into()];
-                self.select("Add skills and plugins for", items, false, SelKind::SyncAgents(name));
+                self.select(
+                    "Add skills and plugins for",
+                    items,
+                    false,
+                    SelKind::SyncAgents(name),
+                );
             }
             KeyCode::Char('a') => {
                 let items = self.snap.providers.iter().map(|p| p.name.clone()).collect();
-                self.select("Attach provider", items, false, SelKind::AttachProvider(name));
+                self.select(
+                    "Attach provider",
+                    items,
+                    false,
+                    SelKind::AttachProvider(name),
+                );
             }
             KeyCode::Char('x') => {
                 let attached = cli::attached_providers(&name);
-                self.select("Detach provider", attached, false, SelKind::DetachProvider(name));
+                self.select(
+                    "Detach provider",
+                    attached,
+                    false,
+                    SelKind::DetachProvider(name),
+                );
             }
             _ => {}
         }
     }
 
     fn gateway_key(&mut self, code: KeyCode) {
-        let Some(g) = self.snap.gateways.get(self.current()) else { return };
+        let Some(g) = self.snap.gateways.get(self.current()) else {
+            return;
+        };
         match code {
             KeyCode::Char('d') => {
                 if !matches!(g.name.as_str(), "openshell" | "openshell-docker") {
@@ -1760,12 +2286,18 @@ impl App {
         match code {
             KeyCode::Char('n') => {
                 let ids = cli::profile_ids(&self.dir);
-                self.select("Create provider from profile", ids, false, SelKind::NewProvider);
+                self.select(
+                    "Create provider from profile",
+                    ids,
+                    false,
+                    SelKind::NewProvider,
+                );
             }
             KeyCode::Char('u') => {
                 if let Some(p) = self.snap.providers.get(self.current()).cloned() {
                     if p.keys.is_empty() {
-                        self.modal = Some(Modal::Info(format!("{} stores no credentials.", p.name)));
+                        self.modal =
+                            Some(Modal::Info(format!("{} stores no credentials.", p.name)));
                     } else {
                         self.start_creds(p.name, true, None);
                     }
@@ -1788,12 +2320,21 @@ impl App {
             return;
         }
         let rows = self.profile_rows();
-        let Some(row) = rows.get(self.current()) else { return };
+        let Some(row) = rows.get(self.current()) else {
+            return;
+        };
         if !row.in_repo {
-            self.modal = Some(Modal::Info(format!("No {}.yaml in providers/ to sync from.", row.id)));
+            self.modal = Some(Modal::Info(format!(
+                "No {}.yaml in providers/ to sync from.",
+                row.id
+            )));
             return;
         }
-        if cli::profile_env_keys(&self.dir, &row.id).first().map(String::as_str) == Some("FORGEJO_HOST") {
+        if cli::profile_env_keys(&self.dir, &row.id)
+            .first()
+            .map(String::as_str)
+            == Some("FORGEJO_HOST")
+        {
             self.modal = Some(Modal::Info(
                 "This profile needs FORGEJO_HOST rendered in. Create it from the Providers tab (n).".into(),
             ));
@@ -1805,13 +2346,27 @@ impl App {
     }
 
     fn open_viewer(&mut self, title: &str, text: String, back: Modal) {
-        self.modal = Some(Modal::Viewer { title: title.into(), text, scroll: 0, back: Box::new(back) });
+        self.modal = Some(Modal::Viewer {
+            title: title.into(),
+            text,
+            scroll: 0,
+            back: Box::new(back),
+        });
     }
 
     fn modal_key(&mut self, modal: Modal, key: KeyEvent) {
         // A prompt can open mid-typing: Enter meant for the shell must not pick an answer.
         let fresh = self.prompt_at.is_some_and(|t| t.elapsed() < PROMPT_GRACE);
-        if fresh && matches!(modal, Modal::Info(_) | Modal::Select { kind: SelKind::Blocked { .. }, .. }) {
+        if fresh
+            && matches!(
+                modal,
+                Modal::Info(_)
+                    | Modal::Select {
+                        kind: SelKind::Blocked { .. },
+                        ..
+                    }
+            )
+        {
             self.modal = Some(modal);
             return;
         }
@@ -1821,9 +2376,17 @@ impl App {
                     self.open_viewer("Details", text.clone(), Modal::Info(text));
                 }
             }
-            Modal::Viewer { title, text, mut scroll, back } => {
+            Modal::Viewer {
+                title,
+                text,
+                mut scroll,
+                back,
+            } => {
                 // The viewer fills the screen minus its border and margin; stop when the last line is at the bottom.
-                let rows = ratatui::crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24).saturating_sub(4);
+                let rows = ratatui::crossterm::terminal::size()
+                    .map(|(_, h)| h)
+                    .unwrap_or(24)
+                    .saturating_sub(4);
                 let last = (text.lines().count() as u16).saturating_sub(rows);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
@@ -1838,7 +2401,12 @@ impl App {
                     KeyCode::Char('G') | KeyCode::End => scroll = last,
                     _ => {}
                 }
-                self.modal = Some(Modal::Viewer { title, text, scroll, back });
+                self.modal = Some(Modal::Viewer {
+                    title,
+                    text,
+                    scroll,
+                    back,
+                });
             }
             Modal::Confirm { text, kind } => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.on_confirm(kind),
@@ -1857,7 +2425,12 @@ impl App {
                 }
                 _ => self.modal = Some(Modal::Confirm { text, kind }),
             },
-            Modal::Input { title, mut buf, mask, kind } => match key.code {
+            Modal::Input {
+                title,
+                mut buf,
+                mask,
+                kind,
+            } => match key.code {
                 KeyCode::Esc => self.cleanup_sync_stage(),
                 KeyCode::Enter => self.on_input(kind, buf),
                 code => {
@@ -1868,12 +2441,26 @@ impl App {
                         }
                         _ => {}
                     }
-                    self.modal = Some(Modal::Input { title, buf, mask, kind });
+                    self.modal = Some(Modal::Input {
+                        title,
+                        buf,
+                        mask,
+                        kind,
+                    });
                 }
             },
-            Modal::Select { title, items, mut cursor, mut marked, multi, kind } => match key.code {
+            Modal::Select {
+                title,
+                items,
+                mut cursor,
+                mut marked,
+                multi,
+                kind,
+            } => match key.code {
                 KeyCode::Esc if matches!(kind, SelKind::SessionMenu | SelKind::Review { .. }) => {}
-                KeyCode::Esc if matches!(kind, SelKind::Blocked { .. }) => self.on_select(kind, vec!["Ignore this time".into()]),
+                KeyCode::Esc if matches!(kind, SelKind::Blocked { .. }) => {
+                    self.on_select(kind, vec!["Ignore this time".into()])
+                }
                 KeyCode::Esc => self.cleanup_sync_stage(),
                 KeyCode::Enter => {
                     let mut picks: Vec<String> = items
@@ -1889,12 +2476,21 @@ impl App {
                 }
                 code => {
                     match code {
-                        KeyCode::Char('j') | KeyCode::Down => cursor = (cursor + 1).min(items.len() - 1),
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            cursor = (cursor + 1).min(items.len() - 1)
+                        }
                         KeyCode::Char('k') | KeyCode::Up => cursor = cursor.saturating_sub(1),
                         KeyCode::Char(' ') if multi => marked[cursor] = !marked[cursor],
                         _ => {}
                     }
-                    self.modal = Some(Modal::Select { title, items, cursor, marked, multi, kind });
+                    self.modal = Some(Modal::Select {
+                        title,
+                        items,
+                        cursor,
+                        marked,
+                        multi,
+                        kind,
+                    });
                 }
             },
         }

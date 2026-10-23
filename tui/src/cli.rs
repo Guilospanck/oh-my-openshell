@@ -37,7 +37,11 @@ pub fn with_gateway(args: Vec<String>) -> Vec<String> {
 }
 
 pub fn exec(prog: &str, args: &[String], env: &[(String, String)]) -> Result<String, String> {
-    let args = if prog == "openshell" { with_gateway(args.to_vec()) } else { args.to_vec() };
+    let args = if prog == "openshell" {
+        with_gateway(args.to_vec())
+    } else {
+        args.to_vec()
+    };
     run(prog, &args, env)
 }
 
@@ -160,7 +164,13 @@ pub fn build_args(dir: &Path, file: &Path, tag: &str) -> Vec<String> {
 
 fn image_freshness(tag: &str, file: &Path) -> Freshness {
     let label = Command::new("docker")
-        .args(["image", "inspect", "-f", &format!("{{{{index .Config.Labels \"{HASH_LABEL}\"}}}}"), tag])
+        .args([
+            "image",
+            "inspect",
+            "-f",
+            &format!("{{{{index .Config.Labels \"{HASH_LABEL}\"}}}}"),
+            tag,
+        ])
         .stderr(Stdio::null())
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -200,8 +210,14 @@ fn text(v: &Value) -> String {
 }
 
 pub fn dockerfile_tag(file: &Path) -> String {
-    let name = file.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    format!("{}:latest", name.trim_start_matches("Dockerfile-").replace('_', "-"))
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    format!(
+        "{}:latest",
+        name.trim_start_matches("Dockerfile-").replace('_', "-")
+    )
 }
 
 pub fn dockerfiles(dir: &Path) -> Vec<PathBuf> {
@@ -277,7 +293,10 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
             if gateway().is_empty() && g["active"].as_bool() == Some(true) {
                 set_gateway(&name);
             }
-            snap.gateways.push(Gateway { name, endpoint: text(&g["endpoint"]) });
+            snap.gateways.push(Gateway {
+                name,
+                endpoint: text(&g["endpoint"]),
+            });
         }
     }
     snap.gateway = gateway();
@@ -290,8 +309,17 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        let freshness = if built { image_freshness(&tag, &file) } else { Freshness::UpToDate };
-        snap.images.push(Image { tag, file, built, freshness });
+        let freshness = if built {
+            image_freshness(&tag, &file)
+        } else {
+            Freshness::UpToDate
+        };
+        snap.images.push(Image {
+            tag,
+            file,
+            built,
+            freshness,
+        });
     }
     match os(&["status"]) {
         Ok(t) => {
@@ -366,18 +394,30 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
 /// config, or, for the vm driver, from the gateway-wide size on its process line.
 fn limits(driver: &str, sandbox: &str) -> String {
     match driver {
-        "docker" => docker_limits(sandbox).unwrap_or_else(|| "unknown (container not found)".into()),
+        "docker" => {
+            docker_limits(sandbox).unwrap_or_else(|| "unknown (container not found)".into())
+        }
         "vm" => vm_limits().unwrap_or_else(|| "unknown".into()),
         _ => "unknown".into(),
     }
 }
 
 fn docker_limits(sandbox: &str) -> Option<String> {
-    let names = run("docker", &["ps".into(), "-a".into(), "--format".into(), "{{.Names}}".into()], &[]).ok()?;
+    let names = run(
+        "docker",
+        &[
+            "ps".into(),
+            "-a".into(),
+            "--format".into(),
+            "{{.Names}}".into(),
+        ],
+        &[],
+    )
+    .ok()?;
     let needle = format!("--{sandbox}-");
-    let container = names
-        .lines()
-        .find(|n| n.starts_with("openshell-") && n.contains(&needle) && !n.ends_with("-supervisor"))?;
+    let container = names.lines().find(|n| {
+        n.starts_with("openshell-") && n.contains(&needle) && !n.ends_with("-supervisor")
+    })?;
     let out = run(
         "docker",
         &[
@@ -392,19 +432,33 @@ fn docker_limits(sandbox: &str) -> Option<String> {
     let mut it = out.split_whitespace();
     let nano: f64 = it.next()?.parse().ok()?;
     let mem: u64 = it.next()?.parse().ok()?;
-    let cpu = if nano == 0.0 { "unlimited".to_string() } else { format!("{} CPU", nano / 1e9) };
-    let mem = if mem == 0 { "unlimited".to_string() } else { format!("{} MiB", mem / (1024 * 1024)) };
+    let cpu = if nano == 0.0 {
+        "unlimited".to_string()
+    } else {
+        format!("{} CPU", nano / 1e9)
+    };
+    let mem = if mem == 0 {
+        "unlimited".to_string()
+    } else {
+        format!("{} MiB", mem / (1024 * 1024))
+    };
     Some(format!("{cpu}, {mem} memory"))
 }
 
 fn vm_limits() -> Option<String> {
     let ps = run("ps", &["-axo".into(), "command".into()], &[]).ok()?;
-    let line = ps.lines().find(|l| l.contains("openshell-driver-vm") && l.contains("--vcpus"))?;
+    let line = ps
+        .lines()
+        .find(|l| l.contains("openshell-driver-vm") && l.contains("--vcpus"))?;
     let arg = |flag: &str| {
         let mut it = line.split_whitespace().skip_while(|w| *w != flag);
         it.nth(1).map(String::from)
     };
-    Some(format!("{} vCPUs, {} MiB memory (gateway-wide, fixed)", arg("--vcpus")?, arg("--mem-mib")?))
+    Some(format!(
+        "{} vCPUs, {} MiB memory (gateway-wide, fixed)",
+        arg("--vcpus")?,
+        arg("--mem-mib")?
+    ))
 }
 
 fn parse(t: &str) -> Result<Value, String> {
@@ -490,9 +544,7 @@ pub fn sync_profile(dir: &Path, id: &str, host: Option<&str>) -> Result<String, 
     let tmp = stage_profile(dir, id, host, Some(version))?;
     let r = os(&["profile", "update", id, "--file", &tmp.to_string_lossy()]);
     let _ = fs::remove_file(&tmp);
-    r.map(|_| {
-        format!("Updated profile {id}. Running sandboxes may need a restart to pick it up.")
-    })
+    r.map(|_| format!("Updated profile {id}. Running sandboxes may need a restart to pick it up."))
 }
 
 /// Create a provider, importing its profile first when needed. Credentials are
@@ -602,7 +654,12 @@ pub fn parse_check(text: &str) -> Result<SyncCheck, String> {
     let pair = |m: &Value| (text_of(&m["host"]), text_of(&m["binary"]));
     Ok(SyncCheck {
         ok: v["ok"].as_bool().unwrap_or(false),
-        missing: v["missing"].as_array().into_iter().flatten().map(pair).collect(),
+        missing: v["missing"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(pair)
+            .collect(),
         blocked: v["items"]
             .as_object()
             .into_iter()
@@ -610,17 +667,32 @@ pub fn parse_check(text: &str) -> Result<SyncCheck, String> {
             .filter(|(_, needs)| needs.as_array().is_some_and(|a| !a.is_empty()))
             .map(|(id, _)| id.clone())
             .collect(),
-        fixes: v["fixes"].as_array().into_iter().flatten().map(text_of).collect(),
+        fixes: v["fixes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(text_of)
+            .collect(),
         secret_fixes: v["secret_fixes"]
             .as_array()
             .into_iter()
             .flatten()
             .map(|f| {
-                let keys = f["keys"].as_array().into_iter().flatten().map(text_of).collect();
+                let keys = f["keys"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(text_of)
+                    .collect();
                 (text_of(&f["profile"]), keys)
             })
             .collect(),
-        unfixed: v["unfixed"].as_array().into_iter().flatten().map(pair).collect(),
+        unfixed: v["unfixed"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(pair)
+            .collect(),
     })
 }
 
@@ -632,7 +704,12 @@ pub fn is_github_key(key: &str) -> bool {
 /// The host's GitHub CLI token, if `gh` is installed and logged in. Read from the
 /// command's output, so it never appears on a command line.
 pub fn gh_token() -> Option<String> {
-    let out = Command::new("gh").args(["auth", "token"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let out = Command::new("gh")
+        .args(["auth", "token"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
     let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && !t.is_empty()).then_some(t)
 }
@@ -649,17 +726,32 @@ fn script_dir(dir: &Path) -> PathBuf {
     }
     std::env::current_exe()
         .ok()
-        .and_then(|e| e.ancestors().find(|a| a.join("sync-agents").is_file()).map(Path::to_path_buf))
+        .and_then(|e| {
+            e.ancestors()
+                .find(|a| a.join("sync-agents").is_file())
+                .map(Path::to_path_buf)
+        })
         .unwrap_or_else(|| dir.to_path_buf())
 }
 
 /// The sandbox user's HOME, which differs by driver (`/workspace` on docker, `/sandbox` on vm)
 /// and is the only place the default policy lets uploads land.
 fn sandbox_home(sandbox: &str) -> String {
-    let args: Vec<String> = ["sandbox", "exec", "-n", sandbox, "--timeout", "30", "--", "sh", "-c", "printf %s \"$HOME\""]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+    let args: Vec<String> = [
+        "sandbox",
+        "exec",
+        "-n",
+        sandbox,
+        "--timeout",
+        "30",
+        "--",
+        "sh",
+        "-c",
+        "printf %s \"$HOME\"",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     exec("openshell", &args, &[])
         .map(|t| t.trim().to_string())
         .ok()
@@ -668,17 +760,35 @@ fn sandbox_home(sandbox: &str) -> String {
 }
 
 /// The profile (YAML) that grants exactly what the selected installs still lack.
-pub fn sync_gen_profile(dir: &Path, sandbox: &str, agent: &str, ids: &[String], name: &str) -> Result<String, String> {
-    let mut args: Vec<String> = ["--gen-profile", sandbox, "--name", name, "--agent", agent, "--only"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+pub fn sync_gen_profile(
+    dir: &Path,
+    sandbox: &str,
+    agent: &str,
+    ids: &[String],
+    name: &str,
+) -> Result<String, String> {
+    let mut args: Vec<String> = [
+        "--gen-profile",
+        sandbox,
+        "--name",
+        name,
+        "--agent",
+        agent,
+        "--only",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
     args.push(ids.join(","));
     let gw = gateway();
     if !gw.is_empty() {
         args.extend(["--gateway".into(), gw]);
     }
-    run(&script_dir(dir).join("sync-agents").to_string_lossy(), &args, &[])
+    run(
+        &script_dir(dir).join("sync-agents").to_string_lossy(),
+        &args,
+        &[],
+    )
 }
 
 /// What the gateway says when it will not merge a provider into the sandbox's policy,
@@ -690,7 +800,14 @@ pub fn attached_providers(sandbox: &str) -> Vec<String> {
     os(&["sandbox", "provider", "list", sandbox, "--output", "json"])
         .ok()
         .and_then(|t| parse(&t).ok())
-        .map(|v| v["providers"].as_array().into_iter().flatten().filter_map(|p| p["name"].as_str().map(String::from)).collect())
+        .map(|v| {
+            v["providers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|p| p["name"].as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -706,7 +823,16 @@ pub fn import_generated(yaml: &str, name: &str, sandbox: &str) -> Result<(), Str
         let _ = os(&["profile", "delete", name]);
         return Err(e);
     }
-    if let Err(e) = os(&["sandbox", "provider", "attach", sandbox, name, "--wait", "--timeout", "30"]) {
+    if let Err(e) = os(&[
+        "sandbox",
+        "provider",
+        "attach",
+        sandbox,
+        name,
+        "--wait",
+        "--timeout",
+        "30",
+    ]) {
         let _ = os(&["provider", "delete", name]);
         let _ = os(&["profile", "delete", name]);
         return Err(e);
@@ -716,7 +842,16 @@ pub fn import_generated(yaml: &str, name: &str, sandbox: &str) -> Result<(), Str
 
 /// Detach a generated provider and remove it and its profile.
 pub fn drop_generated(sandbox: &str, name: &str) -> Result<String, String> {
-    os(&["sandbox", "provider", "detach", sandbox, name, "--wait", "--timeout", "30"])?;
+    os(&[
+        "sandbox",
+        "provider",
+        "detach",
+        sandbox,
+        name,
+        "--wait",
+        "--timeout",
+        "30",
+    ])?;
     os(&["provider", "delete", name])?;
     os(&["profile", "delete", name])?;
     Ok(format!("Removed {name} from {sandbox}"))
@@ -725,13 +860,24 @@ pub fn drop_generated(sandbox: &str, name: &str) -> Result<String, String> {
 /// `agent` is `claude-code`, `pi` or `both`.
 pub fn sync_manifest(dir: &Path, sandbox: &str, agent: &str) -> Result<SyncManifest, String> {
     let script = script_dir(dir).join("sync-agents");
-    let args = ["--json".to_string(), "--agent".into(), agent.into(), "--home".into(), sandbox_home(sandbox)];
+    let args = [
+        "--json".to_string(),
+        "--agent".into(),
+        agent.into(),
+        "--home".into(),
+        sandbox_home(sandbox),
+    ];
     run(&script.to_string_lossy(), &args, &[]).and_then(|t| parse_manifest(&t))
 }
 
 /// Check the selected items against the sandbox's effective network policy.
 /// The script exits 3 when something is blocked but still prints the report.
-pub fn sync_check(dir: &Path, sandbox: &str, agent: &str, ids: &[String]) -> Result<SyncCheck, String> {
+pub fn sync_check(
+    dir: &Path,
+    sandbox: &str,
+    agent: &str,
+    ids: &[String],
+) -> Result<SyncCheck, String> {
     let mut args: Vec<String> = vec![
         "--preflight".into(),
         sandbox.into(),

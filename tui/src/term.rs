@@ -2,21 +2,25 @@
 //! terminal engine) and drawn into the ratatui buffer. The VT handles are !Send, so
 //! everything here lives on the UI thread; only raw bytes cross threads.
 use crate::cli;
-use libghostty_vt::key::{self, Action as KAction, Encoder as KeyEncoder, Event as KeyEv, Key, Mods};
-use libghostty_vt::mouse::{self, Encoder as MouseEncoder, EncoderSize, Event as MouseEv};
 use libghostty_vt::fmt::Format;
+use libghostty_vt::key::{
+    self, Action as KAction, Encoder as KeyEncoder, Event as KeyEv, Key, Mods,
+};
+use libghostty_vt::mouse::{self, Encoder as MouseEncoder, EncoderSize, Event as MouseEv};
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::screen::{CellWide, Screen, TrackedGridRef};
 use libghostty_vt::selection::{FormatOptions, Selection as GhosttySel};
 use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::terminal::{
     ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Options, Point,
-    PointCoordinate, PointSpace, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, Terminal,
-    TertiaryDeviceAttributes,
+    PointCoordinate, PointSpace, PrimaryDeviceAttributes, ScrollViewport,
+    SecondaryDeviceAttributes, Terminal, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{focus, paste};
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
@@ -48,8 +52,32 @@ pub fn is_chord(k: &KeyEvent) -> bool {
 /// Logical key and unshifted codepoint for a character on a US layout.
 fn key_from_char(c: char) -> (Key, char) {
     const LETTERS: [Key; 26] = [
-        Key::A, Key::B, Key::C, Key::D, Key::E, Key::F, Key::G, Key::H, Key::I, Key::J, Key::K, Key::L, Key::M,
-        Key::N, Key::O, Key::P, Key::Q, Key::R, Key::S, Key::T, Key::U, Key::V, Key::W, Key::X, Key::Y, Key::Z,
+        Key::A,
+        Key::B,
+        Key::C,
+        Key::D,
+        Key::E,
+        Key::F,
+        Key::G,
+        Key::H,
+        Key::I,
+        Key::J,
+        Key::K,
+        Key::L,
+        Key::M,
+        Key::N,
+        Key::O,
+        Key::P,
+        Key::Q,
+        Key::R,
+        Key::S,
+        Key::T,
+        Key::U,
+        Key::V,
+        Key::W,
+        Key::X,
+        Key::Y,
+        Key::Z,
     ];
     let lc = c.to_ascii_lowercase();
     match lc {
@@ -124,7 +152,18 @@ fn to_ghostty_key(ev: &mut KeyEv, k: &KeyEvent) -> bool {
         KeyCode::PageUp => Key::PageUp,
         KeyCode::PageDown => Key::PageDown,
         KeyCode::F(n @ 1..=12) => [
-            Key::F1, Key::F2, Key::F3, Key::F4, Key::F5, Key::F6, Key::F7, Key::F8, Key::F9, Key::F10, Key::F11, Key::F12,
+            Key::F1,
+            Key::F2,
+            Key::F3,
+            Key::F4,
+            Key::F5,
+            Key::F6,
+            Key::F7,
+            Key::F8,
+            Key::F9,
+            Key::F10,
+            Key::F11,
+            Key::F12,
         ][n as usize - 1],
         _ => return false,
     };
@@ -133,7 +172,11 @@ fn to_ghostty_key(ev: &mut KeyEv, k: &KeyEvent) -> bool {
         mods |= Mods::SHIFT;
     }
     // Shift is consumed when it already produced the text, e.g. 'A' or '!'.
-    let consumed = if text.is_some() && mods.contains(Mods::SHIFT) { Mods::SHIFT } else { Mods::empty() };
+    let consumed = if text.is_some() && mods.contains(Mods::SHIFT) {
+        Mods::SHIFT
+    } else {
+        Mods::empty()
+    };
     ev.set_action(match k.kind {
         KeyEventKind::Press => KAction::Press,
         KeyEventKind::Repeat => KAction::Repeat,
@@ -174,16 +217,27 @@ pub fn osc52(text: &str) -> String {
     const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::from("\x1b]52;c;");
     for c in text.as_bytes().chunks(3) {
-        let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        let n = c
+            .iter()
+            .enumerate()
+            .fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
         for i in 0..4 {
-            out.push(if i <= c.len() { B64[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+            out.push(if i <= c.len() {
+                B64[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
         }
     }
     out.push('\x07');
     out
 }
 
-type Render = (RenderState<'static>, RowIterator<'static>, CellIterator<'static>);
+type Render = (
+    RenderState<'static>,
+    RowIterator<'static>,
+    CellIterator<'static>,
+);
 
 /// Terminal state plus the encoders that turn host input into bytes for the shell.
 pub struct Vt {
@@ -209,9 +263,19 @@ impl Vt {
         Self::with_scrollback(cols, rows, SCROLLBACK, reply)
     }
 
-    fn with_scrollback(cols: u16, rows: u16, max_scrollback: usize, reply: Sender<Vec<u8>>) -> Result<Self, String> {
+    fn with_scrollback(
+        cols: u16,
+        rows: u16,
+        max_scrollback: usize,
+        reply: Sender<Vec<u8>>,
+    ) -> Result<Self, String> {
         let (cols, rows) = (cols.max(2), rows.max(2));
-        let mut term = Terminal::new(Options { cols, rows, max_scrollback }).map_err(err)?;
+        let mut term = Terminal::new(Options {
+            cols,
+            rows,
+            max_scrollback,
+        })
+        .map_err(err)?;
         term.on_pty_write(move |_, data| {
             let _ = reply.send(data.to_vec());
         })
@@ -220,9 +284,16 @@ impl Vt {
             Some(DeviceAttributes {
                 primary: PrimaryDeviceAttributes::new(
                     ConformanceLevel::VT220,
-                    &[DeviceAttributeFeature::COLUMNS_132, DeviceAttributeFeature::ANSI_COLOR],
+                    &[
+                        DeviceAttributeFeature::COLUMNS_132,
+                        DeviceAttributeFeature::ANSI_COLOR,
+                    ],
                 ),
-                secondary: SecondaryDeviceAttributes { device_type: DeviceType::VT220, firmware_version: 1, rom_cartridge: 0 },
+                secondary: SecondaryDeviceAttributes {
+                    device_type: DeviceType::VT220,
+                    firmware_version: 1,
+                    rom_cartridge: 0,
+                },
                 tertiary: TertiaryDeviceAttributes::default(),
             })
         })
@@ -255,8 +326,15 @@ impl Vt {
     /// Start a selection at a viewport cell.
     pub fn select_start(&mut self, x: u16, y: u16) {
         let screen = self.term.active_screen().unwrap_or_default();
-        self.sel = match (self.term.track_grid_ref(viewport(x, y)), self.term.track_grid_ref(viewport(x, y))) {
-            (Ok(anchor), Ok(head)) => Some(Sel { anchor, head, screen }),
+        self.sel = match (
+            self.term.track_grid_ref(viewport(x, y)),
+            self.term.track_grid_ref(viewport(x, y)),
+        ) {
+            (Ok(anchor), Ok(head)) => Some(Sel {
+                anchor,
+                head,
+                screen,
+            }),
             _ => None,
         };
     }
@@ -279,7 +357,9 @@ impl Vt {
 
     /// True when the selection covers a single cell: a click, not a drag.
     pub fn selection_is_point(&self) -> bool {
-        self.sel.as_ref().is_some_and(|s| s.anchor.point(PointSpace::Screen).ok() == s.head.point(PointSpace::Screen).ok())
+        self.sel.as_ref().is_some_and(|s| {
+            s.anchor.point(PointSpace::Screen).ok() == s.head.point(PointSpace::Screen).ok()
+        })
     }
 
     /// The selection as a snapshot; `None` once its text is gone (pruned from the
@@ -298,7 +378,11 @@ impl Vt {
     /// trimmed, wide characters once. Rows scrolled out of view are included.
     pub fn selection_text(&self) -> Option<String> {
         let sel = self.selection()?;
-        let opts = FormatOptions::new().with_emit_format(Format::Plain).with_unwrap(true).with_trim(true).with_selection(&sel);
+        let opts = FormatOptions::new()
+            .with_emit_format(Format::Plain)
+            .with_unwrap(true)
+            .with_trim(true)
+            .with_selection(&sel);
         let bytes = self.term.format_selection_alloc(None, opts).ok()??;
         Some(String::from_utf8_lossy(&bytes).into_owned())
     }
@@ -315,7 +399,9 @@ impl Vt {
 
     pub fn key(&mut self, k: &KeyEvent) -> Vec<u8> {
         let mut out = Vec::new();
-        self.keys.set_options_from_terminal(&self.term).set_macos_option_as_alt(key::OptionAsAlt::True);
+        self.keys
+            .set_options_from_terminal(&self.term)
+            .set_macos_option_as_alt(key::OptionAsAlt::True);
         if to_ghostty_key(&mut self.kev, k) {
             let _ = self.keys.encode_to_vec(&self.kev, &mut out);
         }
@@ -343,21 +429,26 @@ impl Vt {
             _ => return out,
         };
         // One pixel per cell; the middle of the cell avoids rounding into a neighbour.
-        self.mice.set_options_from_terminal(&self.term).set_size(EncoderSize {
-            screen_width: self.cols as u32,
-            screen_height: self.rows as u32,
-            cell_width: 1,
-            cell_height: 1,
-            padding_top: 0,
-            padding_bottom: 0,
-            padding_left: 0,
-            padding_right: 0,
-        });
+        self.mice
+            .set_options_from_terminal(&self.term)
+            .set_size(EncoderSize {
+                screen_width: self.cols as u32,
+                screen_height: self.rows as u32,
+                cell_width: 1,
+                cell_height: 1,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_left: 0,
+                padding_right: 0,
+            });
         self.mev
             .set_action(action)
             .set_button(button)
             .set_mods(map_mods(me.modifiers))
-            .set_position(mouse::Position { x: me.column as f32 + 0.5, y: me.row as f32 + 0.5 });
+            .set_position(mouse::Position {
+                x: me.column as f32 + 0.5,
+                y: me.row as f32 + 0.5,
+            });
         let _ = self.mice.encode_to_vec(&self.mev, &mut out);
         out
     }
@@ -379,9 +470,15 @@ impl Vt {
         if !self.term.mode(Mode::FOCUS_EVENT).unwrap_or(false) {
             return Vec::new();
         }
-        let ev = if gained { focus::Event::Gained } else { focus::Event::Lost };
+        let ev = if gained {
+            focus::Event::Gained
+        } else {
+            focus::Event::Lost
+        };
         let mut buf = [0u8; 8];
-        ev.encode(&mut buf).map(|n| buf[..n].to_vec()).unwrap_or_default()
+        ev.encode(&mut buf)
+            .map(|n| buf[..n].to_vec())
+            .unwrap_or_default()
     }
 
     pub fn mouse_tracking(&self) -> bool {
@@ -403,7 +500,10 @@ impl Vt {
 
     /// Rows the viewport sits above the live screen.
     pub fn scrolled_back(&self) -> u64 {
-        self.term.scrollbar().map(|s| s.total.saturating_sub(s.offset + s.len)).unwrap_or(0)
+        self.term
+            .scrollbar()
+            .map(|s| s.total.saturating_sub(s.offset + s.len))
+            .unwrap_or(0)
     }
 
     pub fn title(&self) -> String {
@@ -417,7 +517,13 @@ impl Vt {
         self.render(area, &mut buf);
         (0..self.rows)
             .rev()
-            .map(|y| (0..self.cols).map(|x| buf[(x, y)].symbol()).collect::<String>().trim().to_string())
+            .map(|y| {
+                (0..self.cols)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
             .find(|l| !l.is_empty())
             .unwrap_or_default()
     }
@@ -482,7 +588,8 @@ impl Vt {
                     };
                 }
                 if let Some(bc) = buf.cell_mut((area.x + x, area.y + y)) {
-                    bc.set_symbol(if g.is_empty() { " " } else { &g }).set_style(s);
+                    bc.set_symbol(if g.is_empty() { " " } else { &g })
+                        .set_style(s);
                 }
                 x += 1;
             }
@@ -492,7 +599,8 @@ impl Vt {
             return None;
         }
         let cv = snap.cursor_viewport().ok().flatten()?;
-        (cv.x < area.width && cv.y < area.height).then(|| Position::new(area.x + cv.x, area.y + cv.y))
+        (cv.x < area.width && cv.y < area.height)
+            .then(|| Position::new(area.x + cv.x, area.y + cv.y))
     }
 }
 
@@ -529,10 +637,22 @@ impl Session {
         Self::spawn(sandbox, cli::gateway(), "openshell", &args, cols, rows)
     }
 
-    pub fn spawn(sandbox: String, gateway: String, prog: &str, args: &[String], cols: u16, rows: u16) -> Result<Self, String> {
+    pub fn spawn(
+        sandbox: String,
+        gateway: String,
+        prog: &str,
+        args: &[String],
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self, String> {
         let (cols, rows) = (cols.max(2), rows.max(2));
         let pty = native_pty_system()
-            .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+            .openpty(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
             .map_err(|e| e.to_string())?;
         let mut cmd = CommandBuilder::new(prog);
         cmd.args(args);
@@ -605,7 +725,10 @@ impl Session {
                 }
             }
         }
-        if self.reaped.is_some_and(|t| t.elapsed() > Duration::from_millis(500)) {
+        if self
+            .reaped
+            .is_some_and(|t| t.elapsed() > Duration::from_millis(500))
+        {
             self.exited = true;
         }
     }
@@ -620,7 +743,12 @@ impl Session {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let (c, r) = (cols.max(2), rows.max(2));
         if (c, r) != (self.vt.cols, self.vt.rows) {
-            let _ = self.master.resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
+            let _ = self.master.resize(PtySize {
+                rows: r,
+                cols: c,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
             self.vt.resize(c, r);
             self.vt.clear_selection();
         }
@@ -628,9 +756,12 @@ impl Session {
 
     pub fn on_key(&mut self, k: &KeyEvent) {
         // Scrolling keeps a selection; Esc only drops it; any other key drops it and goes on.
-        if k.modifiers.contains(KeyModifiers::SHIFT) && matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) {
+        if k.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(k.code, KeyCode::PageUp | KeyCode::PageDown)
+        {
             let h = (self.vt.rows as isize / 2).max(1);
-            self.vt.scroll(if k.code == KeyCode::PageUp { -h } else { h });
+            self.vt
+                .scroll(if k.code == KeyCode::PageUp { -h } else { h });
             return;
         }
         if self.vt.has_selection() {
@@ -740,7 +871,10 @@ mod tests {
         let none = KeyModifiers::NONE;
         assert_eq!(enc(&mut v, KeyCode::Char('a'), none), "a");
         assert_eq!(enc(&mut v, KeyCode::Char('A'), KeyModifiers::SHIFT), "A");
-        assert_eq!(enc(&mut v, KeyCode::Char('c'), KeyModifiers::CONTROL), "\\x03");
+        assert_eq!(
+            enc(&mut v, KeyCode::Char('c'), KeyModifiers::CONTROL),
+            "\\x03"
+        );
         assert_eq!(enc(&mut v, KeyCode::Up, none), "\\x1b[A");
         assert_eq!(enc(&mut v, KeyCode::Enter, none), "\\r");
         assert_eq!(enc(&mut v, KeyCode::Tab, none), "\\t");
@@ -748,18 +882,36 @@ mod tests {
         assert_eq!(enc(&mut v, KeyCode::F(1), none), "\\x1bOP");
         assert_eq!(enc(&mut v, KeyCode::Char('x'), KeyModifiers::ALT), "\\x1bx");
         // Ghostty's legacy form for Shift+Enter, then the kitty one once the app asks for it.
-        assert_eq!(enc(&mut v, KeyCode::Enter, KeyModifiers::SHIFT), "\\x1b[27;2;13~");
+        assert_eq!(
+            enc(&mut v, KeyCode::Enter, KeyModifiers::SHIFT),
+            "\\x1b[27;2;13~"
+        );
         v.feed(b"\x1b[>1u");
-        assert_eq!(enc(&mut v, KeyCode::Enter, KeyModifiers::SHIFT), "\\x1b[13;2u");
+        assert_eq!(
+            enc(&mut v, KeyCode::Enter, KeyModifiers::SHIFT),
+            "\\x1b[13;2u"
+        );
         assert_eq!(enc(&mut v, KeyCode::Enter, none), "\\r");
     }
 
     #[test]
     fn chord_accepts_both_forms() {
-        assert!(is_chord(&KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)));
-        assert!(is_chord(&KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL)));
-        assert!(!is_chord(&KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE)));
-        assert!(!is_chord(&KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(is_chord(&KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_chord(&KeyEvent::new(
+            KeyCode::Char('5'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_chord(&KeyEvent::new(
+            KeyCode::Char(']'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_chord(&KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL
+        )));
     }
 
     #[test]
@@ -783,7 +935,15 @@ mod tests {
         let area = Rect::new(0, 0, v.cols, v.rows);
         let mut buf = Buffer::empty(area);
         v.render(area, &mut buf);
-        (0..v.rows).map(|y| (0..v.cols).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_string()).collect()
+        (0..v.rows)
+            .map(|y| {
+                (0..v.cols)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 
     fn reversed(v: &Vt, x: u16, y: u16) -> bool {
@@ -801,7 +961,9 @@ mod tests {
         v.select_start(3, 1);
         v.select_to(6, 0);
         assert_eq!(v.selection_text().as_deref(), Some("world\n世x"));
-        assert!(reversed(&v, 6, 0) && reversed(&v, 19, 0) && !reversed(&v, 5, 0) && !reversed(&v, 4, 1));
+        assert!(
+            reversed(&v, 6, 0) && reversed(&v, 19, 0) && !reversed(&v, 5, 0) && !reversed(&v, 4, 1)
+        );
         v.select_start(0, 1);
         v.select_to(19, 1);
         assert_eq!(v.selection_text().as_deref(), Some("世x  end"));
@@ -864,7 +1026,11 @@ mod tests {
         // The text scrolled off the top; the selection went with it.
         assert!(!reversed(&v, 0, 0));
         v.scroll(-3);
-        assert!(shown(&v)[0] == "keep me" && reversed(&v, 0, 0), "{:?}", shown(&v));
+        assert!(
+            shown(&v)[0] == "keep me" && reversed(&v, 0, 0),
+            "{:?}",
+            shown(&v)
+        );
         // With a small scrollback (bytes) the row is dropped, and the selection with it.
         let mut small = Vt::with_scrollback(20, 5, 10, mpsc::channel().0).unwrap();
         small.feed(b"gone soon\r\n");
@@ -873,7 +1039,10 @@ mod tests {
         for i in 0..20_000 {
             small.feed(format!("{i}\r\n").as_bytes());
         }
-        assert!(!small.has_selection(), "pruned text leaves nothing selected");
+        assert!(
+            !small.has_selection(),
+            "pruned text leaves nothing selected"
+        );
     }
 
     #[test]
@@ -885,12 +1054,24 @@ mod tests {
             s.pump();
             thread::sleep(Duration::from_millis(20));
         }
-        let ev = |kind, column, modifiers| MouseEvent { kind, column, row: 0, modifiers };
+        let ev = |kind, column, modifiers| MouseEvent {
+            kind,
+            column,
+            row: 0,
+            modifiers,
+        };
         let none = KeyModifiers::NONE;
-        assert_eq!(s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 0, none)), None);
+        assert_eq!(
+            s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 0, none)),
+            None
+        );
         s.on_mouse(&ev(MouseEventKind::Drag(MouseButton::Left), 3, none));
         assert!(s.vt.has_selection());
-        assert_eq!(s.on_mouse(&ev(MouseEventKind::Up(MouseButton::Left), 3, none)).as_deref(), Some("copy"));
+        assert_eq!(
+            s.on_mouse(&ev(MouseEventKind::Up(MouseButton::Left), 3, none))
+                .as_deref(),
+            Some("copy")
+        );
         // Shift-PgUp scrolls and keeps it; Esc drops it.
         s.on_key(&KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
         assert!(s.vt.has_selection());
@@ -898,18 +1079,35 @@ mod tests {
         assert!(!s.vt.has_selection());
         // A click is not a selection; a drag past the right and bottom edges stops at them.
         s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 2, none));
-        assert_eq!(s.on_mouse(&ev(MouseEventKind::Up(MouseButton::Left), 2, none)), None);
+        assert_eq!(
+            s.on_mouse(&ev(MouseEventKind::Up(MouseButton::Left), 2, none)),
+            None
+        );
         assert!(!s.vt.has_selection());
         s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 5, none));
-        let past = MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 200, row: 9, modifiers: none };
+        let past = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 200,
+            row: 9,
+            modifiers: none,
+        };
         s.on_mouse(&past);
-        let up = MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 200, row: 9, modifiers: none };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 200,
+            row: 9,
+            modifiers: none,
+        };
         assert_eq!(s.on_mouse(&up).as_deref(), Some("me"));
         // A program that tracks the mouse gets plain clicks; Shift still selects.
         s.vt.feed(b"\x1b[?1000h");
         s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 1, none));
         assert!(!s.vt.has_selection());
-        s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::SHIFT));
+        s.on_mouse(&ev(
+            MouseEventKind::Down(MouseButton::Left),
+            1,
+            KeyModifiers::SHIFT,
+        ));
         assert!(s.vt.has_selection());
     }
 

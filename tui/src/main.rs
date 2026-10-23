@@ -32,7 +32,9 @@ fn config_dir() -> PathBuf {
     // Fall back to the symlinked config directory.
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config"));
+        .unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
+        });
     base.join("openshell")
 }
 
@@ -87,10 +89,20 @@ fn host_keys(kitty: bool) -> HostKeys {
 fn host_modes(on: bool, keys: HostKeys) {
     let mut out = io::stdout();
     if on {
-        let _ = execute!(out, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange);
+        let _ = execute!(
+            out,
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnableFocusChange
+        );
         match keys {
             HostKeys::Kitty => {
-                let _ = execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+                let _ = execute!(
+                    out,
+                    PushKeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    )
+                );
             }
             // modifyOtherKeys level 1: only keys with no legacy form (Shift-Enter) change.
             HostKeys::TmuxCsiU => {
@@ -108,7 +120,12 @@ fn host_modes(on: bool, keys: HostKeys) {
             }
             HostKeys::Legacy => {}
         }
-        let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
+        let _ = execute!(
+            out,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            DisableFocusChange
+        );
     }
 }
 
@@ -126,7 +143,11 @@ fn recorded(s: &Step, log: &Path) -> Command {
         c.arg("-q").arg(log).arg(&s.prog).args(&s.args);
     } else {
         // util-linux script: one shell command; -e returns its status.
-        let line = std::iter::once(s.prog.as_str()).chain(s.args.iter().map(String::as_str)).map(sh_quote).collect::<Vec<_>>().join(" ");
+        let line = std::iter::once(s.prog.as_str())
+            .chain(s.args.iter().map(String::as_str))
+            .map(sh_quote)
+            .collect::<Vec<_>>()
+            .join(" ");
         c.args(["-q", "-e", "-c", &line]).arg(log);
     }
     c
@@ -141,7 +162,11 @@ fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
     let mut failed = None;
     for (index, s) in steps.iter().enumerate() {
         println!("$ {} {}", s.prog, s.args.join(" "));
-        let mut cmd = if capture { recorded(s, &log) } else { Command::new(&s.prog) };
+        let mut cmd = if capture {
+            recorded(s, &log)
+        } else {
+            Command::new(&s.prog)
+        };
         if !capture {
             cmd.args(&s.args);
         }
@@ -151,8 +176,17 @@ fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
             Err(e) => e.to_string(),
         };
         println!("\n{} {status}", s.prog);
-        let raw = if capture { std::fs::read(&log).unwrap_or_default() } else { Vec::new() };
-        failed = Some(Failed { index, label: s.label(), status, tail: app::clean_tail(&String::from_utf8_lossy(&raw), 12) });
+        let raw = if capture {
+            std::fs::read(&log).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        failed = Some(Failed {
+            index,
+            label: s.label(),
+            status,
+            tail: app::clean_tail(&String::from_utf8_lossy(&raw), 12),
+        });
         break;
     }
     let _ = std::fs::remove_file(&log);
@@ -225,7 +259,9 @@ fn main() -> io::Result<()> {
                 loop {
                     match event::read()? {
                         Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
-                        Event::Key(k) if k.kind == KeyEventKind::Repeat && app.active.is_some() => app.on_key(k),
+                        Event::Key(k) if k.kind == KeyEventKind::Repeat && app.active.is_some() => {
+                            app.on_key(k)
+                        }
                         Event::Mouse(m) => app.on_mouse(m),
                         Event::Paste(p) => app.on_paste(p),
                         Event::FocusGained => app.on_focus(true),
@@ -295,11 +331,27 @@ mod tests {
                 name: "a".into(),
                 phase: "Ready".into(),
                 created: "now".into(),
-                conditions: vec![Cond { kind: "Ready".into(), status: "True".into(), message: "ok".into() }],
+                conditions: vec![Cond {
+                    kind: "Ready".into(),
+                    status: "True".into(),
+                    message: "ok".into(),
+                }],
             }],
-            providers: vec![Provider { name: "p".into(), ty: "p".into(), keys: vec!["K".into()] }],
-            profiles: vec![Profile { id: "p".into(), version: 1 }],
-            images: vec![Image { tag: "x:latest".into(), file: "Dockerfile-x".into(), built: false, freshness: Default::default() }],
+            providers: vec![Provider {
+                name: "p".into(),
+                ty: "p".into(),
+                keys: vec!["K".into()],
+            }],
+            profiles: vec![Profile {
+                id: "p".into(),
+                version: 1,
+            }],
+            images: vec![Image {
+                tag: "x:latest".into(),
+                file: "Dockerfile-x".into(),
+                built: false,
+                freshness: Default::default(),
+            }],
             logs: Some(("a".into(), "line1\nline2".into())),
             ..Default::default()
         });
@@ -319,7 +371,8 @@ mod tests {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
         let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
-        let s = term::Session::spawn("sb".into(), app.snap.gateway.clone(), "cat", &[], 60, 19).unwrap();
+        let s = term::Session::spawn("sb".into(), app.snap.gateway.clone(), "cat", &[], 60, 19)
+            .unwrap();
         app.sessions.push(s);
         app.active = Some(0);
         let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
@@ -348,11 +401,16 @@ mod tests {
         let (done, _d) = mpsc::channel();
         let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
         for name in ["a", "b"] {
-            app.sessions.push(term::Session::spawn(name.into(), String::new(), "cat", &[], 80, 23).unwrap());
+            app.sessions.push(
+                term::Session::spawn(name.into(), String::new(), "cat", &[], 80, 23).unwrap(),
+            );
         }
         app.active = Some(0);
         app.fit_sessions(120, 40);
-        assert!(app.sessions.iter().all(|s| (s.vt.cols, s.vt.rows) == (120, 39)));
+        assert!(app
+            .sessions
+            .iter()
+            .all(|s| (s.vt.cols, s.vt.rows) == (120, 39)));
         assert_eq!(app::pane(120, 40), (120, 39));
     }
 
@@ -362,7 +420,11 @@ mod tests {
         let (done, _d) = mpsc::channel();
         let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
         app.on_snapshot(Snapshot {
-            sandboxes: vec![Sandbox { name: "sb".into(), phase: "Ready".into(), ..Default::default() }],
+            sandboxes: vec![Sandbox {
+                name: "sb".into(),
+                phase: "Ready".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         });
         let line = "[1] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(0) -> example.com:443 [reason:transparent_tcp_policy_denied]";
@@ -378,7 +440,10 @@ mod tests {
         term.draw(|f| ui::draw(f, &app)).unwrap();
         match &app.modal {
             Some(app::Modal::Select { title, items, .. }) => {
-                assert_eq!(title, "curl was blocked from reaching example.com:443 in sb (2x)");
+                assert_eq!(
+                    title,
+                    "curl was blocked from reaching example.com:443 in sb (2x)"
+                );
                 assert_eq!(items[0], "Allow read-only (GET/HEAD/OPTIONS) for curl");
                 assert_eq!(items.len(), 4);
             }
@@ -387,12 +452,19 @@ mod tests {
         // Esc ignores this time only; p lists it and Enter asks again.
         app.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(app.modal.is_none());
-        assert_eq!(app.watch.for_sandbox("sb")[0].state, watch::State::IgnoredOnce);
+        assert_eq!(
+            app.watch.for_sandbox("sb")[0].state,
+            watch::State::IgnoredOnce
+        );
         app.on_key(KeyEvent::from(KeyCode::Char('p')));
-        assert!(matches!(&app.modal, Some(app::Modal::Select { items, .. }) if items[0].starts_with("ignored once")));
+        assert!(
+            matches!(&app.modal, Some(app::Modal::Select { items, .. }) if items[0].starts_with("ignored once"))
+        );
         term.draw(|f| ui::draw(f, &app)).unwrap();
         app.on_key(KeyEvent::from(KeyCode::Enter));
-        assert!(matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title.starts_with("curl was blocked")));
+        assert!(
+            matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title.starts_with("curl was blocked"))
+        );
         assert!(app.prompt_at.is_some());
     }
 
@@ -402,15 +474,24 @@ mod tests {
         assert!(tmux_keys("always", "csi-u"));
         assert!(!tmux_keys("on", "xterm"), "crossterm drops CSI 27;2;13~");
         assert!(!tmux_keys("off", "csi-u"));
-        assert!(!tmux_keys("", ""), "tmux older than 3.5 has no format option");
+        assert!(
+            !tmux_keys("", ""),
+            "tmux older than 3.5 has no format option"
+        );
     }
 
     #[test]
     fn profile_keys_follow_aliases() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
         assert_eq!(cli::profile_env_keys(&dir, "github"), vec!["GITHUB_TOKEN"]);
-        assert_eq!(cli::profile_env_keys(&dir, "forgejo"), vec!["FORGEJO_HOST", "FORGEJO_TOKEN"]);
-        assert_eq!(cli::dockerfile_tag(&PathBuf::from("images/Dockerfile-claude_code")), "claude-code:latest");
+        assert_eq!(
+            cli::profile_env_keys(&dir, "forgejo"),
+            vec!["FORGEJO_HOST", "FORGEJO_TOKEN"]
+        );
+        assert_eq!(
+            cli::dockerfile_tag(&PathBuf::from("images/Dockerfile-claude_code")),
+            "claude-code:latest"
+        );
     }
 
     const MANIFEST: &str = r#"{"agents":["claude-code","pi"],"stage_dir":"/tmp/stage","secret_findings":[],"items":[
@@ -450,9 +531,21 @@ mod tests {
         assert_eq!(pi.len(), 2);
         let install = &pi[0].args;
         assert!(install.contains(&"exec".to_string()) && install.last().unwrap().contains("-a pi"));
-        assert!(install.last().unwrap().starts_with("export PATH=\"$HOME/.local/bin:$PATH\"; npx --yes skills@1.7.4 add "));
+        assert!(install
+            .last()
+            .unwrap()
+            .starts_with("export PATH=\"$HOME/.local/bin:$PATH\"; npx --yes skills@1.7.4 add "));
         // A directory upload targets the parent: the CLI nests it under its own name.
-        assert_eq!(pi[1].args[1..], ["upload", "sb", "/tmp/stage/skills/bro", "/workspace/.agents/skills", "--no-git-ignore"]);
+        assert_eq!(
+            pi[1].args[1..],
+            [
+                "upload",
+                "sb",
+                "/tmp/stage/skills/bro",
+                "/workspace/.agents/skills",
+                "--no-git-ignore"
+            ]
+        );
         // Only chosen ids run; unchosen items never do.
         assert!(app::sync_steps(&plan("claude-code", &["plugins:swift-lsp"])).len() == 1);
         assert!(app::sync_steps(&plan("pi", &["plugins:swift-lsp"])).is_empty());
@@ -462,7 +555,13 @@ mod tests {
     fn failed_steps_explain_themselves() {
         let rec = "^D\x1b[1m$ npx\x1b[0m\r\nCloning into 'x'...\r\nremote: Repository not found.\r\nfatal: repository 'https://github.com/me/private/' not found\r\n\r\n";
         let tail = app::clean_tail(rec, 2);
-        assert_eq!(tail, vec!["remote: Repository not found.", "fatal: repository 'https://github.com/me/private/' not found"]);
+        assert_eq!(
+            tail,
+            vec![
+                "remote: Repository not found.",
+                "fatal: repository 'https://github.com/me/private/' not found"
+            ]
+        );
         assert!(app::auth_failure(&tail));
         assert_eq!(app::clean_tail("50%\r100%\n", 5), vec!["100%"]);
         for l in [
@@ -472,12 +571,16 @@ mod tests {
         ] {
             assert!(app::auth_failure(&app::clean_tail(l, 5)), "{l}");
         }
-        assert!(!app::auth_failure(&["curl: (56) CONNECT tunnel failed, response 403".into()]));
+        assert!(!app::auth_failure(&[
+            "curl: (56) CONNECT tunnel failed, response 403".into()
+        ]));
         assert!(!app::auth_failure(&["npm error code E404".into()]));
         // Labels drop the PATH prefix; a retry skips the steps already done.
         let p = plan("pi", &["npx-skills:caveman", "own-skills:bro"]);
         let steps = app::sync_steps(&p);
-        assert!(steps[0].label().starts_with("npx --yes skills@1.7.4 add a/b"));
+        assert!(steps[0]
+            .label()
+            .starts_with("npx --yes skills@1.7.4 add a/b"));
         assert!(steps[1].label().starts_with("openshell "));
         let retry = app::sync_steps(&app::SyncPlan { skip: 1, ..p });
         assert_eq!(retry.len(), 1);
@@ -497,20 +600,33 @@ mod tests {
             app.on_key(KeyEvent::from(KeyCode::Char('y')));
             assert!(app.capture && app.job.take().is_some_and(|j| j.len() == 2));
             let tail = tail.iter().map(|s| s.to_string()).collect();
-            app.finish_job(Some(Failed { index: 1, label: "upload bro".into(), status: "exited with 1".into(), tail }));
+            app.finish_job(Some(Failed {
+                index: 1,
+                label: "upload bro".into(),
+                status: "exited with 1".into(),
+                tail,
+            }));
             assert!(!app.capture);
             assert_eq!(app.status, "Step failed: upload bro (exited with 1)");
         };
-        run(&mut app, &["fatal: Authentication failed for 'https://github.com/me/x/'"]);
+        run(
+            &mut app,
+            &["fatal: Authentication failed for 'https://github.com/me/x/'"],
+        );
         match &app.modal {
-            Some(app::Modal::Confirm { kind: app::ConfKind::SyncSecret { sync, profile }, text }) => {
+            Some(app::Modal::Confirm {
+                kind: app::ConfKind::SyncSecret { sync, profile },
+                text,
+            }) => {
                 assert_eq!((profile.as_str(), sync.skip), ("github", 1));
                 assert!(text.contains("Authentication failed"));
             }
             _ => panic!("no github offer"),
         }
         run(&mut app, &["npm error code E404"]);
-        assert!(matches!(&app.modal, Some(app::Modal::Info(t)) if t.contains("upload bro") && t.contains("E404")));
+        assert!(
+            matches!(&app.modal, Some(app::Modal::Info(t)) if t.contains("upload bro") && t.contains("E404"))
+        );
     }
 
     #[test]
@@ -520,12 +636,26 @@ mod tests {
         let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
         let pair = |h: &str, b: &str| (h.to_string(), b.to_string());
         let check = cli::SyncCheck {
-            missing: vec![pair("github.com", "/usr/bin/git"), pair("github.com", "/usr/local/bin/claude"), pair("pypi.org", "/usr/local/bin/uv")],
+            missing: vec![
+                pair("github.com", "/usr/bin/git"),
+                pair("github.com", "/usr/local/bin/claude"),
+                pair("pypi.org", "/usr/local/bin/uv"),
+            ],
             ..Default::default()
         };
-        let sync = Some(app::SyncStage::Check { sync: plan("claude-code", &["npx-skills:caveman"]), check, offered: 0 });
-        app.on_done(Done { msg: "Policy checked".into(), next: None, sync });
-        assert!(matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title == "sb blocks installs; missing: github.com, pypi.org"));
+        let sync = Some(app::SyncStage::Check {
+            sync: plan("claude-code", &["npx-skills:caveman"]),
+            check,
+            offered: 0,
+        });
+        app.on_done(Done {
+            msg: "Policy checked".into(),
+            next: None,
+            sync,
+        });
+        assert!(
+            matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title == "sb blocks installs; missing: github.com, pypi.org")
+        );
     }
 
     #[test]
@@ -539,8 +669,17 @@ mod tests {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
         let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
-        let sync = Some(app::SyncStage::Conflict { sync: plan("pi", &[]), profile: "github".into(), attached, round: 2 });
-        app.on_done(Done { msg: "Could not attach github to sb".into(), next: None, sync });
+        let sync = Some(app::SyncStage::Conflict {
+            sync: plan("pi", &[]),
+            profile: "github".into(),
+            attached,
+            round: 2,
+        });
+        app.on_done(Done {
+            msg: "Could not attach github to sb".into(),
+            next: None,
+            sync,
+        });
         match &app.modal {
             Some(app::Modal::Select { title, items, .. }) => {
                 assert_eq!(title, "github cannot be attached next to what sb has");
@@ -564,9 +703,15 @@ mod tests {
         .unwrap();
         assert!(!c.ok);
         assert_eq!(c.blocked, vec!["a"]);
-        assert_eq!(c.missing, vec![("github.com".to_string(), "/usr/bin/git".to_string())]);
+        assert_eq!(
+            c.missing,
+            vec![("github.com".to_string(), "/usr/bin/git".to_string())]
+        );
         assert_eq!(c.fixes, vec!["claude-marketplace"]);
-        assert_eq!(c.unfixed, vec![("x.com".to_string(), "/usr/bin/git".to_string())]);
+        assert_eq!(
+            c.unfixed,
+            vec![("x.com".to_string(), "/usr/bin/git".to_string())]
+        );
         assert!(cli::parse_check("not json").is_err());
     }
 
@@ -585,7 +730,11 @@ mod tests {
         };
         app.modal = Some(app::Modal::Confirm {
             text: "short summary".into(),
-            kind: app::ConfKind::SyncGen { sync, name: "n".into(), yaml },
+            kind: app::ConfKind::SyncGen {
+                sync,
+                name: "n".into(),
+                yaml,
+            },
         });
         let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
         app.on_key(KeyEvent::from(KeyCode::Char('v')));
