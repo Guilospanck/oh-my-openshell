@@ -316,6 +316,8 @@ pub struct App {
     pub status: String,
     /// When `status` last changed; a shell's status bar shows it for a few seconds.
     status_at: Option<(String, Instant)>,
+    /// Start of the run, the clock the spinner frames are read from.
+    born: Instant,
     pub quit: bool,
     pub job: Option<Vec<Step>>,
     /// Record the job's output, so a failed step can be explained (only sync jobs:
@@ -563,6 +565,7 @@ impl App {
             logview: None,
             status: "Loading...".into(),
             status_at: None,
+            born: Instant::now(),
             quit: false,
             job: None,
             capture: false,
@@ -666,11 +669,25 @@ impl App {
         }
     }
 
-    /// The status, while it is new enough to show over a shell.
+    /// Whether the status names work still in progress (`Detaching x...`).
+    pub fn busy(&self) -> bool {
+        self.status.ends_with("...")
+    }
+
+    /// The spinner frame for now, while busy.
+    pub fn spinner(&self) -> Option<&'static str> {
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        self.busy()
+            .then(|| FRAMES[(self.born.elapsed().as_millis() / 80) as usize % FRAMES.len()])
+    }
+
+    /// The status, while it is new enough to show over a shell (always while busy).
     pub fn flash(&self) -> Option<&str> {
         self.status_at
             .as_ref()
-            .filter(|(s, t)| *s == self.status && t.elapsed() < Duration::from_secs(6))
+            .filter(|(s, t)| {
+                *s == self.status && (self.busy() || t.elapsed() < Duration::from_secs(6))
+            })
             .map(|(s, _)| s.as_str())
     }
 

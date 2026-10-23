@@ -253,8 +253,14 @@ fn main() -> io::Result<()> {
                 app.fit_sessions(size.width, size.height);
             }
             terminal.draw(|f| ui::draw(f, &app))?;
-            // A focused shell wants frames at display rate; the dashboard does not.
-            let wait = if focused { 16 } else { 150 };
+            // A focused shell wants frames at display rate; the dashboard does not, bar a spinner.
+            let wait = if focused {
+                16
+            } else if app.busy() {
+                80
+            } else {
+                150
+            };
             if event::poll(Duration::from_millis(wait))? {
                 loop {
                     match event::read()? {

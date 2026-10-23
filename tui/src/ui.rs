@@ -24,13 +24,37 @@ fn phase_style(phase: &str) -> Style {
     Style::default().fg(c)
 }
 
+/// The status as spans: an orange spinner while work runs, red on a failure, `done` once finished.
+fn status_spans(app: &App, text: &str, base: Style, done: Color) -> Vec<Span<'static>> {
+    let bold = Modifier::BOLD;
+    if let Some(frame) = app.spinner() {
+        let c = Color::Indexed(208);
+        return vec![
+            Span::styled(format!(" {frame} "), base.fg(c).add_modifier(bold)),
+            Span::styled(format!("{text} "), base.fg(c)),
+        ];
+    }
+    let failed = ["Error", "Step failed", "Cancelled"]
+        .iter()
+        .any(|p| text.starts_with(p));
+    let (mark, c) = if failed {
+        ("✗", Color::Red)
+    } else {
+        ("✓", done)
+    };
+    vec![
+        Span::styled(format!(" {mark} "), base.fg(c).add_modifier(bold)),
+        Span::styled(format!("{text} "), base.fg(c)),
+    ]
+}
+
 fn highlight() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
     if let Some(s) = app.session() {
-        draw_session(f, s, app.modal.is_none(), app.flash());
+        draw_session(f, app, s);
         if let Some(m) = &app.modal {
             draw_modal(f, m);
         }
@@ -365,7 +389,12 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         Tab::Gateways => "Enter select  d wipe (delete all data)",
     };
     let lines = vec![
-        Line::from(app.status.clone()),
+        Line::from(status_spans(
+            app,
+            &app.status,
+            Style::default(),
+            Color::Green,
+        )),
         Line::styled(
             format!("{help}  |  Tab/1-5 switch  j/k move  g gateway  r refresh  q quit"),
             Style::default().fg(Color::DarkGray),
@@ -518,7 +547,8 @@ fn draw_modal(f: &mut Frame, m: &Modal) {
 }
 
 /// The shell fills the screen above a one-row status bar; the cursor is shown only with focus.
-fn draw_session(f: &mut Frame, s: &Session, focus: bool, flash: Option<&str>) {
+fn draw_session(f: &mut Frame, app: &App, s: &Session) {
+    let focus = app.modal.is_none();
     let area = f.area();
     let pane = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
     let bar = Rect::new(area.x, pane.bottom(), area.width, area.height - pane.height);
@@ -543,16 +573,8 @@ fn draw_session(f: &mut Frame, s: &Session, focus: bool, flash: Option<&str>) {
             base.fg(Color::Blue),
         ));
     }
-    if let Some(m) = flash.filter(|m| !m.is_empty() && *m != "Ready") {
-        let c = if m.starts_with("Error") {
-            Color::Red
-        } else {
-            Color::Blue
-        };
-        spans.push(Span::styled(
-            format!(" {m} "),
-            base.fg(c).add_modifier(Modifier::BOLD),
-        ));
+    if let Some(m) = app.flash().filter(|m| !m.is_empty() && *m != "Ready") {
+        spans.extend(status_spans(app, m, base, Color::Green));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(base), bar);
     f.render_widget(
