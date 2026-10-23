@@ -5,6 +5,7 @@ mod cli;
 mod logview;
 mod term;
 mod ui;
+mod watch;
 
 use app::{App, Done, Step};
 use ratatui::crossterm::{
@@ -126,6 +127,8 @@ fn main() -> io::Result<()> {
                 lv.sync();
             }
             app.pump_sessions();
+            app.pump_watch();
+            app.tick();
             let focused = app.active.is_some();
             if focused != captured {
                 host_modes(focused, kitty);
@@ -133,7 +136,7 @@ fn main() -> io::Result<()> {
             }
             if focused {
                 let size = terminal.size()?;
-                app.fit_session(size.width, size.height.saturating_sub(1));
+                app.fit_sessions(size.width, size.height);
             }
             terminal.draw(|f| ui::draw(f, &app))?;
             // A focused shell wants frames at display rate; the dashboard does not.
@@ -147,6 +150,7 @@ fn main() -> io::Result<()> {
                         Event::Paste(p) => app.on_paste(p),
                         Event::FocusGained => app.on_focus(true),
                         Event::FocusLost => app.on_focus(false),
+                        Event::Resize(w, h) => app.fit_sessions(w, h),
                         _ => {}
                     }
                     if app.quit || !event::poll(Duration::ZERO)? {
@@ -256,6 +260,60 @@ mod tests {
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.active.is_none() && app.sessions.is_empty());
+    }
+
+    #[test]
+    fn resize_reaches_background_sessions() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        for name in ["a", "b"] {
+            app.sessions.push(term::Session::spawn(name.into(), String::new(), "cat", &[], 80, 23).unwrap());
+        }
+        app.active = Some(0);
+        app.fit_sessions(120, 40);
+        assert!(app.sessions.iter().all(|s| (s.vt.cols, s.vt.rows) == (120, 39)));
+        assert_eq!(app::pane(120, 40), (120, 39));
+    }
+
+    #[test]
+    fn blocked_prompt_queues_and_reviews() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        app.on_snapshot(Snapshot {
+            sandboxes: vec![Sandbox { name: "sb".into(), phase: "Ready".into(), ..Default::default() }],
+            ..Default::default()
+        });
+        let line = "[1] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(0) -> example.com:443 [reason:transparent_tcp_policy_denied]";
+        for _ in 0..2 {
+            app.watch.push("sb", "gw", watch::parse(line).unwrap());
+        }
+        app.pump_watch();
+        // Keys typed for the shell as the prompt opens do not answer it.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(app.modal, Some(app::Modal::Select { .. })));
+        app.prompt_at = None;
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        match &app.modal {
+            Some(app::Modal::Select { title, items, .. }) => {
+                assert_eq!(title, "curl was blocked from reaching example.com:443 in sb (2x)");
+                assert_eq!(items[0], "Allow read-only (GET/HEAD/OPTIONS) for curl");
+                assert_eq!(items.len(), 4);
+            }
+            _ => panic!("no prompt"),
+        }
+        // Esc ignores this time only; p lists it and Enter asks again.
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        assert_eq!(app.watch.for_sandbox("sb")[0].state, watch::State::IgnoredOnce);
+        app.on_key(KeyEvent::from(KeyCode::Char('p')));
+        assert!(matches!(&app.modal, Some(app::Modal::Select { items, .. }) if items[0].starts_with("ignored once")));
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title.starts_with("curl was blocked")));
+        assert!(app.prompt_at.is_some());
     }
 
     #[test]

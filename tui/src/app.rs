@@ -2,11 +2,15 @@
 use crate::cli::{self, Snapshot};
 use crate::logview::LogView;
 use crate::term::{self, Session};
+use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::{
+    io::Write,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     sync::{mpsc::Sender, Arc, Mutex},
     thread,
+    time::{Duration, Instant},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,6 +63,10 @@ pub enum SelKind {
     SyncItems { sandbox: String, agent: String, manifest: cli::SyncManifest, labels: Vec<String> },
     /// Ctrl-] menu over the focused shell.
     SessionMenu,
+    /// What to do about a program the sandbox policy blocked.
+    Blocked { sandbox: String, gateway: String, b: Blocked },
+    /// Denials seen in a sandbox (`p`); choosing a blocked one asks again.
+    Review { sandbox: String, denials: Vec<Denial> },
 }
 
 #[derive(Clone)]
@@ -165,12 +173,20 @@ pub struct App {
     /// Full-screen live log viewer; takes over the keyboard while open.
     pub logview: Option<LogView>,
     pub status: String,
+    /// When `status` last changed; a shell's status bar shows it for a few seconds.
+    status_at: Option<(String, Instant)>,
     pub quit: bool,
     pub job: Option<Vec<Step>>,
     /// Embedded sandbox shells; they keep running while the dashboard is shown.
     pub sessions: Vec<Session>,
     /// Session that has the screen and the keyboard.
     pub active: Option<usize>,
+    /// Policy denials seen in sandboxes with a shell open, and the prompts still to show.
+    pub watch: Watch,
+    /// One log follower per open shell, feeding `watch`.
+    follows: Vec<Follow>,
+    /// When the last watcher prompt opened; keys typed just before it are not answers.
+    pub prompt_at: Option<Instant>,
     /// Credential flow waiting on a running `claude setup-token`.
     token_flow: Option<InKind>,
     /// Staging directory of an in-progress "add skills" flow; removed when it ends.
@@ -281,6 +297,40 @@ fn limit(text: &str) -> Option<String> {
     (!t.starts_with('-') && !t.contains(char::is_whitespace)).then(|| t.to_string())
 }
 
+/// Keys a watcher prompt ignores right after it opens.
+const PROMPT_GRACE: Duration = Duration::from_millis(800);
+
+/// Shell pane on a `w`x`h` screen: everything above the one-row status bar.
+pub fn pane(w: u16, h: u16) -> (u16, u16) {
+    (w, h.saturating_sub(1))
+}
+
+fn notice_text(sandbox: &str, what: &str, reason: &str) -> String {
+    format!(
+        "{sandbox} blocked: {what}\nReason: {reason}\n\nThis is not a missing host rule (for example an L7 rule rejected the request), so allowing the host would not fix it. Review the policy: openshell policy get {sandbox}"
+    )
+}
+
+fn review_label(s: &watch::Seen) -> String {
+    let state = match s.state {
+        State::Pending => "pending",
+        State::Allowed(false) => "allowed (read-only)",
+        State::Allowed(true) => "allowed (all)",
+        State::IgnoredOnce => "ignored once",
+        State::Ignored => "ignored",
+        State::Notice => "notice",
+    };
+    let what = match &s.denial {
+        Denial::Blocked(b) => format!("{} -> {}", b.binary, b.target()),
+        Denial::Notice { what, reason } => format!("{what}: {reason}"),
+    };
+    let mut l = format!("{state:<19} {what} ({}x)", s.count);
+    if l.chars().count() > 90 {
+        l = l.chars().take(87).collect::<String>() + "...";
+    }
+    l
+}
+
 /// True when an `osh` found on PATH is this checkout's launcher.
 fn on_path(dir: &Path) -> bool {
     let Ok(ours) = dir.join("osh").canonicalize() else { return false };
@@ -321,10 +371,14 @@ impl App {
             modal: None,
             logview: None,
             status: "Loading...".into(),
+            status_at: None,
             quit: false,
             job: None,
             sessions: Vec::new(),
             active: None,
+            watch: Watch::default(),
+            follows: Vec::new(),
+            prompt_at: None,
             token_flow: None,
             sync_stage: None,
             sync_secret: None,
@@ -403,6 +457,21 @@ impl App {
         let _ = self.wake.send(());
     }
 
+    /// Note a status change, so a focused shell can flash it.
+    pub fn tick(&mut self) {
+        if self.status_at.as_ref().is_none_or(|(s, _)| *s != self.status) {
+            self.status_at = Some((self.status.clone(), Instant::now()));
+        }
+    }
+
+    /// The status, while it is new enough to show over a shell.
+    pub fn flash(&self) -> Option<&str> {
+        self.status_at
+            .as_ref()
+            .filter(|(s, t)| *s == self.status && t.elapsed() < Duration::from_secs(6))
+            .map(|(s, _)| s.as_str())
+    }
+
     pub fn session(&self) -> Option<&Session> {
         self.active.and_then(|i| self.sessions.get(i))
     }
@@ -424,10 +493,15 @@ impl App {
             return;
         }
         let (w, h) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
-        match Session::open(sandbox, w, h.saturating_sub(1)) {
+        let (cols, rows) = pane(w, h);
+        match Session::open(sandbox.clone(), cols, rows) {
             Ok(s) => {
                 self.sessions.push(s);
                 self.active = Some(self.sessions.len() - 1);
+                match Follow::spawn(sandbox.clone(), gw) {
+                    Ok(f) => self.follows.push(f),
+                    Err(e) => self.status = format!("Blocked-request watcher off for {sandbox}: {e}"),
+                }
             }
             Err(e) => self.status = format!("Error: {e}"),
         }
@@ -435,6 +509,13 @@ impl App {
 
     fn close_session(&mut self, i: usize) -> Session {
         let s = self.sessions.remove(i);
+        self.follows.retain(|f| !(f.sandbox == s.sandbox && f.gateway == s.gateway));
+        if !self.sessions.iter().any(|o| o.sandbox == s.sandbox) {
+            self.watch.end_session(&s.sandbox);
+            if matches!(&self.modal, Some(Modal::Select { kind: SelKind::Blocked { sandbox, .. }, .. }) if *sandbox == s.sandbox) {
+                self.modal = None;
+            }
+        }
         self.active = match self.active {
             Some(a) if a == i => {
                 if matches!(self.modal, Some(Modal::Select { kind: SelKind::SessionMenu, .. })) {
@@ -464,19 +545,108 @@ impl App {
         }
     }
 
-    /// Keep the focused shell the size of the screen minus its status bar.
-    pub fn fit_session(&mut self, cols: u16, rows: u16) {
-        if let Some(s) = self.session_mut() {
+    /// Size every shell, focused or not, to the pane it gets on a `w`x`h` screen.
+    pub fn fit_sessions(&mut self, w: u16, h: u16) {
+        let (cols, rows) = pane(w, h);
+        for s in &mut self.sessions {
             s.resize(cols, rows);
         }
     }
 
     pub fn on_mouse(&mut self, me: MouseEvent) {
         if self.modal.is_none() {
-            if let Some(s) = self.session_mut() {
-                s.on_mouse(&me);
+            if let Some(text) = self.session_mut().and_then(|s| s.on_mouse(&me)) {
+                self.copy(&text);
             }
         }
+    }
+
+    /// Host clipboard: OSC 52 through the terminal, plus `pbcopy` on macOS.
+    fn copy(&mut self, text: &str) {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(term::osc52(text).as_bytes()).and_then(|_| out.flush());
+        if cfg!(target_os = "macos") {
+            if let Ok(mut c) = Command::new("pbcopy").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+                if let Some(mut i) = c.stdin.take() {
+                    let _ = i.write_all(text.as_bytes());
+                }
+                thread::spawn(move || c.wait());
+            }
+        }
+        self.status = format!("copied {} chars", text.chars().count());
+    }
+
+    /// Read new log lines of every open shell's sandbox, then show the next prompt when
+    /// nothing else holds the screen.
+    pub fn pump_watch(&mut self) {
+        let mut stopped = Vec::new();
+        for (i, f) in self.follows.iter_mut().enumerate() {
+            match f.drain() {
+                Ok(lines) => {
+                    for l in lines {
+                        if let Some(d) = watch::parse(&l) {
+                            self.watch.push(&f.sandbox, &f.gateway, d);
+                        }
+                    }
+                }
+                Err(last) => stopped.push((i, last)),
+            }
+        }
+        for (i, last) in stopped.into_iter().rev() {
+            let f = self.follows.remove(i);
+            self.status = format!("Blocked-request watcher for {} stopped: {last}", f.sandbox);
+        }
+        if self.watch.has_queued() && self.modal.is_none() && self.logview.is_none() && self.job.is_none() {
+            self.show_prompt();
+        }
+    }
+
+    fn show_prompt(&mut self) {
+        let Some(p) = self.watch.next() else { return };
+        self.prompt_at = Some(Instant::now());
+        let here = self.session().map(|s| s.sandbox.clone());
+        match p {
+            Prompt::Blocked { sandbox, gateway, b, count } => {
+                let prog = b.program().to_string();
+                let mut title = format!("{prog} was blocked from reaching {}", b.target());
+                if here.as_deref() != Some(sandbox.as_str()) {
+                    title.push_str(&format!(" in {sandbox}"));
+                }
+                if count > 1 {
+                    title.push_str(&format!(" ({count}x)"));
+                }
+                let mut items = Vec::new();
+                // Read-only means HTTP method rules, so only HTTP ports get it.
+                if matches!(b.port, 80 | 443 | 8080 | 8443) {
+                    items.push(format!("Allow read-only (GET/HEAD/OPTIONS) for {prog}"));
+                }
+                items.push(format!("Allow all methods for {prog}"));
+                items.push("Ignore this time".into());
+                items.push("Ignore until the session ends".into());
+                self.select(&title, items, false, SelKind::Blocked { sandbox, gateway, b });
+            }
+            Prompt::Notice { sandbox, what, reason } => {
+                self.modal = Some(Modal::Info(notice_text(&sandbox, &what, &reason)));
+            }
+        }
+    }
+
+    /// `p`: the denials seen in a sandbox while its shell was open.
+    fn review(&mut self, sandbox: String) {
+        let seen = self.watch.for_sandbox(&sandbox);
+        if seen.is_empty() {
+            let how = if self.has_session(&sandbox) { "" } else { " The watcher runs while its shell is open (Enter)." };
+            self.modal = Some(Modal::Info(format!("No blocked requests seen in {sandbox}.{how}")));
+            return;
+        }
+        let items = seen.iter().map(|s| review_label(s)).collect();
+        let denials = seen.iter().map(|s| s.denial.clone()).collect();
+        self.select(
+            &format!("Blocked in {sandbox}; Enter asks again"),
+            items,
+            false,
+            SelKind::Review { sandbox, denials },
+        );
     }
 
     pub fn on_paste(&mut self, text: String) {
@@ -1013,6 +1183,34 @@ impl App {
                     })
                 });
             }
+            SelKind::Blocked { sandbox, gateway, b } => {
+                if let Some(rest) = first.strip_prefix("Allow ") {
+                    let all = rest.starts_with("all");
+                    self.watch.decide(&sandbox, &b, State::Allowed(all));
+                    self.status = format!("Allowing {} to reach {} in {sandbox}...", b.program(), b.target());
+                    self.bg_msg(move || watch::allow(&gateway, &sandbox, &b, all));
+                } else {
+                    let until_end = first.contains("session ends");
+                    let state = if until_end { State::Ignored } else { State::IgnoredOnce };
+                    self.watch.decide(&sandbox, &b, state);
+                    let how = if until_end { "until the session ends" } else { "this time" };
+                    self.status = format!("Ignored {} -> {} {how}", b.program(), b.target());
+                }
+            }
+            SelKind::Review { sandbox, denials } => {
+                let Some(i) = self.watch.for_sandbox(&sandbox).iter().position(|s| review_label(s) == first) else { return };
+                match denials.get(i).cloned() {
+                    Some(Denial::Blocked(b)) => {
+                        let gateway = self.snap.gateway.clone();
+                        self.watch.reprompt(&sandbox, &gateway, b);
+                        self.show_prompt();
+                    }
+                    Some(Denial::Notice { what, reason }) => {
+                        self.modal = Some(Modal::Info(notice_text(&sandbox, &what, &reason)));
+                    }
+                    None => {}
+                }
+            }
             SelKind::SessionMenu => {
                 if first.starts_with("Dashboard") {
                     self.active = None;
@@ -1301,7 +1499,7 @@ impl App {
             return;
         }
         let Some(name) = self.selected_sandbox().map(|s| s.name.clone()) else {
-            if matches!(code, KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x') | KeyCode::Enter) {
+            if matches!(code, KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p') | KeyCode::Enter) {
                 self.modal = Some(Modal::Info(
                     "No sandbox selected. This gateway has none: press n to create one (g switches gateway).".into(),
                 ));
@@ -1309,6 +1507,7 @@ impl App {
             return;
         };
         match code {
+            KeyCode::Char('p') => self.review(name),
             KeyCode::Char('l') => match LogView::open(name) {
                 Ok(lv) => self.logview = Some(lv),
                 Err(e) => self.status = format!("Error: {e}"),
@@ -1449,11 +1648,18 @@ impl App {
     }
 
     fn modal_key(&mut self, modal: Modal, key: KeyEvent) {
+        // A prompt can open mid-typing: Enter meant for the shell must not pick an answer.
+        let fresh = self.prompt_at.is_some_and(|t| t.elapsed() < PROMPT_GRACE);
+        if fresh && matches!(modal, Modal::Info(_) | Modal::Select { kind: SelKind::Blocked { .. }, .. }) {
+            self.modal = Some(modal);
+            return;
+        }
         match modal {
-            Modal::Info(text) => match key.code {
-                KeyCode::Char('v') => self.open_viewer("Details", text.clone(), Modal::Info(text)),
-                _ => {}
-            },
+            Modal::Info(text) => {
+                if key.code == KeyCode::Char('v') {
+                    self.open_viewer("Details", text.clone(), Modal::Info(text));
+                }
+            }
             Modal::Viewer { title, text, mut scroll, back } => {
                 // The viewer fills the screen minus its border and margin; stop when the last line is at the bottom.
                 let rows = ratatui::crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24).saturating_sub(4);
@@ -1505,7 +1711,8 @@ impl App {
                 }
             },
             Modal::Select { title, items, mut cursor, mut marked, multi, kind } => match key.code {
-                KeyCode::Esc if matches!(kind, SelKind::SessionMenu) => {}
+                KeyCode::Esc if matches!(kind, SelKind::SessionMenu | SelKind::Review { .. }) => {}
+                KeyCode::Esc if matches!(kind, SelKind::Blocked { .. }) => self.on_select(kind, vec!["Ignore this time".into()]),
                 KeyCode::Esc => self.cleanup_sync_stage(),
                 KeyCode::Enter => {
                     let mut picks: Vec<String> = items

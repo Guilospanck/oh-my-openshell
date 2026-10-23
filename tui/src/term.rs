@@ -19,6 +19,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
+    text::Span,
 };
 use std::{
     cell::RefCell,
@@ -149,6 +150,69 @@ fn map_color(c: StyleColor) -> Color {
         StyleColor::Palette(i) => Color::Indexed(i.0),
         StyleColor::Rgb(r) => Color::Rgb(r.r, r.g, r.b),
     }
+}
+
+/// A linear selection over viewport cells, `(col, row)`; `anchor` is where the drag began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: (u16, u16),
+    pub head: (u16, u16),
+}
+
+impl Selection {
+    /// Start and end in reading order.
+    fn ends(&self) -> ((u16, u16), (u16, u16)) {
+        let (a, h) = (self.anchor, self.head);
+        if (a.1, a.0) <= (h.1, h.0) {
+            (a, h)
+        } else {
+            (h, a)
+        }
+    }
+
+    /// Inclusive columns selected on row `y` of a `cols`-wide pane.
+    pub fn row_span(&self, y: u16, cols: u16) -> Option<(u16, u16)> {
+        let ((x0, y0), (x1, y1)) = self.ends();
+        if y < y0 || y > y1 || cols == 0 {
+            return None;
+        }
+        let from = if y == y0 { x0 } else { 0 };
+        let to = if y == y1 { x1 } else { cols - 1 };
+        Some((from.min(cols - 1), to.min(cols - 1)))
+    }
+
+    /// Selected text from a rendered pane: trailing blanks trimmed per row, rows joined by
+    /// newlines, and the blank half of wide characters skipped.
+    pub fn text(&self, buf: &Buffer, area: Rect) -> String {
+        let ((_, y0), (_, y1)) = self.ends();
+        let mut rows = Vec::new();
+        for y in y0..=y1.min(area.height.saturating_sub(1)) {
+            let Some((a, b)) = self.row_span(y, area.width) else { continue };
+            let mut line = String::new();
+            let mut x = a;
+            while x <= b {
+                let sym = buf[(area.x + x, area.y + y)].symbol();
+                line.push_str(sym);
+                x += Span::raw(sym).width().max(1) as u16;
+            }
+            rows.push(line.trim_end().to_string());
+        }
+        rows.join("\n")
+    }
+}
+
+/// OSC 52 write that puts `text` on the host terminal's clipboard.
+pub fn osc52(text: &str) -> String {
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::from("\x1b]52;c;");
+    for c in text.as_bytes().chunks(3) {
+        let n = c.iter().enumerate().fold(0u32, |n, (i, b)| n | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            out.push(if i <= c.len() { B64[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    out.push('\x07');
+    out
 }
 
 type Render = (RenderState<'static>, RowIterator<'static>, CellIterator<'static>);
@@ -407,6 +471,9 @@ pub struct Session {
     /// When the child was seen gone; output still queued gets a moment to arrive.
     reaped: Option<Instant>,
     pub exited: bool,
+    /// Text selected with the mouse; drawn reversed, copied on release.
+    pub sel: Option<Selection>,
+    selecting: bool,
 }
 
 impl Session {
@@ -475,6 +542,8 @@ impl Session {
             rx,
             reaped: None,
             exited: false,
+            sel: None,
+            selecting: false,
         })
     }
 
@@ -518,10 +587,15 @@ impl Session {
         if (c, r) != (self.vt.cols, self.vt.rows) {
             let _ = self.master.resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
             self.vt.resize(c, r);
+            self.sel = None;
         }
     }
 
     pub fn on_key(&mut self, k: &KeyEvent) {
+        // Esc only drops a selection; any other key drops it and goes on to the shell.
+        if self.sel.take().is_some() && k.code == KeyCode::Esc {
+            return;
+        }
         if k.modifiers.contains(KeyModifiers::SHIFT) && matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) {
             let h = (self.vt.rows as isize / 2).max(1);
             self.vt.scroll(if k.code == KeyCode::PageUp { -h } else { h });
@@ -532,17 +606,51 @@ impl Session {
         self.send(b);
     }
 
-    pub fn on_mouse(&mut self, me: &MouseEvent) {
-        if self.vt.mouse_tracking() {
+    /// Left-drag selects when the program does not track the mouse, or with Shift held;
+    /// returns the text to copy when the drag ends. Other events go to a tracking program,
+    /// or scroll the primary screen.
+    pub fn on_mouse(&mut self, me: &MouseEvent) -> Option<String> {
+        let at = (me.column.min(self.vt.cols - 1), me.row.min(self.vt.rows - 1));
+        let tracking = self.vt.mouse_tracking();
+        let select = !tracking || me.modifiers.contains(KeyModifiers::SHIFT);
+        match me.kind {
+            MouseEventKind::Down(MouseButton::Left) if select => {
+                self.sel = Some(Selection { anchor: at, head: at });
+                self.selecting = true;
+                return None;
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.selecting => {
+                if let Some(s) = &mut self.sel {
+                    s.head = at;
+                }
+                return None;
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.selecting => {
+                self.selecting = false;
+                let s = self.sel?;
+                if s.anchor == s.head {
+                    self.sel = None;
+                    return None;
+                }
+                let area = Rect::new(0, 0, self.vt.cols, self.vt.rows);
+                let mut buf = Buffer::empty(area);
+                self.vt.render(area, &mut buf);
+                return Some(s.text(&buf, area)).filter(|t| !t.is_empty());
+            }
+            _ => {}
+        }
+        if tracking {
             let b = self.vt.mouse(me);
             self.send(b);
         } else if self.vt.primary_screen() {
             match me.kind {
                 MouseEventKind::ScrollUp => self.vt.scroll(-3),
                 MouseEventKind::ScrollDown => self.vt.scroll(3),
-                _ => {}
+                _ => return None,
             }
+            self.sel = None;
         }
+        None
     }
 
     pub fn on_paste(&mut self, text: String) {
@@ -624,6 +732,50 @@ mod tests {
         assert_eq!(buf[(6, 0)].symbol(), "x");
         assert_eq!(buf[(0, 1)].symbol(), "n");
         assert_eq!(cur, Some(Position::new(4, 1)));
+    }
+
+    #[test]
+    fn selection_spans_rows_and_reads_text() {
+        let mut v = vt();
+        v.feed("hello world\r\n世x  end".as_bytes());
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf);
+        // Dragged backwards from row 1 to row 0: same as forwards.
+        let s = Selection { anchor: (3, 1), head: (6, 0) };
+        assert_eq!(s.row_span(0, 20), Some((6, 19)));
+        assert_eq!(s.row_span(1, 20), Some((0, 3)));
+        assert_eq!(s.row_span(2, 20), None);
+        assert_eq!(s.text(&buf, area), "world\n世x");
+        let one = Selection { anchor: (0, 1), head: (8, 1) };
+        assert_eq!(one.text(&buf, area), "世x  end");
+        assert_eq!(osc52("hi\n"), "\x1b]52;c;aGkK\x07");
+        assert_eq!(osc52("abcd"), "\x1b]52;c;YWJjZA==\x07");
+    }
+
+    #[test]
+    fn drag_selects_and_copies_unless_the_program_tracks_the_mouse() {
+        let args = vec!["-c".to_string(), "printf 'copy me'; sleep 5".to_string()];
+        let mut s = Session::spawn("t".into(), String::new(), "bash", &args, 20, 5).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while s.vt.last_line() != "copy me" && Instant::now() < end {
+            s.pump();
+            thread::sleep(Duration::from_millis(20));
+        }
+        let ev = |kind, column, modifiers| MouseEvent { kind, column, row: 0, modifiers };
+        let none = KeyModifiers::NONE;
+        assert_eq!(s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 0, none)), None);
+        s.on_mouse(&ev(MouseEventKind::Drag(MouseButton::Left), 3, none));
+        assert_eq!(s.sel, Some(Selection { anchor: (0, 0), head: (3, 0) }));
+        assert_eq!(s.on_mouse(&ev(MouseEventKind::Up(MouseButton::Left), 3, none)).as_deref(), Some("copy"));
+        s.on_key(&KeyEvent::from(KeyCode::Esc));
+        assert!(s.sel.is_none());
+        // A program that tracks the mouse gets plain clicks; Shift still selects.
+        s.vt.feed(b"\x1b[?1000h");
+        s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 1, none));
+        assert!(s.sel.is_none());
+        s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::SHIFT));
+        assert!(s.sel.is_some());
     }
 
     #[test]

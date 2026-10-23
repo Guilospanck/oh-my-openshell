@@ -41,7 +41,7 @@ pub fn exec(prog: &str, args: &[String], env: &[(String, String)]) -> Result<Str
     run(prog, &args, env)
 }
 
-fn run(prog: &str, args: &[String], env: &[(String, String)]) -> Result<String, String> {
+pub fn run(prog: &str, args: &[String], env: &[(String, String)]) -> Result<String, String> {
     let out = Command::new(prog)
         .args(args)
         .envs(env.iter().cloned())
@@ -428,7 +428,7 @@ pub fn spawn_poller(
     });
 }
 
-fn valid_host(h: &str) -> bool {
+pub fn valid_host(h: &str) -> bool {
     !h.is_empty()
         && h.len() <= 253
         && h.split('.').all(|l| {

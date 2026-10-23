@@ -31,7 +31,7 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). `osh` puts
 
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`) |
 | Providers | create from a `providers/*.yaml` profile (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated |
@@ -39,6 +39,40 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). `osh` puts
 
 Credentials are read from the environment when exported, else prompted hidden;
 they never go through argv. The footer shows the keys for the current tab.
+
+### Embedded shells
+
+`Enter` on a sandbox opens `bash` in it, inside osh. Every key goes to the
+shell; `Ctrl-]` opens a menu: back to the session, dashboard (the shell keeps
+running, marked `●`; `Enter` on it returns), or close it. Shells keep their
+size when the window resizes, focused or not. `Shift-PgUp`/`PgDn` and the
+mouse wheel scroll back on the main screen; programs that ask for the mouse
+(vim, `less --mouse`) get it.
+
+Under tmux, keys such as `Shift-Enter` reach the shell only with
+`set -g extended-keys always` and `set -g extended-keys-format csi-u`: tmux
+does not answer the kitty keyboard query, so osh cannot ask for them.
+
+### Blocked requests
+
+While a sandbox has a shell open, osh follows its logs. When the network
+policy blocks a program from reaching a host, a prompt opens (over the shell,
+or the dashboard): `curl was blocked from reaching example.com:443`, with
+allow read-only (GET/HEAD/OPTIONS), allow all methods, ignore this time, or
+ignore until the session ends. Allowing adds exactly that `host:port` for
+exactly that binary to the running sandbox (`openshell policy update
+--add-endpoint host:port:read-only:rest:enforce` or `host:port:full`); the
+result shows in the status bar. Denials that a host rule cannot fix (an L7
+rule rejecting the request) show a notice with the reason instead. `p` on the
+Sandboxes tab lists what was seen in the selected sandbox; `Enter` on an entry
+asks again.
+
+### Selection and copy
+
+Drag with the left button to select text in a shell (hold `Shift` when the
+program uses the mouse). Releasing copies it through the terminal (OSC 52;
+under tmux that needs `set -g set-clipboard on`) and `pbcopy` on macOS, and
+the status bar shows `copied N chars`. `Esc` or typing clears the selection.
 
 ## Gateways
 

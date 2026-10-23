@@ -28,7 +28,7 @@ fn highlight() -> Style {
 
 pub fn draw(f: &mut Frame, app: &App) {
     if let Some(s) = app.session() {
-        draw_session(f, s, app.modal.is_none());
+        draw_session(f, s, app.modal.is_none(), app.flash());
         if let Some(m) = &app.modal {
             draw_modal(f, m);
         }
@@ -248,7 +248,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let help = match app.tab {
-        Tab::Sandboxes => "Enter shell (● running)  l logs  n new  d delete  s stop  S start  a/x attach/detach provider  K skills",
+        Tab::Sandboxes => "Enter shell (● running)  l logs  p blocked  n new  d delete  s stop  S start  a/x attach/detach provider  K skills",
         Tab::Providers => "n create  u update credentials  d delete",
         Tab::Profiles => "u / Enter import or update from providers/",
         Tab::Images => "b / Enter build",
@@ -328,7 +328,8 @@ fn draw_modal(f: &mut Frame, m: &Modal) {
             );
         }
         Modal::Select { title, items, cursor, marked, multi, .. } => {
-            let area = centered(f.area(), 60, items.len() as u16 + 4);
+            let widest = items.iter().map(|i| i.chars().count() + 8).chain([title.chars().count() + 4]).max().unwrap_or(0);
+            let area = centered(f.area(), (widest as u16).clamp(60, 100), items.len() as u16 + 4);
             f.render_widget(Clear, area);
             let li: Vec<ListItem> = items
                 .iter()
@@ -347,13 +348,24 @@ fn draw_modal(f: &mut Frame, m: &Modal) {
 }
 
 /// The shell fills the screen above a one-row status bar; the cursor is shown only with focus.
-fn draw_session(f: &mut Frame, s: &Session, focus: bool) {
+fn draw_session(f: &mut Frame, s: &Session, focus: bool, flash: Option<&str>) {
     let area = f.area();
     let pane = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
     let bar = Rect::new(area.x, pane.bottom(), area.width, area.height - pane.height);
     if let Some(p) = s.vt.render(pane, f.buffer_mut()) {
         if focus {
             f.set_cursor_position(p);
+        }
+    }
+    if let Some(sel) = &s.sel {
+        let buf = f.buffer_mut();
+        for y in 0..pane.height {
+            let Some((a, b)) = sel.row_span(y, pane.width) else { continue };
+            for x in a..=b {
+                if let Some(c) = buf.cell_mut((pane.x + x, pane.y + y)) {
+                    c.modifier.toggle(Modifier::REVERSED);
+                }
+            }
         }
     }
     let base = Style::default().fg(Color::Black).bg(Color::Gray);
@@ -365,6 +377,10 @@ fn draw_session(f: &mut Frame, s: &Session, focus: bool) {
     let back = s.vt.scrolled_back();
     if back > 0 {
         spans.push(Span::styled(format!(" [scrollback -{back}, type to return] "), base.fg(Color::Blue)));
+    }
+    if let Some(m) = flash.filter(|m| !m.is_empty() && *m != "Ready") {
+        let c = if m.starts_with("Error") { Color::Red } else { Color::Blue };
+        spans.push(Span::styled(format!(" {m} "), base.fg(c).add_modifier(Modifier::BOLD)));
     }
     f.render_widget(Paragraph::new(Line::from(spans)).style(base), bar);
     f.render_widget(Paragraph::new("Ctrl-] menu ").style(base).alignment(Alignment::Right), bar);
