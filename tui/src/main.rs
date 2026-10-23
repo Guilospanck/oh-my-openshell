@@ -326,7 +326,7 @@ mod tests {
 
     const MANIFEST: &str = r#"{"agents":["claude-code","pi"],"stage_dir":"/tmp/stage","secret_findings":[],"items":[
       {"id":"npx-skills:caveman","group":"npx-skills","name":"caveman","default":true,"kind":"run",
-       "agents":{"claude-code":["npx skills add a/b -g -a claude-code -s caveman -y --copy"],"pi":["npx skills add a/b -g -a pi -s caveman -y --copy"]}},
+       "agents":{"claude-code":["npx --yes skills@1.7.4 add a/b -g -a claude-code -s caveman -y --copy"],"pi":["npx --yes skills@1.7.4 add a/b -g -a pi -s caveman -y --copy"]}},
       {"id":"own-skills:bro","group":"own-skills","name":"bro","default":true,"kind":"upload",
        "agents":{"claude-code":{"src":"/tmp/stage/skills/bro","dest":"/workspace/.claude/skills","result":"/workspace/.claude/skills/bro"},
                  "pi":{"src":"/tmp/stage/skills/bro","dest":"/workspace/.agents/skills","result":"/workspace/.agents/skills/bro"}}},
@@ -360,7 +360,7 @@ mod tests {
         assert_eq!(pi.len(), 2);
         let install = &pi[0].args;
         assert!(install.contains(&"exec".to_string()) && install.last().unwrap().contains("-a pi"));
-        assert!(install.last().unwrap().starts_with("export PATH=\"$HOME/.local/bin:$PATH\"; "));
+        assert!(install.last().unwrap().starts_with("export PATH=\"$HOME/.local/bin:$PATH\"; npx --yes skills@1.7.4 add "));
         // A directory upload targets the parent: the CLI nests it under its own name.
         assert_eq!(pi[1].args[1..], ["upload", "sb", "/tmp/stage/skills/bro", "/workspace/.agents/skills", "--no-git-ignore"]);
         // Only chosen ids run; unchosen items never do.

@@ -104,7 +104,9 @@ the sandbox's network policy first and lists any missing access. Items are
 reinstalled from their sources (`npx skills`, `claude plugin install`,
 `pi install`, graphify from PyPI); only your own skills and `CLAUDE.md` are
 uploaded, after a secret scan (findings block the upload). The OpenShell skills
-and the language-server plugins are left out.
+and the language-server plugins are left out. Versions are pinned: the `skills`
+CLI to `SKILLS_CLI` in `sync-agents`, graphify to the host's version, and
+superpowers for pi to the commit installed on the host.
 
 If the sandbox's policy blocks an install, `K` offers to create (if needed) and attach the anonymous profiles that grant the access, then checks again. The profiles are: `npm`, `pypi`
 (graphify) and `claude-marketplace` (read-only github.com for plugins, `npx
