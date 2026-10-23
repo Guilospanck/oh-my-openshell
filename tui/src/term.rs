@@ -4,12 +4,14 @@
 use crate::cli;
 use libghostty_vt::key::{self, Action as KAction, Encoder as KeyEncoder, Event as KeyEv, Key, Mods};
 use libghostty_vt::mouse::{self, Encoder as MouseEncoder, EncoderSize, Event as MouseEv};
+use libghostty_vt::fmt::Format;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
-use libghostty_vt::screen::{CellWide, Screen};
+use libghostty_vt::screen::{CellWide, Screen, TrackedGridRef};
+use libghostty_vt::selection::{FormatOptions, Selection as GhosttySel};
 use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::terminal::{
-    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Options,
-    PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, Terminal,
+    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Options, Point,
+    PointCoordinate, PointSpace, PrimaryDeviceAttributes, ScrollViewport, SecondaryDeviceAttributes, Terminal,
     TertiaryDeviceAttributes,
 };
 use libghostty_vt::{focus, paste};
@@ -19,7 +21,6 @@ use ratatui::{
     buffer::Buffer,
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
-    text::Span,
 };
 use std::{
     cell::RefCell,
@@ -29,7 +30,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCROLLBACK: usize = 10_000;
+/// Scrollback lines kept per shell; older ones are dropped, so memory stays bounded.
+pub const SCROLLBACK: usize = 10_000;
 /// PTY output chunks queued before the reader blocks, which throttles the shell.
 const QUEUE: usize = 64;
 /// Output bytes parsed per session per loop iteration, so input stays responsive.
@@ -152,53 +154,16 @@ fn map_color(c: StyleColor) -> Color {
     }
 }
 
-/// A linear selection over viewport cells, `(col, row)`; `anchor` is where the drag began.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Selection {
-    pub anchor: (u16, u16),
-    pub head: (u16, u16),
+/// A mouse selection: tracked references to the cells where the drag began and where it is
+/// now. Ghostty moves them with their text through scrolling, new output and history pruning.
+struct Sel {
+    anchor: TrackedGridRef,
+    head: TrackedGridRef,
+    screen: Screen,
 }
 
-impl Selection {
-    /// Start and end in reading order.
-    fn ends(&self) -> ((u16, u16), (u16, u16)) {
-        let (a, h) = (self.anchor, self.head);
-        if (a.1, a.0) <= (h.1, h.0) {
-            (a, h)
-        } else {
-            (h, a)
-        }
-    }
-
-    /// Inclusive columns selected on row `y` of a `cols`-wide pane.
-    pub fn row_span(&self, y: u16, cols: u16) -> Option<(u16, u16)> {
-        let ((x0, y0), (x1, y1)) = self.ends();
-        if y < y0 || y > y1 || cols == 0 {
-            return None;
-        }
-        let from = if y == y0 { x0 } else { 0 };
-        let to = if y == y1 { x1 } else { cols - 1 };
-        Some((from.min(cols - 1), to.min(cols - 1)))
-    }
-
-    /// Selected text from a rendered pane: trailing blanks trimmed per row, rows joined by
-    /// newlines, and the blank half of wide characters skipped.
-    pub fn text(&self, buf: &Buffer, area: Rect) -> String {
-        let ((_, y0), (_, y1)) = self.ends();
-        let mut rows = Vec::new();
-        for y in y0..=y1.min(area.height.saturating_sub(1)) {
-            let Some((a, b)) = self.row_span(y, area.width) else { continue };
-            let mut line = String::new();
-            let mut x = a;
-            while x <= b {
-                let sym = buf[(area.x + x, area.y + y)].symbol();
-                line.push_str(sym);
-                x += Span::raw(sym).width().max(1) as u16;
-            }
-            rows.push(line.trim_end().to_string());
-        }
-        rows.join("\n")
-    }
+fn viewport(x: u16, y: u16) -> Point {
+    Point::Viewport(PointCoordinate { x, y: y as u32 })
 }
 
 /// OSC 52 write that puts `text` on the host terminal's clipboard.
@@ -219,6 +184,8 @@ type Render = (RenderState<'static>, RowIterator<'static>, CellIterator<'static>
 
 /// Terminal state plus the encoders that turn host input into bytes for the shell.
 pub struct Vt {
+    /// Declared before `term` so the tracked references are freed first.
+    sel: Option<Sel>,
     term: Terminal<'static, 'static>,
     render: RefCell<Render>,
     keys: KeyEncoder<'static>,
@@ -236,8 +203,12 @@ fn err(e: impl std::fmt::Debug) -> String {
 impl Vt {
     /// Replies to terminal queries (device attributes, cursor reports) go to `reply`.
     pub fn new(cols: u16, rows: u16, reply: Sender<Vec<u8>>) -> Result<Self, String> {
+        Self::with_scrollback(cols, rows, SCROLLBACK, reply)
+    }
+
+    fn with_scrollback(cols: u16, rows: u16, max_scrollback: usize, reply: Sender<Vec<u8>>) -> Result<Self, String> {
         let (cols, rows) = (cols.max(2), rows.max(2));
-        let mut term = Terminal::new(Options { cols, rows, max_scrollback: SCROLLBACK }).map_err(err)?;
+        let mut term = Terminal::new(Options { cols, rows, max_scrollback }).map_err(err)?;
         term.on_pty_write(move |_, data| {
             let _ = reply.send(data.to_vec());
         })
@@ -255,6 +226,7 @@ impl Vt {
         .map_err(err)?;
         term.on_xtversion(|_| Some("osh")).map_err(err)?;
         Ok(Vt {
+            sel: None,
             term,
             render: RefCell::new((
                 RenderState::new().map_err(err)?,
@@ -272,6 +244,60 @@ impl Vt {
 
     pub fn feed(&mut self, bytes: &[u8]) {
         self.term.vt_write(bytes);
+        if self.sel.is_some() && self.selection().is_none() {
+            self.clear_selection();
+        }
+    }
+
+    /// Start a selection at a viewport cell.
+    pub fn select_start(&mut self, x: u16, y: u16) {
+        let screen = self.term.active_screen().unwrap_or_default();
+        self.sel = match (self.term.track_grid_ref(viewport(x, y)), self.term.track_grid_ref(viewport(x, y))) {
+            (Ok(anchor), Ok(head)) => Some(Sel { anchor, head, screen }),
+            _ => None,
+        };
+    }
+
+    /// Move the selection's moving end to a viewport cell.
+    pub fn select_to(&mut self, x: u16, y: u16) {
+        if let Some(s) = &mut self.sel {
+            let _ = s.head.set(&mut self.term, viewport(x, y));
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.sel = None;
+        let _ = self.term.set_selection(None);
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.sel.is_some()
+    }
+
+    /// True when the selection covers a single cell: a click, not a drag.
+    pub fn selection_is_point(&self) -> bool {
+        self.sel.as_ref().is_some_and(|s| s.anchor.point(PointSpace::Screen).ok() == s.head.point(PointSpace::Screen).ok())
+    }
+
+    /// The selection as a snapshot; `None` once its text is gone (pruned from the
+    /// scrollback, or the other screen is showing).
+    fn selection(&self) -> Option<GhosttySel<'_>> {
+        let s = self.sel.as_ref()?;
+        if self.term.active_screen().ok()? != s.screen {
+            return None;
+        }
+        let a = s.anchor.snapshot(&self.term).ok()??;
+        let h = s.head.snapshot(&self.term).ok()??;
+        Some(GhosttySel::new(a, h, false))
+    }
+
+    /// Selected text as Ghostty copies it: soft-wrapped lines joined, trailing blanks
+    /// trimmed, wide characters once. Rows scrolled out of view are included.
+    pub fn selection_text(&self) -> Option<String> {
+        let sel = self.selection()?;
+        let opts = FormatOptions::new().with_emit_format(Format::Plain).with_unwrap(true).with_trim(true).with_selection(&sel);
+        let bytes = self.term.format_selection_alloc(None, opts).ok()??;
+        Some(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) -> bool {
@@ -395,6 +421,7 @@ impl Vt {
 
     /// Draw the viewport into `area`; returns where the cursor is, if visible.
     pub fn render(&self, area: Rect, buf: &mut Buffer) -> Option<Position> {
+        let _ = self.term.set_selection(self.selection().as_ref());
         let mut r = self.render.borrow_mut();
         let (rs, rows, cells) = &mut *r;
         let snap = rs.update(&self.term).ok()?;
@@ -444,6 +471,13 @@ impl Vt {
                     }
                     s = s.fg(fg).bg(bg).add_modifier(m);
                 }
+                if c.is_selected().unwrap_or(false) {
+                    s = if s.add_modifier.contains(Modifier::REVERSED) {
+                        s.remove_modifier(Modifier::REVERSED)
+                    } else {
+                        s.add_modifier(Modifier::REVERSED)
+                    };
+                }
                 if let Some(bc) = buf.cell_mut((area.x + x, area.y + y)) {
                     bc.set_symbol(if g.is_empty() { " " } else { &g }).set_style(s);
                 }
@@ -471,8 +505,7 @@ pub struct Session {
     /// When the child was seen gone; output still queued gets a moment to arrive.
     reaped: Option<Instant>,
     pub exited: bool,
-    /// Text selected with the mouse; drawn reversed, copied on release.
-    pub sel: Option<Selection>,
+    /// A left-drag is selecting text; it is drawn reversed and copied on release.
     selecting: bool,
 }
 
@@ -542,7 +575,6 @@ impl Session {
             rx,
             reaped: None,
             exited: false,
-            sel: None,
             selecting: false,
         })
     }
@@ -587,19 +619,22 @@ impl Session {
         if (c, r) != (self.vt.cols, self.vt.rows) {
             let _ = self.master.resize(PtySize { rows: r, cols: c, pixel_width: 0, pixel_height: 0 });
             self.vt.resize(c, r);
-            self.sel = None;
+            self.vt.clear_selection();
         }
     }
 
     pub fn on_key(&mut self, k: &KeyEvent) {
-        // Esc only drops a selection; any other key drops it and goes on to the shell.
-        if self.sel.take().is_some() && k.code == KeyCode::Esc {
-            return;
-        }
+        // Scrolling keeps a selection; Esc only drops it; any other key drops it and goes on.
         if k.modifiers.contains(KeyModifiers::SHIFT) && matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) {
             let h = (self.vt.rows as isize / 2).max(1);
             self.vt.scroll(if k.code == KeyCode::PageUp { -h } else { h });
             return;
+        }
+        if self.vt.has_selection() {
+            self.vt.clear_selection();
+            if k.code == KeyCode::Esc {
+                return;
+            }
         }
         self.vt.bottom();
         let b = self.vt.key(k);
@@ -610,33 +645,36 @@ impl Session {
     /// returns the text to copy when the drag ends. Other events go to a tracking program,
     /// or scroll the primary screen.
     pub fn on_mouse(&mut self, me: &MouseEvent) -> Option<String> {
-        let at = (me.column.min(self.vt.cols - 1), me.row.min(self.vt.rows - 1));
+        let (cols, rows) = (self.vt.cols, self.vt.rows);
+        // A drag past the pane edge selects up to the edge.
+        let at = (me.column.min(cols - 1), me.row.min(rows - 1));
         let tracking = self.vt.mouse_tracking();
         let select = !tracking || me.modifiers.contains(KeyModifiers::SHIFT);
         match me.kind {
             MouseEventKind::Down(MouseButton::Left) if select => {
-                self.sel = Some(Selection { anchor: at, head: at });
+                self.vt.select_start(at.0, at.1);
                 self.selecting = true;
                 return None;
             }
             MouseEventKind::Drag(MouseButton::Left) if self.selecting => {
-                if let Some(s) = &mut self.sel {
-                    s.head = at;
+                // Onto the status bar, below the pane: scroll toward the live screen.
+                if me.row >= rows && self.vt.scrolled_back() > 0 {
+                    self.vt.scroll(1);
                 }
+                self.vt.select_to(at.0, at.1);
                 return None;
             }
             MouseEventKind::Up(MouseButton::Left) if self.selecting => {
                 self.selecting = false;
-                let s = self.sel?;
-                if s.anchor == s.head {
-                    self.sel = None;
+                self.vt.select_to(at.0, at.1);
+                if self.vt.selection_is_point() {
+                    self.vt.clear_selection();
                     return None;
                 }
-                let area = Rect::new(0, 0, self.vt.cols, self.vt.rows);
-                let mut buf = Buffer::empty(area);
-                self.vt.render(area, &mut buf);
-                return Some(s.text(&buf, area)).filter(|t| !t.is_empty());
+                return self.vt.selection_text().filter(|t| !t.is_empty());
             }
+            // A click that goes to the program drops the selection.
+            MouseEventKind::Down(_) => self.vt.clear_selection(),
             _ => {}
         }
         if tracking {
@@ -648,7 +686,10 @@ impl Session {
                 MouseEventKind::ScrollDown => self.vt.scroll(3),
                 _ => return None,
             }
-            self.sel = None;
+            // The selection stays on its text; a drag in progress extends to the pointer.
+            if self.selecting {
+                self.vt.select_to(at.0, at.1);
+            }
         }
         None
     }
@@ -734,23 +775,86 @@ mod tests {
         assert_eq!(cur, Some(Position::new(4, 1)));
     }
 
-    #[test]
-    fn selection_spans_rows_and_reads_text() {
-        let mut v = vt();
-        v.feed("hello world\r\n世x  end".as_bytes());
-        let area = Rect::new(0, 0, 20, 5);
+    /// Rows of the rendered viewport, trailing blanks trimmed.
+    fn shown(v: &Vt) -> Vec<String> {
+        let area = Rect::new(0, 0, v.cols, v.rows);
         let mut buf = Buffer::empty(area);
         v.render(area, &mut buf);
+        (0..v.rows).map(|y| (0..v.cols).map(|x| buf[(x, y)].symbol()).collect::<String>().trim_end().to_string()).collect()
+    }
+
+    fn reversed(v: &Vt, x: u16, y: u16) -> bool {
+        let area = Rect::new(0, 0, v.cols, v.rows);
+        let mut buf = Buffer::empty(area);
+        v.render(area, &mut buf);
+        buf[(x, y)].modifier.contains(Modifier::REVERSED)
+    }
+
+    #[test]
+    fn selection_reads_wide_characters_and_trims() {
+        let mut v = vt();
+        v.feed("hello world   \r\n世x  end   ".as_bytes());
         // Dragged backwards from row 1 to row 0: same as forwards.
-        let s = Selection { anchor: (3, 1), head: (6, 0) };
-        assert_eq!(s.row_span(0, 20), Some((6, 19)));
-        assert_eq!(s.row_span(1, 20), Some((0, 3)));
-        assert_eq!(s.row_span(2, 20), None);
-        assert_eq!(s.text(&buf, area), "world\n世x");
-        let one = Selection { anchor: (0, 1), head: (8, 1) };
-        assert_eq!(one.text(&buf, area), "世x  end");
+        v.select_start(3, 1);
+        v.select_to(6, 0);
+        assert_eq!(v.selection_text().as_deref(), Some("world\n世x"));
+        assert!(reversed(&v, 6, 0) && reversed(&v, 19, 0) && !reversed(&v, 5, 0) && !reversed(&v, 4, 1));
+        v.select_start(0, 1);
+        v.select_to(19, 1);
+        assert_eq!(v.selection_text().as_deref(), Some("世x  end"));
+        assert!(!v.selection_is_point());
+        v.clear_selection();
+        assert!(v.selection_text().is_none() && !reversed(&v, 0, 1));
         assert_eq!(osc52("hi\n"), "\x1b]52;c;aGkK\x07");
         assert_eq!(osc52("abcd"), "\x1b]52;c;YWJjZA==\x07");
+    }
+
+    #[test]
+    fn selection_in_scrolled_history_copies_what_is_shown() {
+        let mut v = vt();
+        for i in 0..30 {
+            v.feed(format!("line {i}\r\n").as_bytes());
+        }
+        v.scroll(-10);
+        let rows = shown(&v);
+        v.select_start(0, 1);
+        v.select_to(19, 3);
+        assert_eq!(v.selection_text().unwrap(), rows[1..=3].join("\n"));
+        // Scrolling back to the bottom keeps it on the same text, now out of view.
+        let text = v.selection_text();
+        v.bottom();
+        assert_eq!(v.selection_text(), text);
+        // A selection extended across a scroll spans more rows than the viewport has.
+        v.scroll(-10);
+        v.select_start(0, 0);
+        v.scroll(8);
+        v.select_to(19, 4);
+        assert_eq!(v.selection_text().unwrap().lines().count(), 13);
+    }
+
+    #[test]
+    fn selection_follows_new_output_and_clears_once_pruned() {
+        let mut v = vt();
+        v.feed(b"keep me\r\n");
+        v.select_start(0, 0);
+        v.select_to(6, 0);
+        for i in 0..6 {
+            v.feed(format!("more {i}\r\n").as_bytes());
+        }
+        assert_eq!(v.selection_text().as_deref(), Some("keep me"));
+        // The text scrolled off the top; the selection went with it.
+        assert!(!reversed(&v, 0, 0));
+        v.scroll(-3);
+        assert!(shown(&v)[0] == "keep me" && reversed(&v, 0, 0), "{:?}", shown(&v));
+        // With a small scrollback the row is dropped, and the selection with it.
+        let mut small = Vt::with_scrollback(20, 5, 10, mpsc::channel().0).unwrap();
+        small.feed(b"gone soon\r\n");
+        small.select_start(0, 0);
+        small.select_to(8, 0);
+        for i in 0..20_000 {
+            small.feed(format!("{i}\r\n").as_bytes());
+        }
+        assert!(!small.has_selection(), "pruned text leaves nothing selected");
     }
 
     #[test]
@@ -766,16 +870,28 @@ mod tests {
         let none = KeyModifiers::NONE;
         assert_eq!(s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 0, none)), None);
         s.on_mouse(&ev(MouseEventKind::Drag(MouseButton::Left), 3, none));
-        assert_eq!(s.sel, Some(Selection { anchor: (0, 0), head: (3, 0) }));
+        assert!(s.vt.has_selection());
         assert_eq!(s.on_mouse(&ev(MouseEventKind::Up(MouseButton::Left), 3, none)).as_deref(), Some("copy"));
+        // Shift-PgUp scrolls and keeps it; Esc drops it.
+        s.on_key(&KeyEvent::new(KeyCode::PageUp, KeyModifiers::SHIFT));
+        assert!(s.vt.has_selection());
         s.on_key(&KeyEvent::from(KeyCode::Esc));
-        assert!(s.sel.is_none());
+        assert!(!s.vt.has_selection());
+        // A click is not a selection; a drag past the right and bottom edges stops at them.
+        s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 2, none));
+        assert_eq!(s.on_mouse(&ev(MouseEventKind::Up(MouseButton::Left), 2, none)), None);
+        assert!(!s.vt.has_selection());
+        s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 5, none));
+        let past = MouseEvent { kind: MouseEventKind::Drag(MouseButton::Left), column: 200, row: 9, modifiers: none };
+        s.on_mouse(&past);
+        let up = MouseEvent { kind: MouseEventKind::Up(MouseButton::Left), column: 200, row: 9, modifiers: none };
+        assert_eq!(s.on_mouse(&up).as_deref(), Some("me"));
         // A program that tracks the mouse gets plain clicks; Shift still selects.
         s.vt.feed(b"\x1b[?1000h");
         s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 1, none));
-        assert!(s.sel.is_none());
+        assert!(!s.vt.has_selection());
         s.on_mouse(&ev(MouseEventKind::Down(MouseButton::Left), 1, KeyModifiers::SHIFT));
-        assert!(s.sel.is_some());
+        assert!(s.vt.has_selection());
     }
 
     #[test]

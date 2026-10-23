@@ -357,17 +357,6 @@ fn draw_session(f: &mut Frame, s: &Session, focus: bool, flash: Option<&str>) {
             f.set_cursor_position(p);
         }
     }
-    if let Some(sel) = &s.sel {
-        let buf = f.buffer_mut();
-        for y in 0..pane.height {
-            let Some((a, b)) = sel.row_span(y, pane.width) else { continue };
-            for x in a..=b {
-                if let Some(c) = buf.cell_mut((pane.x + x, pane.y + y)) {
-                    c.modifier.toggle(Modifier::REVERSED);
-                }
-            }
-        }
-    }
     let base = Style::default().fg(Color::Black).bg(Color::Gray);
     let mut spans = vec![Span::styled(format!(" {} ", s.sandbox), base.add_modifier(Modifier::BOLD))];
     let title = s.vt.title();

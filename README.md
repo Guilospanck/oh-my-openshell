@@ -72,7 +72,10 @@ asks again.
 Drag with the left button to select text in a shell (hold `Shift` when the
 program uses the mouse). Releasing copies it through the terminal (OSC 52;
 under tmux that needs `set -g set-clipboard on`) and `pbcopy` on macOS, and
-the status bar shows `copied N chars`. `Esc` or typing clears the selection.
+the status bar shows `copied N chars`. The selection stays on its text while
+you scroll (wheel, `Shift-PgUp`) or new output arrives, so it can span more
+than one screen; text dropped from the scrollback drops it. `Esc`, typing or a
+click clears it.
 
 ## Gateways
 
