@@ -24,9 +24,14 @@ Builds the ratatui TUI (`tui/`) with cargo on first run and whenever its
 sources change. Offers to install OpenShell if missing. Needs `cargo`; Docker
 for image builds.
 
+The embedded sandbox shell uses libghostty-vt (Ghostty's terminal engine),
+which builds only with Zig 0.15 (`brew install zig@0.15`). `osh` puts
+`zig@0.15` on PATH for the build; building by hand needs
+`PATH="$(brew --prefix zig@0.15)/bin:$PATH" LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast cargo build --release`.
+
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), attach (`Enter`), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`) |
 | Providers | create from a `providers/*.yaml` profile (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated |
@@ -34,6 +39,49 @@ for image builds.
 
 Credentials are read from the environment when exported, else prompted hidden;
 they never go through argv. The footer shows the keys for the current tab.
+
+### Embedded shells
+
+`Enter` on a sandbox opens `bash` in it, inside osh. Every key goes to the
+shell; `Ctrl-]` opens a menu: back to the session, dashboard (the shell keeps
+running, marked `●`; `Enter` on it returns), or close it. Shells keep their
+size when the window resizes, focused or not. `Shift-PgUp`/`PgDn` and the
+mouse wheel scroll back on the main screen; programs that ask for the mouse
+(vim, `less --mouse`) get it.
+
+Under tmux, `Shift-Enter` reaches the shell when tmux has
+`set -g extended-keys on` (or `always`) and `set -g extended-keys-format csi-u`:
+tmux does not answer the kitty keyboard query, so while a shell has focus osh
+asks tmux for modifyOtherKeys instead. The `xterm` format is not used (osh's
+input library cannot read it); there `Shift-Enter` arrives as `Enter`.
+
+`Alt` works as Meta (sent as an `Esc` prefix: `Alt-b`/`Alt-f` move by word in
+bash). On macOS the host terminal must send it, e.g. "Use Option as Meta key"
+in Terminal.app or "Esc+" for Option in iTerm2; that setting is outside osh.
+
+### Blocked requests
+
+While a sandbox has a shell open, osh follows its logs. When the network
+policy blocks a program from reaching a host, a prompt opens (over the shell,
+or the dashboard): `curl was blocked from reaching example.com:443`, with
+allow read-only (GET/HEAD/OPTIONS), allow all methods, ignore this time, or
+ignore until the session ends. Allowing adds exactly that `host:port` for
+exactly that binary to the running sandbox (`openshell policy update
+--add-endpoint host:port:read-only:rest:enforce` or `host:port:full`); the
+result shows in the status bar. Denials that a host rule cannot fix (an L7
+rule rejecting the request) show a notice with the reason instead. `p` on the
+Sandboxes tab lists what was seen in the selected sandbox; `Enter` on an entry
+asks again.
+
+### Selection and copy
+
+Drag with the left button to select text in a shell (hold `Shift` when the
+program uses the mouse). Releasing copies it through the terminal (OSC 52;
+under tmux that needs `set -g set-clipboard on`) and `pbcopy` on macOS, and
+the status bar shows `copied N chars`. The selection stays on its text while
+you scroll (wheel, `Shift-PgUp`) or new output arrives, so it can span more
+than one screen; text dropped from the scrollback drops it. `Esc`, typing or a
+click clears it.
 
 ## Gateways
 
@@ -62,7 +110,9 @@ the sandbox's network policy first and lists any missing access. Items are
 reinstalled from their sources (`npx skills`, `claude plugin install`,
 `pi install`, graphify from PyPI); only your own skills and `CLAUDE.md` are
 uploaded, after a secret scan (findings block the upload). The OpenShell skills
-and the language-server plugins are left out.
+and the language-server plugins are left out. Versions are pinned: the `skills`
+CLI to `SKILLS_CLI` in `sync-agents`, graphify to the host's version, and
+superpowers for pi to the commit installed on the host.
 
 If the sandbox's policy blocks an install, `K` offers to create (if needed) and attach the anonymous profiles that grant the access, then checks again. The profiles are: `npm`, `pypi`
 (graphify) and `claude-marketplace` (read-only github.com for plugins, `npx
@@ -76,7 +126,8 @@ the hosts and programs still missing (no credential), shows you a summary,
 asks for a name (default `install-<sandbox>`), then imports it, creates the
 provider and attaches it. After the installs it offers to detach and delete
 it, since the network is only needed while installing. This also avoids the
-overlap errors between built-in profiles.
+attach conflicts between built-in profiles; if an attach still fails, it is
+removed again instead of left on the gateway.
 
 Profiles that need a secret (for example `github`, for private skill sources)
 are offered the same way. For a GitHub token, `osh` offers to read it from
@@ -84,9 +135,23 @@ are offered the same way. For a GitHub token, `osh` offers to read it from
 paste one (hidden; use a fine-grained, read-only token from
 github.com/settings/personal-access-tokens/new). Tokens exported in the shell
 that started `osh` are used without asking. As with Docker Sandboxes, the
-real secret stays on the host. Profiles that define the same endpoint
-differently, such as `pypi` and `github` (both define `api.github.com`),
-cannot be attached together; detach one first.
+real secret stays on the host. The gateway refuses to attach a provider whose
+endpoints it cannot merge with those already attached: a credentialed endpoint
+(`github` injects its token on `github.com` and `api.github.com`) next to a
+profile that allows the same host uninspected, or two inspected (`rest`)
+entries for one host that differ in `enforcement` or `allow_encoded_slash`.
+`pypi` therefore gives `github.com` and `api.github.com` the same inspected
+shape as `github`, so the two attach together (re-import `pypi` on gateways
+that have the old one). When an attach is refused during `K`, osh lists the
+attached providers and offers to detach one and try again.
+
+The installs run in your terminal and stop at the first failing step. osh then
+says which step failed and shows the end of its output (recorded with
+`script`, so the steps keep a real terminal). When that output reads like
+GitHub refusing access (a private repository: `Repository not found`,
+`could not read Username`, `Authentication failed`), it offers to create or
+attach the `github` provider and run the installs again from that step. The
+policy check cannot predict this: it is not a network block.
 
 ## Setup without osh
 

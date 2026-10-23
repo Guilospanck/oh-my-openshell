@@ -9,8 +9,10 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
+        less \
         python3 \
         ripgrep \
+        vim-tiny \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned: rebuild with --build-arg PI_VERSION=<version> to change. Keep in step with the host.

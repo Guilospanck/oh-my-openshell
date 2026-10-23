@@ -36,7 +36,11 @@ SKIP_DIRS = {"synced"}
 EXCLUDED_SKILLS = {"openshell-cli", "debug-inference", "debug-openshell-cluster", "generate-sandbox-policy"}
 # Plugins that need language-server binaries the images do not ship.
 HOST_ONLY_PLUGINS = {"clangd-lsp", "gopls-lsp", "rust-analyzer-lsp", "swift-lsp"}
-# Claude plugin -> the equivalent install command for pi, where one exists.
+# The `skills` CLI that `npx` runs, pinned so a sandbox gets what the host tested with
+# (`npm view skills version` when this was last bumped). Bump it deliberately.
+SKILLS_CLI = "skills@1.7.4"
+# Claude plugin -> the equivalent install command for pi, where one exists. The host's
+# installed commit (gitCommitSha) is appended as `@<sha>`, so pi gets the same version.
 PI_PLUGINS = {"superpowers": "pi install git:github.com/obra/superpowers"}
 # Network each install step needs: (host, binary). A sandbox policy allows a
 # binary to reach an endpoint, so both halves must match a rule. Binaries are the
@@ -82,7 +86,7 @@ def npx_skills():
             continue
         # -a is required: without it the CLI writes into every agent it knows (dozens of dot-directories).
         # claude-code lands in ~/.claude/skills, pi in ~/.agents/skills; both are real copies (--copy).
-        cmd = lambda agent: [f"npx --yes skills add {v['source']} -g -a {agent} -s {name} -y --copy"]
+        cmd = lambda agent: [f"npx --yes {SKILLS_CLI} add {v['source']} -g -a {agent} -s {name} -y --copy"]
         out.append(item("npx-skills", name, f"{v['source']} @ {v.get('skillFolderHash', '?')[:7]}",
                         {a: cmd(a) for a in AGENTS}, needs=NEEDS["npx"]))
     return out
@@ -109,7 +113,8 @@ def plugins():
         agents = {"claude-code": ([add] if add else []) + [f"claude plugin install {key}"]}
         needs = list(NEEDS["claude-plugin"])
         if name in PI_PLUGINS:
-            agents["pi"] = [PI_PLUGINS[name]]
+            sha = entries[0].get("gitCommitSha", "")
+            agents["pi"] = [PI_PLUGINS[name] + (f"@{sha}" if re.fullmatch(r"[0-9a-f]{40}", sha) else "")]
             needs += NEEDS["pi-plugin"]
         out.append(item("plugins", name, detail, agents, needs=needs,
                         note="" if "pi" in agents else "no pi equivalent known"))

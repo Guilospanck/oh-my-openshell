@@ -18,8 +18,10 @@ RUN apt-get update \
         ca-certificates \
         curl \
         git \
+        less \
         python3 \
         ripgrep \
+        vim-tiny \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=claude-install /usr/local/lib/node_modules /usr/local/lib/node_modules

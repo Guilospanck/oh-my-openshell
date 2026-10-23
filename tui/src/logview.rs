@@ -79,7 +79,13 @@ impl LogView {
     }
 
     fn spawn(name: &str, source: &str, buf: &Arc<Mutex<Buf>>) -> Result<Child, String> {
-        let mut args = vec!["logs".into(), name.to_string(), "--tail".into(), "-n".into(), BACKLOG.into()];
+        let mut args = vec![
+            "logs".into(),
+            name.to_string(),
+            "--tail".into(),
+            "-n".into(),
+            BACKLOG.into(),
+        ];
         if source != "all" {
             args.extend(["--source".into(), source.to_string()]);
         }
@@ -114,7 +120,11 @@ impl LogView {
         self.buf = Arc::new(Mutex::new(Buf::default()));
         self.child = Self::spawn(&self.name, SOURCES[self.source], &self.buf).ok();
         if self.child.is_none() {
-            self.buf.lock().unwrap().lines.push("failed to restart openshell logs".into());
+            self.buf
+                .lock()
+                .unwrap()
+                .lines
+                .push("failed to restart openshell logs".into());
         }
         self.seen_dropped = 0;
         self.top = 0;
@@ -158,11 +168,20 @@ impl LogView {
         if n == 0 || self.query.is_empty() {
             return;
         }
-        let start = self.current.unwrap_or(if forward { self.top.saturating_sub(1) } else { self.top + 1 });
-        let found = if forward {
-            (start + 1..n).chain(0..=start.min(n - 1)).find(|&i| self.matches(&b.lines[i]))
+        let start = self.current.unwrap_or(if forward {
+            self.top.saturating_sub(1)
         } else {
-            (0..start.min(n)).rev().chain((start..n).rev()).find(|&i| self.matches(&b.lines[i]))
+            self.top + 1
+        });
+        let found = if forward {
+            (start + 1..n)
+                .chain(0..=start.min(n - 1))
+                .find(|&i| self.matches(&b.lines[i]))
+        } else {
+            (0..start.min(n))
+                .rev()
+                .chain((start..n).rev())
+                .find(|&i| self.matches(&b.lines[i]))
         };
         drop(b);
         if let Some(i) = found {
@@ -249,7 +268,10 @@ mod tests {
     use super::*;
 
     fn view(lines: usize) -> LogView {
-        let buf = Buf { lines: (0..lines).map(|i| format!("line {i}")).collect(), dropped: 0 };
+        let buf = Buf {
+            lines: (0..lines).map(|i| format!("line {i}")).collect(),
+            dropped: 0,
+        };
         LogView {
             name: "a".into(),
             source: 0,
