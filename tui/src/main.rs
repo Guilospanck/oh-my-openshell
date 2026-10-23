@@ -43,18 +43,70 @@ fn pause() {
     let _ = io::stdin().read_line(&mut s);
 }
 
-/// Mouse, paste and focus reports (and kitty keys, when the host has them) are only
+/// How the host terminal can report modified keys such as Shift-Enter.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HostKeys {
+    Legacy,
+    /// The kitty keyboard protocol.
+    Kitty,
+    /// tmux's extended keys, asked for with modifyOtherKeys; only in the `csi-u` format,
+    /// since crossterm cannot parse the xterm one (`CSI 27;mod;key~`) and drops it.
+    TmuxCsiU,
+}
+
+/// tmux does not answer the kitty query, but with `extended-keys on` (or `always`) and
+/// `extended-keys-format csi-u` it reports Shift-Enter as `CSI 13;2u` once asked.
+fn tmux_keys(extended: &str, format: &str) -> bool {
+    matches!(extended.trim(), "on" | "always") && format.trim() == "csi-u"
+}
+
+fn host_keys(kitty: bool) -> HostKeys {
+    if kitty {
+        return HostKeys::Kitty;
+    }
+    if std::env::var_os("TMUX").is_none() {
+        return HostKeys::Legacy;
+    }
+    let opt = |name: &str| {
+        Command::new("tmux")
+            .args(["show", "-gv", name])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default()
+    };
+    if tmux_keys(&opt("extended-keys"), &opt("extended-keys-format")) {
+        HostKeys::TmuxCsiU
+    } else {
+        HostKeys::Legacy
+    }
+}
+
+/// Mouse, paste and focus reports (and modified keys, when the host has them) are only
 /// wanted while a shell has focus; the dashboard keeps the host terminal's own.
-fn host_modes(on: bool, kitty: bool) {
+fn host_modes(on: bool, keys: HostKeys) {
     let mut out = io::stdout();
     if on {
         let _ = execute!(out, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange);
-        if kitty {
-            let _ = execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        match keys {
+            HostKeys::Kitty => {
+                let _ = execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+            }
+            // modifyOtherKeys level 1: only keys with no legacy form (Shift-Enter) change.
+            HostKeys::TmuxCsiU => {
+                let _ = out.write_all(b"\x1b[>4;1m").and_then(|_| out.flush());
+            }
+            HostKeys::Legacy => {}
         }
     } else {
-        if kitty {
-            let _ = execute!(out, PopKeyboardEnhancementFlags);
+        match keys {
+            HostKeys::Kitty => {
+                let _ = execute!(out, PopKeyboardEnhancementFlags);
+            }
+            HostKeys::TmuxCsiU => {
+                let _ = out.write_all(b"\x1b[>4;0m").and_then(|_| out.flush());
+            }
+            HostKeys::Legacy => {}
         }
         let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
     }
@@ -147,7 +199,7 @@ fn main() -> io::Result<()> {
 
     let mut app = App::new(dir, selected, wake_tx, done_tx);
     let mut terminal = ratatui::init();
-    let kitty = supports_keyboard_enhancement().unwrap_or(false);
+    let keys = host_keys(supports_keyboard_enhancement().unwrap_or(false));
     let mut captured = false;
     let result = (|| -> io::Result<()> {
         while !app.quit {
@@ -159,7 +211,7 @@ fn main() -> io::Result<()> {
             app.tick();
             let focused = app.active.is_some();
             if focused != captured {
-                host_modes(focused, kitty);
+                host_modes(focused, keys);
                 captured = focused;
             }
             if focused {
@@ -204,7 +256,7 @@ fn main() -> io::Result<()> {
             }
             if let Some(steps) = app.job.take() {
                 if captured {
-                    host_modes(false, kitty);
+                    host_modes(false, keys);
                     captured = false;
                 }
                 let failed = run_steps(steps, app.capture);
@@ -217,7 +269,7 @@ fn main() -> io::Result<()> {
         Ok(())
     })();
     if captured {
-        host_modes(false, kitty);
+        host_modes(false, keys);
     }
     ratatui::restore();
     app.cleanup_sync_stage();
@@ -342,6 +394,15 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title.starts_with("curl was blocked")));
         assert!(app.prompt_at.is_some());
+    }
+
+    #[test]
+    fn tmux_extended_keys_only_in_csi_u() {
+        assert!(tmux_keys("on\n", "csi-u\n"));
+        assert!(tmux_keys("always", "csi-u"));
+        assert!(!tmux_keys("on", "xterm"), "crossterm drops CSI 27;2;13~");
+        assert!(!tmux_keys("off", "csi-u"));
+        assert!(!tmux_keys("", ""), "tmux older than 3.5 has no format option");
     }
 
     #[test]

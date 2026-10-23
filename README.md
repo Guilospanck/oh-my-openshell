@@ -49,9 +49,15 @@ size when the window resizes, focused or not. `Shift-PgUp`/`PgDn` and the
 mouse wheel scroll back on the main screen; programs that ask for the mouse
 (vim, `less --mouse`) get it.
 
-Under tmux, keys such as `Shift-Enter` reach the shell only with
-`set -g extended-keys always` and `set -g extended-keys-format csi-u`: tmux
-does not answer the kitty keyboard query, so osh cannot ask for them.
+Under tmux, `Shift-Enter` reaches the shell when tmux has
+`set -g extended-keys on` (or `always`) and `set -g extended-keys-format csi-u`:
+tmux does not answer the kitty keyboard query, so while a shell has focus osh
+asks tmux for modifyOtherKeys instead. The `xterm` format is not used (osh's
+input library cannot read it); there `Shift-Enter` arrives as `Enter`.
+
+`Alt` works as Meta (sent as an `Esc` prefix: `Alt-b`/`Alt-f` move by word in
+bash). On macOS the host terminal must send it, e.g. "Use Option as Meta key"
+in Terminal.app or "Esc+" for Option in iTerm2; that setting is outside osh.
 
 ### Blocked requests
 
