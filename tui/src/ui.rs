@@ -239,7 +239,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let help = match app.tab {
-        Tab::Sandboxes => "Enter attach  l logs  n new  d delete  s stop  S start  a/x attach/detach provider",
+        Tab::Sandboxes => "Enter attach  l logs  n new  d delete  s stop  S start  a/x attach/detach provider  K skills",
         Tab::Providers => "n create  u update credentials  d delete",
         Tab::Profiles => "u / Enter import or update from providers/",
         Tab::Images => "b / Enter build",
@@ -261,24 +261,48 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     Rect::new(area.x + (area.width - w) / 2, area.y + (area.height - h) / 2, w, h)
 }
 
+/// A box that fits `text` (wrapped to `w` columns) when it can; the flag says it did not fit
+/// and the text should be read in the viewer.
+fn fit(screen: Rect, w: u16, text: &str) -> (Rect, bool) {
+    let inner = w.min(screen.width).saturating_sub(2).max(1) as usize;
+    let rows: usize = text.lines().map(|l| l.chars().count().max(1).div_ceil(inner)).sum();
+    let want = rows as u16 + 5;
+    (centered(screen, w, want), want > screen.height)
+}
+
 fn draw_modal(f: &mut Frame, m: &Modal) {
     match m {
+        Modal::Viewer { title, text, scroll, .. } => {
+            let area = centered(f.area(), 100, f.area().height.saturating_sub(2));
+            f.render_widget(Clear, area);
+            let total = text.lines().count();
+            let at = (*scroll as usize + 1).min(total.max(1));
+            f.render_widget(
+                Paragraph::new(text.as_str())
+                    .scroll((*scroll, 0))
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title(format!(" {title} {at}/{total}  j/k PgUp/PgDn g/G scroll, Esc back ")),
+                    ),
+                area,
+            );
+        }
         Modal::Info(t) => {
-            let area = centered(f.area(), 70, 7);
+            let (area, more) = fit(f.area(), 70, t);
             f.render_widget(Clear, area);
             f.render_widget(
-                Paragraph::new(format!("{t}\n\nPress any key."))
+                Paragraph::new(format!("{t}\n\n{}", if more { "v: scroll. Any other key closes." } else { "Press any key." }))
                     .wrap(Wrap { trim: true })
                     .block(Block::default().borders(Borders::ALL).title(" Info ")),
                 area,
             );
         }
         Modal::Confirm { text, .. } => {
-            let h = text.lines().count() as u16 + 4;
-            let area = centered(f.area(), 90, h);
+            let (area, more) = fit(f.area(), 90, text);
             f.render_widget(Clear, area);
             f.render_widget(
-                Paragraph::new(format!("{text}\n(y/n)"))
+                Paragraph::new(format!("{text}\n(y/n{})", if more { ", v: scroll" } else { "" }))
                     .wrap(Wrap { trim: false })
                     .block(Block::default().borders(Borders::ALL).title(" Confirm ")),
                 area,

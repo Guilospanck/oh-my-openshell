@@ -48,6 +48,14 @@ pub enum SelKind {
     Gateway,
     /// How to obtain the Claude Code setup token; carries the credential flow to resume.
     ClaudeToken(InKind),
+    /// Whether to take a GitHub token from `gh auth token` or paste one; carries the flow to resume.
+    GhToken(InKind),
+    /// How to grant the network access a blocked sync is missing.
+    SyncAccess { sync: SyncPlan, check: cli::SyncCheck },
+    /// Which agents to add skills for, in this sandbox.
+    SyncAgents(String),
+    /// Items to add; `labels` are the list entries in manifest order.
+    SyncItems { sandbox: String, agent: String, manifest: cli::SyncManifest, labels: Vec<String> },
 }
 
 #[derive(Clone)]
@@ -57,6 +65,8 @@ pub enum InKind {
     Cpu(Plan),
     Memory(Plan),
     Command(Plan),
+    /// Name for a generated install-access provider.
+    GenName(SyncPlan),
     /// Prompt for each key in turn; `next` resumes a sandbox plan afterwards.
     Cred {
         provider: String,
@@ -73,6 +83,13 @@ pub enum ConfKind {
     DeleteSandbox(String),
     DeleteProvider(String),
     ResetGateway(String),
+    Sync(SyncPlan),
+    /// Set up a provider that needs a secret, then attach it and check again.
+    SyncSecret { sync: SyncPlan, profile: String },
+    /// Import, create and attach a generated profile, then check again.
+    SyncGen { sync: SyncPlan, name: String, yaml: String },
+    /// Detach and delete the install-access provider once the installs are done.
+    DropAccess { sandbox: String, name: String },
 }
 
 pub enum Modal {
@@ -95,6 +112,8 @@ pub enum Modal {
         kind: ConfKind,
     },
     Info(String),
+    /// Read-only scrollable text; `back` is shown again when it closes.
+    Viewer { title: String, text: String, scroll: u16, back: Box<Modal> },
 }
 
 /// A command run with the terminal handed back to it (attach, build, create).
@@ -106,6 +125,28 @@ pub struct Step {
 pub struct Done {
     pub msg: String,
     pub next: Option<(Plan, Vec<String>)>,
+    pub sync: Option<SyncStage>,
+}
+
+/// Result of a background step of the "add skills to a sandbox" flow.
+pub enum SyncStage {
+    Manifest { sandbox: String, agent: String, manifest: cli::SyncManifest },
+    /// `offered`: fix rounds already done (0 none, 1 anonymous profiles, 2 secret profiles).
+    Check { sync: SyncPlan, check: cli::SyncCheck, offered: u8 },
+    /// A provider that needs a secret now exists: attach it and check again.
+    Attach { sync: SyncPlan, profile: String },
+    /// A generated profile for the user to review.
+    Generated { sync: SyncPlan, name: String, yaml: String },
+}
+
+/// What the user chose to put into one sandbox.
+#[derive(Clone)]
+pub struct SyncPlan {
+    pub sandbox: String,
+    /// `claude-code`, `pi` or `both`.
+    pub agent: String,
+    pub manifest: cli::SyncManifest,
+    pub ids: Vec<String>,
 }
 
 pub struct App {
@@ -125,6 +166,12 @@ pub struct App {
     pub job: Option<Vec<Step>>,
     /// Credential flow waiting on a running `claude setup-token`.
     token_flow: Option<InKind>,
+    /// Staging directory of an in-progress "add skills" flow; removed when it ends.
+    sync_stage: Option<String>,
+    /// Set while a provider with a secret is being created for a blocked sync.
+    sync_secret: Option<SyncPlan>,
+    /// `(sandbox, provider)` of generated install access that is still attached.
+    temp_access: Option<(String, String)>,
     selected: Arc<Mutex<Option<String>>>,
     wake: Sender<()>,
     done_tx: Sender<Done>,
@@ -136,10 +183,90 @@ pub struct ProfileRow {
     pub gateway_version: Option<u64>,
 }
 
-const PRESETS: [(&str, &str, &str); 2] = [
+const PRESETS: [(&str, &str, &str); 3] = [
     ("Claude Code (subscription)", "claude-code:latest", "claude-code"),
+    ("pi (attach a model provider afterwards)", "pi:latest", ""),
     ("Custom...", "", ""),
 ];
+
+/// The hosts and programs a generated profile grants, short enough for a confirm box.
+fn profile_summary(yaml: &str) -> String {
+    let mut hosts = Vec::new();
+    let mut bins = Vec::new();
+    let mut in_bins = false;
+    for l in yaml.lines() {
+        if l.starts_with("binaries:") {
+            in_bins = true;
+        } else if let Some(h) = l.strip_prefix("  - host: ") {
+            hosts.push(h.trim());
+        } else if in_bins {
+            if let Some(b) = l.strip_prefix("  - ") {
+                bins.push(b.trim());
+            }
+        }
+    }
+    format!(
+        "Hosts (port 443, no credential): {}\nPrograms allowed to reach them: {}\nGitHub is read-only (clone and fetch); npm is read-only.",
+        hosts.join(", "),
+        bins.join(", ")
+    )
+}
+
+fn sync_label(i: &cli::SyncItem) -> String {
+    let agents: Vec<&str> = i.agents.iter().map(|(a, _)| a.as_str()).collect();
+    let tag = if i.kind == "host-only" { " (host-only)" } else { "" };
+    format!("{:<11} {}  [{}]{tag}", i.group, i.name, agents.join(", "))
+}
+
+/// Commands run in the sandbox with `~/.local/bin` on PATH: uv installs there and the
+/// sandbox PATH lacks it.
+fn in_sandbox(sandbox: &str, command: &str) -> Step {
+    Step {
+        prog: "openshell".into(),
+        args: cli::with_gateway(vec![
+            "sandbox".into(),
+            "exec".into(),
+            "-n".into(),
+            sandbox.into(),
+            "--timeout".into(),
+            "900".into(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            format!("export PATH=\"$HOME/.local/bin:$PATH\"; {command}"),
+        ]),
+    }
+}
+
+/// Steps for the chosen items, in manifest order, for the chosen agents.
+pub fn sync_steps(plan: &SyncPlan) -> Vec<Step> {
+    let wanted: &[&str] = match plan.agent.as_str() {
+        "both" => &["claude-code", "pi"],
+        "pi" => &["pi"],
+        _ => &["claude-code"],
+    };
+    let mut steps = Vec::new();
+    for item in plan.manifest.items.iter().filter(|i| plan.ids.contains(&i.id)) {
+        for (_, spec) in item.agents.iter().filter(|(a, _)| wanted.contains(&a.as_str())) {
+            if let Some(cmds) = spec.as_array() {
+                steps.extend(cmds.iter().filter_map(|c| c.as_str()).map(|c| in_sandbox(&plan.sandbox, c)));
+            } else if let (Some(src), Some(dest)) = (spec["src"].as_str(), spec["dest"].as_str()) {
+                steps.push(Step {
+                    prog: "openshell".into(),
+                    args: cli::with_gateway(vec![
+                        "sandbox".into(),
+                        "upload".into(),
+                        plan.sandbox.clone(),
+                        src.into(),
+                        dest.into(),
+                        "--no-git-ignore".into(),
+                    ]),
+                });
+            }
+        }
+    }
+    steps
+}
 
 /// Trimmed limit value; `None` when it could be mistaken for a flag or has spaces.
 fn limit(text: &str) -> Option<String> {
@@ -190,6 +317,9 @@ impl App {
             quit: false,
             job: None,
             token_flow: None,
+            sync_stage: None,
+            sync_secret: None,
+            temp_access: None,
             selected,
             wake,
             done_tx,
@@ -273,6 +403,7 @@ impl App {
             let d = f().unwrap_or_else(|e| Done {
                 msg: format!("Error: {e}"),
                 next: None,
+                sync: None,
             });
             let _ = tx.send(d);
         });
@@ -282,12 +413,33 @@ impl App {
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
     {
-        self.bg(move || f().map(|msg| Done { msg, next: None }));
+        self.bg(move || f().map(|msg| Done { msg, next: None, sync: None }));
     }
 
     pub fn on_done(&mut self, d: Done) {
         self.status = d.msg;
+        if self.status.starts_with("Error") {
+            self.temp_access = None;
+        }
         self.refresh();
+        if let Some(stage) = d.sync {
+            match stage {
+                SyncStage::Manifest { sandbox, agent, manifest } => self.pick_sync_items(sandbox, agent, manifest),
+                SyncStage::Check { sync, check, offered } => self.confirm_sync(sync, check, offered),
+                SyncStage::Attach { sync, profile } => self.attach_and_check(sync, vec![profile], vec![], 2),
+                SyncStage::Generated { sync, name, yaml } => {
+                    self.modal = Some(Modal::Confirm {
+                        text: format!(
+                            "Import a profile named `{name}`, create the provider, attach it to {} and run the installs? You can remove it afterwards.\n\n{}",
+                            sync.sandbox,
+                            profile_summary(&yaml)
+                        ) + "\n\nv: view the full profile",
+                        kind: ConfKind::SyncGen { sync, name, yaml },
+                    });
+                }
+            }
+            return;
+        }
         if let Some((plan, mut missing)) = d.next {
             if self.status.starts_with("Error") {
                 return;
@@ -371,12 +523,31 @@ impl App {
                 );
                 return;
             }
+            if cli::is_github_key(&key) && cli::gh_token().is_some() {
+                let items = vec![
+                    "Use the token from `gh auth token` (read on this host; never shown or put on a command line)".to_string(),
+                    "Paste a token (hidden)".to_string(),
+                ];
+                self.select(
+                    "GitHub token",
+                    items,
+                    false,
+                    SelKind::GhToken(InKind::Cred { provider, keys, values, update, next }),
+                );
+                return;
+            }
             let mask = key != "FORGEJO_HOST";
-            let title = format!("{provider}: {key}{}", if mask { " (hidden)" } else { "" });
+            let hint = if cli::is_github_key(&key) {
+                ". Use a fine-grained, read-only token: github.com/settings/personal-access-tokens/new"
+            } else {
+                ""
+            };
+            let title = format!("{provider}: {key}{}{hint}", if mask { " (hidden)" } else { "" });
             self.input(&title, mask, InKind::Cred { provider, keys, values, update, next });
             return;
         }
         let dir = self.dir.clone();
+        let attach = if update { None } else { self.sync_secret.take() };
         self.status = format!("Working on provider {provider}...");
         self.bg(move || {
             let msg = if update {
@@ -384,7 +555,8 @@ impl App {
             } else {
                 cli::create_provider(&dir, &provider, &values)?
             };
-            Ok(Done { msg, next })
+            let sync = attach.map(|sync| SyncStage::Attach { sync, profile: provider.clone() });
+            Ok(Done { msg, next, sync })
         });
     }
 
@@ -396,7 +568,149 @@ impl App {
     }
 
     /// Called after a terminal hand-over: resume a token flow with the paste prompt.
+    /// Remove the staging directory of the "add skills" flow, if one exists.
+    pub fn cleanup_sync_stage(&mut self) {
+        self.sync_secret = None;
+        if let Some(dir) = self.sync_stage.take() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    fn pick_sync_items(&mut self, sandbox: String, agent: String, manifest: cli::SyncManifest) {
+        self.cleanup_sync_stage();
+        self.sync_stage = Some(manifest.stage_dir.clone());
+        let labels: Vec<String> = manifest.items.iter().map(sync_label).collect();
+        let secrets = match manifest.findings {
+            Some(0) => "secret scan clean".to_string(),
+            Some(n) => format!("secret scan: {n} finding(s)"),
+            None => "secret scan skipped (gitleaks missing)".to_string(),
+        };
+        let title = format!("Add to {sandbox} ({agent}); Space marks, {secrets}");
+        let defaults: Vec<bool> = manifest.items.iter().map(|i| i.default).collect();
+        let kind = SelKind::SyncItems { sandbox, agent, manifest, labels: labels.clone() };
+        self.select(&title, labels, true, kind);
+        if let Some(Modal::Select { marked, .. }) = &mut self.modal {
+            *marked = defaults;
+        }
+    }
+
+    fn confirm_sync(&mut self, sync: SyncPlan, check: cli::SyncCheck, offered: u8) {
+        if !check.ok {
+            let mut text = format!("The policy of {} blocks these installs:\n", sync.sandbox);
+            for id in &check.blocked {
+                text.push_str(&format!("  {id}\n"));
+            }
+            text.push_str("\nMissing network access (host, binary):\n");
+            for (host, bin) in &check.missing {
+                text.push_str(&format!("  {host}  {bin}\n"));
+            }
+            if offered == 0 {
+                let hosts: Vec<&str> = check.missing.iter().map(|(h, _)| h.as_str()).collect();
+                let mut items = Vec::new();
+                if !check.fixes.is_empty() {
+                    items.push(format!("Add the built-in profile(s): {}", check.fixes.join(", ")));
+                }
+                items.push("Generate a custom profile for exactly this (review it first)".to_string());
+                items.push("Cancel".to_string());
+                let title = format!("{} blocks installs; missing: {}", sync.sandbox, hosts.join(", "));
+                self.select(&title, items, false, SelKind::SyncAccess { sync, check });
+                return;
+            }
+            if let (Some((profile, keys)), true) = (check.secret_fixes.first(), offered < 2) {
+                let exists = self.snap.providers.iter().any(|g| &g.name == profile);
+                text.push_str(&format!(
+                    "\nThe `{profile}` provider grants the rest but needs a secret ({}). ",
+                    keys.join(" or ")
+                ));
+                text.push_str(if exists {
+                    "It exists on this gateway: attach it to the sandbox?"
+                } else if keys.iter().any(|k| cli::is_github_key(k)) && cli::gh_token().is_some() {
+                    "Create it from your `gh` login (the token stays on this host) and attach it?"
+                } else {
+                    "Create it now (you will be asked for the secret, hidden) and attach it?"
+                });
+                self.modal = Some(Modal::Confirm {
+                    text,
+                    kind: ConfKind::SyncSecret { sync, profile: profile.clone() },
+                });
+                return;
+            }
+            if !check.unfixed.is_empty() {
+                text.push_str("\nNo built-in profile covers:");
+                for (host, bin) in &check.unfixed {
+                    text.push_str(&format!(" {host} ({bin})"));
+                }
+                text.push('\n');
+            }
+            text.push_str("\nAttach a provider profile that grants it (a: attach provider), or edit the policy, then retry.");
+            self.cleanup_sync_stage();
+            self.modal = Some(Modal::Info(text));
+            return;
+        }
+        let steps_list = sync_steps(&sync);
+        let uploads = steps_list.iter().any(|s| s.args.iter().any(|a| a == "upload"));
+        if uploads && sync.manifest.findings.unwrap_or(0) > 0 {
+            let n = sync.manifest.findings.unwrap_or(0);
+            self.cleanup_sync_stage();
+            self.modal = Some(Modal::Info(format!(
+                "The secret scan found {n} finding(s) in the files that would be uploaded. Run `sync-agents --json` and review the staged files, or deselect the uploads (own-skills, context)."
+            )));
+            return;
+        }
+        let steps = steps_list.len();
+        self.modal = Some(Modal::Confirm {
+            text: format!(
+                "Run {steps} step(s) in sandbox '{}' for {}? Policy allows the network access they need.",
+                sync.sandbox, sync.agent
+            ),
+            kind: ConfKind::Sync(sync),
+        });
+    }
+
+    /// Create (the ones in `create`) and attach `profiles`, then check the policy again.
+    /// `round` is stored in the result so the same offer is not made twice.
+    fn attach_and_check(&mut self, sync: SyncPlan, profiles: Vec<String>, create: Vec<String>, round: u8) {
+        let dir = self.dir.clone();
+        self.status = format!("Adding {} to {}...", profiles.join(", "), sync.sandbox);
+        self.bg(move || {
+            for p in &profiles {
+                if create.contains(p) {
+                    cli::create_provider(&dir, p, &[])?;
+                }
+                cli::os(&["sandbox", "provider", "attach", &sync.sandbox, p, "--wait", "--timeout", "30"])
+                    .map_err(|e| {
+                        if e.contains("not in a state required") {
+                            format!(
+                                "{p} overlaps the endpoints of a provider already on {} (for example pypi and github both define api.github.com). Detach one (x) and retry. {e}",
+                                sync.sandbox
+                            )
+                        } else {
+                            e
+                        }
+                    })?;
+            }
+            let check = cli::sync_check(&dir, &sync.sandbox, &sync.agent, &sync.ids)?;
+            Ok(Done {
+                msg: format!("Added {}", profiles.join(", ")),
+                next: None,
+                sync: Some(SyncStage::Check { sync, check, offered: round }),
+            })
+        });
+    }
+
+    /// Ask whether to remove the generated install access, if any is still attached.
+    fn offer_drop(&mut self) {
+        if let Some((sandbox, name)) = self.temp_access.take() {
+            self.modal = Some(Modal::Confirm {
+                text: format!("Detach {name} from {sandbox} and delete it and its profile? Its network access is only needed while installing."),
+                kind: ConfKind::DropAccess { sandbox, name },
+            });
+        }
+    }
+
     pub fn finish_job(&mut self) {
+        self.cleanup_sync_stage();
+        self.offer_drop();
         let Some(flow) = self.token_flow.take() else { return };
         let InKind::Cred { provider, keys, values, .. } = &flow else { return };
         let title = format!("Paste the token claude printed: {provider}: {} (hidden)", keys[values.len()]);
@@ -479,7 +793,7 @@ impl App {
                 } else {
                     let plan = Plan {
                         image: p.1.into(),
-                        providers: vec![p.2.into()],
+                        providers: if p.2.is_empty() { vec![] } else { vec![p.2.into()] },
                         ..Plan::default()
                     };
                     self.proceed(plan);
@@ -529,6 +843,77 @@ impl App {
                     self.generate_token(flow);
                 }
             }
+            SelKind::SyncAccess { sync, check } => {
+                if first.starts_with("Add the built-in") {
+                    let create: Vec<String> = check
+                        .fixes
+                        .iter()
+                        .filter(|p| !self.snap.providers.iter().any(|g| &g.name == *p))
+                        .cloned()
+                        .collect();
+                    self.attach_and_check(sync, check.fixes, create, 1);
+                } else if first.starts_with("Generate") {
+                    self.input(
+                        &format!("Name for the generated provider (empty = install-{})", sync.sandbox),
+                        false,
+                        InKind::GenName(sync),
+                    );
+                } else {
+                    self.cleanup_sync_stage();
+                }
+            }
+            SelKind::GhToken(flow) => {
+                let InKind::Cred { provider, keys, mut values, update, next } = flow else { return };
+                let key = keys[values.len()].clone();
+                match cli::gh_token().filter(|_| first.starts_with("Use")) {
+                    Some(token) => {
+                        values.push((key, token));
+                        self.cred_step(InKind::Cred { provider, keys, values, update, next });
+                    }
+                    None => {
+                        let title = format!(
+                            "{provider}: {key} (hidden). Use a fine-grained, read-only token: github.com/settings/personal-access-tokens/new"
+                        );
+                        self.input(&title, true, InKind::Cred { provider, keys, values, update, next });
+                    }
+                }
+            }
+            SelKind::SyncAgents(sandbox) => {
+                let agent = if first == "both" { "both".to_string() } else { first };
+                let dir = self.dir.clone();
+                self.status = "Reading the host's skills and plugins...".into();
+                self.bg(move || {
+                    let manifest = cli::sync_manifest(&dir, &sandbox, &agent)?;
+                    Ok(Done {
+                        msg: format!("Found {} item(s)", manifest.items.len()),
+                        next: None,
+                        sync: Some(SyncStage::Manifest { sandbox, agent, manifest }),
+                    })
+                });
+            }
+            SelKind::SyncItems { sandbox, agent, manifest, labels } => {
+                let ids: Vec<String> = labels
+                    .iter()
+                    .zip(&manifest.items)
+                    .filter(|(l, _)| picks.contains(l))
+                    .map(|(_, i)| i.id.clone())
+                    .collect();
+                if ids.is_empty() {
+                    self.cleanup_sync_stage();
+                    self.status = "Nothing selected".into();
+                    return;
+                }
+                let dir = self.dir.clone();
+                self.status = "Checking the sandbox policy...".into();
+                self.bg(move || {
+                    let check = cli::sync_check(&dir, &sandbox, &agent, &ids)?;
+                    Ok(Done {
+                        msg: "Policy checked".into(),
+                        next: None,
+                        sync: Some(SyncStage::Check { sync: SyncPlan { sandbox, agent, manifest, ids }, check, offered: 0 }),
+                    })
+                });
+            }
             SelKind::NewProvider => {
                 if self.snap.providers.iter().any(|p| p.name == first) {
                     self.modal = Some(Modal::Info(format!(
@@ -558,6 +943,30 @@ impl App {
                 if !text.trim().is_empty() {
                     self.pick_providers(Plan { image: text.trim().into(), ..Plan::default() });
                 }
+            }
+            InKind::GenName(sync) => {
+                let raw = if text.trim().is_empty() { format!("install-{}", sync.sandbox) } else { text };
+                let name: String = raw
+                    .trim()
+                    .to_lowercase()
+                    .chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                    .collect();
+                if self.snap.providers.iter().any(|p| p.name == name) {
+                    self.cleanup_sync_stage();
+                    self.modal = Some(Modal::Info(format!("A provider named {name} already exists. Pick another name.")));
+                    return;
+                }
+                let dir = self.dir.clone();
+                self.status = "Generating the profile...".into();
+                self.bg(move || {
+                    let yaml = cli::sync_gen_profile(&dir, &sync.sandbox, &sync.agent, &sync.ids, &name)?;
+                    Ok(Done {
+                        msg: "Profile generated".into(),
+                        next: None,
+                        sync: Some(SyncStage::Generated { sync, name, yaml }),
+                    })
+                });
             }
             InKind::Name(mut plan) => {
                 plan.name = text.trim().into();
@@ -643,6 +1052,30 @@ impl App {
             ConfKind::DeleteSandbox(name) => self.bg_msg(move || {
                 cli::os(&["sandbox", "delete", &name]).map(|_| format!("Deleted sandbox {name}"))
             }),
+            ConfKind::Sync(plan) => self.job = Some(sync_steps(&plan)),
+            ConfKind::SyncGen { sync, name, yaml } => {
+                self.temp_access = Some((sync.sandbox.clone(), name.clone()));
+                self.status = format!("Importing {name} and attaching it to {}...", sync.sandbox);
+                let dir = self.dir.clone();
+                self.bg(move || {
+                    cli::import_generated(&yaml, &name, &sync.sandbox)?;
+                    let check = cli::sync_check(&dir, &sync.sandbox, &sync.agent, &sync.ids)?;
+                    Ok(Done {
+                        msg: format!("Attached {name}"),
+                        next: None,
+                        sync: Some(SyncStage::Check { sync, check, offered: 1 }),
+                    })
+                });
+            }
+            ConfKind::DropAccess { sandbox, name } => self.bg_msg(move || cli::drop_generated(&sandbox, &name)),
+            ConfKind::SyncSecret { sync, profile } => {
+                if self.snap.providers.iter().any(|g| g.name == profile) {
+                    self.attach_and_check(sync, vec![profile], vec![], 2);
+                } else {
+                    self.sync_secret = Some(sync);
+                    self.start_creds(profile, false, None);
+                }
+            }
             ConfKind::ResetGateway(name) => {
                 self.job = Some(vec![Step {
                     prog: self.dir.join("gateway-reset").to_string_lossy().into(),
@@ -725,7 +1158,14 @@ impl App {
             self.start_wizard();
             return;
         }
-        let Some(name) = self.selected_sandbox().map(|s| s.name.clone()) else { return };
+        let Some(name) = self.selected_sandbox().map(|s| s.name.clone()) else {
+            if matches!(code, KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x') | KeyCode::Enter) {
+                self.modal = Some(Modal::Info(
+                    "No sandbox selected. This gateway has none: press n to create one (g switches gateway).".into(),
+                ));
+            }
+            return;
+        };
         match code {
             KeyCode::Char('l') => match LogView::open(name) {
                 Ok(lv) => self.logview = Some(lv),
@@ -741,7 +1181,9 @@ impl App {
                         name,
                         "--tty".into(),
                         "--".into(),
-                        "bash".into(),
+                        "sh".into(),
+                        "-c".into(),
+                        "export PATH=\"$HOME/.local/bin:$PATH\"; exec bash".into(),
                     ]),
                 }])
             }
@@ -757,6 +1199,10 @@ impl App {
             KeyCode::Char('S') => self.bg_msg(move || {
                 cli::os(&["sandbox", "start", &name]).map(|_| format!("Started {name}"))
             }),
+            KeyCode::Char('K') => {
+                let items = vec!["claude-code".into(), "pi".into(), "both".into()];
+                self.select("Add skills and plugins for", items, false, SelKind::SyncAgents(name));
+            }
             KeyCode::Char('a') => {
                 let items = self.snap.providers.iter().map(|p| p.name.clone()).collect();
                 self.select("Attach provider", items, false, SelKind::AttachProvider(name));
@@ -871,16 +1317,54 @@ impl App {
         self.bg_msg(move || cli::sync_profile(&dir, &id, None));
     }
 
+    fn open_viewer(&mut self, title: &str, text: String, back: Modal) {
+        self.modal = Some(Modal::Viewer { title: title.into(), text, scroll: 0, back: Box::new(back) });
+    }
+
     fn modal_key(&mut self, modal: Modal, key: KeyEvent) {
         match modal {
-            Modal::Info(_) => {}
+            Modal::Info(text) => match key.code {
+                KeyCode::Char('v') => self.open_viewer("Details", text.clone(), Modal::Info(text)),
+                _ => {}
+            },
+            Modal::Viewer { title, text, mut scroll, back } => {
+                // The viewer fills the screen minus its border and margin; stop when the last line is at the bottom.
+                let rows = ratatui::crossterm::terminal::size().map(|(_, h)| h).unwrap_or(24).saturating_sub(4);
+                let last = (text.lines().count() as u16).saturating_sub(rows);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                        self.modal = Some(*back);
+                        return;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => scroll = (scroll + 1).min(last),
+                    KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => scroll = (scroll + 10).min(last),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::Char('g') | KeyCode::Home => scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => scroll = last,
+                    _ => {}
+                }
+                self.modal = Some(Modal::Viewer { title, text, scroll, back });
+            }
             Modal::Confirm { text, kind } => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.on_confirm(kind),
-                KeyCode::Char('n') | KeyCode::Esc => {}
+                KeyCode::Char('v') => {
+                    let full = match &kind {
+                        ConfKind::SyncGen { yaml, .. } => yaml.clone(),
+                        _ => text.clone(),
+                    };
+                    self.open_viewer("Details", full, Modal::Confirm { text, kind });
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {
+                    self.cleanup_sync_stage();
+                    if matches!(kind, ConfKind::Sync(_)) {
+                        self.offer_drop();
+                    }
+                }
                 _ => self.modal = Some(Modal::Confirm { text, kind }),
             },
             Modal::Input { title, mut buf, mask, kind } => match key.code {
-                KeyCode::Esc => {}
+                KeyCode::Esc => self.cleanup_sync_stage(),
                 KeyCode::Enter => self.on_input(kind, buf),
                 code => {
                     match code {
@@ -894,7 +1378,7 @@ impl App {
                 }
             },
             Modal::Select { title, items, mut cursor, mut marked, multi, kind } => match key.code {
-                KeyCode::Esc => {}
+                KeyCode::Esc => self.cleanup_sync_stage(),
                 KeyCode::Enter => {
                     let mut picks: Vec<String> = items
                         .iter()

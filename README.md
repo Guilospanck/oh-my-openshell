@@ -54,6 +54,40 @@ The real token stays outside the sandbox; only `api.anthropic.com` is
 allowed. Tokens expire and are not refreshed: generate a new one and use `u`
 in Providers.
 
+## Skills and plugins in a sandbox
+
+In `osh`, Sandboxes, select a sandbox and press `K`: pick the agent
+(`claude-code`, `pi` or `both`), mark the items, and confirm. The TUI checks
+the sandbox's network policy first and lists any missing access. Items are
+reinstalled from their sources (`npx skills`, `claude plugin install`,
+`pi install`, graphify from PyPI); only your own skills and `CLAUDE.md` are
+uploaded, after a secret scan (findings block the upload). The OpenShell skills
+and the language-server plugins are left out.
+
+If the sandbox's policy blocks an install, `K` offers to create (if needed) and attach the anonymous profiles that grant the access, then checks again. The profiles are: `npm`, `pypi`
+(graphify) and `claude-marketplace` (read-only github.com for plugins, `npx
+skills` and `pi install`). You can also create them by hand with `just provider-npm`,
+`just provider-pypi` and `just provider-claude-marketplace`. Preview the list
+with `just sync-agents --dry-run`.
+
+When access is missing, `K` offers either the built-in profiles above or a
+generated one: `sync-agents --gen-profile` writes a profile that grants only
+the hosts and programs still missing (no credential), shows you a summary,
+asks for a name (default `install-<sandbox>`), then imports it, creates the
+provider and attaches it. After the installs it offers to detach and delete
+it, since the network is only needed while installing. This also avoids the
+overlap errors between built-in profiles.
+
+Profiles that need a secret (for example `github`, for private skill sources)
+are offered the same way. For a GitHub token, `osh` offers to read it from
+`gh auth token` on the host (never shown, never on a command line), or you can
+paste one (hidden; use a fine-grained, read-only token from
+github.com/settings/personal-access-tokens/new). Tokens exported in the shell
+that started `osh` are used without asking. As with Docker Sandboxes, the
+real secret stays on the host. Profiles that define the same endpoint
+differently, such as `pypi` and `github` (both define `api.github.com`),
+cannot be attached together; detach one first.
+
 ## Setup without osh
 
 `just install` (OpenShell, and links `osh` into `~/.local/bin` so it runs from

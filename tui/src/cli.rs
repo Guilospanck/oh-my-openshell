@@ -532,3 +532,203 @@ pub fn update_credentials(name: &str, values: &[(String, String)]) -> Result<Str
         "Updated credentials for {name}. Start a new client process to pick them up."
     ))
 }
+
+/// One thing `sync-agents` can put into a sandbox.
+#[derive(Clone, Debug, Default)]
+pub struct SyncItem {
+    pub id: String,
+    pub group: String,
+    pub name: String,
+    pub default: bool,
+    /// `run` (commands), `upload` (staged files) or `host-only`.
+    pub kind: String,
+    /// Per agent: an array of commands, or an object with `src`, `dest`, `result`.
+    pub agents: Vec<(String, Value)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SyncManifest {
+    /// Directory holding the files to upload; the caller removes it.
+    pub stage_dir: String,
+    pub items: Vec<SyncItem>,
+    /// Secret-scan findings in the staged files; `None` when gitleaks is missing.
+    pub findings: Option<usize>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SyncCheck {
+    pub ok: bool,
+    /// `(host, binary)` pairs the sandbox policy does not allow.
+    pub missing: Vec<(String, String)>,
+    /// Ids of selected items that cannot run under the policy.
+    pub blocked: Vec<String>,
+    /// Anonymous provider profiles that grant the missing access.
+    pub fixes: Vec<String>,
+    /// Profiles that grant the access but need a secret: `(profile, env keys)`.
+    pub secret_fixes: Vec<(String, Vec<String>)>,
+    /// Missing pairs no anonymous profile grants.
+    pub unfixed: Vec<(String, String)>,
+}
+
+pub fn parse_manifest(text: &str) -> Result<SyncManifest, String> {
+    let v = parse(text)?;
+    let items = v["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| SyncItem {
+            id: text_of(&i["id"]),
+            group: text_of(&i["group"]),
+            name: text_of(&i["name"]),
+            default: i["default"].as_bool().unwrap_or(false),
+            kind: text_of(&i["kind"]),
+            agents: i["agents"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        })
+        .collect();
+    Ok(SyncManifest {
+        stage_dir: text_of(&v["stage_dir"]),
+        items,
+        findings: v["secret_findings"].as_array().map(|a| a.len()),
+    })
+}
+
+pub fn parse_check(text: &str) -> Result<SyncCheck, String> {
+    let v = parse(text)?;
+    let pair = |m: &Value| (text_of(&m["host"]), text_of(&m["binary"]));
+    Ok(SyncCheck {
+        ok: v["ok"].as_bool().unwrap_or(false),
+        missing: v["missing"].as_array().into_iter().flatten().map(pair).collect(),
+        blocked: v["items"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(_, needs)| needs.as_array().is_some_and(|a| !a.is_empty()))
+            .map(|(id, _)| id.clone())
+            .collect(),
+        fixes: v["fixes"].as_array().into_iter().flatten().map(text_of).collect(),
+        secret_fixes: v["secret_fixes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| {
+                let keys = f["keys"].as_array().into_iter().flatten().map(text_of).collect();
+                (text_of(&f["profile"]), keys)
+            })
+            .collect(),
+        unfixed: v["unfixed"].as_array().into_iter().flatten().map(pair).collect(),
+    })
+}
+
+/// Whether `key` is a GitHub token variable that `gh auth token` can supply.
+pub fn is_github_key(key: &str) -> bool {
+    matches!(key, "GITHUB_TOKEN" | "GH_TOKEN")
+}
+
+/// The host's GitHub CLI token, if `gh` is installed and logged in. Read from the
+/// command's output, so it never appears on a command line.
+pub fn gh_token() -> Option<String> {
+    let out = Command::new("gh").args(["auth", "token"]).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
+    let t = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !t.is_empty()).then_some(t)
+}
+
+fn text_of(v: &Value) -> String {
+    text(v)
+}
+
+/// Directory holding `sync-agents`: the config directory, or else the checkout this binary
+/// was built in (`<repo>/tui/target/release/osh-tui`), for when `OSH_DIR` is not set.
+fn script_dir(dir: &Path) -> PathBuf {
+    if dir.join("sync-agents").is_file() {
+        return dir.to_path_buf();
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|e| e.ancestors().find(|a| a.join("sync-agents").is_file()).map(Path::to_path_buf))
+        .unwrap_or_else(|| dir.to_path_buf())
+}
+
+/// The sandbox user's HOME, which differs by driver (`/workspace` on docker, `/sandbox` on vm)
+/// and is the only place the default policy lets uploads land.
+fn sandbox_home(sandbox: &str) -> String {
+    let args: Vec<String> = ["sandbox", "exec", "-n", sandbox, "--timeout", "30", "--", "sh", "-c", "printf %s \"$HOME\""]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    exec("openshell", &args, &[])
+        .map(|t| t.trim().to_string())
+        .ok()
+        .filter(|h| h.starts_with('/'))
+        .unwrap_or_else(|| "/workspace".into())
+}
+
+/// The profile (YAML) that grants exactly what the selected installs still lack.
+pub fn sync_gen_profile(dir: &Path, sandbox: &str, agent: &str, ids: &[String], name: &str) -> Result<String, String> {
+    let mut args: Vec<String> = ["--gen-profile", sandbox, "--name", name, "--agent", agent, "--only"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.push(ids.join(","));
+    let gw = gateway();
+    if !gw.is_empty() {
+        args.extend(["--gateway".into(), gw]);
+    }
+    run(&script_dir(dir).join("sync-agents").to_string_lossy(), &args, &[])
+}
+
+/// Import a generated profile, create its provider (no credential) and attach it.
+pub fn import_generated(yaml: &str, name: &str, sandbox: &str) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(format!("osh-{name}.yaml"));
+    fs::write(&tmp, yaml).map_err(|e| e.to_string())?;
+    let imported = os(&["profile", "import", "--file", &tmp.to_string_lossy()]);
+    let _ = fs::remove_file(&tmp);
+    imported?;
+    os(&["provider", "create", "--name", name, "--type", name])?;
+    os(&["sandbox", "provider", "attach", sandbox, name, "--wait", "--timeout", "30"])?;
+    Ok(())
+}
+
+/// Detach a generated provider and remove it and its profile.
+pub fn drop_generated(sandbox: &str, name: &str) -> Result<String, String> {
+    os(&["sandbox", "provider", "detach", sandbox, name, "--wait", "--timeout", "30"])?;
+    os(&["provider", "delete", name])?;
+    os(&["profile", "delete", name])?;
+    Ok(format!("Removed {name} from {sandbox}"))
+}
+
+/// `agent` is `claude-code`, `pi` or `both`.
+pub fn sync_manifest(dir: &Path, sandbox: &str, agent: &str) -> Result<SyncManifest, String> {
+    let script = script_dir(dir).join("sync-agents");
+    let args = ["--json".to_string(), "--agent".into(), agent.into(), "--home".into(), sandbox_home(sandbox)];
+    run(&script.to_string_lossy(), &args, &[]).and_then(|t| parse_manifest(&t))
+}
+
+/// Check the selected items against the sandbox's effective network policy.
+/// The script exits 3 when something is blocked but still prints the report.
+pub fn sync_check(dir: &Path, sandbox: &str, agent: &str, ids: &[String]) -> Result<SyncCheck, String> {
+    let mut args: Vec<String> = vec![
+        "--preflight".into(),
+        sandbox.into(),
+        "--json".into(),
+        "--agent".into(),
+        agent.into(),
+        "--only".into(),
+        ids.join(","),
+    ];
+    let gw = gateway();
+    if !gw.is_empty() {
+        args.extend(["--gateway".into(), gw]);
+    }
+    let out = Command::new(script_dir(dir).join("sync-agents"))
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("sync-agents: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    parse_check(&stdout).map_err(|_| String::from_utf8_lossy(&out.stderr).trim().to_string())
+}

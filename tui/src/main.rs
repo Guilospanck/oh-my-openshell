@@ -132,6 +132,7 @@ fn main() -> io::Result<()> {
         Ok(())
     })();
     ratatui::restore();
+    app.cleanup_sync_stage();
     result
 }
 
@@ -179,5 +180,104 @@ mod tests {
         assert_eq!(cli::profile_env_keys(&dir, "github"), vec!["GITHUB_TOKEN"]);
         assert_eq!(cli::profile_env_keys(&dir, "forgejo"), vec!["FORGEJO_HOST", "FORGEJO_TOKEN"]);
         assert_eq!(cli::dockerfile_tag(&PathBuf::from("images/Dockerfile-claude_code")), "claude-code:latest");
+    }
+
+    const MANIFEST: &str = r#"{"agents":["claude-code","pi"],"stage_dir":"/tmp/stage","secret_findings":[],"items":[
+      {"id":"npx-skills:caveman","group":"npx-skills","name":"caveman","default":true,"kind":"run",
+       "agents":{"claude-code":["npx skills add a/b -g -a claude-code -s caveman -y --copy"],"pi":["npx skills add a/b -g -a pi -s caveman -y --copy"]}},
+      {"id":"own-skills:bro","group":"own-skills","name":"bro","default":true,"kind":"upload",
+       "agents":{"claude-code":{"src":"/tmp/stage/skills/bro","dest":"/workspace/.claude/skills","result":"/workspace/.claude/skills/bro"},
+                 "pi":{"src":"/tmp/stage/skills/bro","dest":"/workspace/.agents/skills","result":"/workspace/.agents/skills/bro"}}},
+      {"id":"plugins:swift-lsp","group":"plugins","name":"swift-lsp","default":false,"kind":"host-only",
+       "agents":{"claude-code":["claude plugin install swift-lsp@m"]}}]}"#;
+
+    fn plan(agent: &str, ids: &[&str]) -> app::SyncPlan {
+        app::SyncPlan {
+            sandbox: "sb".into(),
+            agent: agent.into(),
+            manifest: cli::parse_manifest(MANIFEST).unwrap(),
+            ids: ids.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn manifest_parses_defaults_and_findings() {
+        let m = cli::parse_manifest(MANIFEST).unwrap();
+        assert_eq!(m.stage_dir, "/tmp/stage");
+        assert_eq!(m.findings, Some(0));
+        assert_eq!(m.items.len(), 3);
+        assert!(m.items[0].default && !m.items[2].default);
+        assert_eq!(m.items[2].kind, "host-only");
+    }
+
+    #[test]
+    fn sync_steps_follow_agent_and_selection() {
+        let both = app::sync_steps(&plan("both", &["npx-skills:caveman", "own-skills:bro"]));
+        assert_eq!(both.len(), 4);
+        let pi = app::sync_steps(&plan("pi", &["npx-skills:caveman", "own-skills:bro"]));
+        assert_eq!(pi.len(), 2);
+        let install = &pi[0].args;
+        assert!(install.contains(&"exec".to_string()) && install.last().unwrap().contains("-a pi"));
+        assert!(install.last().unwrap().starts_with("export PATH=\"$HOME/.local/bin:$PATH\"; "));
+        // A directory upload targets the parent: the CLI nests it under its own name.
+        assert_eq!(pi[1].args[1..], ["upload", "sb", "/tmp/stage/skills/bro", "/workspace/.agents/skills", "--no-git-ignore"]);
+        // Only chosen ids run; unchosen items never do.
+        assert!(app::sync_steps(&plan("claude-code", &["plugins:swift-lsp"])).len() == 1);
+        assert!(app::sync_steps(&plan("pi", &["plugins:swift-lsp"])).is_empty());
+    }
+
+    #[test]
+    fn check_reports_blocked_items_and_missing_access() {
+        let c = cli::parse_check(
+            r#"{"ok":false,"items":{"a":[["github.com","/usr/bin/git"]],"b":[]},
+                "missing":[{"host":"github.com","binary":"/usr/bin/git"}],
+                "fixes":["claude-marketplace"],"unfixed":[{"host":"x.com","binary":"/usr/bin/git"}]}"#,
+        )
+        .unwrap();
+        assert!(!c.ok);
+        assert_eq!(c.blocked, vec!["a"]);
+        assert_eq!(c.missing, vec![("github.com".to_string(), "/usr/bin/git".to_string())]);
+        assert_eq!(c.fixes, vec!["claude-marketplace"]);
+        assert_eq!(c.unfixed, vec![("x.com".to_string(), "/usr/bin/git".to_string())]);
+        assert!(cli::parse_check("not json").is_err());
+    }
+
+    #[test]
+    fn long_text_opens_in_a_scrollable_viewer() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let yaml: String = (0..60).map(|i| format!("line {i}\n")).collect();
+        let sync = app::SyncPlan {
+            sandbox: "sb".into(),
+            agent: "pi".into(),
+            manifest: cli::parse_manifest(MANIFEST).unwrap(),
+            ids: vec![],
+        };
+        app.modal = Some(app::Modal::Confirm {
+            text: "short summary".into(),
+            kind: app::ConfKind::SyncGen { sync, name: "n".into(), yaml },
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char('v')));
+        for _ in 0..3 {
+            app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        }
+        match &app.modal {
+            Some(app::Modal::Viewer { scroll, text, .. }) => {
+                assert_eq!(*scroll, 3);
+                assert!(text.starts_with("line 0"));
+            }
+            _ => panic!("viewer not open"),
+        }
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char('G')));
+        match &app.modal {
+            Some(app::Modal::Viewer { scroll, .. }) => assert!(*scroll > 3 && *scroll < 60),
+            _ => panic!("viewer closed"),
+        }
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
+        term.draw(|f| ui::draw(f, &app)).unwrap();
     }
 }
