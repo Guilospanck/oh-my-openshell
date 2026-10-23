@@ -1,0 +1,35 @@
+# syntax=docker/dockerfile:1
+
+# pi (https://github.com/badlogic/pi-mono) executes shell commands and needs OS tools.
+FROM node:24-bookworm-slim AS runtime
+
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        python3 \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+# Pinned: rebuild with --build-arg PI_VERSION=<version> to change. Keep in step with the host.
+ARG PI_VERSION=1.4.0
+RUN npm install --global --omit=dev "@earendil-works/pi-coding-agent@${PI_VERSION}" \
+    && pi --version
+
+# pi reads skills from ~/.agents/skills and ~/.pi/agent/skills, context from ~/.pi/agent.
+RUN mkdir -p /workspace /home/node/.pi/agent /home/node/.agents/skills \
+    && chown -R node:node /workspace /home/node/.pi /home/node/.agents
+
+# uv installs graphify (a Python tool); python3 above satisfies its 3.10+ need.
+COPY --from=ghcr.io/astral-sh/uv:0.13.5 /uv /uvx /usr/local/bin/
+
+ENV NODE_ENV=production \
+    HOME=/home/node
+
+USER node
+WORKDIR /workspace
+
+# Supply credentials at runtime (provider or login); never bake them into the image.
+# For persistent state, preserve /home/node/.pi/agent.

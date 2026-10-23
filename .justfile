@@ -85,6 +85,10 @@ provider-npm: (_create-provider "npm")
 [group('providers')]
 provider-pypi: (_create-provider "pypi")
 
+# Read-only github.com for `claude plugin install`; no credential variables required.
+[group('providers')]
+provider-claude-marketplace: (_create-provider "claude-marketplace")
+
 [private]
 _create-provider provider:
     #!/usr/bin/env bash
@@ -97,7 +101,7 @@ _create-provider provider:
       claude-code) required=(CLAUDE_CODE_OAUTH_TOKEN) ;;
       github) alternatives=(GITHUB_TOKEN GH_TOKEN) ;;
       forgejo) required=(FORGEJO_HOST FORGEJO_TOKEN) ;;
-      npm|pypi) ;;
+      npm|pypi|claude-marketplace) ;;
       *) echo "Unknown provider: $provider" >&2; exit 1 ;;
     esac
 
@@ -213,3 +217,11 @@ uninstall:
 	rm -rf "$config_dir" "$state_dir" "$share_dir"
 	just --justfile "{{justfile_directory()}}/.justfile" unlink
 	echo "OpenShell removed. Repo checkout left in place."
+
+# Show how the host's agent setup (Claude Code and pi) would be reproduced in a sandbox:
+# install commands where an installer exists, uploads otherwise. Only --dry-run and
+# --json and --preflight SANDBOX [--gateway NAME] are implemented; none installs, copies or
+# uploads anything. --preflight checks the install steps' network needs against the sandbox policy.
+# Example: just sync-agents --dry-run --agent pi
+sync-agents *args:
+	@"{{justfile_directory()}}/sync-agents" {{args}}

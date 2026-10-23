@@ -1,0 +1,27 @@
+# Read-only GitHub access for installing Claude Code plugins and marketplaces
+# (`claude plugin install name@marketplace`). The claude-code profile only allows
+# api.anthropic.com, and the github profile grants git but not the claude binary.
+# Anonymous: no credential. Git is listed too because it is unverified whether
+# claude clones through its own HTTP client or through the git CLI.
+# Smoke test in a sandbox: claude plugin install superpowers@claude-plugins-official
+id: claude-marketplace
+display_name: Claude plugin marketplaces (GitHub, read-only)
+description: Anonymous read-only github.com access for claude plugin installs
+category: agent
+endpoints:
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
+binaries:
+  - /usr/bin/claude
+  - /usr/local/bin/claude
+  - /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+  - /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+  - /usr/bin/git
+  - /usr/local/bin/git

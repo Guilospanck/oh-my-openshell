@@ -1,0 +1,450 @@
+#!/usr/bin/env python3
+"""sync-agents: describe how the host's agent setup (Claude Code and pi) would
+be reproduced in a sandbox. Reads install records, runs nothing, uploads nothing.
+
+  sync-agents --dry-run [--agent claude-code|pi|both]   human-readable manifest
+  sync-agents --json    [--agent ...]                   machine-readable manifest
+  sync-agents --preflight SANDBOX [--gateway NAME] [--json] [--agent ...] [--only ID,ID]
+      check each install step's network needs against the sandbox's effective policy
+
+Item kinds: "run" (commands to execute in the sandbox), "upload" (a staged file
+or directory to upload; symlinks already dereferenced), "host-only" (listed,
+never selected by default). --json leaves the staging directory in place and
+reports it as "stage_dir"; the caller removes it.
+Commands run in the sandbox with ~/.local/bin on PATH (uv installs there, and the
+sandbox PATH lacks it); the runner adds that prefix.
+Never touches settings.json, hooks, ~/.claude.json or skills/synced.
+"""
+import fnmatch, json, os, re, shutil, subprocess, sys, tempfile
+from pathlib import Path
+
+HOME = Path.home()
+CLAUDE = Path(os.environ.get("CLAUDE_CONFIG_DIR", HOME / ".claude"))
+REPO = Path(__file__).resolve().parent
+LOCK = HOME / ".agents" / ".skill-lock.json"
+PLUGINS = CLAUDE / "plugins" / "installed_plugins.json"
+MARKETPLACES = CLAUDE / "plugins" / "known_marketplaces.json"
+AGENTS = ("claude-code", "pi")
+# OpenShell sets HOME=/workspace inside sandboxes (the image's /home/node is not used, and the
+# default filesystem policy forbids it), so every agent directory lives under /workspace.
+# The sandbox user's HOME differs by driver (/workspace on docker, /sandbox on vm): the TUI passes --home.
+SANDBOX_HOME = "/workspace"
+# Skills a package installer writes itself: not copied, not "unclassified".
+PACKAGE_SKILLS = {"graphify"}
+SKIP_DIRS = {"synced"}
+# Installed on the host but not wanted in the sandbox.
+EXCLUDED_SKILLS = {"openshell-cli", "debug-inference", "debug-openshell-cluster", "generate-sandbox-policy"}
+# Plugins that need language-server binaries the images do not ship.
+HOST_ONLY_PLUGINS = {"clangd-lsp", "gopls-lsp", "rust-analyzer-lsp", "swift-lsp"}
+# Claude plugin -> the equivalent install command for pi, where one exists.
+PI_PLUGINS = {"superpowers": "pi install git:github.com/obra/superpowers"}
+# Network each install step needs: (host, binary). A sandbox policy allows a
+# binary to reach an endpoint, so both halves must match a rule. Binaries are the
+# paths the images install; globs in the policy are matched with fnmatch.
+BIN_NODE, BIN_GIT, BIN_UV, BIN_CLAUDE = "/usr/local/bin/node", "/usr/bin/git", "/usr/local/bin/uv", "/usr/local/bin/claude"
+NEEDS = {
+    # npx fetches the `skills` package from npm, then git-clones the skill's repository.
+    "npx": [("registry.npmjs.org", BIN_NODE), ("github.com", BIN_GIT)],
+    # `claude plugin install` clones the marketplace itself, as the claude process.
+    "claude-plugin": [("github.com", BIN_CLAUDE)],
+    "pi-plugin": [("github.com", BIN_GIT), ("registry.npmjs.org", BIN_NODE)],
+    # The images ship uv and python3, so uv only needs the package index.
+    "uv": [("pypi.org", BIN_UV), ("files.pythonhosted.org", BIN_UV)],
+}
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=20).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def item(group, name, detail, agents, kind="run", default=True, needs=(), note=""):
+    """agents maps an agent name to its commands (run) or its upload spec."""
+    return dict(group=group, id=f"{group}:{name}", name=name, detail=detail, kind=kind,
+                default=default and kind != "host-only", agents=agents,
+                needs=sorted({tuple(n) for n in needs}), note=note)
+
+
+def npx_skills():
+    lock = (load(LOCK) or {}).get("skills", {})
+    out = []
+    for name, v in sorted(lock.items()):
+        if name in EXCLUDED_SKILLS:
+            continue
+        # -a is required: without it the CLI writes into every agent it knows (dozens of dot-directories).
+        # claude-code lands in ~/.claude/skills, pi in ~/.agents/skills; both are real copies (--copy).
+        cmd = lambda agent: [f"npx --yes skills add {v['source']} -g -a {agent} -s {name} -y --copy"]
+        out.append(item("npx-skills", name, f"{v['source']} @ {v.get('skillFolderHash', '?')[:7]}",
+                        {a: cmd(a) for a in AGENTS}, needs=NEEDS["npx"]))
+    return out
+
+
+def marketplace_add(market):
+    """The command that registers a marketplace in the sandbox, or None when its source is not GitHub.
+    A fresh sandbox knows no marketplaces, so `plugin install` alone fails with "not found"."""
+    src = ((load(MARKETPLACES) or {}).get(market) or {}).get("source", {})
+    return f"claude plugin marketplace add {src['repo']}" if src.get("source") == "github" and src.get("repo") else None
+
+
+def plugins():
+    data = (load(PLUGINS) or {}).get("plugins", {})
+    out = []
+    for key, entries in sorted(data.items()):
+        name = key.split("@")[0]
+        detail = f"{key} v{entries[0].get('version', '?')}"
+        if name in HOST_ONLY_PLUGINS:
+            out.append(item("plugins", name, detail, {"claude-code": [f"claude plugin install {key}"]},
+                            kind="host-only", note="needs the language-server binary in the image; no official pi equivalent"))
+            continue
+        add = marketplace_add(key.split("@")[-1])
+        agents = {"claude-code": ([add] if add else []) + [f"claude plugin install {key}"]}
+        needs = list(NEEDS["claude-plugin"])
+        if name in PI_PLUGINS:
+            agents["pi"] = [PI_PLUGINS[name]]
+            needs += NEEDS["pi-plugin"]
+        out.append(item("plugins", name, detail, agents, needs=needs,
+                        note="" if "pi" in agents else "no pi equivalent known"))
+    return out
+
+
+def packages():
+    if not (CLAUDE / "skills" / "graphify").exists():
+        return []
+    version = (run("graphify", "--version").split() or ["?"])[-1]
+    install = f"uv tool install graphifyy=={version}"
+    return [item("packages", "graphify", f"graphifyy {version} (PyPI; needs python 3.10+ and uv in the image)",
+                 {"claude-code": [install, "graphify install"],
+                  "pi": [install, "graphify install --platform pi"]},
+                 needs=NEEDS["uv"])]
+
+
+def own_skills(locked):
+    """Skills no installer can fetch: everything left in ~/.claude/skills."""
+    own, unclassified = [], []
+    for p in sorted((CLAUDE / "skills").iterdir()):
+        if p.name in locked or p.name in EXCLUDED_SKILLS or p.name in PACKAGE_SKILLS or p.name in SKIP_DIRS:
+            continue
+        if not (p / "SKILL.md").is_file():
+            unclassified.append(p.name)
+            continue
+        own.append(p)
+    return own, unclassified
+
+
+def memory_dir():
+    return CLAUDE / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(REPO)) / "memory"
+
+
+def stage_and_describe(own, stage):
+    """Copy what would be uploaded into stage and return its upload items."""
+    ignore = shutil.ignore_patterns(".DS_Store")
+    items = []
+    for p in own:
+        shutil.copytree(p, stage / "skills" / p.name, symlinks=False, ignore_dangling_symlinks=True, ignore=ignore)
+        src = str(stage / "skills" / p.name)
+        kind = "symlink, dereferenced" if p.is_symlink() else "directory"
+        items.append(item("own-skills", p.name, kind, {
+            # `openshell sandbox upload DIR DEST` creates DEST/<basename of DIR>, so DEST is the parent.
+            "claude-code": dict(src=src, dest=f"{SANDBOX_HOME}/.claude/skills", result=f"{SANDBOX_HOME}/.claude/skills/{p.name}"),
+            "pi": dict(src=src, dest=f"{SANDBOX_HOME}/.agents/skills", result=f"{SANDBOX_HOME}/.agents/skills/{p.name}"),
+        }, kind="upload"))
+    if (CLAUDE / "CLAUDE.md").is_file():
+        shutil.copy2(CLAUDE / "CLAUDE.md", stage / "CLAUDE.md", follow_symlinks=True)
+        src = str(stage / "CLAUDE.md")
+        items.append(item("context", "CLAUDE.md", "global instructions", {
+            "claude-code": dict(src=src, dest=f"{SANDBOX_HOME}/.claude/CLAUDE.md", result=f"{SANDBOX_HOME}/.claude/CLAUDE.md"),
+            "pi": dict(src=src, dest=f"{SANDBOX_HOME}/.pi/agent/AGENTS.md", result=f"{SANDBOX_HOME}/.pi/agent/AGENTS.md"),
+        }, kind="upload"))
+    mem = memory_dir()
+    if mem.is_dir() and any(mem.iterdir()):
+        shutil.copytree(mem, stage / "memory", ignore=ignore)
+        items.append(item("context", "memory", "this repo's Claude memory", {
+            "claude-code": dict(src=str(stage / "memory"), dest=f"{SANDBOX_HOME}/.claude/projects/-workspace",
+                                result=f"{SANDBOX_HOME}/.claude/projects/-workspace/memory"),
+        }, kind="upload"))
+    return items
+
+
+def scan(stage):
+    if not shutil.which("gitleaks"):
+        return None
+    report = stage / ".gitleaks-report.json"
+    run("gitleaks", "dir", str(stage), "--config", str(REPO / ".gitleaks.toml"), "--no-banner", "--no-color",
+        "--log-level", "error", "--redact", "--report-format", "json", "--report-path", str(report))
+    found = [dict(rule=f["RuleID"], file=str(Path(f["File"]).relative_to(stage)), line=f["StartLine"])
+             for f in load(report) or []]
+    report.unlink(missing_ok=True)
+    return found
+
+
+def parse_args(argv):
+    opts = dict(mode=None, agent="both", sandbox=None, gateway="", json=False, only=None, name="")
+    it = iter(argv)
+    for a in it:
+        if a in ("--dry-run", "--json") and opts["mode"] is None:
+            opts["mode"] = a
+        elif a == "--json":
+            opts["json"] = True
+        elif a in ("--preflight", "--gen-profile"):
+            opts["mode"], opts["sandbox"] = a, next(it, "")
+        elif a == "--name":
+            opts["name"] = next(it, "")
+        elif a == "--agent":
+            opts["agent"] = next(it, "")
+        elif a == "--only":
+            opts["only"] = set(filter(None, next(it, "").split(",")))
+        elif a == "--gateway":
+            opts["gateway"] = next(it, "")
+        elif a == "--home":
+            global SANDBOX_HOME
+            SANDBOX_HOME = next(it, "").rstrip("/") or SANDBOX_HOME
+        else:
+            opts["mode"] = None
+            break
+    if opts["mode"] is None or opts["agent"] not in (*AGENTS, "both") or (opts["mode"] in ("--preflight", "--gen-profile") and not opts["sandbox"]):
+        sys.exit("usage: sync-agents (--dry-run | --json | --preflight SANDBOX [--gateway NAME] [--json] | --gen-profile SANDBOX --name ID [--gateway NAME]) [--agent claude-code|pi|both] [--only ID,ID] [--home DIR]")
+    opts["agents"] = AGENTS if opts["agent"] == "both" else (opts["agent"],)
+    return opts
+
+
+def network_rules(sandbox, gateway):
+    """The effective policy's network rules, or an error string."""
+    cmd = ["openshell"] + (["-g", gateway] if gateway else []) + ["policy", "get", sandbox, "--full", "-o", "json"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return None, str(e)
+    if r.returncode != 0:
+        return None, (r.stdout + r.stderr).strip()
+    try:
+        return list((json.loads(r.stdout)["policy"].get("network_policies") or {}).values()), ""
+    except (ValueError, KeyError) as e:
+        return None, f"unreadable policy: {e}"
+
+
+def allows(rules, host, binary, port=443):
+    """True if some rule lets `binary` reach host:port. Hosts and binaries may be globs."""
+    for rule in rules:
+        if not any(fnmatch.fnmatchcase(binary, b.get("path", "")) for b in rule.get("binaries", [])):
+            continue
+        for ep in rule.get("endpoints", []):
+            ports = ep.get("ports") or [ep.get("port")]
+            if port in ports and fnmatch.fnmatchcase(host, ep.get("host", "")):
+                return True
+    return False
+
+
+def profile_table(anonymous=True):
+    """Provider profiles in providers/, as {id: ([(host, port, [binary globs])], [env keys])}:
+    those needing no credential, or those needing one.
+    Read with a small line parser: the files are flat and PyYAML is not guaranteed."""
+    found = {}
+    for f in sorted((REPO / "providers").glob("*.yaml")):
+        text = f.read_text()
+        if bool(re.search(r"^credentials:", text, re.M)) == anonymous:
+            continue
+        pid = re.search(r"^id:\s*(\S+)", text, re.M)
+        if not pid:
+            continue
+        binaries = re.findall(r"^\s+-\s+(/\S+)\s*$", text.split("\nbinaries:", 1)[-1], re.M) if "\nbinaries:" in text else []
+        inline = re.search(r"^binaries:\s*\[(.*?)\]", text, re.M)
+        if inline:
+            binaries = [b.strip() for b in inline.group(1).split(",") if b.strip()]
+        eps = [(m.group(1), int(m.group(2) or 443)) for m in re.finditer(r"^\s+-\s+host:\s*(\S+)(?:\s*\n\s+port:\s*(\d+))?", text, re.M)]
+        env = re.search(r"env_vars:\s*\[(.*?)\]", text)
+        keys = [k.strip() for k in env.group(1).split(",") if k.strip()] if env else []
+        found[pid.group(1)] = ([(h, port, binaries) for h, port in eps], keys)
+    return found
+
+
+def covering(profiles, host, binary):
+    return next((pid for pid, (eps, _) in profiles.items()
+                 if any(fnmatch.fnmatchcase(host, h) and any(fnmatch.fnmatchcase(binary, b) for b in bins)
+                        for h, _, bins in eps)), None)
+
+
+def fixes_for(missing):
+    """Profiles that grant the missing (host, binary) pairs: anonymous ones first, then ones that
+    need a secret ({id: env keys}); plus the pairs no profile grants."""
+    anon, secret = profile_table(True), profile_table(False)
+    chosen, needs_secret, unfixed = [], {}, []
+    for host, binary in missing:
+        hit = covering(anon, host, binary)
+        if hit:
+            if hit not in chosen:
+                chosen.append(hit)
+            continue
+        hit = covering(secret, host, binary)
+        if hit:
+            needs_secret[hit] = secret[hit][1]
+        else:
+            unfixed.append((host, binary))
+    return chosen, needs_secret, unfixed
+
+
+# Endpoint shapes for hosts whose traffic is better restricted than opened wholesale.
+ENDPOINT_YAML = {
+    "github.com": """  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
+""",
+    "registry.npmjs.org": """  - host: registry.npmjs.org
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+    # Scoped packages (@scope/name) are requested as @scope%2fname.
+    allow_encoded_slash: true
+""",
+}
+# Other paths the same program is installed at, so one profile works on every image.
+BINARY_ALIASES = {
+    BIN_NODE: ["/usr/bin/node"],
+    BIN_GIT: ["/usr/local/bin/git"],
+    BIN_CLAUDE: ["/usr/bin/claude", "/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+                 "/usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"],
+}
+
+
+def generated_profile(name, missing, sandbox):
+    """A provider profile (YAML) granting exactly the missing (host, binary) pairs, no credential."""
+    hosts = sorted({h for h, _ in missing})
+    binaries = []
+    for _, b in sorted(missing):
+        for path in [b, *BINARY_ALIASES.get(b, [])]:
+            if path not in binaries:
+                binaries.append(path)
+    endpoints = "".join(ENDPOINT_YAML.get(h, f"  - host: {h}\n    port: 443\n") for h in hosts)
+    return (f"# Generated by sync-agents for the install steps of sandbox {sandbox}. No credential.\n"
+            f"# Grants only: {', '.join(hosts)}. Detach it once the installs are done.\n"
+            f"id: {name}\ndisplay_name: Install access for {sandbox}\n"
+            f"description: Network the skill and plugin installs need, generated for {sandbox}\n"
+            f"category: agent\nendpoints:\n{endpoints}binaries:\n" + "".join(f"  - {b}\n" for b in binaries))
+
+
+def preflight(items, rules, only=None):
+    """Map each selected item id to the (host, binary) needs the policy does not allow.
+    Selected = the ids in `only`, or every default item when `only` is None."""
+    chosen = [i for i in items if (i["id"] in only if only is not None else i["default"])]
+    return {i["id"]: [n for n in i["needs"] if not allows(rules, *n)] for i in chosen if i["needs"]}
+
+
+def for_agents(it, agents):
+    """Keep only the selected agents; drop items that apply to none of them."""
+    kept = {a: v for a, v in it["agents"].items() if a in agents}
+    if not kept:
+        return None
+    # The claude binary is only needed when claude-code is a target.
+    needs = [n for n in it["needs"] if n[1] != BIN_CLAUDE or "claude-code" in kept]
+    return dict(it, agents=kept, needs=needs)
+
+
+def show(it):
+    mark = " " if it["default"] else "-"
+    print(f" {mark} {it['name']:<26} {it['detail']}")
+    for agent, spec in it["agents"].items():
+        if it["kind"] == "upload":
+            print(f"      {agent:<11} upload -> {spec['result']}")
+        else:
+            for c in spec:
+                print(f"      {agent:<11} $ {c}")
+    if it["note"]:
+        print(f"      note: {it['note']}")
+
+
+def report_preflight(opts, items):
+    rules, err = network_rules(opts["sandbox"], opts["gateway"])
+    if rules is None:
+        sys.exit(f"cannot read the policy of {opts['sandbox']}: {err}")
+    result = preflight(items, rules, opts["only"])
+    missing = {n for needs in result.values() for n in needs}
+    fixes, needs_secret, unfixed = fixes_for(sorted(missing))
+    if opts["json"]:
+        print(json.dumps(dict(sandbox=opts["sandbox"], ok=not missing, items=result,
+                              missing=[dict(host=h, binary=b) for h, b in sorted(missing)],
+                              fixes=fixes, secret_fixes=[dict(profile=p, keys=k) for p, k in needs_secret.items()],
+                              unfixed=[dict(host=h, binary=b) for h, b in unfixed])))
+    else:
+        print(f"Policy check for {opts['sandbox']} (selected items only)")
+        for item_id, needs in sorted(result.items()):
+            print(f"  {'blocked' if needs else 'ok     '}  {item_id}" + "".join(f"\n            needs {h} for {b}" for h, b in needs))
+        print("\nAll network access allowed." if not missing else f"\n{len(missing)} access rule(s) missing: attach the provider profiles that allow them, or edit the policy." + (f" Profiles that grant them: {', '.join(fixes)}." if fixes else ""))
+    sys.exit(0 if not missing else 3)
+
+
+def report_profile(opts, items):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", opts["name"]):
+        sys.exit("--name must be lowercase letters, digits and dashes")
+    rules, err = network_rules(opts["sandbox"], opts["gateway"])
+    if rules is None:
+        sys.exit(f"cannot read the policy of {opts['sandbox']}: {err}")
+    missing = sorted({n for needs in preflight(items, rules, opts["only"]).values() for n in needs})
+    if not missing:
+        sys.exit("nothing is missing: the policy already allows every selected install")
+    print(generated_profile(opts["name"], missing, opts["sandbox"]), end="")
+
+
+def main():
+    opts = parse_args(sys.argv[1:])
+    mode, agents = opts["mode"], opts["agents"]
+    locked = {Path(i["name"]).name for i in npx_skills()}
+    own, unclassified = own_skills(locked)
+    stage = Path(tempfile.mkdtemp(prefix="sync-agents-"))
+    try:
+        items = npx_skills() + plugins() + packages() + stage_and_describe(own, stage)
+        items = [i for i in (for_agents(i, agents) for i in items) if i]
+        if mode == "--preflight":
+            report_preflight(opts, items)
+            return
+        if mode == "--gen-profile":
+            report_profile(opts, items)
+            return
+        findings = scan(stage)
+        if mode == "--json":
+            print(json.dumps(dict(agents=agents, stage_dir=str(stage), items=items, unclassified=unclassified,
+                                  secret_findings=findings)))
+            return
+        print("Dry run: nothing is installed, copied or uploaded.")
+        print(f"Agents: {', '.join(agents)}   Sandbox HOME: {SANDBOX_HOME}   ('-' = not selected by default)")
+        for group in ("npx-skills", "plugins", "packages", "own-skills", "context"):
+            rows = [i for i in items if i["group"] == group]
+            print(f"\n{group} ({len(rows)})")
+            for r in rows:
+                show(r)
+            if not rows:
+                print("  none")
+        if unclassified:
+            print(f"\nUnclassified, skipped (no SKILL.md): {', '.join(unclassified)}")
+        needs = sorted({n for i in items if i["default"] for n in i["needs"]})
+        print("\nNetwork the selected installs need (host, binary)")
+        for host, binary in needs:
+            print(f"  {host:<28} {binary}")
+        print("\nSecret scan of staged uploads")
+        if findings is None:
+            print("  gitleaks not installed: skipped")
+        else:
+            for f in findings:
+                print(f"  {f['rule']}  {f['file']}:{f['line']}")
+            print(f"  {len(findings)} finding(s): review before any real sync" if findings else "  clean")
+        print("\nExcluded always: settings.json, hooks, ~/.claude.json, skills/synced")
+    finally:
+        if mode != "--json":
+            shutil.rmtree(stage, ignore_errors=True)
+
+
+main()
