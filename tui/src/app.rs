@@ -55,6 +55,8 @@ pub enum SelKind {
     ClaudeToken(InKind),
     /// Whether to take a GitHub token from `gh auth token` or paste one; carries the flow to resume.
     GhToken(InKind),
+    /// Which attached provider to detach so that `profile` can be attached.
+    Conflict { sync: SyncPlan, profile: String, round: u8 },
     /// How to grant the network access a blocked sync is missing.
     SyncAccess { sync: SyncPlan, check: cli::SyncCheck },
     /// Which agents to add skills for, in this sandbox.
@@ -224,6 +226,10 @@ pub enum SyncStage {
     Attach { sync: SyncPlan, profile: String },
     /// A generated profile for the user to review.
     Generated { sync: SyncPlan, name: String, yaml: String },
+    /// A conflicting provider was detached: attach `profile` again.
+    Retry { sync: SyncPlan, profile: String, round: u8 },
+    /// The gateway would not attach `profile` next to the providers already `attached`.
+    Conflict { sync: SyncPlan, profile: String, attached: Vec<String>, round: u8 },
 }
 
 /// What the user chose to put into one sandbox.
@@ -374,6 +380,24 @@ pub fn sync_steps(plan: &SyncPlan) -> Vec<Step> {
         }
     }
     steps.into_iter().skip(plan.skip).collect()
+}
+
+/// Choices when the gateway refuses to attach `profile`: detach one of the others (only
+/// needed while installing, and can be attached again afterwards), or stop. The usual
+/// cause is a credentialed endpoint (github) on a host another profile allows uninspected.
+pub fn conflict_items(attached: &[String], profile: &str) -> Vec<String> {
+    let mut items: Vec<String> = attached
+        .iter()
+        .filter(|a| *a != profile)
+        .map(|a| format!("Detach {a}, then attach {profile} and check again"))
+        .collect();
+    items.push("Cancel".into());
+    items
+}
+
+/// The provider a `conflict_items` choice detaches.
+pub fn conflict_pick(item: &str) -> Option<&str> {
+    item.strip_prefix("Detach ")?.split(',').next()
 }
 
 /// Trimmed limit value; `None` when it could be mistaken for a flag or has spaces.
@@ -783,6 +807,12 @@ impl App {
                 SyncStage::Manifest { sandbox, agent, manifest } => self.pick_sync_items(sandbox, agent, manifest),
                 SyncStage::Check { sync, check, offered } => self.confirm_sync(sync, check, offered),
                 SyncStage::Attach { sync, profile } => self.attach_and_check(sync, vec![profile], vec![], 2),
+                SyncStage::Retry { sync, profile, round } => self.attach_and_check(sync, vec![profile], vec![], round),
+                SyncStage::Conflict { sync, profile, attached, round } => {
+                    let title = format!("{profile} cannot be attached next to what {} has", sync.sandbox);
+                    let items = conflict_items(&attached, &profile);
+                    self.select(&title, items, false, SelKind::Conflict { sync, profile, round });
+                }
                 SyncStage::Generated { sync, name, yaml } => {
                     self.modal = Some(Modal::Confirm {
                         text: format!(
@@ -1036,17 +1066,18 @@ impl App {
                 if create.contains(p) {
                     cli::create_provider(&dir, p, &[])?;
                 }
-                cli::os(&["sandbox", "provider", "attach", &sync.sandbox, p, "--wait", "--timeout", "30"])
-                    .map_err(|e| {
-                        if e.contains("not in a state required") {
-                            format!(
-                                "{p} overlaps the endpoints of a provider already on {} (for example pypi and github both define api.github.com). Detach one (x) and retry. {e}",
-                                sync.sandbox
-                            )
-                        } else {
-                            e
-                        }
-                    })?;
+                if let Err(e) = cli::os(&["sandbox", "provider", "attach", &sync.sandbox, p, "--wait", "--timeout", "30"]) {
+                    if !e.contains(cli::ATTACH_CONFLICT) {
+                        return Err(e);
+                    }
+                    // The gateway refused to merge it with what is attached: offer to detach one.
+                    let attached = cli::attached_providers(&sync.sandbox);
+                    return Ok(Done {
+                        msg: format!("Could not attach {p} to {}", sync.sandbox),
+                        next: None,
+                        sync: Some(SyncStage::Conflict { sync, profile: p.clone(), attached, round }),
+                    });
+                }
             }
             let check = cli::sync_check(&dir, &sync.sandbox, &sync.agent, &sync.ids)?;
             Ok(Done {
@@ -1230,6 +1261,24 @@ impl App {
                 } else {
                     self.generate_token(flow);
                 }
+            }
+            SelKind::Conflict { sync, profile, round } => {
+                let Some(other) = conflict_pick(&first).map(String::from) else {
+                    self.cleanup_sync_stage();
+                    self.offer_drop("");
+                    return;
+                };
+                self.status = format!("Detaching {other} from {}...", sync.sandbox);
+                let sandbox = sync.sandbox.clone();
+                let tx = self.done_tx.clone();
+                thread::spawn(move || {
+                    let r = cli::os(&["sandbox", "provider", "detach", &sandbox, &other, "--wait", "--timeout", "30"]);
+                    let d = match r {
+                        Ok(_) => Done { msg: format!("Detached {other}"), next: None, sync: Some(SyncStage::Retry { sync, profile, round }) },
+                        Err(e) => Done { msg: format!("Error: {e}"), next: None, sync: None },
+                    };
+                    let _ = tx.send(d);
+                });
             }
             SelKind::SyncAccess { sync, check } => {
                 if first.starts_with("Add the built-in") {
@@ -1657,18 +1706,7 @@ impl App {
                 self.select("Attach provider", items, false, SelKind::AttachProvider(name));
             }
             KeyCode::Char('x') => {
-                let attached = cli::os(&["sandbox", "provider", "list", &name, "--output", "json"])
-                    .ok()
-                    .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
-                    .map(|v| {
-                        v["providers"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|p| p["name"].as_str().map(String::from))
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
+                let attached = cli::attached_providers(&name);
                 self.select("Detach provider", attached, false, SelKind::DetachProvider(name));
             }
             _ => {}

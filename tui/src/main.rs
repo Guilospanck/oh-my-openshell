@@ -529,6 +529,32 @@ mod tests {
     }
 
     #[test]
+    fn attach_conflict_offers_to_detach_another_provider() {
+        let attached = vec!["pypi".to_string(), "github".to_string(), "npm".to_string()];
+        let items = app::conflict_items(&attached, "github");
+        assert_eq!(items[0], "Detach pypi, then attach github and check again");
+        assert_eq!(items.len(), 3);
+        assert_eq!(app::conflict_pick(&items[1]), Some("npm"));
+        assert_eq!(app::conflict_pick("Cancel"), None);
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let sync = Some(app::SyncStage::Conflict { sync: plan("pi", &[]), profile: "github".into(), attached, round: 2 });
+        app.on_done(Done { msg: "Could not attach github to sb".into(), next: None, sync });
+        match &app.modal {
+            Some(app::Modal::Select { title, items, .. }) => {
+                assert_eq!(title, "github cannot be attached next to what sb has");
+                assert_eq!(items.last().map(String::as_str), Some("Cancel"));
+            }
+            _ => panic!("no conflict choice"),
+        }
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.modal.is_none(), "Cancel closes it");
+    }
+
+    #[test]
     fn check_reports_blocked_items_and_missing_access() {
         let c = cli::parse_check(
             r#"{"ok":false,"items":{"a":[["github.com","/usr/bin/git"]],"b":[]},

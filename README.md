@@ -126,7 +126,8 @@ the hosts and programs still missing (no credential), shows you a summary,
 asks for a name (default `install-<sandbox>`), then imports it, creates the
 provider and attaches it. After the installs it offers to detach and delete
 it, since the network is only needed while installing. This also avoids the
-overlap errors between built-in profiles.
+attach conflicts between built-in profiles; if an attach still fails, it is
+removed again instead of left on the gateway.
 
 Profiles that need a secret (for example `github`, for private skill sources)
 are offered the same way. For a GitHub token, `osh` offers to read it from
@@ -134,9 +135,15 @@ are offered the same way. For a GitHub token, `osh` offers to read it from
 paste one (hidden; use a fine-grained, read-only token from
 github.com/settings/personal-access-tokens/new). Tokens exported in the shell
 that started `osh` are used without asking. As with Docker Sandboxes, the
-real secret stays on the host. Profiles that define the same endpoint
-differently, such as `pypi` and `github` (both define `api.github.com`),
-cannot be attached together; detach one first.
+real secret stays on the host. The gateway refuses to attach a provider whose
+endpoints it cannot merge with those already attached: a credentialed endpoint
+(`github` injects its token on `github.com` and `api.github.com`) next to a
+profile that allows the same host uninspected, or two inspected (`rest`)
+entries for one host that differ in `enforcement` or `allow_encoded_slash`.
+`pypi` therefore gives `github.com` and `api.github.com` the same inspected
+shape as `github`, so the two attach together (re-import `pypi` on gateways
+that have the old one). When an attach is refused during `K`, osh lists the
+attached providers and offers to detach one and try again.
 
 The installs run in your terminal and stop at the first failing step. osh then
 says which step failed and shows the end of its output (recorded with

@@ -39,12 +39,25 @@ endpoints:
     port: 443
   - host: files.pythonhosted.org
     port: 443
+  # github.com and api.github.com have the same shape as in github.yaml: the gateway
+  # refuses to merge github's credentialed endpoints into an L4-only (bare) rule, so
+  # bare entries here made pypi and github impossible to attach together.
   - host: github.com
     port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
   - host: objects.githubusercontent.com
     port: 443
   - host: api.github.com
     port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
   - host: downloads.python.org
     port: 443
 binaries:

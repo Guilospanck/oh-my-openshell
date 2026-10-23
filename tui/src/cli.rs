@@ -681,6 +681,19 @@ pub fn sync_gen_profile(dir: &Path, sandbox: &str, agent: &str, ids: &[String], 
     run(&script_dir(dir).join("sync-agents").to_string_lossy(), &args, &[])
 }
 
+/// What the gateway says when it will not merge a provider into the sandbox's policy,
+/// e.g. github's credentialed github.com next to a profile that allows it uninspected.
+pub const ATTACH_CONFLICT: &str = "not in a state required";
+
+/// Names of the providers attached to a sandbox.
+pub fn attached_providers(sandbox: &str) -> Vec<String> {
+    os(&["sandbox", "provider", "list", sandbox, "--output", "json"])
+        .ok()
+        .and_then(|t| parse(&t).ok())
+        .map(|v| v["providers"].as_array().into_iter().flatten().filter_map(|p| p["name"].as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
 /// Import a generated profile, create its provider (no credential) and attach it.
 pub fn import_generated(yaml: &str, name: &str, sandbox: &str) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!("osh-{name}.yaml"));
@@ -688,8 +701,16 @@ pub fn import_generated(yaml: &str, name: &str, sandbox: &str) -> Result<(), Str
     let imported = os(&["profile", "import", "--file", &tmp.to_string_lossy()]);
     let _ = fs::remove_file(&tmp);
     imported?;
-    os(&["provider", "create", "--name", name, "--type", name])?;
-    os(&["sandbox", "provider", "attach", sandbox, name, "--wait", "--timeout", "30"])?;
+    // Nothing is left behind when a step fails: the caller forgets the name on error.
+    if let Err(e) = os(&["provider", "create", "--name", name, "--type", name]) {
+        let _ = os(&["profile", "delete", name]);
+        return Err(e);
+    }
+    if let Err(e) = os(&["sandbox", "provider", "attach", sandbox, name, "--wait", "--timeout", "30"]) {
+        let _ = os(&["provider", "delete", name]);
+        let _ = os(&["profile", "delete", name]);
+        return Err(e);
+    }
     Ok(())
 }
 
