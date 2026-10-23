@@ -133,6 +133,82 @@ pub struct Step {
     pub args: Vec<String>,
 }
 
+impl Step {
+    /// What the step does, for messages: the in-sandbox command without its PATH prefix.
+    pub fn label(&self) -> String {
+        match self.args.last() {
+            Some(c) if self.args.iter().any(|a| a == "-c") => c.strip_prefix(SANDBOX_PATH).unwrap_or(c).to_string(),
+            _ => format!("{} {}", self.prog, self.args.join(" ")),
+        }
+    }
+}
+
+/// The step a terminal job stopped at, and the end of its output when it was recorded.
+pub struct Failed {
+    /// Position among the steps that ran.
+    pub index: usize,
+    pub label: String,
+    pub status: String,
+    pub tail: Vec<String>,
+}
+
+/// The last `n` non-blank lines of a terminal recording, without escape sequences or `\r`.
+pub fn clean_tail(raw: &str, n: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for l in raw.split('\n') {
+        let mut out = String::new();
+        let mut it = l.trim_end_matches('\r').chars().peekable();
+        while let Some(c) = it.next() {
+            match c {
+                '\x1b' => {
+                    // CSI: parameters up to a final byte in @..~; other escapes: one more char.
+                    if it.peek() == Some(&'[') {
+                        it.next();
+                        for f in it.by_ref() {
+                            if ('@'..='~').contains(&f) {
+                                break;
+                            }
+                        }
+                    } else {
+                        it.next();
+                    }
+                }
+                // A carriage return redraws the line (progress bars): keep what came last.
+                '\r' => out.clear(),
+                c if c.is_control() => {}
+                c => out.push(c),
+            }
+        }
+        if !out.trim().is_empty() {
+            lines.push(out.trim_end().to_string());
+        }
+    }
+    let from = lines.len().saturating_sub(n);
+    lines.split_off(from)
+}
+
+/// Whether a failed step's output reads like git or GitHub refusing access, which a
+/// GitHub token fixes; a policy block looks different and the policy check catches it.
+pub fn auth_failure(tail: &[String]) -> bool {
+    tail.iter().any(|l| {
+        let l = l.to_lowercase();
+        [
+            "authentication failed",
+            "could not read username",
+            "could not read password",
+            "terminal prompts disabled",
+            "repository not found",
+            "permission denied (publickey)",
+            "the requested url returned error: 401",
+            "the requested url returned error: 403",
+            "the requested url returned error: 404",
+        ]
+        .iter()
+        .any(|p| l.contains(p))
+            || (l.contains("github") && (l.contains(" 404") || l.contains("not found")))
+    })
+}
+
 pub struct Done {
     pub msg: String,
     pub next: Option<(Plan, Vec<String>)>,
@@ -158,6 +234,8 @@ pub struct SyncPlan {
     pub agent: String,
     pub manifest: cli::SyncManifest,
     pub ids: Vec<String>,
+    /// Steps already done by an earlier run that stopped; a retry starts after them.
+    pub skip: usize,
 }
 
 pub struct App {
@@ -177,6 +255,11 @@ pub struct App {
     status_at: Option<(String, Instant)>,
     pub quit: bool,
     pub job: Option<Vec<Step>>,
+    /// Record the job's output, so a failed step can be explained (only sync jobs:
+    /// `claude setup-token` prints a secret).
+    pub capture: bool,
+    /// The sync plan the running job installs.
+    running_sync: Option<SyncPlan>,
     /// Embedded sandbox shells; they keep running while the dashboard is shown.
     pub sessions: Vec<Session>,
     /// Session that has the screen and the keyboard.
@@ -241,6 +324,8 @@ fn sync_label(i: &cli::SyncItem) -> String {
     format!("{:<11} {}  [{}]{tag}", i.group, i.name, agents.join(", "))
 }
 
+const SANDBOX_PATH: &str = "export PATH=\"$HOME/.local/bin:$PATH\"; ";
+
 /// Commands run in the sandbox with `~/.local/bin` on PATH: uv installs there and the
 /// sandbox PATH lacks it.
 fn in_sandbox(sandbox: &str, command: &str) -> Step {
@@ -256,7 +341,7 @@ fn in_sandbox(sandbox: &str, command: &str) -> Step {
             "--".into(),
             "sh".into(),
             "-c".into(),
-            format!("export PATH=\"$HOME/.local/bin:$PATH\"; {command}"),
+            format!("{SANDBOX_PATH}{command}"),
         ]),
     }
 }
@@ -288,7 +373,7 @@ pub fn sync_steps(plan: &SyncPlan) -> Vec<Step> {
             }
         }
     }
-    steps
+    steps.into_iter().skip(plan.skip).collect()
 }
 
 /// Trimmed limit value; `None` when it could be mistaken for a flag or has spaces.
@@ -374,6 +459,8 @@ impl App {
             status_at: None,
             quit: false,
             job: None,
+            capture: false,
+            running_sync: None,
             sessions: Vec::new(),
             active: None,
             watch: Watch::default(),
@@ -967,19 +1054,46 @@ impl App {
         });
     }
 
-    /// Ask whether to remove the generated install access, if any is still attached.
-    fn offer_drop(&mut self) {
-        if let Some((sandbox, name)) = self.temp_access.take() {
-            self.modal = Some(Modal::Confirm {
-                text: format!("Detach {name} from {sandbox} and delete it and its profile? Its network access is only needed while installing."),
-                kind: ConfKind::DropAccess { sandbox, name },
-            });
-        }
+    /// Ask whether to remove the generated install access, if any is still attached;
+    /// `before` is shown above the question.
+    fn offer_drop(&mut self, before: &str) -> bool {
+        let Some((sandbox, name)) = self.temp_access.take() else { return false };
+        self.modal = Some(Modal::Confirm {
+            text: format!("{before}Detach {name} from {sandbox} and delete it and its profile? Its network access is only needed while installing."),
+            kind: ConfKind::DropAccess { sandbox, name },
+        });
+        true
     }
 
-    pub fn finish_job(&mut self) {
+    /// After a terminal job. A sync that stopped says at which step; when the output reads
+    /// like GitHub refusing access (a private repository), it offers the `github` provider
+    /// and a retry from that step.
+    pub fn finish_job(&mut self, failed: Option<Failed>) {
+        self.capture = false;
+        if let (Some(f), Some(mut sync)) = (failed, self.running_sync.take()) {
+            self.status = format!("Step failed: {} ({})", f.label, f.status);
+            let output = if f.tail.is_empty() { String::new() } else { format!("\n\nLast output:\n{}", f.tail.join("\n")) };
+            if auth_failure(&f.tail) {
+                sync.skip += f.index;
+                self.modal = Some(Modal::Confirm {
+                    text: format!(
+                        "This step failed, and its output looks like GitHub refusing access (a private repository?):\n  {}{output}\n\nCreate or attach the `github` provider (the token stays on this host), then run the installs again from this step?",
+                        f.label
+                    ),
+                    kind: ConfKind::SyncSecret { sync, profile: "github".into() },
+                });
+                return;
+            }
+            self.cleanup_sync_stage();
+            let text = format!("The installs stopped at a failed step ({}):\n  {}{output}", f.status, f.label);
+            if !self.offer_drop(&format!("{text}\n\n")) {
+                self.modal = Some(Modal::Info(text));
+            }
+            return;
+        }
+        self.running_sync = None;
         self.cleanup_sync_stage();
-        self.offer_drop();
+        self.offer_drop("");
         let Some(flow) = self.token_flow.take() else { return };
         let InKind::Cred { provider, keys, values, .. } = &flow else { return };
         let title = format!("Paste the token claude printed: {provider}: {} (hidden)", keys[values.len()]);
@@ -1179,7 +1293,7 @@ impl App {
                     Ok(Done {
                         msg: "Policy checked".into(),
                         next: None,
-                        sync: Some(SyncStage::Check { sync: SyncPlan { sandbox, agent, manifest, ids }, check, offered: 0 }),
+                        sync: Some(SyncStage::Check { sync: SyncPlan { sandbox, agent, manifest, ids, skip: 0 }, check, offered: 0 }),
                     })
                 });
             }
@@ -1362,7 +1476,11 @@ impl App {
             ConfKind::DeleteSandbox(name) => self.bg_msg(move || {
                 cli::os(&["sandbox", "delete", &name]).map(|_| format!("Deleted sandbox {name}"))
             }),
-            ConfKind::Sync(plan) => self.job = Some(sync_steps(&plan)),
+            ConfKind::Sync(plan) => {
+                self.job = Some(sync_steps(&plan));
+                self.capture = true;
+                self.running_sync = Some(plan);
+            }
             ConfKind::SyncGen { sync, name, yaml } => {
                 self.temp_access = Some((sync.sandbox.clone(), name.clone()));
                 self.status = format!("Importing {name} and attaching it to {}...", sync.sandbox);
@@ -1690,8 +1808,8 @@ impl App {
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
                     self.cleanup_sync_stage();
-                    if matches!(kind, ConfKind::Sync(_)) {
-                        self.offer_drop();
+                    if matches!(kind, ConfKind::Sync(_) | ConfKind::SyncSecret { .. }) {
+                        self.offer_drop("");
                     }
                 }
                 _ => self.modal = Some(Modal::Confirm { text, kind }),

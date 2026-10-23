@@ -132,6 +132,14 @@ real secret stays on the host. Profiles that define the same endpoint
 differently, such as `pypi` and `github` (both define `api.github.com`),
 cannot be attached together; detach one first.
 
+The installs run in your terminal and stop at the first failing step. osh then
+says which step failed and shows the end of its output (recorded with
+`script`, so the steps keep a real terminal). When that output reads like
+GitHub refusing access (a private repository: `Repository not found`,
+`could not read Username`, `Authentication failed`), it offers to create or
+attach the `github` provider and run the installs again from that step. The
+policy check cannot predict this: it is not a network block.
+
 ## Setup without osh
 
 `just install` (OpenShell, and links `osh` into `~/.local/bin` so it runs from

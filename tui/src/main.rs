@@ -7,7 +7,7 @@ mod term;
 mod ui;
 mod watch;
 
-use app::{App, Done, Step};
+use app::{App, Done, Failed, Step};
 use ratatui::crossterm::{
     event::{
         self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -60,24 +60,52 @@ fn host_modes(on: bool, kitty: bool) {
     }
 }
 
-/// Hand the terminal to child processes, then take it back.
-fn run_steps(steps: Vec<Step>) {
-    ratatui::restore();
-    for s in steps {
-        println!("$ {} {}", s.prog, s.args.join(" "));
-        match Command::new(&s.prog).args(&s.args).status() {
-            Ok(st) if st.success() => {}
-            Ok(st) => {
-                println!("\n{} exited with {st}", s.prog);
-                break;
-            }
-            Err(e) => {
-                println!("\n{}: {e}", s.prog);
-                break;
-            }
-        }
+/// Single-quote `s` for `sh -c`.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The step run under script(1), which keeps the child on a terminal (prompts, progress
+/// bars and colours work as before) while it records the output to `log`.
+fn recorded(s: &Step, log: &Path) -> Command {
+    let mut c = Command::new("script");
+    if cfg!(target_os = "macos") {
+        // BSD script: `script -q FILE CMD ARGS...`, exits with the command's status.
+        c.arg("-q").arg(log).arg(&s.prog).args(&s.args);
+    } else {
+        // util-linux script: one shell command; -e returns its status.
+        let line = std::iter::once(s.prog.as_str()).chain(s.args.iter().map(String::as_str)).map(sh_quote).collect::<Vec<_>>().join(" ");
+        c.args(["-q", "-e", "-c", &line]).arg(log);
     }
+    c
+}
+
+/// Hand the terminal to child processes, then take it back. Returns the step that failed;
+/// with `capture`, the end of its output too.
+fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
+    ratatui::restore();
+    let log = std::env::temp_dir().join(format!("osh-step-{}.log", std::process::id()));
+    let capture = capture && cli::have("script");
+    let mut failed = None;
+    for (index, s) in steps.iter().enumerate() {
+        println!("$ {} {}", s.prog, s.args.join(" "));
+        let mut cmd = if capture { recorded(s, &log) } else { Command::new(&s.prog) };
+        if !capture {
+            cmd.args(&s.args);
+        }
+        let status = match cmd.status() {
+            Ok(st) if st.success() => continue,
+            Ok(st) => format!("exited with {st}"),
+            Err(e) => e.to_string(),
+        };
+        println!("\n{} {status}", s.prog);
+        let raw = if capture { std::fs::read(&log).unwrap_or_default() } else { Vec::new() };
+        failed = Some(Failed { index, label: s.label(), status, tail: app::clean_tail(&String::from_utf8_lossy(&raw), 12) });
+        break;
+    }
+    let _ = std::fs::remove_file(&log);
     pause();
+    failed
 }
 
 /// Offer to install OpenShell before the dashboard opens. Returns false to quit.
@@ -179,10 +207,10 @@ fn main() -> io::Result<()> {
                     host_modes(false, kitty);
                     captured = false;
                 }
-                run_steps(steps);
+                let failed = run_steps(steps, app.capture);
                 terminal = ratatui::init();
                 terminal.clear()?;
-                app.finish_job();
+                app.finish_job(failed);
                 app.refresh();
             }
         }
@@ -339,6 +367,7 @@ mod tests {
             agent: agent.into(),
             manifest: cli::parse_manifest(MANIFEST).unwrap(),
             ids: ids.iter().map(|s| s.to_string()).collect(),
+            skip: 0,
         }
     }
 
@@ -369,6 +398,32 @@ mod tests {
     }
 
     #[test]
+    fn failed_steps_explain_themselves() {
+        let rec = "^D\x1b[1m$ npx\x1b[0m\r\nCloning into 'x'...\r\nremote: Repository not found.\r\nfatal: repository 'https://github.com/me/private/' not found\r\n\r\n";
+        let tail = app::clean_tail(rec, 2);
+        assert_eq!(tail, vec!["remote: Repository not found.", "fatal: repository 'https://github.com/me/private/' not found"]);
+        assert!(app::auth_failure(&tail));
+        assert_eq!(app::clean_tail("50%\r100%\n", 5), vec!["100%"]);
+        for l in [
+            "fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "remote: Invalid username or token. Password authentication is not supported.\nfatal: Authentication failed for 'https://github.com/a/b/'",
+            "error: The requested URL returned error: 403",
+        ] {
+            assert!(app::auth_failure(&app::clean_tail(l, 5)), "{l}");
+        }
+        assert!(!app::auth_failure(&["curl: (56) CONNECT tunnel failed, response 403".into()]));
+        assert!(!app::auth_failure(&["npm error code E404".into()]));
+        // Labels drop the PATH prefix; a retry skips the steps already done.
+        let p = plan("pi", &["npx-skills:caveman", "own-skills:bro"]);
+        let steps = app::sync_steps(&p);
+        assert!(steps[0].label().starts_with("npx --yes skills@1.7.4 add a/b"));
+        assert!(steps[1].label().starts_with("openshell "));
+        let retry = app::sync_steps(&app::SyncPlan { skip: 1, ..p });
+        assert_eq!(retry.len(), 1);
+        assert_eq!(sh_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
     fn check_reports_blocked_items_and_missing_access() {
         let c = cli::parse_check(
             r#"{"ok":false,"items":{"a":[["github.com","/usr/bin/git"]],"b":[]},
@@ -395,6 +450,7 @@ mod tests {
             agent: "pi".into(),
             manifest: cli::parse_manifest(MANIFEST).unwrap(),
             ids: vec![],
+            skip: 0,
         };
         app.modal = Some(app::Modal::Confirm {
             text: "short summary".into(),
