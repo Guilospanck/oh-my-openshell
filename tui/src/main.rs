@@ -485,6 +485,50 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_sync_names_the_step_and_offers_github_for_auth_errors() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let run = |app: &mut App, tail: &[&str]| {
+            app.modal = Some(app::Modal::Confirm {
+                text: "run?".into(),
+                kind: app::ConfKind::Sync(plan("pi", &["npx-skills:caveman", "own-skills:bro"])),
+            });
+            app.on_key(KeyEvent::from(KeyCode::Char('y')));
+            assert!(app.capture && app.job.take().is_some_and(|j| j.len() == 2));
+            let tail = tail.iter().map(|s| s.to_string()).collect();
+            app.finish_job(Some(Failed { index: 1, label: "upload bro".into(), status: "exited with 1".into(), tail }));
+            assert!(!app.capture);
+            assert_eq!(app.status, "Step failed: upload bro (exited with 1)");
+        };
+        run(&mut app, &["fatal: Authentication failed for 'https://github.com/me/x/'"]);
+        match &app.modal {
+            Some(app::Modal::Confirm { kind: app::ConfKind::SyncSecret { sync, profile }, text }) => {
+                assert_eq!((profile.as_str(), sync.skip), ("github", 1));
+                assert!(text.contains("Authentication failed"));
+            }
+            _ => panic!("no github offer"),
+        }
+        run(&mut app, &["npm error code E404"]);
+        assert!(matches!(&app.modal, Some(app::Modal::Info(t)) if t.contains("upload bro") && t.contains("E404")));
+    }
+
+    #[test]
+    fn blocked_title_names_each_host_once() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let pair = |h: &str, b: &str| (h.to_string(), b.to_string());
+        let check = cli::SyncCheck {
+            missing: vec![pair("github.com", "/usr/bin/git"), pair("github.com", "/usr/local/bin/claude"), pair("pypi.org", "/usr/local/bin/uv")],
+            ..Default::default()
+        };
+        let sync = Some(app::SyncStage::Check { sync: plan("claude-code", &["npx-skills:caveman"]), check, offered: 0 });
+        app.on_done(Done { msg: "Policy checked".into(), next: None, sync });
+        assert!(matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title == "sb blocks installs; missing: github.com, pypi.org"));
+    }
+
+    #[test]
     fn check_reports_blocked_items_and_missing_access() {
         let c = cli::parse_check(
             r#"{"ok":false,"items":{"a":[["github.com","/usr/bin/git"]],"b":[]},

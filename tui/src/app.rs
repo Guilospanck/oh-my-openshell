@@ -961,7 +961,10 @@ impl App {
                 text.push_str(&format!("  {host}  {bin}\n"));
             }
             if offered == 0 {
-                let hosts: Vec<&str> = check.missing.iter().map(|(h, _)| h.as_str()).collect();
+                let mut hosts: Vec<&str> = check.missing.iter().map(|(h, _)| h.as_str()).collect();
+                // One host can be missing for several programs.
+                hosts.sort();
+                hosts.dedup();
                 let mut items = Vec::new();
                 if !check.fixes.is_empty() {
                     items.push(format!("Add the built-in profile(s): {}", check.fixes.join(", ")));
@@ -1070,8 +1073,10 @@ impl App {
     /// and a retry from that step.
     pub fn finish_job(&mut self, failed: Option<Failed>) {
         self.capture = false;
-        if let (Some(f), Some(mut sync)) = (failed, self.running_sync.take()) {
+        if let Some(f) = &failed {
             self.status = format!("Step failed: {} ({})", f.label, f.status);
+        }
+        if let (Some(f), Some(mut sync)) = (failed, self.running_sync.take()) {
             let output = if f.tail.is_empty() { String::new() } else { format!("\n\nLast output:\n{}", f.tail.join("\n")) };
             if auth_failure(&f.tail) {
                 sync.skip += f.index;
