@@ -1,12 +1,21 @@
 //! osh: ratatui front end for OpenShell. Dashboard of sandboxes with live
-//! status, plus creating, attaching, providers, profiles and images.
+//! status, embedded sandbox shells, plus creating, providers, profiles and images.
 mod app;
 mod cli;
 mod logview;
+mod term;
 mod ui;
 
 use app::{App, Done, Step};
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::{
+    event::{
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    },
+    execute,
+    terminal::supports_keyboard_enhancement,
+};
 use std::{
     io::{self, Write},
     path::{Path, PathBuf},
@@ -31,6 +40,23 @@ fn pause() {
     let _ = io::stdout().flush();
     let mut s = String::new();
     let _ = io::stdin().read_line(&mut s);
+}
+
+/// Mouse, paste and focus reports (and kitty keys, when the host has them) are only
+/// wanted while a shell has focus; the dashboard keeps the host terminal's own.
+fn host_modes(on: bool, kitty: bool) {
+    let mut out = io::stdout();
+    if on {
+        let _ = execute!(out, EnableMouseCapture, EnableBracketedPaste, EnableFocusChange);
+        if kitty {
+            let _ = execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        }
+    } else {
+        if kitty {
+            let _ = execute!(out, PopKeyboardEnhancementFlags);
+        }
+        let _ = execute!(out, DisableMouseCapture, DisableBracketedPaste, DisableFocusChange);
+    }
 }
 
 /// Hand the terminal to child processes, then take it back.
@@ -92,16 +118,39 @@ fn main() -> io::Result<()> {
 
     let mut app = App::new(dir, selected, wake_tx, done_tx);
     let mut terminal = ratatui::init();
+    let kitty = supports_keyboard_enhancement().unwrap_or(false);
+    let mut captured = false;
     let result = (|| -> io::Result<()> {
         while !app.quit {
             if let Some(lv) = &mut app.logview {
                 lv.sync();
             }
+            app.pump_sessions();
+            let focused = app.active.is_some();
+            if focused != captured {
+                host_modes(focused, kitty);
+                captured = focused;
+            }
+            if focused {
+                let size = terminal.size()?;
+                app.fit_session(size.width, size.height.saturating_sub(1));
+            }
             terminal.draw(|f| ui::draw(f, &app))?;
-            if event::poll(Duration::from_millis(150))? {
-                if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
-                        app.on_key(k);
+            // A focused shell wants frames at display rate; the dashboard does not.
+            let wait = if focused { 16 } else { 150 };
+            if event::poll(Duration::from_millis(wait))? {
+                loop {
+                    match event::read()? {
+                        Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
+                        Event::Key(k) if k.kind == KeyEventKind::Repeat && app.active.is_some() => app.on_key(k),
+                        Event::Mouse(m) => app.on_mouse(m),
+                        Event::Paste(p) => app.on_paste(p),
+                        Event::FocusGained => app.on_focus(true),
+                        Event::FocusLost => app.on_focus(false),
+                        _ => {}
+                    }
+                    if app.quit || !event::poll(Duration::ZERO)? {
+                        break;
                     }
                 }
             }
@@ -122,6 +171,10 @@ fn main() -> io::Result<()> {
                 app.on_done(d);
             }
             if let Some(steps) = app.job.take() {
+                if captured {
+                    host_modes(false, kitty);
+                    captured = false;
+                }
                 run_steps(steps);
                 terminal = ratatui::init();
                 terminal.clear()?;
@@ -131,6 +184,9 @@ fn main() -> io::Result<()> {
         }
         Ok(())
     })();
+    if captured {
+        host_modes(false, kitty);
+    }
     ratatui::restore();
     app.cleanup_sync_stage();
     result
@@ -140,7 +196,7 @@ fn main() -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::cli::{Cond, Image, Profile, Provider, Sandbox, Snapshot};
-    use ratatui::crossterm::event::{KeyCode, KeyEvent};
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
@@ -172,6 +228,34 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Char('n')));
         assert!(app.modal.is_some());
         term.draw(|f| ui::draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn session_view_routes_keys_and_draws_its_menu() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let s = term::Session::spawn("sb".into(), app.snap.gateway.clone(), "cat", &[], 60, 19).unwrap();
+        app.sessions.push(s);
+        app.active = Some(0);
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!app.quit, "Ctrl-C belongs to the shell");
+        app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL));
+        assert!(app.modal.is_some());
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.active.is_none() && app.sessions.len() == 1 && app.has_session("sb"));
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        app.active = Some(0);
+        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        for _ in 0..2 {
+            app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.active.is_none() && app.sessions.is_empty());
     }
 
     #[test]

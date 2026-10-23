@@ -24,9 +24,14 @@ Builds the ratatui TUI (`tui/`) with cargo on first run and whenever its
 sources change. Offers to install OpenShell if missing. Needs `cargo`; Docker
 for image builds.
 
+The embedded sandbox shell uses libghostty-vt (Ghostty's terminal engine),
+which builds only with Zig 0.15 (`brew install zig@0.15`). `osh` puts
+`zig@0.15` on PATH for the build; building by hand needs
+`PATH="$(brew --prefix zig@0.15)/bin:$PATH" LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast cargo build --release`.
+
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), attach (`Enter`), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`) |
 | Providers | create from a `providers/*.yaml` profile (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated |

@@ -9,6 +9,12 @@ BIN="$DIR/tui/target/release/osh-tui"
 
 if [[ ! -x "$BIN" || -n "$(find "$DIR/tui/src" "$DIR/tui/Cargo.toml" -newer "$BIN" -print -quit)" ]]; then
   command -v cargo >/dev/null 2>&1 || { echo "osh: cargo is required to build the TUI (rustup)" >&2; exit 1; }
+  # libghostty-vt (the embedded terminal) builds only with Zig 0.15.
+  ZIG=$(brew --prefix zig@0.15 2>/dev/null || true)/bin
+  [[ -d "$ZIG" ]] || ZIG=/opt/homebrew/opt/zig@0.15/bin
+  [[ -d "$ZIG" ]] && export PATH="$ZIG:$PATH"
+  [[ "$(zig version 2>/dev/null)" == 0.15.* ]] || { echo "osh: Zig 0.15 is required to build the TUI (brew install zig@0.15)" >&2; exit 1; }
+  export LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast
   echo "osh: building TUI..." >&2
   cargo build --release --quiet --manifest-path "$DIR/tui/Cargo.toml"
 fi

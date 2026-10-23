@@ -1,7 +1,8 @@
 //! Application state, modal flows and key handling.
 use crate::cli::{self, Snapshot};
 use crate::logview::LogView;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::term::{self, Session};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::{
     path::{Path, PathBuf},
     sync::{mpsc::Sender, Arc, Mutex},
@@ -56,6 +57,8 @@ pub enum SelKind {
     SyncAgents(String),
     /// Items to add; `labels` are the list entries in manifest order.
     SyncItems { sandbox: String, agent: String, manifest: cli::SyncManifest, labels: Vec<String> },
+    /// Ctrl-] menu over the focused shell.
+    SessionMenu,
 }
 
 #[derive(Clone)]
@@ -116,7 +119,7 @@ pub enum Modal {
     Viewer { title: String, text: String, scroll: u16, back: Box<Modal> },
 }
 
-/// A command run with the terminal handed back to it (attach, build, create).
+/// A command run with the terminal handed back to it (build, create, setup-token).
 pub struct Step {
     pub prog: String,
     pub args: Vec<String>,
@@ -164,6 +167,10 @@ pub struct App {
     pub status: String,
     pub quit: bool,
     pub job: Option<Vec<Step>>,
+    /// Embedded sandbox shells; they keep running while the dashboard is shown.
+    pub sessions: Vec<Session>,
+    /// Session that has the screen and the keyboard.
+    pub active: Option<usize>,
     /// Credential flow waiting on a running `claude setup-token`.
     token_flow: Option<InKind>,
     /// Staging directory of an in-progress "add skills" flow; removed when it ends.
@@ -316,6 +323,8 @@ impl App {
             status: "Loading...".into(),
             quit: false,
             job: None,
+            sessions: Vec::new(),
+            active: None,
             token_flow: None,
             sync_stage: None,
             sync_secret: None,
@@ -392,6 +401,96 @@ impl App {
 
     pub fn refresh(&self) {
         let _ = self.wake.send(());
+    }
+
+    pub fn session(&self) -> Option<&Session> {
+        self.active.and_then(|i| self.sessions.get(i))
+    }
+
+    fn session_mut(&mut self) -> Option<&mut Session> {
+        self.active.and_then(|i| self.sessions.get_mut(i))
+    }
+
+    /// Whether `sandbox` on the shown gateway has a running shell.
+    pub fn has_session(&self, sandbox: &str) -> bool {
+        self.sessions.iter().any(|s| s.sandbox == sandbox && s.gateway == self.snap.gateway)
+    }
+
+    /// Focus the shell of `sandbox`, starting one sized to the screen if none runs.
+    fn open_session(&mut self, sandbox: String) {
+        let gw = cli::gateway();
+        if let Some(i) = self.sessions.iter().position(|s| s.sandbox == sandbox && s.gateway == gw) {
+            self.active = Some(i);
+            return;
+        }
+        let (w, h) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+        match Session::open(sandbox, w, h.saturating_sub(1)) {
+            Ok(s) => {
+                self.sessions.push(s);
+                self.active = Some(self.sessions.len() - 1);
+            }
+            Err(e) => self.status = format!("Error: {e}"),
+        }
+    }
+
+    fn close_session(&mut self, i: usize) -> Session {
+        let s = self.sessions.remove(i);
+        self.active = match self.active {
+            Some(a) if a == i => {
+                if matches!(self.modal, Some(Modal::Select { kind: SelKind::SessionMenu, .. })) {
+                    self.modal = None;
+                }
+                None
+            }
+            Some(a) if a > i => Some(a - 1),
+            a => a,
+        };
+        s
+    }
+
+    /// Feed every shell's output to its terminal, focused or not, and drop ended ones.
+    pub fn pump_sessions(&mut self) {
+        for s in &mut self.sessions {
+            s.pump();
+        }
+        while let Some(i) = self.sessions.iter().position(|s| s.exited) {
+            let s = self.close_session(i);
+            let last = s.vt.last_line();
+            self.status = if last.is_empty() {
+                format!("Shell in {} ended", s.sandbox)
+            } else {
+                format!("Shell in {} ended: {last}", s.sandbox)
+            };
+        }
+    }
+
+    /// Keep the focused shell the size of the screen minus its status bar.
+    pub fn fit_session(&mut self, cols: u16, rows: u16) {
+        if let Some(s) = self.session_mut() {
+            s.resize(cols, rows);
+        }
+    }
+
+    pub fn on_mouse(&mut self, me: MouseEvent) {
+        if self.modal.is_none() {
+            if let Some(s) = self.session_mut() {
+                s.on_mouse(&me);
+            }
+        }
+    }
+
+    pub fn on_paste(&mut self, text: String) {
+        if self.modal.is_none() {
+            if let Some(s) = self.session_mut() {
+                s.on_paste(text);
+            }
+        }
+    }
+
+    pub fn on_focus(&mut self, gained: bool) {
+        if let Some(s) = self.session_mut() {
+            s.on_focus(gained);
+        }
     }
 
     fn bg<F>(&self, f: F)
@@ -914,6 +1013,19 @@ impl App {
                     })
                 });
             }
+            SelKind::SessionMenu => {
+                if first.starts_with("Dashboard") {
+                    self.active = None;
+                    self.status = "Shell kept running; Enter on its sandbox returns to it".into();
+                    self.refresh();
+                } else if first.starts_with("Close") {
+                    if let Some(i) = self.active {
+                        let s = self.close_session(i);
+                        self.status = format!("Closed the shell in {}", s.sandbox);
+                        self.refresh();
+                    }
+                }
+            }
             SelKind::NewProvider => {
                 if self.snap.providers.iter().any(|p| p.name == first) {
                     self.modal = Some(Modal::Info(format!(
@@ -1091,6 +1203,10 @@ impl App {
     // ---- keys ------------------------------------------------------------
 
     pub fn on_key(&mut self, key: KeyEvent) {
+        if self.active.is_some() {
+            self.session_key(key);
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -1118,6 +1234,32 @@ impl App {
                 self.refresh();
             }
             _ => self.tab_key(key.code),
+        }
+    }
+
+    /// Keys while a shell has focus: the chord, then an open modal, then the shell.
+    fn session_key(&mut self, key: KeyEvent) {
+        let menu = matches!(self.modal, Some(Modal::Select { kind: SelKind::SessionMenu, .. }));
+        if term::is_chord(&key) {
+            if menu {
+                self.modal = None;
+            } else if self.modal.is_none() {
+                let name = self.session().map(|s| s.sandbox.clone()).unwrap_or_default();
+                let items = vec![
+                    "Back to the session".into(),
+                    "Dashboard (keep the session running)".into(),
+                    "Close the session".into(),
+                ];
+                self.select(&format!("Shell in {name}"), items, false, SelKind::SessionMenu);
+            }
+            return;
+        }
+        if let Some(modal) = self.modal.take() {
+            self.modal_key(modal, key);
+            return;
+        }
+        if let Some(s) = self.session_mut() {
+            s.on_key(&key);
         }
     }
 
@@ -1171,22 +1313,7 @@ impl App {
                 Ok(lv) => self.logview = Some(lv),
                 Err(e) => self.status = format!("Error: {e}"),
             },
-            KeyCode::Enter => {
-                self.job = Some(vec![Step {
-                    prog: "openshell".into(),
-                    args: cli::with_gateway(vec![
-                        "sandbox".into(),
-                        "exec".into(),
-                        "-n".into(),
-                        name,
-                        "--tty".into(),
-                        "--".into(),
-                        "sh".into(),
-                        "-c".into(),
-                        "export PATH=\"$HOME/.local/bin:$PATH\"; exec bash".into(),
-                    ]),
-                }])
-            }
+            KeyCode::Enter => self.open_session(name),
             KeyCode::Char('d') => {
                 self.modal = Some(Modal::Confirm {
                     text: format!("Delete sandbox '{name}'? Its contents are lost."),
@@ -1378,6 +1505,7 @@ impl App {
                 }
             },
             Modal::Select { title, items, mut cursor, mut marked, multi, kind } => match key.code {
+                KeyCode::Esc if matches!(kind, SelKind::SessionMenu) => {}
                 KeyCode::Esc => self.cleanup_sync_stage(),
                 KeyCode::Enter => {
                     let mut picks: Vec<String> = items

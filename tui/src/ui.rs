@@ -2,6 +2,7 @@
 use crate::app::{App, Modal, Tab, TABS};
 use crate::cli::Freshness;
 use crate::logview::LogView;
+use crate::term::Session;
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -26,6 +27,13 @@ fn highlight() -> Style {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
+    if let Some(s) = app.session() {
+        draw_session(f, s, app.modal.is_none());
+        if let Some(m) = &app.modal {
+            draw_modal(f, m);
+        }
+        return;
+    }
     if let Some(lv) = &app.logview {
         draw_logview(f, lv);
         return;
@@ -98,7 +106,8 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
         .sandboxes
         .iter()
         .map(|s| {
-            Row::new(vec![s.name.clone(), s.phase.clone(), s.created.clone()])
+            let name = if app.has_session(&s.name) { format!("● {}", s.name) } else { s.name.clone() };
+            Row::new(vec![name, s.phase.clone(), s.created.clone()])
                 .style(phase_style(&s.phase))
         })
         .collect();
@@ -239,7 +248,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let help = match app.tab {
-        Tab::Sandboxes => "Enter attach  l logs  n new  d delete  s stop  S start  a/x attach/detach provider  K skills",
+        Tab::Sandboxes => "Enter shell (● running)  l logs  n new  d delete  s stop  S start  a/x attach/detach provider  K skills",
         Tab::Providers => "n create  u update credentials  d delete",
         Tab::Profiles => "u / Enter import or update from providers/",
         Tab::Images => "b / Enter build",
@@ -335,6 +344,30 @@ fn draw_modal(f: &mut Frame, m: &Modal) {
             f.render_stateful_widget(list, area, &mut ListState::default().with_selected(Some(*cursor)));
         }
     }
+}
+
+/// The shell fills the screen above a one-row status bar; the cursor is shown only with focus.
+fn draw_session(f: &mut Frame, s: &Session, focus: bool) {
+    let area = f.area();
+    let pane = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+    let bar = Rect::new(area.x, pane.bottom(), area.width, area.height - pane.height);
+    if let Some(p) = s.vt.render(pane, f.buffer_mut()) {
+        if focus {
+            f.set_cursor_position(p);
+        }
+    }
+    let base = Style::default().fg(Color::Black).bg(Color::Gray);
+    let mut spans = vec![Span::styled(format!(" {} ", s.sandbox), base.add_modifier(Modifier::BOLD))];
+    let title = s.vt.title();
+    if !title.is_empty() {
+        spans.push(Span::styled(format!(" {title} "), base));
+    }
+    let back = s.vt.scrolled_back();
+    if back > 0 {
+        spans.push(Span::styled(format!(" [scrollback -{back}, type to return] "), base.fg(Color::Blue)));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(base), bar);
+    f.render_widget(Paragraph::new("Ctrl-] menu ").style(base).alignment(Alignment::Right), bar);
 }
 
 fn draw_logview(f: &mut Frame, lv: &LogView) {
