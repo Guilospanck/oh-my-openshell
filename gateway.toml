@@ -4,3 +4,12 @@ version = 2
 [openshell.gateway]
 compute_driver = "vm"
 
+
+# Lets sandboxes share host folders (virtiofs) via --driver-config-json mounts.
+# Raw host bind mounts have no label resolver, so admission is off for this driver.
+[openshell.drivers.vm]
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.vm.resource_admission]
+enabled = false

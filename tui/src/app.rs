@@ -40,6 +40,9 @@ pub struct Plan {
     pub memory: String,
     /// Non-empty: run once via `sh -c` and delete the sandbox afterwards (`--no-keep`).
     pub command: String,
+    /// Absolute host folder mounted at `/sandbox/<folder name>`; empty = none.
+    pub share: String,
+    pub share_rw: bool,
 }
 
 #[derive(Clone)]
@@ -47,6 +50,8 @@ pub enum SelKind {
     Preset,
     Image,
     Providers(Plan),
+    /// Read-only or read-write access to the shared host folder.
+    ShareAccess(Plan),
     AttachProvider(String),
     DetachProvider(String),
     NewProvider,
@@ -96,6 +101,7 @@ pub enum InKind {
     Name(Plan),
     Cpu(Plan),
     Memory(Plan),
+    Share(Plan),
     Command(Plan),
     /// Name for a generated install-access provider.
     GenName(SyncPlan),
@@ -1500,6 +1506,9 @@ impl App {
         if !plan.memory.is_empty() {
             args.extend(["--memory".into(), plan.memory.clone()]);
         }
+        if let Some(json) = self.share_config(plan) {
+            args.extend(["--driver-config-json".into(), json]);
+        }
         for p in &plan.providers {
             args.extend(["--provider".into(), p.clone()]);
         }
@@ -1594,6 +1603,10 @@ impl App {
                     ])
                     .map(|_| format!("Detached {first} from {sb}"))
                 });
+            }
+            SelKind::ShareAccess(mut plan) => {
+                plan.share_rw = first == "Read-write";
+                self.ask_command(plan);
             }
             SelKind::Gateway => {
                 let name = first.split_whitespace().next().unwrap_or_default();
@@ -1930,7 +1943,7 @@ impl App {
                         InKind::Cpu(plan),
                     );
                 } else {
-                    self.ask_command(plan);
+                    self.ask_share(plan);
                 }
             }
             InKind::Cpu(mut plan) => {
@@ -1949,7 +1962,33 @@ impl App {
                     return self.bad_limit("Memory");
                 };
                 plan.memory = v;
-                self.ask_command(plan);
+                self.ask_share(plan);
+            }
+            InKind::Share(mut plan) => {
+                let text = text.trim();
+                if text.is_empty() {
+                    return self.ask_command(plan);
+                }
+                let path = match text.strip_prefix("~/") {
+                    Some(rest) => std::env::var("HOME")
+                        .map(|h| format!("{h}/{rest}"))
+                        .unwrap_or_else(|_| text.into()),
+                    None => text.into(),
+                };
+                let path = path.trim_end_matches('/').to_string();
+                if !std::path::Path::new(&path).is_absolute()
+                    || !std::path::Path::new(&path).is_dir()
+                {
+                    self.status = format!("Not an existing absolute folder: {path}");
+                    return self.ask_share(plan);
+                }
+                plan.share = path;
+                self.select(
+                    "Access to the shared folder",
+                    vec!["Read-only".into(), "Read-write".into()],
+                    false,
+                    SelKind::ShareAccess(plan),
+                );
             }
             InKind::Command(mut plan) => {
                 plan.command = text.trim().into();
@@ -1992,6 +2031,38 @@ impl App {
     /// The vm driver ignores per-sandbox limits; its size is fixed gateway-wide.
     fn limits_supported(&self) -> bool {
         !self.snap.driver.is_empty() && self.snap.driver != "vm"
+    }
+
+    /// Only the vm and docker gateways in this repo allow host mounts.
+    fn shares_supported(&self) -> bool {
+        matches!(self.snap.driver.as_str(), "vm" | "docker")
+    }
+
+    fn ask_share(&mut self, plan: Plan) {
+        if self.shares_supported() {
+            self.input(
+                "Host folder to share, absolute path (empty = none)",
+                false,
+                InKind::Share(plan),
+            );
+        } else {
+            self.ask_command(plan);
+        }
+    }
+
+    /// `--driver-config-json` value mounting the plan's host folder, keyed by the active driver.
+    fn share_config(&self, plan: &Plan) -> Option<String> {
+        if plan.share.is_empty() {
+            return None;
+        }
+        let name = std::path::Path::new(&plan.share).file_name()?.to_str()?;
+        let mount = serde_json::json!({
+            "type": "bind",
+            "source": plan.share,
+            "target": format!("/sandbox/{name}"),
+            "read_only": !plan.share_rw,
+        });
+        Some(serde_json::json!({ self.snap.driver.as_str(): { "mounts": [mount] } }).to_string())
     }
 
     fn ask_command(&mut self, plan: Plan) {
