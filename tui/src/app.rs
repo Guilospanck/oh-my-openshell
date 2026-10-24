@@ -50,6 +50,8 @@ pub enum SelKind {
     Preset,
     Image,
     Providers(Plan),
+    /// No folder, the folder `osh` was started in, or one typed in.
+    ShareChoice(Plan),
     /// Read-only or read-write access to the shared host folder.
     ShareAccess(Plan),
     AttachProvider(String),
@@ -1604,6 +1606,20 @@ impl App {
                     .map(|_| format!("Detached {first} from {sb}"))
                 });
             }
+            SelKind::ShareChoice(mut plan) => {
+                if first == "No folder" {
+                    self.ask_command(plan);
+                } else if let Some(dir) = first.strip_prefix("Current folder: ") {
+                    plan.share = dir.into();
+                    self.ask_access(plan);
+                } else {
+                    self.input(
+                        "Host folder to share, absolute path (empty = none)",
+                        false,
+                        InKind::Share(plan),
+                    );
+                }
+            }
             SelKind::ShareAccess(mut plan) => {
                 plan.share_rw = first == "Read-write";
                 self.ask_command(plan);
@@ -1983,12 +1999,7 @@ impl App {
                     return self.ask_share(plan);
                 }
                 plan.share = path;
-                self.select(
-                    "Access to the shared folder",
-                    vec!["Read-only".into(), "Read-write".into()],
-                    false,
-                    SelKind::ShareAccess(plan),
-                );
+                self.ask_access(plan);
             }
             InKind::Command(mut plan) => {
                 plan.command = text.trim().into();
@@ -2040,14 +2051,32 @@ impl App {
 
     fn ask_share(&mut self, plan: Plan) {
         if self.shares_supported() {
-            self.input(
-                "Host folder to share, absolute path (empty = none)",
+            let here = std::env::current_dir()
+                .map(|d| d.display().to_string())
+                .unwrap_or_default();
+            let mut items = vec!["No folder".to_string()];
+            if !here.is_empty() {
+                items.push(format!("Current folder: {here}"));
+            }
+            items.push("Other folder...".into());
+            self.select(
+                "Share a host folder?",
+                items,
                 false,
-                InKind::Share(plan),
+                SelKind::ShareChoice(plan),
             );
         } else {
             self.ask_command(plan);
         }
+    }
+
+    fn ask_access(&mut self, plan: Plan) {
+        self.select(
+            "Access to the shared folder",
+            vec!["Read-only".into(), "Read-write".into()],
+            false,
+            SelKind::ShareAccess(plan),
+        );
     }
 
     /// `--driver-config-json` value mounting the plan's host folder, keyed by the active driver.
