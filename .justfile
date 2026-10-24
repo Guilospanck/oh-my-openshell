@@ -1,4 +1,4 @@
-# Installs OpenShell and links osh into PATH
+# Installs or upgrades OpenShell (OPENSHELL_VERSION=v0.1.5 pins a release) and links osh into PATH
 install: link
 	#!/usr/bin/env bash
 	set -euo pipefail
@@ -19,7 +19,20 @@ install: link
 	install -m 644 "$config_source" "$config_dir/gateway.toml"
 
 	brew services restart openshell
+	openshell --version
+	# The service needs a moment to listen again after the restart.
+	for _ in $(seq 20); do openshell status >/dev/null 2>&1 && break; sleep 1; done
 	openshell status
+
+# Upgrades OpenShell to the latest release, then restarts the Docker gateway if it is set up
+upgrade: install
+	#!/usr/bin/env bash
+	set -euo pipefail
+
+	label="dev.guilospanck.openshell-docker"
+	if launchctl print "gui/$(id -u)/$label" >/dev/null 2>&1; then
+	    launchctl kickstart -k "gui/$(id -u)/$label"
+	fi
 
 # Needs the Homebrew service to have run once (shared TLS). The vm gateway
 # ignores per-sandbox --cpu/--memory; this one honours them.
