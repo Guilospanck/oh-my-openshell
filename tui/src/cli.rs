@@ -379,6 +379,72 @@ pub fn profile_path(dir: &Path, id: &str) -> PathBuf {
     dir.join("providers").join(format!("{id}.yaml"))
 }
 
+/// Repo profiles that need no credential and declare `host` as an endpoint: attaching one
+/// gives a sandbox that host with the profile's exact settings.
+pub fn profiles_for_host(dir: &Path, host: &str) -> Vec<String> {
+    let want = format!("host: {host}");
+    profile_ids(dir)
+        .into_iter()
+        .filter(|id| {
+            profile_env_keys(dir, id).is_empty()
+                && fs::read_to_string(profile_path(dir, id))
+                    .unwrap_or_default()
+                    .lines()
+                    .any(|l| l.trim().trim_start_matches("- ").trim() == want)
+        })
+        .collect()
+}
+
+/// Profile for one `host:port` and one binary, with the options `policy update
+/// --add-endpoint` cannot set (`allow_encoded_slash`: scoped npm packages are `@scope%2fname`).
+pub fn slash_profile(name: &str, host: &str, port: u16, binary: &str) -> String {
+    format!(
+        "id: {name}\ndisplay_name: {host} (encoded slashes)\ndescription: Read-only {host} with encoded slashes allowed\ncategory: data\nendpoints:\n  - host: {host}\n    port: {port}\n    protocol: rest\n    access: read-only\n    enforcement: enforce\n    allow_encoded_slash: true\nbinaries: [{binary}]\n"
+    )
+}
+
+/// Name for a generated profile of `host`.
+pub fn slash_name(host: &str) -> String {
+    format!("slash-{}", host.replace('.', "-"))
+}
+
+/// Create the provider for a repo profile when the gateway lacks it, then attach it.
+pub fn attach_profile(dir: &Path, sandbox: &str, id: &str) -> Result<String, String> {
+    if os(&["provider", "get", id]).is_err() {
+        create_provider(dir, id, &[])?;
+    }
+    os(&[
+        "sandbox",
+        "provider",
+        "attach",
+        sandbox,
+        id,
+        "--wait",
+        "--timeout",
+        "30",
+    ])
+    .map(|_| format!("Attached {id} to {sandbox}"))
+}
+
+/// Replace the ad-hoc rule for `host:port` with a generated provider that allows encoded slashes.
+pub fn allow_slashes(sandbox: &str, host: &str, port: u16, binary: &str) -> Result<String, String> {
+    let name = slash_name(host);
+    let _ = os(&[
+        "policy",
+        "update",
+        sandbox,
+        "--remove-endpoint",
+        &format!("{host}:{port}"),
+        "--wait",
+        "--timeout",
+        "60",
+    ]);
+    import_generated(&slash_profile(&name, host, port, binary), &name, sandbox)?;
+    Ok(format!(
+        "Allowed encoded slashes for {host} in {sandbox} ({name})"
+    ))
+}
+
 /// Credential variables a profile expects. For alias lists such as
 /// `[GITHUB_TOKEN, GH_TOKEN]` only the first name is prompted for.
 /// `FORGEJO_HOST` is prepended when the profile is a template over it.
@@ -1021,4 +1087,32 @@ pub fn sync_check(
         .map_err(|e| format!("sync-agents: {e}"))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     parse_check(&stdout).map_err(|_| String::from_utf8_lossy(&out.stderr).trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_profiles_answer_for_their_hosts_without_credentials() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        assert_eq!(profiles_for_host(&dir, "registry.npmjs.org"), ["npm"]);
+        let git = profiles_for_host(&dir, "github.com");
+        assert!(git.contains(&"claude-marketplace".to_string()));
+        assert!(!git.contains(&"github".to_string()), "github needs a token");
+        assert!(profiles_for_host(&dir, "example.com").is_empty());
+    }
+
+    #[test]
+    fn generated_slash_profile_names_one_host_and_binary() {
+        let y = slash_profile(
+            &slash_name("registry.npmjs.org"),
+            "registry.npmjs.org",
+            443,
+            "/usr/local/bin/node",
+        );
+        assert!(y.starts_with("id: slash-registry-npmjs-org\n"));
+        assert!(y.contains("    allow_encoded_slash: true\n"));
+        assert!(y.ends_with("binaries: [/usr/local/bin/node]\n"));
+    }
 }

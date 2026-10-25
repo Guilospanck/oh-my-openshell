@@ -4,6 +4,7 @@ use crate::cli;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::{BufRead, BufReader, Read},
+    path::PathBuf,
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver, Sender, TryRecvError},
     thread,
@@ -82,7 +83,8 @@ pub fn parse(line: &str) -> Option<Denial> {
         .into_iter()
         .find(|(k, _)| *k == "engine")
         .map(|(_, v)| v);
-    if reason == "policy_dns_ineligible" {
+    // A policy update closes the tunnels opened under the old one; clients just reconnect.
+    if reason == "policy_dns_ineligible" || reason.contains("policy generation is stale") {
         return None;
     }
     let head = body.split(" [").next().unwrap_or_default().trim();
@@ -129,6 +131,8 @@ pub enum State {
     Allowed(bool),
     IgnoredOnce,
     Ignored,
+    /// Refused for good in this sandbox, whichever binary asks.
+    Never,
     Notice,
 }
 
@@ -163,6 +167,9 @@ pub struct Watch {
     queue: VecDeque<Prompt>,
     ignored: HashSet<Key>,
     allowed_at: HashMap<Key, Instant>,
+    /// `(sandbox, host, port)` the user never wants to allow; kept in `never_file`.
+    never: HashSet<(String, String, u16)>,
+    never_file: Option<PathBuf>,
 }
 
 /// After an allow, repeats of the same denial are in flight, not a new request.
@@ -172,7 +179,55 @@ fn key(sandbox: &str, b: &Blocked) -> Key {
     (sandbox.into(), b.binary.clone(), b.host.clone(), b.port)
 }
 
+/// Where the never-allow list lives: `$XDG_STATE_HOME/osh/never`, else `~/.local/state/osh/never`.
+pub fn never_path() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
+    Some(base.join("osh/never"))
+}
+
 impl Watch {
+    /// A watcher whose never-allow list is read from, and saved to, `file`.
+    pub fn with_never_file(file: Option<PathBuf>) -> Self {
+        let never = file
+            .as_ref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| {
+                t.lines()
+                    .filter_map(|l| {
+                        let mut f = l.split('\t');
+                        let (sb, host, port) = (f.next()?, f.next()?, f.next()?);
+                        Some((sb.to_string(), host.to_string(), port.parse().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            never,
+            never_file: file,
+            ..Self::default()
+        }
+    }
+
+    fn save_never(&self) {
+        let Some(f) = &self.never_file else { return };
+        let mut lines: Vec<String> = self
+            .never
+            .iter()
+            .map(|(s, h, p)| format!("{s}\t{h}\t{p}"))
+            .collect();
+        lines.sort();
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(f, lines.join("\n") + "\n");
+    }
+
     fn seen_mut(&mut self, sandbox: &str, d: &Denial) -> Option<&mut Seen> {
         self.seen
             .iter_mut()
@@ -200,6 +255,13 @@ impl Watch {
         match d {
             Denial::Blocked(b) => {
                 let k = key(sandbox, &b);
+                if self
+                    .never
+                    .contains(&(sandbox.to_string(), b.host.clone(), b.port))
+                {
+                    self.set(sandbox, &Denial::Blocked(b), State::Never);
+                    return;
+                }
                 if self.ignored.contains(&k)
                     || self
                         .allowed_at
@@ -274,6 +336,10 @@ impl Watch {
         } else {
             self.ignored.remove(&k);
         }
+        if state == State::Never {
+            self.never.insert((sandbox.into(), b.host.clone(), b.port));
+            self.save_never();
+        }
         if matches!(state, State::Allowed(_)) {
             self.allowed_at.insert(k.clone(), Instant::now());
         }
@@ -285,6 +351,12 @@ impl Watch {
     /// Ask about `b` again now, whatever was decided before.
     pub fn reprompt(&mut self, sandbox: &str, gateway: &str, b: Blocked) {
         let k = key(sandbox, &b);
+        if self
+            .never
+            .remove(&(sandbox.to_string(), b.host.clone(), b.port))
+        {
+            self.save_never();
+        }
         self.ignored.remove(&k);
         self.allowed_at.remove(&k);
         self.queue
@@ -497,6 +569,8 @@ mod tests {
 
     #[test]
     fn parser_offers_only_fixable_denials() {
+        let stale = "[1] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED api.anthropic.com:443 [reason:L7 tunnel closed before inspection because policy changed: policy generation is stale [captured_generation:1 current_generation:2]]";
+        assert_eq!(parse(stale), None, "a policy reload is not a denial");
         assert_eq!(parse(CURL), Some(Denial::Blocked(curl())));
         assert_eq!(parse(CURL_ISO), Some(Denial::Blocked(curl())));
         assert_eq!(parse(DNS), None);
@@ -563,6 +637,28 @@ mod tests {
         assert!(matches!(w.next(), Some(Prompt::Blocked { .. })));
         assert!(matches!(w.next(), Some(Prompt::Notice { .. })));
         assert!(w.next().is_none());
+        // Never: refused for good, even after the session ends, until asked again.
+        let never = Blocked {
+            host: "example.net".into(),
+            binary: "/usr/bin/wget".into(),
+            ..curl()
+        };
+        w.push("sb", "gw", Denial::Blocked(never.clone()));
+        assert!(matches!(w.next(), Some(Prompt::Blocked { b, .. }) if b == never));
+        w.decide("sb", &never, State::Never);
+        let same_host = Blocked {
+            binary: "/usr/bin/curl".into(),
+            ..never.clone()
+        };
+        w.push("sb", "gw", Denial::Blocked(same_host.clone()));
+        assert!(!w.has_queued(), "never covers every binary");
+        w.end_session("sb");
+        w.push("sb", "gw", Denial::Blocked(same_host.clone()));
+        assert!(!w.has_queued(), "never outlives the session");
+        w.reprompt("sb", "gw", same_host);
+        assert!(w.has_queued(), "asking again lifts it");
+        w.next();
+        w.next();
         w.end_session("sb");
         w.push("sb", "gw", d);
         assert!(w.has_queued(), "ignores end with the session");

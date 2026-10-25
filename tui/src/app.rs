@@ -92,6 +92,13 @@ pub enum SelKind {
         gateway: String,
         b: Blocked,
     },
+    /// A rejected request-target holds an encoded `/`: allow it through a generated provider.
+    Slashes {
+        sandbox: String,
+        host: String,
+        port: u16,
+        binary: String,
+    },
     /// Denials seen in a sandbox (`p`); choosing a blocked one asks again.
     Review {
         sandbox: String,
@@ -512,6 +519,10 @@ fn notice_text(sandbox: &str, what: &str, reason: &str) -> String {
     )
 }
 
+fn prog_of(binary: &str) -> &str {
+    binary.rsplit('/').next().unwrap_or(binary)
+}
+
 fn review_label(s: &watch::Seen) -> String {
     let state = match s.state {
         State::Pending => "pending",
@@ -519,6 +530,7 @@ fn review_label(s: &watch::Seen) -> String {
         State::Allowed(true) => "allowed (all)",
         State::IgnoredOnce => "ignored once",
         State::Ignored => "ignored",
+        State::Never => "never",
         State::Notice => "notice",
     };
     let what = match &s.denial {
@@ -588,7 +600,7 @@ impl App {
             running_sync: None,
             sessions: Vec::new(),
             active: None,
-            watch: Watch::default(),
+            watch: Watch::with_never_file(watch::never_path()),
             follows: Vec::new(),
             prompt_at: None,
             token_flow: None,
@@ -927,6 +939,14 @@ impl App {
                     title.push_str(&format!(" ({count}x)"));
                 }
                 let mut items = Vec::new();
+                // A profile for the host knows its details (encoded slashes, git POSTs).
+                let attached = cli::attached_providers(&sandbox);
+                for id in cli::profiles_for_host(&self.dir, &b.host)
+                    .into_iter()
+                    .filter(|id| !attached.contains(id))
+                {
+                    items.push(format!("Attach the {id} provider (recommended)"));
+                }
                 // Read-only means HTTP method rules, so only HTTP ports get it.
                 if matches!(b.port, 80 | 443 | 8080 | 8443) {
                     items.push(format!("Allow read-only (GET/HEAD/OPTIONS) for {prog}"));
@@ -934,6 +954,7 @@ impl App {
                 items.push(format!("Allow all methods for {prog}"));
                 items.push("Ignore this time".into());
                 items.push("Ignore until the session ends".into());
+                items.push(format!("Never allow {} in {sandbox}", b.target()));
                 self.select(
                     &title,
                     items,
@@ -950,9 +971,49 @@ impl App {
                 what,
                 reason,
             } => {
+                if let Some((host, port, binary)) = self.slash_fix(&sandbox, &what, &reason) {
+                    let title = format!(
+                        "{host}:{port} rejected a request path with an encoded '/' in {sandbox}"
+                    );
+                    let items = vec![
+                        format!("Allow encoded slashes for {host} ({})", prog_of(&binary)),
+                        "Dismiss".into(),
+                    ];
+                    self.select(
+                        &title,
+                        items,
+                        false,
+                        SelKind::Slashes {
+                            sandbox,
+                            host,
+                            port,
+                            binary,
+                        },
+                    );
+                    return;
+                }
                 self.modal = Some(Modal::Info(notice_text(&sandbox, &what, &reason)));
             }
         }
+    }
+
+    /// The host, port and program to fix an encoded-slash rejection for, when the program
+    /// is known from an earlier blocked request to the same host.
+    fn slash_fix(&self, sandbox: &str, what: &str, reason: &str) -> Option<(String, u16, String)> {
+        if !reason.contains("allow_encoded_slash") {
+            return None;
+        }
+        let (host, port) = what.split_whitespace().next()?.rsplit_once(':')?;
+        let port: u16 = port.parse().ok()?;
+        let binary = self
+            .watch
+            .for_sandbox(sandbox)
+            .into_iter()
+            .find_map(|s| match &s.denial {
+                Denial::Blocked(b) if b.host == host && b.port == port => Some(b.binary.clone()),
+                _ => None,
+            })?;
+        Some((host.to_string(), port, binary))
     }
 
     /// `p`: the denials seen in a sandbox while its shell was open.
@@ -1886,7 +1947,19 @@ impl App {
                 gateway,
                 b,
             } => {
-                if let Some(rest) = first.strip_prefix("Allow ") {
+                if let Some(id) = first
+                    .strip_prefix("Attach the ")
+                    .and_then(|r| r.split_whitespace().next())
+                {
+                    let id = id.to_string();
+                    let dir = self.dir.clone();
+                    self.watch.decide(&sandbox, &b, State::Allowed(false));
+                    self.status = format!("Attaching {id} to {sandbox}...");
+                    self.bg_msg(move || cli::attach_profile(&dir, &sandbox, &id));
+                } else if first.starts_with("Never allow ") {
+                    self.watch.decide(&sandbox, &b, State::Never);
+                    self.status = format!("Never asking about {} in {sandbox}", b.target());
+                } else if let Some(rest) = first.strip_prefix("Allow ") {
                     let all = rest.starts_with("all");
                     self.watch.decide(&sandbox, &b, State::Allowed(all));
                     self.status = format!(
@@ -1909,6 +1982,17 @@ impl App {
                         "this time"
                     };
                     self.status = format!("Ignored {} -> {} {how}", b.program(), b.target());
+                }
+            }
+            SelKind::Slashes {
+                sandbox,
+                host,
+                port,
+                binary,
+            } => {
+                if first.starts_with("Allow ") {
+                    self.status = format!("Allowing encoded slashes for {host} in {sandbox}...");
+                    self.bg_msg(move || cli::allow_slashes(&sandbox, &host, port, &binary));
                 }
             }
             SelKind::Review { sandbox, denials } => {

@@ -64,8 +64,17 @@ in Terminal.app or "Esc+" for Option in iTerm2; that setting is outside osh.
 While a sandbox has a shell open, osh follows its logs. When the network
 policy blocks a program from reaching a host, a prompt opens (over the shell,
 or the dashboard): `curl was blocked from reaching example.com:443`, with
-allow read-only (GET/HEAD/OPTIONS), allow all methods, ignore this time, or
-ignore until the session ends. Allowing adds exactly that `host:port` for
+allow read-only (GET/HEAD/OPTIONS), allow all methods, ignore this time,
+ignore until the session ends, or never allow that `host:port` in this sandbox
+(any program; saved in `~/.local/state/osh/never`, and `p` then Enter asks
+again). When a profile in `providers/` (no credential needed) declares the
+blocked host, the first choice is `Attach the <profile> provider (recommended)`:
+the profile carries details a plain allow cannot, such as `npm`'s encoded
+slashes for scoped packages. For other hosts, a request rejected for an encoded
+`/` (`@scope%2fname`) opens a prompt to allow encoded slashes: osh replaces the
+ad-hoc rule with a generated `slash-<host>` provider for that host and program.
+Requests cut off by a policy reload (`policy generation is stale`) are
+not shown. Allowing adds exactly that `host:port` for
 exactly that binary to the running sandbox (`openshell policy update
 --add-endpoint host:port:read-only:rest:enforce` or `host:port:full`); the
 result shows in the status bar. Denials that a host rule cannot fix (an L7
