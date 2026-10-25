@@ -6,7 +6,10 @@
 # CLAUDE_CODE_OAUTH_TOKEN. See ../README.md for creation and rotation.
 # Static auth metadata does not insert headers: Claude reads the environment
 # placeholder and sends it as a bearer token; OpenShell resolves it at the API.
-# No telemetry endpoints: keep the credential boundary limited to inference.
+# raw.githubusercontent.com and downloads.claude.ai are read-only: Claude fetches
+# metadata and release files from them at startup (blocked prompts otherwise).
+# git and npm access come from the claude-marketplace and npm profiles.
+# No telemetry endpoints (http-intake.logs.us5.datadoghq.com stays blocked): keep the credential boundary limited to inference.
 # platform.claude.com is read-only: Claude's startup connectivity check fails with
 # "Unable to connect to Anthropic services" (exit 1) when it is unreachable.
 # Verify binary paths in your image; the npm install can resolve into bin/claude.exe.
@@ -32,6 +35,16 @@ endpoints:
     access: read-write
     enforcement: enforce
   - host: platform.claude.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: raw.githubusercontent.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: downloads.claude.ai
     port: 443
     protocol: rest
     access: read-only

@@ -18,6 +18,12 @@ endpoints:
       - allow: { method: HEAD, path: "**" }
       - allow: { method: OPTIONS, path: "**" }
       - allow: { method: POST, path: "/**/git-upload-pack" }
+  # Same shape as in pypi.yaml and github.yaml so the profiles attach together.
+  - host: api.github.com
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
 binaries:
   - /usr/bin/claude
   - /usr/local/bin/claude
@@ -25,3 +31,4 @@ binaries:
   - /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
   - /usr/bin/git
   - /usr/local/bin/git
+  - /usr/lib/git-core/git-remote-http
