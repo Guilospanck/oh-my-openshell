@@ -205,6 +205,75 @@ pub struct Snapshot {
     pub error: Option<String>,
 }
 
+/// Label tying a sandbox to the host folder it shares.
+pub const SHARE_LABEL: &str = "osh.share";
+
+/// Label value for a host folder. Values cannot hold `/`, so this is an FNV-1a hash of the path.
+pub fn share_key(path: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in path.bytes() {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{h:016x}")
+}
+
+/// Folders that identify the project `osh` started in: the current folder, then its git root.
+/// Outside a git repository only the current folder counts.
+pub fn project_dirs() -> Vec<String> {
+    let mut dirs: Vec<String> = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .into_iter()
+        .collect();
+    if let Ok(root) = run("git", &["rev-parse".into(), "--show-toplevel".into()], &[]) {
+        let root = root.trim().to_string();
+        if !root.is_empty() && !dirs.contains(&root) {
+            dirs.push(root);
+        }
+    }
+    dirs
+}
+
+/// Ready sandboxes on any gateway sharing the current folder or, failing that, its git root,
+/// as (gateway, sandbox). The active gateway comes first.
+pub fn find_shared() -> Vec<(String, String)> {
+    let mut gateways: Vec<(bool, String)> = os_global(&["gateway", "list", "-o", "json"])
+        .and_then(|t| parse(&t))
+        .map(|v| {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .map(|g| (g["active"].as_bool() != Some(true), text(&g["name"])))
+                .collect()
+        })
+        .unwrap_or_default();
+    gateways.sort();
+    for dir in project_dirs() {
+        let selector = format!("{SHARE_LABEL}={}", share_key(&dir));
+        let mut hits = Vec::new();
+        for (_, gw) in &gateways {
+            let args = ["-g", gw, "sandbox", "list", "--selector", &selector];
+            let args: Vec<String> = args
+                .iter()
+                .chain(&["--output", "json"])
+                .map(|s| s.to_string())
+                .collect();
+            let Ok(v) = run("openshell", &args, &[]).and_then(|t| parse(&t)) else {
+                continue;
+            };
+            for s in v["sandboxes"].as_array().into_iter().flatten() {
+                if text(&s["phase"]) == "Ready" {
+                    hits.push((gw.clone(), text(&s["name"])));
+                }
+            }
+        }
+        if !hits.is_empty() {
+            return hits;
+        }
+    }
+    Vec::new()
+}
+
 fn text(v: &Value) -> String {
     v.as_str().unwrap_or_default().to_string()
 }

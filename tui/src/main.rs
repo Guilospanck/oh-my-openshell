@@ -232,6 +232,9 @@ fn main() -> io::Result<()> {
     cli::spawn_poller(dir.clone(), snap_tx, selected.clone(), wake_rx);
 
     let mut app = App::new(dir, selected, wake_tx, done_tx);
+    if !std::env::args().any(|a| a == "--ui") {
+        app.jump_to(cli::find_shared());
+    }
     let mut terminal = ratatui::init();
     let keys = host_keys(supports_keyboard_enhancement().unwrap_or(false));
     let mut captured = false;
@@ -324,6 +327,47 @@ mod tests {
     use crate::cli::{Cond, Image, Profile, Provider, Sandbox, Snapshot};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn share_keys_are_stable_and_label_safe() {
+        assert_eq!(cli::share_key("/a/b"), cli::share_key("/a/b"));
+        assert_ne!(cli::share_key("/a/b"), cli::share_key("/a/c"));
+        let key = cli::share_key("/Users/x/my repo");
+        assert_eq!(key.len(), 16);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn jump_offers_a_pick_across_gateways_and_waits_for_the_chosen_gateway() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        app.jump_to(vec![]);
+        assert!(app.modal.is_none());
+        assert!(app.status.starts_with("No ready sandbox shares"));
+
+        let hit = |gw: &str, name: &str| (gw.to_string(), name.to_string());
+        app.jump_to(vec![hit("openshell", "a"), hit("openshell-docker", "b")]);
+        assert!(matches!(
+            app.modal,
+            Some(app::Modal::Select {
+                kind: app::SelKind::OpenShared(_),
+                ..
+            })
+        ));
+
+        // One hit on the current gateway is pending until that gateway's snapshot loads.
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        app.jump_to(vec![hit(&cli::gateway(), "a")]);
+        app.on_snapshot(Snapshot {
+            gateway_ok: false,
+            gateway: cli::gateway(),
+            ..Default::default()
+        });
+        assert!(app.sessions.is_empty());
+    }
 
     #[test]
     fn every_tab_and_modal_renders() {

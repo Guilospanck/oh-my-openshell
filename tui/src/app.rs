@@ -50,6 +50,8 @@ pub enum SelKind {
     Preset,
     Image,
     Providers(Plan),
+    /// Which of several sandboxes (gateway, name) sharing the project folder to open.
+    OpenShared(Vec<(String, String)>),
     /// No folder, the folder `osh` was started in, or one typed in.
     ShareChoice(Plan),
     /// Read-only or read-write access to the shared host folder.
@@ -352,6 +354,8 @@ pub struct App {
     /// `(sandbox, provider)` of generated install access that is still attached.
     temp_access: Option<(String, String)>,
     selected: Arc<Mutex<Option<String>>>,
+    /// Sandbox (gateway, name) to open once that gateway's snapshot has loaded.
+    pending_open: Option<(String, String)>,
     wake: Sender<()>,
     done_tx: Sender<Done>,
 }
@@ -529,6 +533,10 @@ fn review_label(s: &watch::Seen) -> String {
 }
 
 /// True when an `osh` found on PATH is this checkout's launcher.
+fn hit_label((gw, name): &(String, String)) -> String {
+    format!("{name} on {gw}")
+}
+
 fn on_path(dir: &Path) -> bool {
     let Ok(ours) = dir.join("osh").canonicalize() else {
         return false;
@@ -588,9 +596,42 @@ impl App {
             sync_secret: None,
             temp_access: None,
             selected,
+            pending_open: None,
             wake,
             done_tx,
         }
+    }
+
+    /// Open one of `hits` (gateway, sandbox) from `cli::find_shared`: straight away when there
+    /// is one, after a pick when there are several.
+    pub fn jump_to(&mut self, hits: Vec<(String, String)>) {
+        match hits.len() {
+            0 => self.status = "No ready sandbox shares this folder or its git root".into(),
+            1 => self.go_to(hits[0].clone()),
+            _ => {
+                let items = hits.iter().map(hit_label).collect();
+                self.select(
+                    "Sandboxes sharing this project",
+                    items,
+                    false,
+                    SelKind::OpenShared(hits),
+                );
+            }
+        }
+    }
+
+    /// Switch to the sandbox's gateway if needed; the session opens once that gateway has loaded.
+    fn go_to(&mut self, (gw, name): (String, String)) {
+        if gw != cli::gateway() {
+            cli::set_gateway(&gw);
+            self.snap = Snapshot::default();
+            self.snap.gateway = gw.clone();
+            self.cursor = [0; 5];
+            self.status = format!("Switching to {gw}...");
+            self.sync_selection();
+            self.refresh();
+        }
+        self.pending_open = Some((gw, name));
     }
 
     fn idx(&self) -> usize {
@@ -639,6 +680,17 @@ impl App {
 
     pub fn on_snapshot(&mut self, snap: Snapshot) {
         self.snap = snap;
+        if self.snap.gateway_ok
+            && self.snap.error.is_none()
+            && self
+                .pending_open
+                .as_ref()
+                .is_some_and(|(gw, _)| *gw == self.snap.gateway)
+        {
+            if let Some((_, name)) = self.pending_open.take() {
+                self.open_session(name);
+            }
+        }
         self.config_stale = config_stale(&self.dir);
         for i in 0..4 {
             let len = [
@@ -1510,6 +1562,10 @@ impl App {
         }
         if let Some(json) = self.share_config(plan) {
             args.extend(["--driver-config-json".into(), json]);
+            args.extend([
+                "--label".into(),
+                format!("{}={}", cli::SHARE_LABEL, cli::share_key(&plan.share)),
+            ]);
         }
         for p in &plan.providers {
             args.extend(["--provider".into(), p.clone()]);
@@ -1606,10 +1662,18 @@ impl App {
                     .map(|_| format!("Detached {first} from {sb}"))
                 });
             }
+            SelKind::OpenShared(hits) => {
+                if let Some(hit) = hits.into_iter().find(|h| hit_label(h) == first) {
+                    self.go_to(hit);
+                }
+            }
             SelKind::ShareChoice(mut plan) => {
                 if first == "No folder" {
                     self.ask_command(plan);
-                } else if let Some(dir) = first.strip_prefix("Current folder: ") {
+                } else if let Some(dir) = first
+                    .strip_prefix("Current folder: ")
+                    .or_else(|| first.strip_prefix("Git repo root: "))
+                {
                     plan.share = dir.into();
                     self.ask_access(plan);
                 } else {
@@ -2051,12 +2115,14 @@ impl App {
 
     fn ask_share(&mut self, plan: Plan) {
         if self.shares_supported() {
-            let here = std::env::current_dir()
-                .map(|d| d.display().to_string())
-                .unwrap_or_default();
             let mut items = vec!["No folder".to_string()];
-            if !here.is_empty() {
-                items.push(format!("Current folder: {here}"));
+            for (i, dir) in cli::project_dirs().iter().enumerate() {
+                let what = if i == 0 {
+                    "Current folder"
+                } else {
+                    "Git repo root"
+                };
+                items.push(format!("{what}: {dir}"));
             }
             items.push("Other folder...".into());
             self.select(
