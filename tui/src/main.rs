@@ -323,6 +323,22 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sandbox_paths_follow_the_current_folder_inside_the_share() {
+        assert_eq!(
+            cli::sandbox_paths("/h/proj", "/h/proj/src/a"),
+            vec!["/sandbox/proj/src/a", "/sandbox/proj"]
+        );
+        assert_eq!(
+            cli::sandbox_paths("/h/proj", "/h/proj"),
+            vec!["/sandbox/proj"]
+        );
+        assert_eq!(
+            cli::sandbox_paths("/h/proj", "/elsewhere"),
+            vec!["/sandbox/proj"]
+        );
+    }
+
     use super::*;
     use crate::cli::{Cond, Image, Profile, Provider, Sandbox, Snapshot};
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

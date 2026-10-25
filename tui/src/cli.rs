@@ -234,6 +234,60 @@ pub fn project_dirs() -> Vec<String> {
     dirs
 }
 
+/// Where host folder `shared` appears in a sandbox, plus the spot inside it matching `cwd`.
+/// Shared folders are mounted at `/sandbox/<folder name>`; most specific path first.
+pub fn sandbox_paths(shared: &str, cwd: &str) -> Vec<String> {
+    let shared = std::path::Path::new(shared);
+    let Some(name) = shared.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let root = format!("/sandbox/{name}");
+    let mut paths = Vec::new();
+    if let Ok(rel) = std::path::Path::new(cwd).strip_prefix(shared) {
+        if !rel.as_os_str().is_empty() {
+            paths.push(format!("{root}/{}", rel.display()));
+        }
+    }
+    paths.push(root);
+    paths
+}
+
+/// Folders to try as the start directory of a shell in `sandbox`: empty unless the sandbox
+/// shares the current folder or its git root.
+pub fn start_dirs(sandbox: &str) -> Vec<String> {
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    for dir in project_dirs() {
+        let selector = format!("{SHARE_LABEL}={}", share_key(&dir));
+        let args = with_gateway(
+            [
+                "sandbox",
+                "list",
+                "--selector",
+                &selector,
+                "--output",
+                "json",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+        );
+        let Ok(v) = run("openshell", &args, &[]).and_then(|t| parse(&t)) else {
+            continue;
+        };
+        let shares = v["sandboxes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|s| text(&s["name"]) == sandbox);
+        if shares {
+            return sandbox_paths(&dir, &cwd);
+        }
+    }
+    Vec::new()
+}
+
 /// Ready sandboxes on any gateway sharing the current folder or, failing that, its git root,
 /// as (gateway, sandbox). The active gateway comes first.
 pub fn find_shared() -> Vec<(String, String)> {

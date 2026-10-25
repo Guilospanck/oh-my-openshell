@@ -620,9 +620,25 @@ pub struct Session {
     selecting: bool,
 }
 
+/// Shell script for a new session: puts `~/.local/bin` on PATH, enters the first of `dirs`
+/// that exists, then replaces itself with `bash`.
+fn start_script(dirs: &[String]) -> String {
+    let mut script = String::from("export PATH=\"$HOME/.local/bin:$PATH\"; ");
+    for d in dirs {
+        script.push_str(&format!(
+            "cd '{}' 2>/dev/null || ",
+            d.replace('\'', "'\\''")
+        ));
+    }
+    script.push_str("true; exec bash");
+    script
+}
+
 impl Session {
     /// `bash` in the sandbox with `~/.local/bin` on PATH, like the other in-sandbox commands.
+    /// A sandbox sharing the current project starts inside the shared folder.
     pub fn open(sandbox: String, cols: u16, rows: u16) -> Result<Self, String> {
+        let script = start_script(&cli::start_dirs(&sandbox));
         let args = cli::with_gateway(vec![
             "sandbox".into(),
             "exec".into(),
@@ -632,7 +648,7 @@ impl Session {
             "--".into(),
             "sh".into(),
             "-c".into(),
-            "export PATH=\"$HOME/.local/bin:$PATH\"; exec bash".into(),
+            script,
         ]);
         Self::spawn(sandbox, cli::gateway(), "openshell", &args, cols, rows)
     }
@@ -855,6 +871,18 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn start_script_tries_each_dir_and_quotes_them() {
+        assert_eq!(
+            start_script(&[]),
+            "export PATH=\"$HOME/.local/bin:$PATH\"; true; exec bash"
+        );
+        let s = start_script(&["/sandbox/it's/src".into(), "/sandbox/it's".into()]);
+        assert!(s.contains(
+            "cd '/sandbox/it'\\''s/src' 2>/dev/null || cd '/sandbox/it'\\''s' 2>/dev/null || true;"
+        ));
+    }
+
     use super::*;
 
     fn vt() -> Vt {
