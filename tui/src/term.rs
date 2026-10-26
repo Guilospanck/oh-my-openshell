@@ -961,7 +961,12 @@ mod tests {
         let s = git_identity_exports(Some("O'Neil"), Some("a@b.c"));
         assert!(s.contains("export GIT_AUTHOR_NAME='O'\\''Neil'; "));
         assert!(s.contains("export GIT_COMMITTER_EMAIL='a@b.c'; "));
-        assert_eq!(git_identity_exports(None, Some("a@b.c")).matches("export").count(), 2);
+        assert_eq!(
+            git_identity_exports(None, Some("a@b.c"))
+                .matches("export")
+                .count(),
+            2
+        );
     }
 
     fn vt() -> Vt {
