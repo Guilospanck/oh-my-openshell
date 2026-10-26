@@ -50,9 +50,12 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   `gateway-reset` and the TUI hints branch on `uname` / `cfg!(target_os)`.
   `just gateway-docker` is a no-op there. Linux needs Docker Engine, Zig 0.15
   (PATH or Linuxbrew) and `wl-paste` or `xclip` for image paste.
-- Only macOS has been run by hand. The Linux install, uninstall and
-  gateway-reset paths were written from OpenShell's installer and systemd unit
-  (`deploy/deb/openshell-gateway.service`), not run on Linux.
+- `just test-linux` (Docker; `tests/linux/`) runs the real build, clippy and
+  tests on Ubuntu, and the Linux `install`, `uninstall` and `gateway-reset`
+  paths against stubbed `curl`, `systemctl`, `docker` and `openshell`. Run it
+  after changing any of those. It proves our scripts call the right commands,
+  not that OpenShell's packages and systemd unit behave as assumed; a real
+  Linux host with Docker Engine is still untested.
 - Keep new code portable: no BSD-only or GNU-only flags without a branch on
   `uname` / `cfg!(target_os)`, no hard-coded `/opt/homebrew` outside the macOS
   files above.

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/_log"
+log "$@"
+case "$1 $2" in "ps -aq") echo abc123 ;; "volume ls") echo vol1 ;; esac; exit 0

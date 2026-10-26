@@ -195,7 +195,9 @@ test and change the repo. For humans: `just doctor` checks the prerequisites,
 and a bare `just` lists the recipes. Both build on macOS and Linux (Zig 0.15 on
 PATH, or `brew install zig@0.15` with Homebrew or Linuxbrew). The Linux
 install, uninstall and gateway-reset paths follow OpenShell's packaged systemd
-service but were written without a Linux host and are untested.
+service. `just test-linux` checks them in Docker against stubbed system tools
+(and runs the real build and tests on Ubuntu); they have not run on a real
+Linux host.
 
 ## Setup without osh
 

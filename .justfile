@@ -51,6 +51,10 @@ check:
 	cargo clippy --all-targets --manifest-path "$manifest" -- -D warnings
 	cargo test --manifest-path "$manifest"
 
+# Runs the Linux test suite in Docker (real build and checks, stubbed install/uninstall/gateway-reset)
+test-linux *args:
+	@"{{justfile_directory()}}/tests/linux/run.sh" {{args}}
+
 # Installs or upgrades OpenShell (OPENSHELL_VERSION=v0.1.5 pins a release) and links osh into PATH
 install: link
 	#!/usr/bin/env bash

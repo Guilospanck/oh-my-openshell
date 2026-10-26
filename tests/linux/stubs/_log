@@ -1,0 +1,2 @@
+# Sourced by the stubs: record "<command> <args>" in $STUB_LOG.
+log() { echo "$(basename "$0") $*" >> "${STUB_LOG:?}"; }

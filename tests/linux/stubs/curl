@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+. "$(dirname "$0")/_log"
+log "$@"
+echo "echo installer-ran >> \"$STUB_LOG\""
