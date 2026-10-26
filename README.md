@@ -195,10 +195,10 @@ is a GitHub repository, the wizard asks about GitHub access to it: none,
 read-only (the `github` provider), an existing repo provider, or read and
 write with a new fine-grained token. For read/write osh shows the steps and
 opens GitHub's token page with the owner, a 30 day expiry and the permissions
-(Contents and Pull requests: Read and write) filled in. GitHub cannot
+(Contents, Pull requests and Workflows: Read and write) filled in. GitHub cannot
 preselect the repository, so the steps tell you to choose "Only select
-repositories" and pick it (add Workflows only to push `.github/workflows`; an
-organization may have to approve the token first). Paste the token (hidden);
+repositories" and pick it (Workflows is needed to push
+`.github/workflows`; an organization may have to approve the token first). Paste the token (hidden);
 osh checks it can see the repo before using it.
 
 osh then imports a profile `gh-<owner>-<repo>`: the `github` profile's read

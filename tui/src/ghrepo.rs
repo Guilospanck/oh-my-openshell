@@ -90,7 +90,7 @@ pub fn token_url(r: &GhRepo, label: &str) -> String {
     let name: String = format!("osh-{}", slug(label)).chars().take(40).collect();
     let name = name.trim_end_matches('-');
     format!(
-        "https://github.com/settings/personal-access-tokens/new?name={}&description={}&target_name={}&expires_in={TOKEN_DAYS}&contents=write&pull_requests=write",
+        "https://github.com/settings/personal-access-tokens/new?name={}&description={}&target_name={}&expires_in={TOKEN_DAYS}&contents=write&pull_requests=write&workflows=write",
         encode(name),
         encode(&format!("osh sandbox access to {}", r.full())),
         encode(&r.owner),
@@ -103,7 +103,7 @@ pub fn steps(r: &GhRepo, url: &str) -> String {
         "Create a fine-grained token for {full}:\n\
          1. Open {url}\n\
          2. Resource owner: {owner}. Repository access: Only select repositories, then {full}.\n\
-         3. Keep Contents and Pull requests at Read and write (add Workflows only if you push .github/workflows).\n\
+         3. Keep Contents, Pull requests and Workflows at Read and write (GitHub rejects a push that touches .github/workflows without Workflows).\n\
          4. Expiration: {TOKEN_DAYS} days. Generate the token and copy it.\n\
          An organization may need to approve the token before it works.",
         full = r.full(),
@@ -378,8 +378,8 @@ mod tests {
         assert!(u.contains("target_name=acme&"));
         assert!(u.contains("expires_in=30&"));
         assert!(u.contains("contents=write") && u.contains("pull_requests=write"));
+        assert!(u.contains("workflows=write"));
         assert!(u.contains("description=osh%20sandbox%20access%20to%20acme%2Fapp"));
-        assert!(!u.contains("workflows"));
     }
 
     #[test]
