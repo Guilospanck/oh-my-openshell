@@ -2,6 +2,7 @@
 //! status, embedded sandbox shells, plus creating, providers, profiles and images.
 mod app;
 mod cli;
+mod clip;
 mod logview;
 mod term;
 mod ui;

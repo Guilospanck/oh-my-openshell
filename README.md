@@ -92,6 +92,25 @@ you scroll (wheel, `Shift-PgUp`) or new output arrives, so it can span more
 than one screen; text dropped from the scrollback drops it. `Esc`, typing or a
 click clears it.
 
+### Clipboard between host and sandbox
+
+**Sandbox to host.** When a program in the focused shell copies text (OSC 52,
+as Claude Code does), osh puts it on the host clipboard the same way a drag
+does and shows `sandbox copied N chars`. Only plain text up to 1 MiB from the
+shell in front is taken; clipboard reads and background shells are ignored.
+A program in the sandbox can overwrite your clipboard this way, so check what
+you paste into a host terminal.
+
+**Host to sandbox (images).** `Ctrl-V` in a shell with an image on the host
+clipboard (a screenshot, say) uploads it as a PNG to `~/.osh-paste/` in the
+sandbox and types its path, which Claude Code and other agents that take image
+paths attach as an image. With no image on the clipboard, `Ctrl-V` goes to the
+shell as usual. The clipboard is read only when you press it, images over
+20 MiB are refused, the host copy lives in a private temp directory only for
+the upload, and the sandbox copies are deleted when the last shell for that
+sandbox closes. The host needs `pngpaste` (macOS; `just install` installs it),
+`wl-paste` (Wayland) or `xclip` (X11).
+
 ## Gateways
 
 - **vm** (default, Homebrew service, libkrun): fixed size per VM.

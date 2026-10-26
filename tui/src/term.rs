@@ -12,8 +12,8 @@ use libghostty_vt::screen::{CellWide, Screen, TrackedGridRef};
 use libghostty_vt::selection::{FormatOptions, Selection as GhosttySel};
 use libghostty_vt::style::{StyleColor, Underline};
 use libghostty_vt::terminal::{
-    ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType, Mode, Options, Point,
-    PointCoordinate, PointSpace, PrimaryDeviceAttributes, ScrollViewport,
+    ClipboardLocation, ConformanceLevel, DeviceAttributeFeature, DeviceAttributes, DeviceType,
+    Mode, Options, Point, PointCoordinate, PointSpace, PrimaryDeviceAttributes, ScrollViewport,
     SecondaryDeviceAttributes, Terminal, TertiaryDeviceAttributes,
 };
 use libghostty_vt::{focus, paste};
@@ -29,7 +29,11 @@ use ratatui::{
 use std::{
     cell::RefCell,
     io::{Read, Write},
-    sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
+    sync::{
+        atomic::AtomicBool,
+        mpsc::{self, Receiver, Sender, SyncSender, TryRecvError},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -43,6 +47,8 @@ pub const SCROLLBACK: usize = 16 << 20;
 const QUEUE: usize = 64;
 /// Output bytes parsed per session per loop iteration, so input stays responsive.
 const BUDGET: usize = 1 << 20;
+/// Largest clipboard write taken from a program in the sandbox.
+const MAX_CLIPBOARD: usize = 1 << 20;
 
 /// Ctrl-]: legacy terminals send 0x1d, which crossterm reports as Ctrl+5.
 pub fn is_chord(k: &KeyEvent) -> bool {
@@ -208,6 +214,19 @@ struct Sel {
     screen: Screen,
 }
 
+/// Bytes that paste `text` into a program.
+pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
+    let mut data = text.into_bytes();
+    let mut out = vec![0u8; data.len() + 32];
+    match paste::encode(&mut data, bracketed, &mut out) {
+        Ok(n) => {
+            out.truncate(n);
+            out
+        }
+        Err(_) => Vec::new(),
+    }
+}
+
 fn viewport(x: u16, y: u16) -> Point {
     Point::Viewport(PointCoordinate { x, y: y as u32 })
 }
@@ -249,6 +268,8 @@ pub struct Vt {
     kev: KeyEv<'static>,
     mice: MouseEncoder<'static>,
     mev: MouseEv<'static>,
+    /// Text the program in the shell asked to put on the clipboard (OSC 52).
+    clip: Receiver<String>,
     pub cols: u16,
     pub rows: u16,
 }
@@ -299,6 +320,18 @@ impl Vt {
         })
         .map_err(err)?;
         term.on_xtversion(|_| Some("osh")).map_err(err)?;
+        let (clip_tx, clip) = mpsc::channel();
+        term.on_clipboard_write(move |_, w| {
+            if w.location() == ClipboardLocation::Standard {
+                if let Some(c) = w.contents().find(|c| c.mime.starts_with("text/")) {
+                    if !c.data.is_empty() && c.data.len() <= MAX_CLIPBOARD {
+                        let _ = clip_tx.send(c.data.to_string());
+                    }
+                }
+            }
+            Ok(())
+        })
+        .map_err(err)?;
         Ok(Vt {
             sel: None,
             term,
@@ -311,6 +344,7 @@ impl Vt {
             kev: KeyEv::new().map_err(err)?,
             mice: MouseEncoder::new().map_err(err)?,
             mev: MouseEv::new().map_err(err)?,
+            clip,
             cols,
             rows,
         })
@@ -454,16 +488,17 @@ impl Vt {
     }
 
     pub fn paste(&self, text: String) -> Vec<u8> {
-        let bracketed = self.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
-        let mut data = text.into_bytes();
-        let mut out = vec![0u8; data.len() + 32];
-        match paste::encode(&mut data, bracketed, &mut out) {
-            Ok(n) => {
-                out.truncate(n);
-                out
-            }
-            Err(_) => Vec::new(),
-        }
+        paste_bytes(text, self.bracketed_paste())
+    }
+
+    /// Whether the program asked for pastes to be wrapped in bracketed-paste markers.
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode(Mode::BRACKETED_PASTE).unwrap_or(false)
+    }
+
+    /// The latest text the program asked to copy since the last call.
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.clip.try_iter().last()
     }
 
     pub fn focus(&self, gained: bool) -> Vec<u8> {
@@ -618,6 +653,8 @@ pub struct Session {
     pub exited: bool,
     /// A left-drag is selecting text; it is drawn reversed and copied on release.
     selecting: bool,
+    /// Set once an image was pasted into this sandbox, so closing the last shell cleans up.
+    pub pasted: Arc<AtomicBool>,
 }
 
 /// Shell script for a new session: puts `~/.local/bin` on PATH, enters the first of `dirs`
@@ -715,6 +752,7 @@ impl Session {
             reaped: None,
             exited: false,
             selecting: false,
+            pasted: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -844,6 +882,11 @@ impl Session {
         None
     }
 
+    /// Channel into the shell's input, for a thread that types after the UI moved on.
+    pub fn input(&self) -> Sender<Vec<u8>> {
+        self.tx.clone()
+    }
+
     pub fn on_paste(&mut self, text: String) {
         self.vt.bottom();
         let b = self.vt.paste(text);
@@ -891,6 +934,20 @@ mod tests {
 
     fn enc(v: &mut Vt, code: KeyCode, m: KeyModifiers) -> String {
         v.key(&KeyEvent::new(code, m)).escape_ascii().to_string()
+    }
+
+    #[test]
+    fn program_clipboard_writes_reach_the_host_only_as_plain_standard_text() {
+        let mut v = vt();
+        v.feed(b"\x1b]52;c;aGkK\x07");
+        assert_eq!(v.take_clipboard().as_deref(), Some("hi\n"));
+        assert_eq!(v.take_clipboard(), None);
+        // Reads, the primary selection and an empty payload are not copies.
+        v.feed(b"\x1b]52;c;?\x07\x1b]52;p;aGkK\x07\x1b]52;c;\x07");
+        assert_eq!(v.take_clipboard(), None);
+        // Only the last of several writes counts.
+        v.feed(b"\x1b]52;c;YQ==\x07\x1b]52;c;Yg==\x07");
+        assert_eq!(v.take_clipboard().as_deref(), Some("b"));
     }
 
     #[test]

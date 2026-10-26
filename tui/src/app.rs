@@ -1,5 +1,6 @@
 //! Application state, modal flows and key handling.
 use crate::cli::{self, Snapshot};
+use crate::clip;
 use crate::logview::LogView;
 use crate::term::{self, Session};
 use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
@@ -8,7 +9,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::{mpsc::Sender, Arc, Mutex},
+    sync::{atomic::Ordering, mpsc::Sender, Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
@@ -811,6 +812,10 @@ impl App {
         self.follows
             .retain(|f| !(f.sandbox == s.sandbox && f.gateway == s.gateway));
         if !self.sessions.iter().any(|o| o.sandbox == s.sandbox) {
+            if s.pasted.load(Ordering::Relaxed) {
+                let (gateway, sandbox) = (s.gateway.clone(), s.sandbox.clone());
+                thread::spawn(move || clip::clean(&gateway, &sandbox));
+            }
             self.watch.end_session(&s.sandbox);
             if matches!(&self.modal, Some(Modal::Select { kind: SelKind::Blocked { sandbox, .. }, .. }) if *sandbox == s.sandbox)
             {
@@ -838,8 +843,18 @@ impl App {
 
     /// Feed every shell's output to its terminal, focused or not, and drop ended ones.
     pub fn pump_sessions(&mut self) {
-        for s in &mut self.sessions {
+        let mut copy = None;
+        for (i, s) in self.sessions.iter_mut().enumerate() {
             s.pump();
+            // Only the shell in front may write to the host clipboard; others are dropped.
+            if let Some(t) = s.vt.take_clipboard() {
+                if self.active == Some(i) {
+                    copy = Some(t);
+                }
+            }
+        }
+        if let Some(t) = copy {
+            self.copy(&t, "sandbox copied");
         }
         while let Some(i) = self.sessions.iter().position(|s| s.exited) {
             let s = self.close_session(i);
@@ -863,13 +878,13 @@ impl App {
     pub fn on_mouse(&mut self, me: MouseEvent) {
         if self.modal.is_none() {
             if let Some(text) = self.session_mut().and_then(|s| s.on_mouse(&me)) {
-                self.copy(&text);
+                self.copy(&text, "copied");
             }
         }
     }
 
     /// Host clipboard: OSC 52 through the terminal, plus `pbcopy` on macOS.
-    fn copy(&mut self, text: &str) {
+    fn copy(&mut self, text: &str, what: &str) {
         let mut out = std::io::stdout();
         let _ = out
             .write_all(term::osc52(text).as_bytes())
@@ -887,7 +902,7 @@ impl App {
                 thread::spawn(move || c.wait());
             }
         }
-        self.status = format!("copied {} chars", text.chars().count());
+        self.status = format!("{what} {} chars", text.chars().count());
     }
 
     /// Read new log lines of every open shell's sandbox, then show the next prompt when
@@ -1042,6 +1057,10 @@ impl App {
 
     pub fn on_paste(&mut self, text: String) {
         if self.modal.is_none() {
+            // A terminal that holds only an image on the clipboard reports an empty paste.
+            if text.is_empty() && self.paste_image() {
+                return;
+            }
             if let Some(s) = self.session_mut() {
                 s.on_paste(text);
             }
@@ -2401,9 +2420,40 @@ impl App {
             self.modal_key(modal, key);
             return;
         }
+        // Ctrl-V with an image on the host clipboard; otherwise the shell gets the key.
+        if key.modifiers == KeyModifiers::CONTROL
+            && key.code == KeyCode::Char('v')
+            && self.paste_image()
+        {
+            return;
+        }
         if let Some(s) = self.session_mut() {
             s.on_key(&key);
         }
+    }
+
+    /// Upload the host clipboard's image to the focused shell's sandbox and type its path
+    /// there. False when the clipboard holds no image.
+    fn paste_image(&mut self) -> bool {
+        if self.session().is_none() {
+            return false;
+        }
+        let Some(png) = clip::host_image() else {
+            return false;
+        };
+        let Some(s) = self.session() else {
+            return false;
+        };
+        let (gateway, sandbox) = (s.gateway.clone(), s.sandbox.clone());
+        let (input, bracketed, pasted) = (s.input(), s.vt.bracketed_paste(), s.pasted.clone());
+        self.status = format!("Uploading image ({} KB) to {sandbox}...", png.len() / 1024);
+        self.bg_msg(move || {
+            let path = clip::upload(&gateway, &sandbox, &png)?;
+            pasted.store(true, Ordering::Relaxed);
+            let _ = input.send(term::paste_bytes(path.clone(), bracketed));
+            Ok(format!("Pasted image ({} KB): {path}", png.len() / 1024))
+        });
+        true
     }
 
     fn switch(&mut self, i: usize) {

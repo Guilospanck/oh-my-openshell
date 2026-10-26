@@ -9,6 +9,8 @@ install: link
 	fi
 
 	brew install e2fsprogs
+	# zig@0.15 builds osh's embedded terminal; pngpaste reads host clipboard images for Ctrl-V in a shell.
+	brew install zig@0.15 pngpaste
 	curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 
 	config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/openshell"
