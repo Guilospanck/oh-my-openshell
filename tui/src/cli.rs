@@ -1,4 +1,5 @@
 //! Thin wrappers around the `openshell`, `docker` and `just` CLIs.
+use crate::ghrepo::{self, GhRepo, Tracked};
 use serde_json::Value;
 use std::{
     fs,
@@ -424,6 +425,206 @@ pub fn attach_profile(dir: &Path, sandbox: &str, id: &str) -> Result<String, Str
         "30",
     ])
     .map(|_| format!("Attached {id} to {sandbox}"))
+}
+
+/// The GitHub repository the `origin` remote of git folder `dir` points at, if any.
+pub fn repo_origin(dir: &str) -> Option<GhRepo> {
+    let args = ["-C", dir, "remote", "get-url", "origin"].map(String::from);
+    ghrepo::parse_remote(&run("git", &args, &[]).ok()?)
+}
+
+/// Open `url` in the host's browser. False when no opener could be started.
+pub fn open_url(url: &str) -> bool {
+    let opener = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    Command::new(opener)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+/// HTTP status of `GET /repos/OWNER/REPO` with `token`. The token reaches curl in a private
+/// header file, so it never appears in argv.
+pub fn repo_status(repo: &GhRepo, token: &str) -> Result<u16, String> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let file = std::env::temp_dir().join(format!(
+        "osh-hdr-{}-{}",
+        std::process::id(),
+        ghrepo::now_secs()
+    ));
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&file)
+        .map_err(|e| e.to_string())?;
+    let written = writeln!(f, "Authorization: Bearer {token}");
+    drop(f);
+    let out = written.map_err(|e| e.to_string()).and_then(|_| {
+        let args = [
+            "-sS".to_string(),
+            "--max-time".into(),
+            "15".into(),
+            "-o".into(),
+            "/dev/null".into(),
+            "-w".into(),
+            "%{http_code}".into(),
+            "-H".into(),
+            format!("@{}", file.display()),
+            "-H".into(),
+            "Accept: application/vnd.github+json".into(),
+            "-H".into(),
+            "User-Agent: osh".into(),
+            format!("https://api.github.com/repos/{}", repo.full()),
+        ];
+        run("curl", &args, &[])
+    });
+    let _ = fs::remove_file(&file);
+    out?.trim()
+        .parse()
+        .map_err(|_| "GitHub gave no HTTP status".to_string())
+}
+
+/// Why a repo check failed, or `None` when `status` means the token can see the repo.
+pub fn repo_status_problem(status: u16, repo: &GhRepo) -> Option<String> {
+    let full = repo.full();
+    match status {
+        200 => None,
+        401 => Some("GitHub rejected the token (401): copy all of it, and check it has not expired".into()),
+        403 => Some(format!(
+            "GitHub refused the token for {full} (403): the organization may need to approve it"
+        )),
+        404 => Some(format!(
+            "The token cannot see {full} (404): set Resource owner to {} and select that repository",
+            repo.owner
+        )),
+        s => Some(format!("GitHub answered {s} for {full}")),
+    }
+}
+
+fn track_repo(provider: &str, repo: &GhRepo) {
+    let args = [
+        "provider".to_string(),
+        "update".into(),
+        provider.into(),
+        "--credential-expires-at".into(),
+        format!(
+            "GITHUB_TOKEN={}",
+            ghrepo::expiry_ms(ghrepo::now_secs(), ghrepo::TOKEN_DAYS)
+        ),
+    ];
+    let _ = exec("openshell", &args, &[]);
+    ghrepo::track(
+        ghrepo::tracked_path().as_deref(),
+        Tracked {
+            gateway: gateway(),
+            provider: provider.into(),
+            expiry_ms: ghrepo::expiry_ms(ghrepo::now_secs(), ghrepo::TOKEN_DAYS),
+            repo: repo.full(),
+        },
+    );
+}
+
+/// Import the repo's push profile when the gateway lacks it, then create `provider` from it
+/// with `token`. The token goes through the environment, never argv.
+pub fn create_repo_provider(repo: &GhRepo, provider: &str, token: &str) -> Result<String, String> {
+    let id = ghrepo::profile_id(repo);
+    let imported = os(&["profile", "describe", &id]).is_err();
+    if imported {
+        let tmp = std::env::temp_dir().join(format!("osh-{id}.yaml"));
+        fs::write(&tmp, ghrepo::push_profile(repo)).map_err(|e| e.to_string())?;
+        let r = os(&["profile", "import", "--file", &tmp.to_string_lossy()]);
+        let _ = fs::remove_file(&tmp);
+        r?;
+    }
+    let args: Vec<String> = [
+        "provider",
+        "create",
+        "--name",
+        provider,
+        "--type",
+        &id,
+        "--credential",
+        "GITHUB_TOKEN",
+    ]
+    .map(String::from)
+    .to_vec();
+    let env = [("GITHUB_TOKEN".to_string(), token.to_string())];
+    if let Err(e) = exec("openshell", &args, &env) {
+        if imported {
+            let _ = os(&["profile", "delete", &id]);
+        }
+        return Err(e);
+    }
+    track_repo(provider, repo);
+    Ok(format!("Created provider {provider} for {}", repo.full()))
+}
+
+/// Swap in a new token for a repo provider and restart its 30 day clock.
+pub fn renew_repo_token(repo: &GhRepo, provider: &str, token: &str) -> Result<String, String> {
+    update_credentials(provider, &[("GITHUB_TOKEN".into(), token.into())])?;
+    track_repo(provider, repo);
+    Ok(format!("Renewed the token of {provider} ({})", repo.full()))
+}
+
+/// Running sandboxes among `sandboxes` that have `provider` attached.
+pub fn running_with(provider: &str, sandboxes: &[Sandbox]) -> Vec<String> {
+    sandboxes
+        .iter()
+        .filter(|s| s.phase == "Ready")
+        .filter(|s| attached_providers(&s.name).iter().any(|p| p == provider))
+        .map(|s| s.name.clone())
+        .collect()
+}
+
+/// Stop and start `sandbox`, so its programs start with the current provider credentials.
+pub fn restart_sandbox(sandbox: &str) -> Result<(), String> {
+    os(&["sandbox", "stop", sandbox])?;
+    os(&["sandbox", "start", sandbox]).map(|_| ())
+}
+
+/// Remove the per-sandbox repo providers of a deleted sandbox, and their profiles once no
+/// other provider uses them. Returns the providers removed.
+pub fn drop_repo_providers(sandbox: &str, providers: &[Provider]) -> Vec<String> {
+    let file = ghrepo::tracked_path();
+    let gw = gateway();
+    let mine: Vec<Tracked> = ghrepo::load_tracked(file.as_deref())
+        .into_iter()
+        .filter(|t| {
+            t.gateway == gw
+                && ghrepo::parse_remote(&format!("https://github.com/{}", t.repo))
+                    .is_some_and(|r| ghrepo::provider_name(sandbox, &r) == t.provider)
+        })
+        .collect();
+    let mut removed = Vec::new();
+    for t in &mine {
+        if os(&["provider", "delete", &t.provider]).is_ok() {
+            ghrepo::untrack(file.as_deref(), &gw, &t.provider);
+            removed.push(t.provider.clone());
+        }
+    }
+    for t in &mine {
+        let Some(ty) = providers
+            .iter()
+            .find(|p| p.name == t.provider)
+            .map(|p| &p.ty)
+        else {
+            continue;
+        };
+        let used = providers
+            .iter()
+            .any(|p| &p.ty == ty && !removed.contains(&p.name));
+        if !used {
+            let _ = os(&["profile", "delete", ty]);
+        }
+    }
+    removed
 }
 
 /// Replace the ad-hoc rule for `host:port` with a generated provider that allows encoded slashes.
@@ -1092,6 +1293,20 @@ pub fn sync_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_status_problems_tell_the_user_what_to_fix() {
+        let r = GhRepo {
+            owner: "acme".into(),
+            repo: "app".into(),
+        };
+        assert_eq!(repo_status_problem(200, &r), None);
+        assert!(repo_status_problem(401, &r).unwrap().contains("expired"));
+        assert!(repo_status_problem(403, &r).unwrap().contains("approve"));
+        let nf = repo_status_problem(404, &r).unwrap();
+        assert!(nf.contains("acme/app") && nf.contains("Resource owner to acme"));
+        assert!(repo_status_problem(500, &r).unwrap().contains("500"));
+    }
 
     #[test]
     fn repo_profiles_answer_for_their_hosts_without_credentials() {

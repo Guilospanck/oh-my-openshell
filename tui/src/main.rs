@@ -3,6 +3,7 @@
 mod app;
 mod cli;
 mod clip;
+mod ghrepo;
 mod logview;
 mod term;
 mod ui;
@@ -723,6 +724,7 @@ mod tests {
             msg: "Policy checked".into(),
             next: None,
             sync,
+            gh: None,
         });
         assert!(
             matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title == "sb blocks installs; missing: github.com, pypi.org")
@@ -750,6 +752,7 @@ mod tests {
             msg: "Could not attach github to sb".into(),
             next: None,
             sync,
+            gh: None,
         });
         match &app.modal {
             Some(app::Modal::Select { title, items, .. }) => {

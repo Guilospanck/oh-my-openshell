@@ -1,6 +1,7 @@
 //! Application state, modal flows and key handling.
 use crate::cli::{self, Snapshot};
 use crate::clip;
+use crate::ghrepo::{self, GhRepo};
 use crate::logview::LogView;
 use crate::term::{self, Session};
 use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
@@ -31,6 +32,9 @@ pub const TABS: [(Tab, &str); 5] = [
     (Tab::Gateways, "Gateways"),
 ];
 
+/// Entry in the Providers tab's create list that starts the repo token flow.
+const GH_REPO_ITEM: &str = "GitHub repo, read/write (fine-grained token)...";
+
 #[derive(Clone, Default)]
 pub struct Plan {
     pub image: String,
@@ -44,6 +48,44 @@ pub struct Plan {
     /// Absolute host folder mounted at `/sandbox/<folder name>`; empty = none.
     pub share: String,
     pub share_rw: bool,
+    /// Read/write access to the shared folder's GitHub repo; the provider is created on confirm.
+    pub gh: Option<GhGrant>,
+    /// Where the wizard continues once a provider the plan needs exists.
+    pub resume: Resume,
+}
+
+/// A repo token pasted for a new sandbox; kept in memory only until the provider is created.
+#[derive(Clone)]
+pub struct GhGrant {
+    pub repo: GhRepo,
+    pub token: String,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub enum Resume {
+    #[default]
+    Name,
+    Command,
+    Create,
+}
+
+/// What a repo token is for.
+#[derive(Clone)]
+pub enum Goal {
+    /// A token only this sandbox uses: `github-<sandbox>-<repo>`.
+    Sandbox(Plan),
+    /// A token shared by sandboxes, created for this plan: `github-<repo>`.
+    SharedFor(Plan),
+    /// A shared token created from the Providers tab.
+    Shared,
+    /// A new token for an existing provider.
+    Renew(String),
+}
+
+#[derive(Clone)]
+pub struct RepoFlow {
+    pub repo: GhRepo,
+    pub goal: Goal,
 }
 
 #[derive(Clone)]
@@ -60,6 +102,10 @@ pub enum SelKind {
     AttachProvider(String),
     DetachProvider(String),
     NewProvider,
+    /// GitHub access for the repo of the shared folder.
+    GhAccess(Plan, GhRepo),
+    /// Which tracked repo token of a sandbox to renew.
+    RenewPick(Vec<ghrepo::Tracked>),
     Gateway,
     /// How to obtain the Claude Code setup token; carries the credential flow to resume.
     ClaudeToken(InKind),
@@ -115,6 +161,10 @@ pub enum InKind {
     Memory(Plan),
     Share(Plan),
     Command(Plan),
+    /// The hidden token for a repo; checked against GitHub before it is used.
+    RepoToken(RepoFlow),
+    /// `OWNER/REPO` for a shared repo provider.
+    RepoName,
     /// Name for a generated install-access provider.
     GenName(SyncPlan),
     /// Prompt for each key in turn; `next` resumes a sandbox plan afterwards.
@@ -130,6 +180,10 @@ pub enum InKind {
 #[derive(Clone)]
 pub enum ConfKind {
     CreateSandbox(Plan),
+    /// Show the token steps, open the page, then ask for the token.
+    RepoSteps(RepoFlow),
+    /// Stop and start these sandboxes so they pick up a renewed token.
+    Restart(Vec<String>),
     DeleteSandbox(String),
     DeleteProvider(String),
     ResetGateway(String),
@@ -269,6 +323,21 @@ pub struct Done {
     pub msg: String,
     pub next: Option<(Plan, Vec<String>)>,
     pub sync: Option<SyncStage>,
+    pub gh: Option<GhStage>,
+}
+
+/// Result of checking a pasted repo token against GitHub.
+pub enum GhStage {
+    /// A repo token was swapped; these running sandboxes still use the old one.
+    Renewed {
+        provider: String,
+        sandboxes: Vec<String>,
+    },
+    Checked {
+        flow: Box<RepoFlow>,
+        token: String,
+        problem: Option<String>,
+    },
 }
 
 /// Result of a background step of the "add skills to a sandbox" flow.
@@ -361,6 +430,8 @@ pub struct App {
     sync_secret: Option<SyncPlan>,
     /// `(sandbox, provider)` of generated install access that is still attached.
     temp_access: Option<(String, String)>,
+    /// Repo tokens osh created, with their expiry; shown on the Providers tab.
+    pub tracked: Vec<ghrepo::Tracked>,
     selected: Arc<Mutex<Option<String>>>,
     /// Sandbox (gateway, name) to open once that gateway's snapshot has loaded.
     pending_open: Option<(String, String)>,
@@ -607,6 +678,7 @@ impl App {
             token_flow: None,
             sync_stage: None,
             sync_secret: None,
+            tracked: ghrepo::load_tracked(ghrepo::tracked_path().as_deref()),
             temp_access: None,
             selected,
             pending_open: None,
@@ -1083,6 +1155,7 @@ impl App {
                 msg: format!("Error: {e}"),
                 next: None,
                 sync: None,
+                gh: None,
             });
             let _ = tx.send(d);
         });
@@ -1097,12 +1170,14 @@ impl App {
                 msg,
                 next: None,
                 sync: None,
+                gh: None,
             })
         });
     }
 
     pub fn on_done(&mut self, d: Done) {
         self.status = d.msg;
+        self.tracked = ghrepo::load_tracked(ghrepo::tracked_path().as_deref());
         if self.status.starts_with("Error") {
             self.temp_access = None;
         }
@@ -1162,12 +1237,41 @@ impl App {
             }
             return;
         }
+        match d.gh {
+            Some(GhStage::Checked {
+                flow,
+                token,
+                problem,
+            }) => return self.repo_checked(*flow, token, problem),
+            Some(GhStage::Renewed {
+                provider,
+                sandboxes,
+            }) => {
+                if !sandboxes.is_empty() && !self.status.starts_with("Error") {
+                    self.modal = Some(Modal::Confirm {
+                        text: format!(
+                            "{provider} has a new token, but programs already running in {} keep the old one.\n\nRestart {}? Running programs in {} stop and /tmp is cleared; files in /sandbox are kept.",
+                            sandboxes.join(", "),
+                            if sandboxes.len() == 1 { "it" } else { "them" },
+                            if sandboxes.len() == 1 { "it" } else { "them" },
+                        ),
+                        kind: ConfKind::Restart(sandboxes),
+                    });
+                }
+                return;
+            }
+            None => {}
+        }
         if let Some((plan, mut missing)) = d.next {
             if self.status.starts_with("Error") {
                 return;
             }
             if missing.is_empty() {
-                self.ask_name(plan);
+                match plan.resume {
+                    Resume::Name => self.ask_name(plan),
+                    Resume::Command => self.ask_command(plan),
+                    Resume::Create => self.job = Some(self.sandbox_steps(&plan)),
+                }
             } else {
                 let p = missing.remove(0);
                 self.start_creds(p, false, Some((plan, missing)));
@@ -1320,7 +1424,12 @@ impl App {
                 sync,
                 profile: provider.clone(),
             });
-            Ok(Done { msg, next, sync })
+            Ok(Done {
+                msg,
+                next,
+                sync,
+                gh: None,
+            })
         });
     }
 
@@ -1496,6 +1605,7 @@ impl App {
                             attached,
                             round,
                         }),
+                        gh: None,
                     });
                 }
             }
@@ -1508,6 +1618,7 @@ impl App {
                     check,
                     offered: round,
                 }),
+                gh: None,
             })
         });
     }
@@ -1650,6 +1761,12 @@ impl App {
         for p in &plan.providers {
             args.extend(["--provider".into(), p.clone()]);
         }
+        if let Some(g) = &plan.gh {
+            args.extend([
+                "--provider".into(),
+                ghrepo::provider_name(&plan.name, &g.repo),
+            ]);
+        }
         if plan.command.is_empty() {
             // The detached shell stays the main process; sessions come from `exec`.
             args.push("--detach".into());
@@ -1766,7 +1883,45 @@ impl App {
             }
             SelKind::ShareAccess(mut plan) => {
                 plan.share_rw = first == "Read-write";
-                self.ask_command(plan);
+                self.ask_github(plan);
+            }
+            SelKind::GhAccess(mut plan, repo) => {
+                if first.starts_with("Read-only") {
+                    if !plan.providers.iter().any(|p| p == "github") {
+                        plan.providers.push("github".into());
+                    }
+                    if self.missing(&["github".to_string()]).is_empty() {
+                        self.ask_command(plan);
+                    } else {
+                        plan.resume = Resume::Command;
+                        self.start_creds("github".into(), false, Some((plan, vec![])));
+                    }
+                } else if let Some(name) = first.strip_prefix("Use existing provider ") {
+                    plan.providers.push(name.into());
+                    self.ask_command(plan);
+                } else if first.starts_with("Read and write, a token for this sandbox") {
+                    if plan.name.is_empty() {
+                        plan.name = self.free_name(&ghrepo::slug(&repo.repo));
+                        self.status = format!("Sandbox name set to {}", plan.name);
+                    }
+                    self.repo_steps(RepoFlow {
+                        repo,
+                        goal: Goal::Sandbox(plan),
+                    });
+                } else if first.starts_with("Read and write, a token shared") {
+                    self.repo_steps(RepoFlow {
+                        repo,
+                        goal: Goal::SharedFor(plan),
+                    });
+                } else {
+                    self.ask_command(plan);
+                }
+            }
+            SelKind::RenewPick(tracked) => {
+                let label = first.split_whitespace().next().unwrap_or_default();
+                if let Some(t) = tracked.iter().find(|t| t.provider == label) {
+                    self.renew(t);
+                }
             }
             SelKind::Gateway => {
                 let name = first.split_whitespace().next().unwrap_or_default();
@@ -1829,11 +1984,13 @@ impl App {
                                 profile,
                                 round,
                             }),
+                            gh: None,
                         },
                         Err(e) => Done {
                             msg: format!("Error: {e}"),
                             next: None,
                             sync: None,
+                            gh: None,
                         },
                     };
                     let _ = tx.send(d);
@@ -1920,6 +2077,7 @@ impl App {
                             agent,
                             manifest,
                         }),
+                        gh: None,
                     })
                 });
             }
@@ -1958,6 +2116,7 @@ impl App {
                             check,
                             offered: 0,
                         }),
+                        gh: None,
                     })
                 });
             }
@@ -2049,13 +2208,161 @@ impl App {
                 }
             }
             SelKind::NewProvider => {
-                if self.snap.providers.iter().any(|p| p.name == first) {
+                if first == GH_REPO_ITEM {
+                    let hint = cli::project_dirs()
+                        .iter()
+                        .find_map(|d| cli::repo_origin(d))
+                        .map(|r| r.full())
+                        .unwrap_or_default();
+                    let title = if hint.is_empty() {
+                        "Repository, OWNER/REPO".to_string()
+                    } else {
+                        format!("Repository, OWNER/REPO (empty = {hint})")
+                    };
+                    self.input(&title, false, InKind::RepoName);
+                } else if self.snap.providers.iter().any(|p| p.name == first) {
                     self.modal = Some(Modal::Info(format!(
                         "Provider {first} exists. Use u on the Providers tab to update credentials."
                     )));
                 } else {
                     self.start_creds(first, false, None);
                 }
+            }
+        }
+    }
+
+    /// After the share is set: offer GitHub access when the shared folder is a GitHub repo.
+    fn ask_github(&mut self, plan: Plan) {
+        let Some(repo) = cli::repo_origin(&plan.share) else {
+            return self.ask_command(plan);
+        };
+        let mut items = vec![
+            "No GitHub access".to_string(),
+            "Read-only (the github provider)".into(),
+        ];
+        let id = ghrepo::profile_id(&repo);
+        let now = ghrepo::now_secs();
+        for p in self.snap.providers.iter().filter(|p| p.ty == id) {
+            let note = self
+                .tracked_for(&p.name)
+                .map(|t| format!(" ({})", ghrepo::expiry_note(now, t.expiry_ms)))
+                .unwrap_or_default();
+            items.push(format!("Use existing provider {}{note}", p.name));
+        }
+        items.push("Read and write, a token for this sandbox".into());
+        items.push(format!(
+            "Read and write, a token shared by sandboxes ({})",
+            ghrepo::shared_provider_name(&repo)
+        ));
+        let title = format!("GitHub access to {}", repo.full());
+        self.select(&title, items, false, SelKind::GhAccess(plan, repo));
+    }
+
+    /// `base`, or `base-2`, `base-3`... when a sandbox of that name exists.
+    fn free_name(&self, base: &str) -> String {
+        let taken = |n: &str| self.snap.sandboxes.iter().any(|s| s.name == n);
+        let mut name = base.to_string();
+        let mut i = 2;
+        while taken(&name) {
+            name = format!("{base}-{i}");
+            i += 1;
+        }
+        name
+    }
+
+    /// Label for the token name GitHub shows: the sandbox, or just the repo.
+    fn repo_label(&self, flow: &RepoFlow) -> String {
+        match &flow.goal {
+            Goal::Sandbox(plan) => format!("{}-{}", plan.name, flow.repo.repo),
+            _ => flow.repo.repo.clone(),
+        }
+    }
+
+    fn repo_steps(&mut self, flow: RepoFlow) {
+        let url = ghrepo::token_url(&flow.repo, &self.repo_label(&flow));
+        self.modal = Some(Modal::Confirm {
+            text: format!(
+                "{}\n\nOpen the page now and paste the token next?",
+                ghrepo::steps(&flow.repo, &url)
+            ),
+            kind: ConfKind::RepoSteps(flow),
+        });
+    }
+
+    /// Banner text when a repo token of this gateway expired or expires within a week.
+    pub fn expiry_banner(&self) -> Option<String> {
+        let names: Vec<String> = self.snap.providers.iter().map(|p| p.name.clone()).collect();
+        let now = ghrepo::now_secs();
+        let list = ghrepo::expiring(&self.tracked, &cli::gateway(), &names, now);
+        (!list.is_empty()).then(|| ghrepo::banner(&list, now))
+    }
+
+    fn tracked_for(&self, provider: &str) -> Option<ghrepo::Tracked> {
+        let gw = cli::gateway();
+        self.tracked
+            .iter()
+            .find(|t| t.provider == provider && t.gateway == gw)
+            .cloned()
+    }
+
+    fn renew(&mut self, t: &ghrepo::Tracked) {
+        match ghrepo::parse_remote(&format!("https://github.com/{}", t.repo)) {
+            Some(repo) => self.repo_steps(RepoFlow {
+                repo,
+                goal: Goal::Renew(t.provider.clone()),
+            }),
+            None => self.status = format!("Error: cannot read the repo of {}", t.provider),
+        }
+    }
+
+    /// The pasted token was checked: continue the flow, or ask again with the problem.
+    fn repo_checked(&mut self, flow: RepoFlow, token: String, problem: Option<String>) {
+        if let Some(p) = problem {
+            let title = format!("{p}. Paste again (hidden), Esc cancels");
+            return self.input(&title, true, InKind::RepoToken(flow));
+        }
+        let repo = flow.repo.clone();
+        match flow.goal {
+            Goal::Sandbox(mut plan) => {
+                plan.gh = Some(GhGrant { repo, token });
+                self.ask_command(plan);
+            }
+            Goal::SharedFor(mut plan) => {
+                let provider = ghrepo::shared_provider_name(&repo);
+                plan.providers.push(provider.clone());
+                plan.resume = Resume::Command;
+                self.status = format!("Creating provider {provider}...");
+                self.bg(move || {
+                    cli::create_repo_provider(&repo, &provider, &token)?;
+                    Ok(Done {
+                        msg: format!("Created provider {provider}"),
+                        next: Some((plan, vec![])),
+                        sync: None,
+                        gh: None,
+                    })
+                });
+            }
+            Goal::Shared => {
+                let provider = ghrepo::shared_provider_name(&repo);
+                self.status = format!("Creating provider {provider}...");
+                self.bg_msg(move || cli::create_repo_provider(&repo, &provider, &token));
+            }
+            Goal::Renew(provider) => {
+                self.status = format!("Renewing the token of {provider}...");
+                let sandboxes = self.snap.sandboxes.clone();
+                self.bg(move || {
+                    let msg = cli::renew_repo_token(&repo, &provider, &token)?;
+                    let running = cli::running_with(&provider, &sandboxes);
+                    Ok(Done {
+                        msg,
+                        next: None,
+                        sync: None,
+                        gh: Some(GhStage::Renewed {
+                            provider,
+                            sandboxes: running,
+                        }),
+                    })
+                });
             }
         }
     }
@@ -2114,6 +2421,7 @@ impl App {
                         msg: "Profile generated".into(),
                         next: None,
                         sync: Some(SyncStage::Generated { sync, name, yaml }),
+                        gh: None,
                     })
                 });
             }
@@ -2176,9 +2484,56 @@ impl App {
                     .map(|s| format!("{} {}", s.prog, s.args.join(" ")))
                     .collect::<Vec<_>>()
                     .join("\n");
+                let extra = plan.gh.as_ref().map_or(String::new(), |g| {
+                    format!(
+                        "First creates provider {} for {} from the pasted token (expires in {} days).\n\n",
+                        ghrepo::provider_name(&plan.name, &g.repo),
+                        g.repo.full(),
+                        ghrepo::TOKEN_DAYS
+                    )
+                });
                 self.modal = Some(Modal::Confirm {
-                    text: format!("Run:\n{summary}\n\nContinue?"),
+                    text: format!("{extra}Run:\n{summary}\n\nContinue?"),
                     kind: ConfKind::CreateSandbox(plan),
+                });
+            }
+            InKind::RepoName => {
+                let text = text.trim();
+                let repo = if text.is_empty() {
+                    cli::project_dirs().iter().find_map(|d| cli::repo_origin(d))
+                } else {
+                    ghrepo::parse_remote(&format!("https://github.com/{text}"))
+                };
+                match repo {
+                    Some(repo) => self.repo_steps(RepoFlow {
+                        repo,
+                        goal: Goal::Shared,
+                    }),
+                    None => self.status = "Error: expected OWNER/REPO on github.com".into(),
+                }
+            }
+            InKind::RepoToken(flow) => {
+                let token = text.trim().to_string();
+                if token.is_empty() {
+                    self.status = "Cancelled: empty value".into();
+                    return;
+                }
+                self.status = format!("Checking the token against {}...", flow.repo.full());
+                self.bg(move || {
+                    let problem = match cli::repo_status(&flow.repo, &token) {
+                        Ok(s) => cli::repo_status_problem(s, &flow.repo),
+                        Err(e) => Some(format!("Could not reach GitHub: {e}")),
+                    };
+                    Ok(Done {
+                        msg: "Checked the token".into(),
+                        next: None,
+                        sync: None,
+                        gh: Some(GhStage::Checked {
+                            flow: Box::new(flow),
+                            token,
+                            problem,
+                        }),
+                    })
                 });
             }
             InKind::Cred {
@@ -2298,10 +2653,56 @@ impl App {
 
     fn on_confirm(&mut self, kind: ConfKind) {
         match kind {
-            ConfKind::CreateSandbox(plan) => self.job = Some(self.sandbox_steps(&plan)),
-            ConfKind::DeleteSandbox(name) => self.bg_msg(move || {
-                cli::os(&["sandbox", "delete", &name]).map(|_| format!("Deleted sandbox {name}"))
-            }),
+            ConfKind::CreateSandbox(mut plan) => match plan.gh.take() {
+                None => self.job = Some(self.sandbox_steps(&plan)),
+                Some(g) => {
+                    let provider = ghrepo::provider_name(&plan.name, &g.repo);
+                    plan.gh = Some(GhGrant {
+                        repo: g.repo.clone(),
+                        token: String::new(),
+                    });
+                    plan.resume = Resume::Create;
+                    self.status = format!("Creating provider {provider}...");
+                    self.bg(move || {
+                        cli::create_repo_provider(&g.repo, &provider, &g.token)?;
+                        Ok(Done {
+                            msg: format!("Created provider {provider}"),
+                            next: Some((plan, vec![])),
+                            sync: None,
+                            gh: None,
+                        })
+                    });
+                }
+            },
+            ConfKind::Restart(names) => {
+                self.status = format!("Restarting {}...", names.join(", "));
+                self.bg_msg(move || {
+                    for n in &names {
+                        cli::restart_sandbox(n).map_err(|e| format!("{n}: {e}"))?;
+                    }
+                    Ok(format!("Restarted {}", names.join(", ")))
+                });
+            }
+            ConfKind::RepoSteps(flow) => {
+                let url = ghrepo::token_url(&flow.repo, &self.repo_label(&flow));
+                if !cli::open_url(&url) {
+                    self.status = "Could not open a browser; use the URL shown".into();
+                }
+                let title = format!("Token for {} (hidden)", flow.repo.full());
+                self.input(&title, true, InKind::RepoToken(flow));
+            }
+            ConfKind::DeleteSandbox(name) => {
+                let providers = self.snap.providers.clone();
+                self.bg_msg(move || {
+                    cli::os(&["sandbox", "delete", &name])?;
+                    let gone = cli::drop_repo_providers(&name, &providers);
+                    Ok(if gone.is_empty() {
+                        format!("Deleted sandbox {name}")
+                    } else {
+                        format!("Deleted sandbox {name} and {}", gone.join(", "))
+                    })
+                })
+            }
             ConfKind::Sync(plan) => {
                 self.job = Some(sync_steps(&plan));
                 self.capture = true;
@@ -2322,6 +2723,7 @@ impl App {
                             check,
                             offered: 1,
                         }),
+                        gh: None,
                     })
                 });
             }
@@ -2496,7 +2898,7 @@ impl App {
         let Some(name) = self.selected_sandbox().map(|s| s.name.clone()) else {
             if matches!(
                 code,
-                KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p') | KeyCode::Enter
+                KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p' | 't') | KeyCode::Enter
             ) {
                 self.modal = Some(Modal::Info(
                     "No sandbox selected. This gateway has none: press n to create one (g switches gateway).".into(),
@@ -2506,6 +2908,38 @@ impl App {
         };
         match code {
             KeyCode::Char('p') => self.review(name),
+            KeyCode::Char('t') => {
+                let attached = cli::attached_providers(&name);
+                let mine: Vec<ghrepo::Tracked> = self
+                    .tracked
+                    .iter()
+                    .filter(|t| t.gateway == cli::gateway() && attached.contains(&t.provider))
+                    .cloned()
+                    .collect();
+                match mine.len() {
+                    0 => {
+                        self.modal = Some(Modal::Info(format!(
+                            "{name} has no GitHub repo token created by osh."
+                        )))
+                    }
+                    1 => self.renew(&mine[0]),
+                    _ => {
+                        let now = ghrepo::now_secs();
+                        let items = mine
+                            .iter()
+                            .map(|t| {
+                                format!(
+                                    "{} ({}, {})",
+                                    t.provider,
+                                    t.repo,
+                                    ghrepo::expiry_note(now, t.expiry_ms)
+                                )
+                            })
+                            .collect();
+                        self.select("Renew which token?", items, false, SelKind::RenewPick(mine));
+                    }
+                }
+            }
             KeyCode::Char('l') => match LogView::open(name) {
                 Ok(lv) => self.logview = Some(lv),
                 Err(e) => self.status = format!("Error: {e}"),
@@ -2602,7 +3036,8 @@ impl App {
     fn provider_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('n') => {
-                let ids = cli::profile_ids(&self.dir);
+                let mut ids = cli::profile_ids(&self.dir);
+                ids.push(GH_REPO_ITEM.into());
                 self.select(
                     "Create provider from profile",
                     ids,
@@ -2612,6 +3047,9 @@ impl App {
             }
             KeyCode::Char('u') => {
                 if let Some(p) = self.snap.providers.get(self.current()).cloned() {
+                    if let Some(t) = self.tracked_for(&p.name) {
+                        return self.renew(&t);
+                    }
                     if p.keys.is_empty() {
                         self.modal =
                             Some(Modal::Info(format!("{} stores no credentials.", p.name)));
@@ -2811,5 +3249,265 @@ impl App {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    fn app() -> App {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done)
+    }
+
+    fn repo() -> GhRepo {
+        GhRepo {
+            owner: "acme".into(),
+            repo: "app".into(),
+        }
+    }
+
+    /// A temporary git folder whose `origin` is `url`.
+    fn git_dir(tag: &str, url: Option<&str>) -> String {
+        let dir = std::env::temp_dir().join(format!("osh-app-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_string_lossy().to_string();
+        cli::run(
+            "git",
+            &["-C".into(), d.clone(), "init".into(), "-q".into()],
+            &[],
+        )
+        .unwrap();
+        if let Some(u) = url {
+            let args = ["-C", &d, "remote", "add", "origin", u].map(String::from);
+            cli::run("git", &args, &[]).unwrap();
+        }
+        d
+    }
+
+    fn select_items(app: &App) -> (String, Vec<String>) {
+        match &app.modal {
+            Some(Modal::Select { title, items, .. }) => (title.clone(), items.clone()),
+            _ => panic!("no select"),
+        }
+    }
+
+    #[test]
+    fn github_access_is_offered_for_a_shared_github_repo_only() {
+        let mut a = app();
+        let d = git_dir("gh", Some("git@github.com:acme/app.git"));
+        a.ask_github(Plan {
+            share: d.clone(),
+            ..Plan::default()
+        });
+        let (title, items) = select_items(&a);
+        assert_eq!(title, "GitHub access to acme/app");
+        assert_eq!(items[0], "No GitHub access");
+        assert!(items[1].starts_with("Read-only"));
+        assert!(items
+            .iter()
+            .any(|i| i.starts_with("Read and write, a token for this sandbox")));
+        assert!(items
+            .iter()
+            .any(|i| i.contains("shared by sandboxes (github-app)")));
+        let _ = std::fs::remove_dir_all(d);
+
+        let mut a = app();
+        let d = git_dir("other", Some("git@example.com:acme/app.git"));
+        a.ask_github(Plan {
+            share: d.clone(),
+            ..Plan::default()
+        });
+        assert!(matches!(
+            &a.modal,
+            Some(Modal::Input {
+                kind: InKind::Command(_),
+                ..
+            })
+        ));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn existing_repo_providers_are_listed_with_their_expiry() {
+        let mut a = app();
+        let d = git_dir("exist", Some("https://github.com/acme/app"));
+        a.snap.providers.push(cli::Provider {
+            name: "github-app".into(),
+            ty: "gh-acme-app".into(),
+            keys: vec!["GITHUB_TOKEN".into()],
+        });
+        a.snap.providers.push(cli::Provider {
+            name: "github".into(),
+            ty: "github".into(),
+            keys: vec![],
+        });
+        a.ask_github(Plan {
+            share: d.clone(),
+            ..Plan::default()
+        });
+        let (_, items) = select_items(&a);
+        assert!(items.contains(&"Use existing provider github-app".to_string()));
+        assert!(!items.iter().any(|i| i.contains("provider github ")));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn read_write_names_the_sandbox_after_the_repo_and_shows_the_token_steps() {
+        let mut a = app();
+        a.snap.sandboxes.push(cli::Sandbox {
+            name: "app".into(),
+            ..cli::Sandbox::default()
+        });
+        a.on_select(
+            SelKind::GhAccess(Plan::default(), repo()),
+            vec!["Read and write, a token for this sandbox".into()],
+        );
+        match &a.modal {
+            Some(Modal::Confirm { text, kind }) => {
+                assert!(text.contains("Only select repositories, then acme/app"));
+                assert!(text.contains("target_name=acme"));
+                assert!(text.contains("name=osh-app-2-app"));
+                match kind {
+                    ConfKind::RepoSteps(RepoFlow {
+                        goal: Goal::Sandbox(p),
+                        ..
+                    }) => assert_eq!(p.name, "app-2"),
+                    _ => panic!("wrong confirm"),
+                }
+            }
+            _ => panic!("no steps"),
+        }
+    }
+
+    #[test]
+    fn a_bad_token_is_asked_for_again_a_good_one_continues_the_wizard() {
+        let mut a = app();
+        let flow = RepoFlow {
+            repo: repo(),
+            goal: Goal::Sandbox(Plan {
+                name: "dev".into(),
+                ..Plan::default()
+            }),
+        };
+        a.repo_checked(
+            flow.clone(),
+            "t".into(),
+            Some("The token cannot see acme/app (404)".into()),
+        );
+        match &a.modal {
+            Some(Modal::Input { title, mask, .. }) => {
+                assert!(*mask);
+                assert!(title.contains("404") && title.contains("Paste again"));
+            }
+            _ => panic!("no re-ask"),
+        }
+        a.repo_checked(flow, "secret".into(), None);
+        match &a.modal {
+            Some(Modal::Input {
+                kind: InKind::Command(p),
+                ..
+            }) => {
+                let g = p.gh.as_ref().unwrap();
+                assert_eq!(
+                    (g.repo.full(), g.token.as_str()),
+                    ("acme/app".into(), "secret")
+                );
+            }
+            _ => panic!("wizard did not continue"),
+        }
+    }
+
+    #[test]
+    fn the_sandbox_create_command_names_the_repo_provider_and_never_holds_the_token() {
+        let a = app();
+        let steps = a.sandbox_steps(&Plan {
+            name: "dev".into(),
+            gh: Some(GhGrant {
+                repo: repo(),
+                token: "ghp_secret".into(),
+            }),
+            ..Plan::default()
+        });
+        let args = steps.last().unwrap().args.join(" ");
+        assert!(args.contains("--provider github-dev-app"), "{args}");
+        assert!(!args.contains("ghp_secret"));
+    }
+
+    #[test]
+    fn a_renewed_token_offers_to_restart_the_sandboxes_still_using_the_old_one() {
+        let mut a = app();
+        a.on_done(Done {
+            msg: "Renewed the token of github-dev-app".into(),
+            next: None,
+            sync: None,
+            gh: Some(GhStage::Renewed {
+                provider: "github-dev-app".into(),
+                sandboxes: vec!["dev".into()],
+            }),
+        });
+        match &a.modal {
+            Some(Modal::Confirm {
+                text,
+                kind: ConfKind::Restart(names),
+            }) => {
+                assert_eq!(names, &["dev".to_string()]);
+                assert!(text.contains("Restart it?"));
+                assert!(text.contains("/tmp is cleared") && text.contains("/sandbox are kept"));
+            }
+            _ => panic!("no restart offer"),
+        }
+        let mut a = app();
+        a.on_done(Done {
+            msg: "Renewed".into(),
+            next: None,
+            sync: None,
+            gh: Some(GhStage::Renewed {
+                provider: "p".into(),
+                sandboxes: vec![],
+            }),
+        });
+        assert!(a.modal.is_none());
+    }
+
+    #[test]
+    fn the_banner_names_an_expiring_token_of_a_provider_that_exists() {
+        let mut a = app();
+        assert_eq!(a.expiry_banner(), None);
+        let soon = ghrepo::expiry_ms(ghrepo::now_secs(), 3);
+        a.tracked.push(ghrepo::Tracked {
+            gateway: cli::gateway(),
+            provider: "github-dev-app".into(),
+            expiry_ms: soon,
+            repo: "acme/app".into(),
+        });
+        assert_eq!(a.expiry_banner(), None, "provider is not on the gateway");
+        a.snap.providers.push(cli::Provider {
+            name: "github-dev-app".into(),
+            ty: "gh-acme-app".into(),
+            keys: vec![],
+        });
+        let b = a.expiry_banner().unwrap();
+        assert!(
+            b.contains("github-dev-app") && b.contains("expires in 3d"),
+            "{b}"
+        );
+    }
+
+    #[test]
+    fn free_names_skip_existing_sandboxes() {
+        let mut a = app();
+        assert_eq!(a.free_name("app"), "app");
+        for n in ["app", "app-2"] {
+            a.snap.sandboxes.push(cli::Sandbox {
+                name: n.into(),
+                ..cli::Sandbox::default()
+            });
+        }
+        assert_eq!(a.free_name("app"), "app-3");
     }
 }

@@ -2,6 +2,7 @@
 //! terminal engine) and drawn into the ratatui buffer. The VT handles are !Send, so
 //! everything here lives on the UI thread; only raw bytes cross threads.
 use crate::cli;
+use crate::ghrepo;
 use libghostty_vt::fmt::Format;
 use libghostty_vt::key::{
     self, Action as KAction, Encoder as KeyEncoder, Event as KeyEv, Key, Mods,
@@ -697,12 +698,13 @@ fn git_identity_exports(name: Option<&str>, email: Option<&str>) -> String {
 impl Session {
     /// `bash` in the sandbox with `~/.local/bin` on PATH, like the other in-sandbox commands.
     /// A sandbox sharing the current project starts inside the shared folder. Git there uses
-    /// the host's `user.name` and `user.email`.
+    /// the host's `user.name` and `user.email`, and GitHub remotes are fetched over HTTPS.
     pub fn open(sandbox: String, cols: u16, rows: u16) -> Result<Self, String> {
         let script = git_identity_exports(
             host_git("user.name").as_deref(),
             host_git("user.email").as_deref(),
-        ) + &start_script(&cli::start_dirs(&sandbox));
+        ) + ghrepo::https_rewrite_exports()
+            + &start_script(&cli::start_dirs(&sandbox));
         let args = cli::with_gateway(vec![
             "sandbox".into(),
             "exec".into(),

@@ -1,6 +1,7 @@
 //! Rendering.
 use crate::app::{App, Modal, Tab, TABS};
-use crate::cli::Freshness;
+use crate::cli::{self, Freshness};
+use crate::ghrepo;
 use crate::logview::LogView;
 use crate::term::Session;
 use ratatui::{
@@ -64,23 +65,34 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_logview(f, lv);
         return;
     }
+    let banner = app.expiry_banner();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
+            Constraint::Length(u16::from(banner.is_some())),
             Constraint::Min(5),
             Constraint::Length(2),
         ])
         .split(f.area());
     draw_tabs(f, app, rows[0]);
-    match app.tab {
-        Tab::Sandboxes => draw_sandboxes(f, app, rows[1]),
-        Tab::Providers => draw_providers(f, app, rows[1]),
-        Tab::Profiles => draw_profiles(f, app, rows[1]),
-        Tab::Images => draw_images(f, app, rows[1]),
-        Tab::Gateways => draw_gateways(f, app, rows[1]),
+    if let Some(b) = banner {
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                format!(" ⚠ {b}"),
+                Style::default().fg(Color::Yellow),
+            )),
+            rows[1],
+        );
     }
-    draw_footer(f, app, rows[2]);
+    match app.tab {
+        Tab::Sandboxes => draw_sandboxes(f, app, rows[2]),
+        Tab::Providers => draw_providers(f, app, rows[2]),
+        Tab::Profiles => draw_profiles(f, app, rows[2]),
+        Tab::Images => draw_images(f, app, rows[2]),
+        Tab::Gateways => draw_gateways(f, app, rows[2]),
+    }
+    draw_footer(f, app, rows[3]);
     if let Some(m) = &app.modal {
         draw_modal(f, m);
     }
@@ -236,18 +248,39 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
         .snap
         .providers
         .iter()
-        .map(|p| Row::new(vec![p.name.clone(), p.ty.clone(), p.keys.join(", ")]))
+        .map(|p| {
+            let gw = cli::gateway();
+            let note = app
+                .tracked
+                .iter()
+                .find(|t| t.provider == p.name && t.gateway == gw)
+                .map(|t| {
+                    let now = ghrepo::now_secs();
+                    (
+                        format!("{}: {}", t.repo, ghrepo::expiry_note(now, t.expiry_ms)),
+                        ghrepo::days_left(now, t.expiry_ms) <= ghrepo::WARN_DAYS,
+                    )
+                });
+            let (note, soon) = note.unwrap_or_default();
+            let row = Row::new(vec![p.name.clone(), p.ty.clone(), p.keys.join(", "), note]);
+            if soon {
+                row.style(Style::default().fg(Color::Yellow))
+            } else {
+                row
+            }
+        })
         .collect();
     let table = Table::new(
         rows,
         [
-            Constraint::Length(20),
+            Constraint::Length(28),
+            Constraint::Length(24),
             Constraint::Length(20),
             Constraint::Min(20),
         ],
     )
     .header(
-        Row::new(vec!["NAME", "TYPE", "CREDENTIAL KEYS"])
+        Row::new(vec!["NAME", "TYPE", "CREDENTIAL KEYS", "GITHUB TOKEN"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(highlight())
@@ -382,8 +415,8 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let help = match app.tab {
-        Tab::Sandboxes => "Enter shell (● running)  l logs  p blocked  n new  d delete  s stop  S start  a/x attach/detach provider  K skills",
-        Tab::Providers => "n create  u update credentials  d delete",
+        Tab::Sandboxes => "Enter shell (● running)  l logs  p blocked  n new  d delete  s stop  S start  a/x attach/detach provider  K skills  t renew GitHub token",
+        Tab::Providers => "n create  u update credentials (renews GitHub repo tokens)  d delete",
         Tab::Profiles => "u / Enter import or update from providers/",
         Tab::Images => "b / Enter build",
         Tab::Gateways => "Enter select  d wipe (delete all data)",

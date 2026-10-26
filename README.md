@@ -31,8 +31,8 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). `osh` puts
 
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`) |
-| Providers | create from a `providers/*.yaml` profile (`n`), update credentials (`u`), delete (`d`) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a GitHub repo token (`t`) |
+| Providers | create from a `providers/*.yaml` profile or a read/write GitHub repo token (`n`), update credentials (`u`; renews a repo token), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated |
 | Gateways | switch (`g` / `Enter`), wipe and restart empty (`d`) |
@@ -186,6 +186,39 @@ GitHub refusing access (a private repository: `Repository not found`,
 `could not read Username`, `Authentication failed`), it offers to create or
 attach the `github` provider and run the installs again from that step. The
 policy check cannot predict this: it is not a network block.
+
+### GitHub read/write access to a repo
+
+When a new sandbox shares a folder (`n`, "Share a host folder?") whose `origin`
+is a GitHub repository, the wizard asks about GitHub access to it: none,
+read-only (the `github` provider), an existing repo provider, or read and
+write with a new fine-grained token. For read/write osh shows the steps and
+opens GitHub's token page with the owner, a 30 day expiry and the permissions
+(Contents and Pull requests: Read and write) filled in. GitHub cannot
+preselect the repository, so the steps tell you to choose "Only select
+repositories" and pick it (add Workflows only to push `.github/workflows`; an
+organization may have to approve the token first). Paste the token (hidden);
+osh checks it can see the repo before using it.
+
+osh then imports a profile `gh-<owner>-<repo>`: the `github` profile's read
+access plus `POST .../<owner>/<repo>.git/git-receive-pack`, so pushes reach
+that repo only. The token lives in a provider created from it: `github-<sandbox>-<repo>`
+for one sandbox, or `github-<repo>` when you pick "shared by sandboxes" (also
+`n` on the Providers tab, "GitHub repo, read/write"; attach it to other
+sandboxes with `a` or pick it in the wizard). A sandbox's own provider is deleted
+with the sandbox; a shared one stays until you delete it.
+
+Tokens expire after 30 days. The Providers tab shows the repo and time left
+(yellow in the last 7 days), and a yellow banner under the tabs names the
+soonest token to expire (or already expired) on every tab. Renew with `u` on
+the provider, or `t` on a sandbox: osh shows the steps again and swaps the new
+token in, then offers to restart the running sandboxes that have the provider
+attached (stop and start: running programs end and `/tmp` is cleared, files in
+`/sandbox` are kept), since programs already running keep the old token. The expiry is
+kept in `~/.local/state/osh/tokens`; the token itself never touches argv or
+that file. Shells opened by osh rewrite `git@github.com:` remotes to HTTPS
+through `GIT_CONFIG_*` variables, because the provider only reaches
+`github.com:443`; the repo's `.git/config` on the host is not changed.
 
 ## Development and agents
 
