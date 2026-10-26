@@ -206,7 +206,7 @@ fn ensure_installed(dir: &Path) -> bool {
             return false;
         }
         if !cli::have("just") {
-            println!("`just` is required to run the installer (brew install just).");
+            println!("`just` is required to run the installer (macOS: brew install just; Linux: your package manager or https://just.systems).");
             return false;
         }
         let st = Command::new("just")
@@ -289,7 +289,11 @@ fn main() -> io::Result<()> {
                     app.status = if s.gateway_ok {
                         "Ready".into()
                     } else {
-                        "Gateway unreachable: brew services start openshell (vm) or just gateway-docker".into()
+                        if cfg!(target_os = "macos") {
+                            "Gateway unreachable: brew services start openshell (vm) or just gateway-docker".into()
+                        } else {
+                            "Gateway unreachable: systemctl --user start openshell-gateway".into()
+                        }
                     };
                 }
                 if let Some(e) = &s.error {

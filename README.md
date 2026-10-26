@@ -113,7 +113,13 @@ sandbox closes. The host needs `pngpaste` (macOS; `just install` installs it),
 
 ## Gateways
 
-- **vm** (default, Homebrew service, libkrun): fixed size per VM.
+- **Linux**: one gateway, `openshell`, the packaged `openshell-gateway`
+  systemd user service on the Docker driver (honours CPU/memory limits).
+  `just install` runs the official installer (deb/rpm; needs Docker Engine and
+  `sudo`) and copies `gateway-linux.toml` to `~/.config/openshell/gateway.toml`.
+  Logs: `journalctl --user -u openshell-gateway`. The two gateways below are
+  macOS only.
+- **vm** (default on macOS, Homebrew service, libkrun): fixed size per VM.
 - **docker** (`openshell-docker`, Colima): honours per-sandbox CPU/memory
   limits, weaker isolation. Needs the Homebrew gateway run once for shared TLS.
 
@@ -187,9 +193,9 @@ policy check cannot predict this: it is not a network block.
 test and change the repo. For humans: `just doctor` checks the prerequisites,
 `just check` runs format, clippy and tests (needs only `cargo` and Zig 0.15),
 and a bare `just` lists the recipes. Both build on macOS and Linux (Zig 0.15 on
-PATH, or `brew install zig@0.15` with Homebrew or Linuxbrew). The Docker
-gateway (`just gateway-docker`) is macOS only, and `just install` assumes
-Homebrew; the Linux paths of the rest are written but not tested on a Linux host.
+PATH, or `brew install zig@0.15` with Homebrew or Linuxbrew). The Linux
+install, uninstall and gateway-reset paths follow OpenShell's packaged systemd
+service but were written without a Linux host and are untested.
 
 ## Setup without osh
 

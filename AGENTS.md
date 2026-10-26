@@ -37,18 +37,22 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 | `providers/*.yaml` | OpenShell provider profiles (network policy per service). Imported with `openshell provider profile import` |
 | `images/Dockerfile-*` | Sandbox images built from the Images tab |
 | `sync-agents` | Python 3: manifest of the host's Claude Code / pi setup to reproduce in a sandbox |
-| `gateway*.toml`, `gateway-docker-service`, `gateway-reset` | Gateway config and services |
+| `gateway.toml` (macOS vm), `gateway-linux.toml`, `gateway-docker.toml` + `gateway-docker-service` (macOS), `gateway-reset` | Gateway config and services |
 | `git-hooks/check-secrets`, `.githooks/`, `.gitleaks.toml` | Pre-commit secret/PII scan (Gitleaks) |
 
 ## Platforms
 
-- macOS: everything works. Linux: `osh`, `just build|test|check|doctor`, the
-  clipboard code (`wl-paste`/`xclip`, util-linux `script`) and the sandbox
-  features are written for it, but only macOS has been run by hand; the Linux
-  build and tests were not run on a Linux host.
-- macOS only: `just gateway-docker`, the Docker gateway in `gateway-reset`,
-  `gateway-docker-service` (launchd, Colima, `/opt/homebrew` paths). `just
-  install` and `uninstall` assume Homebrew (Linuxbrew counts) and are untested on Linux.
+- macOS: vm gateway (Homebrew service, `gateway.toml`) plus an optional
+  Docker gateway (launchd, Colima, `gateway-docker.toml`,
+  `gateway-docker-service`).
+- Linux: one gateway, the packaged `openshell-gateway` systemd user service on
+  the Docker driver (`gateway-linux.toml`). `just install`, `uninstall`,
+  `gateway-reset` and the TUI hints branch on `uname` / `cfg!(target_os)`.
+  `just gateway-docker` is a no-op there. Linux needs Docker Engine, Zig 0.15
+  (PATH or Linuxbrew) and `wl-paste` or `xclip` for image paste.
+- Only macOS has been run by hand. The Linux install, uninstall and
+  gateway-reset paths were written from OpenShell's installer and systemd unit
+  (`deploy/deb/openshell-gateway.service`), not run on Linux.
 - Keep new code portable: no BSD-only or GNU-only flags without a branch on
   `uname` / `cfg!(target_os)`, no hard-coded `/opt/homebrew` outside the macOS
   files above.

@@ -1,0 +1,18 @@
+# Gateway config for Linux: `just install` copies it to ~/.config/openshell/gateway.toml,
+# which the packaged systemd user service (openshell-gateway) reads. The Docker driver
+# honours per-sandbox --cpu and --memory. Needs Docker Engine from a system package.
+# The vm driver (gateway.toml) is what macOS uses.
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "docker"
+
+# Lets sandboxes bind-mount host folders via --driver-config-json mounts.
+# Raw host bind mounts have no label resolver, so admission is off for this driver.
+[openshell.drivers.docker]
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.docker.resource_admission]
+enabled = false

@@ -15,7 +15,7 @@ doctor:
 	source "{{justfile_directory()}}/dev-env"
 	if osh_use_zig; then echo "ok       zig 0.15"; else echo "MISSING  zig 0.15  (macOS: brew install zig@0.15; Linux: Zig 0.15 on PATH or Linuxbrew zig@0.15)"; bad=1; fi
 	want openshell "just install; only needed to run osh, not to build or test it"
-	want docker "only needed for image builds and the docker gateway"
+	want docker "image builds and the docker gateway; the Linux gateway needs it too"
 	if [[ "$(uname)" == Darwin ]]; then
 	    want pngpaste "just install installs it; host-image paste (Ctrl-V)"
 	else
@@ -56,26 +56,37 @@ install: link
 	#!/usr/bin/env bash
 	set -euo pipefail
 
-	if ! command -v brew >/dev/null 2>&1; then
-	    echo "Homebrew is required. Install it from https://brew.sh" >&2
-	    exit 1
-	fi
-
-	brew install e2fsprogs
-	# zig@0.15 builds osh's embedded terminal; pngpaste reads host clipboard images for Ctrl-V in a shell.
-	# On Linux install wl-clipboard (Wayland) or xclip (X11) with your package manager for that.
-	brew install zig@0.15
-	[[ "$(uname)" != Darwin ]] || brew install pngpaste
-	curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
-
 	config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/openshell"
-	config_source="{{justfile_directory()}}/gateway.toml"
 	mkdir -p "$config_dir"
 	# Copy, don't symlink: the gateway refuses a symlinked config.
-	rm -f "$config_dir/gateway.toml"
-	install -m 644 "$config_source" "$config_dir/gateway.toml"
+	copy_config() {
+	    rm -f "$config_dir/gateway.toml"
+	    install -m 644 "{{justfile_directory()}}/$1" "$config_dir/gateway.toml"
+	}
 
-	brew services restart openshell
+	if [[ "$(uname)" == Darwin ]]; then
+	    if ! command -v brew >/dev/null 2>&1; then
+	        echo "Homebrew is required. Install it from https://brew.sh" >&2
+	        exit 1
+	    fi
+	    brew install e2fsprogs
+	    # zig@0.15 builds osh's embedded terminal; pngpaste reads host clipboard images for Ctrl-V in a shell.
+	    brew install zig@0.15 pngpaste
+	    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+	    copy_config gateway.toml
+	    brew services restart openshell
+	else
+	    # Linux: the official installer adds the deb/rpm packages (sudo) and enables the
+	    # openshell-gateway systemd user service. It needs Docker Engine from a system package.
+	    # Zig 0.15 (build) and wl-clipboard or xclip (image paste) are not installed here: see `just doctor`.
+	    command -v docker >/dev/null 2>&1 || echo "warning: Docker Engine not found; the Linux gateway needs it" >&2
+	    copy_config gateway-linux.toml
+	    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+	    systemctl --user daemon-reload
+	    systemctl --user enable openshell-gateway
+	    systemctl --user restart openshell-gateway
+	fi
+
 	openshell --version
 	# The service needs a moment to listen again after the restart.
 	for _ in $(seq 20); do openshell status >/dev/null 2>&1 && break; sleep 1; done
@@ -97,7 +108,7 @@ upgrade: install
 gateway-docker:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	[[ "$(uname)" == Darwin ]] || { echo "gateway-docker is macOS only (launchd agent, Colima)" >&2; exit 1; }
+	[[ "$(uname)" == Darwin ]] || { echo "Not needed on Linux: its only gateway already uses the Docker driver (gateway-linux.toml)."; exit 0; }
 
 	service="$(readlink -f "{{justfile_directory()}}/gateway-docker-service")"
 	label="dev.guilospanck.openshell-docker"
@@ -269,8 +280,12 @@ uninstall:
 	plist="$HOME/Library/LaunchAgents/$label.plist"
 
 	echo "This will remove:"
-	echo "  launchd agent  $label"
-	echo "  brew service + formula  openshell"
+	if [[ "$(uname)" == Darwin ]]; then
+	    echo "  launchd agent  $label"
+	    echo "  brew service + formula  openshell"
+	else
+	    echo "  systemd user service  openshell-gateway (stopped and disabled)"
+	fi
 	echo "  $config_dir"
 	echo "  $state_dir"
 	echo "  $share_dir"
@@ -278,16 +293,25 @@ uninstall:
 	read -r -p "Type 'uninstall' to continue: " answer
 	[[ "$answer" == uninstall ]] || { echo "aborted"; exit 1; }
 
-	launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
-	rm -f "$plist"
-	if command -v brew >/dev/null 2>&1; then
-	    brew services stop openshell 2>/dev/null || true
-	    brew uninstall openshell 2>/dev/null || true
+	if [[ "$(uname)" == Darwin ]]; then
+	    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+	    rm -f "$plist"
+	    if command -v brew >/dev/null 2>&1; then
+	        brew services stop openshell 2>/dev/null || true
+	        brew uninstall openshell 2>/dev/null || true
+	    fi
+	else
+	    systemctl --user disable --now openshell-gateway 2>/dev/null || true
 	fi
 	# rm -rf does not follow the symlinks in the config dir (images, providers).
 	rm -rf "$config_dir" "$state_dir" "$share_dir"
 	just --justfile "{{justfile_directory()}}/.justfile" unlink
-	echo "OpenShell removed. Repo checkout left in place."
+	if [[ "$(uname)" == Darwin ]]; then
+	    echo "OpenShell removed. Repo checkout left in place."
+	else
+	    echo "OpenShell state removed. Repo checkout left in place. Remove the packages yourself:"
+	    echo "  Debian/Ubuntu: sudo apt remove 'openshell*'    Fedora/RHEL: sudo dnf remove 'openshell*'"
+	fi
 
 # Show how the host's agent setup (Claude Code and pi) would be reproduced in a sandbox:
 # install commands where an installer exists, uploads otherwise. Only --dry-run and
