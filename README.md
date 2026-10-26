@@ -43,7 +43,8 @@ they never go through argv. The footer shows the keys for the current tab.
 ### Embedded shells
 
 `Enter` on a sandbox opens `bash` in it, inside osh. Every key goes to the
-shell; `Ctrl-]` opens a menu: back to the session, dashboard (the shell keeps
+shell; `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
+each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), dashboard (the shell keeps
 running, marked `●`; `Enter` on it returns), or close it. Shells keep their
 size when the window resizes, focused or not. `Shift-PgUp`/`PgDn` and the
 mouse wheel scroll back on the main screen; programs that ask for the mouse

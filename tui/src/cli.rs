@@ -1201,6 +1201,123 @@ pub fn attached_providers(sandbox: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// One network endpoint a provider profile opens.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct EndpointPerm {
+    pub host: String,
+    pub port: u64,
+    pub protocol: String,
+    /// `read-only`, `read-write`, `full`, or empty when `rules` spell it out.
+    pub access: String,
+    pub enforcement: String,
+    /// `METHOD path` allow rules.
+    pub rules: Vec<String>,
+}
+
+/// What an attached provider's profile grants a sandbox.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct ProviderPerm {
+    pub name: String,
+    pub ty: String,
+    pub category: String,
+    pub description: String,
+    /// `ENV_VAR (auth style, required|optional)` per credential.
+    pub credentials: Vec<String>,
+    pub endpoints: Vec<EndpointPerm>,
+    pub binaries: Vec<String>,
+    /// Set when the profile could not be found.
+    pub error: Option<String>,
+}
+
+fn strings(v: &Value) -> Vec<String> {
+    v.as_array().into_iter().flatten().map(text).collect()
+}
+
+/// Read one entry of `openshell profile list --output json`.
+fn parse_perm(name: &str, ty: &str, p: &Value) -> ProviderPerm {
+    let credentials = p["credentials"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let vars = strings(&c["env_vars"]);
+            let who = if vars.is_empty() {
+                text(&c["name"])
+            } else {
+                vars.join(", ")
+            };
+            let req = if c["required"].as_bool().unwrap_or(false) {
+                "required"
+            } else {
+                "optional"
+            };
+            format!("{who} ({}, {req})", text(&c["auth_style"]))
+        })
+        .collect();
+    let endpoints = p["endpoints"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|e| EndpointPerm {
+            host: text(&e["host"]),
+            port: e["port"].as_u64().unwrap_or(0),
+            protocol: text(&e["protocol"]),
+            access: text(&e["access"]),
+            enforcement: text(&e["enforcement"]),
+            rules: e["rules"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|r| {
+                    format!(
+                        "{} {}",
+                        text(&r["allow"]["method"]),
+                        text(&r["allow"]["path"])
+                    )
+                })
+                .collect(),
+        })
+        .collect();
+    ProviderPerm {
+        name: name.into(),
+        ty: ty.into(),
+        category: text(&p["category"]),
+        description: text(&p["description"]),
+        credentials,
+        endpoints,
+        binaries: strings(&p["binaries"]),
+        error: None,
+    }
+}
+
+/// What each provider attached to `sandbox` allows, from the gateway's profiles.
+pub fn provider_permissions(sandbox: &str, providers: &[Provider]) -> Vec<ProviderPerm> {
+    let profiles = os(&["profile", "list", "--output", "json"])
+        .and_then(|t| parse(&t))
+        .unwrap_or_default();
+    attached_providers(sandbox)
+        .into_iter()
+        .map(|name| {
+            let ty = providers
+                .iter()
+                .find(|p| p.name == name)
+                .map_or(name.clone(), |p| p.ty.clone());
+            match profiles
+                .as_array()
+                .and_then(|a| a.iter().find(|p| p["id"].as_str() == Some(&ty)))
+            {
+                Some(p) => parse_perm(&name, &ty, p),
+                None => ProviderPerm {
+                    name,
+                    ty: ty.clone(),
+                    error: Some(format!("profile {ty} not found on the gateway")),
+                    ..Default::default()
+                },
+            }
+        })
+        .collect()
+}
+
 /// Import a generated profile, create its provider (no credential) and attach it.
 pub fn import_generated(yaml: &str, name: &str, sandbox: &str) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(format!("osh-{name}.yaml"));
@@ -1293,6 +1410,29 @@ pub fn sync_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_json_becomes_permissions() {
+        let v: Value = serde_json::from_str(
+            r#"{"category":"agent","description":"d","binaries":["/usr/bin/x"],
+            "credentials":[{"name":"t","env_vars":["TOK"],"required":true,"auth_style":"bearer"}],
+            "endpoints":[{"host":"h.io","port":443,"protocol":"rest","access":"read-only","enforcement":"enforce"},
+              {"host":"g.com","port":443,"protocol":"rest","enforcement":"enforce",
+               "rules":[{"allow":{"method":"POST","path":"/a/git-receive-pack"}}]}]}"#,
+        )
+        .unwrap();
+        let p = parse_perm("n", "ty", &v);
+        assert_eq!(p.credentials, ["TOK (bearer, required)"]);
+        assert_eq!(p.binaries, ["/usr/bin/x"]);
+        assert_eq!(p.endpoints[0].access, "read-only");
+        assert_eq!(p.endpoints[1].rules, ["POST /a/git-receive-pack"]);
+        let text: String = crate::ui::perm_lines(&[p])
+            .iter()
+            .map(|l| l.to_string() + "\n")
+            .collect();
+        assert!(text.contains("h.io:443") && text.contains("custom rules"));
+        assert!(text.contains("POST /a/git-receive-pack") && text.contains("/usr/bin/x"));
+    }
 
     #[test]
     fn repo_status_problems_tell_the_user_what_to_fix() {

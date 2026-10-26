@@ -454,13 +454,15 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL));
         assert!(app.modal.is_some());
         term.draw(|f| ui::draw(f, &app)).unwrap();
-        app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        for _ in 0..2 {
+            app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        }
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.active.is_none() && app.sessions.len() == 1 && app.has_session("sb"));
         term.draw(|f| ui::draw(f, &app)).unwrap();
         app.active = Some(0);
         app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
-        for _ in 0..2 {
+        for _ in 0..3 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));

@@ -232,7 +232,11 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
         .unwrap_or("");
     let height = right[1].height.saturating_sub(2) as usize;
     let lines: Vec<&str> = log_text.lines().collect();
-    let tail = lines[lines.len().saturating_sub(height)..].join("\n");
+    let tail = lines[lines.len().saturating_sub(height)..]
+        .iter()
+        .map(|l| crate::logview::humanize(l))
+        .collect::<Vec<_>>()
+        .join("\n");
     f.render_widget(
         Paragraph::new(tail).block(
             Block::default()
@@ -459,8 +463,105 @@ fn fit(screen: Rect, w: u16, text: &str) -> (Rect, bool) {
     (centered(screen, w, want), want > screen.height)
 }
 
+/// Styled lines for the providers popup: one block per provider.
+pub fn perm_lines(perms: &[cli::ProviderPerm]) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let head = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let label = Style::default().add_modifier(Modifier::BOLD);
+    let mut out: Vec<Line> = Vec::new();
+    if perms.is_empty() {
+        out.push(Line::styled("No providers are attached.", dim));
+    }
+    for (i, p) in perms.iter().enumerate() {
+        if i > 0 {
+            out.push(Line::default());
+        }
+        let mut title = vec![Span::styled(format!("\u{25a0} {}", p.name), head)];
+        if p.name != p.ty {
+            title.push(Span::styled(format!("  type {}", p.ty), dim));
+        }
+        if !p.category.is_empty() {
+            title.push(Span::styled(format!("  [{}]", p.category), dim));
+        }
+        out.push(Line::from(title));
+        if let Some(e) = &p.error {
+            out.push(Line::styled(
+                format!("  {e}"),
+                Style::default().fg(Color::Red),
+            ));
+            continue;
+        }
+        if !p.description.is_empty() {
+            out.push(Line::styled(format!("  {}", p.description), dim));
+        }
+        out.push(Line::from(Span::styled("  Credentials", label)));
+        if p.credentials.is_empty() {
+            out.push(Line::styled("    none", dim));
+        }
+        for c in &p.credentials {
+            out.push(Line::from(format!("    {c}")));
+        }
+        out.push(Line::from(Span::styled("  Network", label)));
+        if p.endpoints.is_empty() {
+            out.push(Line::styled("    none", dim));
+        }
+        for e in &p.endpoints {
+            let (access, color) = match e.access.as_str() {
+                "read-only" => ("read-only", Color::Green),
+                "read-write" => ("read-write", Color::Yellow),
+                "full" => ("full", Color::Red),
+                "" => ("custom rules", Color::Yellow),
+                other => (other, Color::Reset),
+            };
+            out.push(Line::from(vec![
+                Span::raw(format!("    {:<34}", format!("{}:{}", e.host, e.port))),
+                Span::styled(format!("{access:<13}"), Style::default().fg(color)),
+                Span::styled(format!("{} {}", e.protocol, e.enforcement), dim),
+            ]));
+            for r in &e.rules {
+                let writes =
+                    !(r.starts_with("GET ") || r.starts_with("HEAD ") || r.starts_with("OPTIONS "));
+                let color = if writes { Color::Yellow } else { Color::Green };
+                out.push(Line::styled(
+                    format!("        {r}"),
+                    Style::default().fg(color),
+                ));
+            }
+        }
+        out.push(Line::from(Span::styled("  Binaries", label)));
+        if p.binaries.is_empty() {
+            out.push(Line::styled("    any", dim));
+        }
+        for b in &p.binaries {
+            out.push(Line::from(format!("    {b}")));
+        }
+    }
+    out
+}
+
 fn draw_modal(f: &mut Frame, m: &Modal) {
     match m {
+        Modal::Providers {
+            sandbox,
+            perms,
+            scroll,
+        } => {
+            let area = centered(f.area(), 110, f.area().height.saturating_sub(2));
+            f.render_widget(Clear, area);
+            let lines = perm_lines(perms);
+            let at = (*scroll as usize + 1).min(lines.len().max(1));
+            f.render_widget(
+                Paragraph::new(lines.clone()).scroll((*scroll, 0)).block(
+                    Block::default().borders(Borders::ALL).title(format!(
+                        " Providers of {sandbox} {at}/{}  j/k PgUp/PgDn g/G scroll, Esc close ",
+                        lines.len()
+                    )),
+                ),
+                area,
+            );
+        }
         Modal::Viewer {
             title,
             text,

@@ -226,6 +226,12 @@ pub enum Modal {
         kind: ConfKind,
     },
     Info(String),
+    /// What the providers attached to a sandbox allow; read-only, scrollable.
+    Providers {
+        sandbox: String,
+        perms: Vec<cli::ProviderPerm>,
+        scroll: u16,
+    },
     /// Read-only scrollable text; `back` is shown again when it closes.
     Viewer {
         title: String,
@@ -2195,7 +2201,16 @@ impl App {
                 }
             }
             SelKind::SessionMenu => {
-                if first.starts_with("Dashboard") {
+                if first.starts_with("Providers") {
+                    if let Some(name) = self.session().map(|s| s.sandbox.clone()) {
+                        let perms = cli::provider_permissions(&name, &self.snap.providers);
+                        self.modal = Some(Modal::Providers {
+                            sandbox: name,
+                            perms,
+                            scroll: 0,
+                        });
+                    }
+                } else if first.starts_with("Dashboard") {
                     self.active = None;
                     self.status = "Shell kept running; Enter on its sandbox returns to it".into();
                     self.refresh();
@@ -2806,6 +2821,7 @@ impl App {
                     .unwrap_or_default();
                 let items = vec![
                     "Back to the session".into(),
+                    "Providers and their permissions".into(),
                     "Dashboard (keep the session running)".into(),
                     "Close the session".into(),
                 ];
@@ -3130,6 +3146,32 @@ impl App {
                 if key.code == KeyCode::Char('v') {
                     self.open_viewer("Details", text.clone(), Modal::Info(text));
                 }
+            }
+            Modal::Providers {
+                sandbox,
+                perms,
+                mut scroll,
+            } => {
+                let rows = ratatui::crossterm::terminal::size()
+                    .map(|(_, h)| h)
+                    .unwrap_or(24)
+                    .saturating_sub(4);
+                let last = (crate::ui::perm_lines(&perms).len() as u16).saturating_sub(rows);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return,
+                    KeyCode::Char('j') | KeyCode::Down => scroll = (scroll + 1).min(last),
+                    KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => scroll = (scroll + 10).min(last),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::Char('g') | KeyCode::Home => scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => scroll = last,
+                    _ => {}
+                }
+                self.modal = Some(Modal::Providers {
+                    sandbox,
+                    perms,
+                    scroll,
+                });
             }
             Modal::Viewer {
                 title,
