@@ -181,6 +181,16 @@ GitHub refusing access (a private repository: `Repository not found`,
 attach the `github` provider and run the installs again from that step. The
 policy check cannot predict this: it is not a network block.
 
+## Development and agents
+
+`AGENTS.md` (also `CLAUDE.md`, a symlink) tells coding agents how to build,
+test and change the repo. For humans: `just doctor` checks the prerequisites,
+`just check` runs format, clippy and tests (needs only `cargo` and Zig 0.15),
+and a bare `just` lists the recipes. Both build on macOS and Linux (Zig 0.15 on
+PATH, or `brew install zig@0.15` with Homebrew or Linuxbrew). The Docker
+gateway (`just gateway-docker`) is macOS only, and `just install` assumes
+Homebrew; the Linux paths of the rest are written but not tested on a Linux host.
+
 ## Setup without osh
 
 `just install` (OpenShell, and links `osh` into `~/.local/bin` so it runs from

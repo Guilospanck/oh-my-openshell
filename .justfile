@@ -1,3 +1,56 @@
+# Lists the recipes. First on purpose: a bare `just` must not run `install`.
+default:
+	@just --justfile "{{justfile_directory()}}/.justfile" --list
+
+# Checks the build prerequisites (cargo, Zig 0.15, just, gitleaks) and optional tools; read-only
+doctor:
+	#!/usr/bin/env bash
+	set -u
+	bad=0
+	need() { if command -v "$1" >/dev/null 2>&1; then echo "ok       $1"; else echo "MISSING  $1  ($2)"; bad=1; fi; }
+	want() { if command -v "$1" >/dev/null 2>&1; then echo "ok       $1"; else echo "optional $1  ($2)"; fi; }
+	need cargo "https://rustup.rs"
+	need just "brew install just"
+	need gitleaks "brew install gitleaks or a release binary; the pre-commit hook needs it"
+	source "{{justfile_directory()}}/dev-env"
+	if osh_use_zig; then echo "ok       zig 0.15"; else echo "MISSING  zig 0.15  (macOS: brew install zig@0.15; Linux: Zig 0.15 on PATH or Linuxbrew zig@0.15)"; bad=1; fi
+	want openshell "just install; only needed to run osh, not to build or test it"
+	want docker "only needed for image builds and the docker gateway"
+	if [[ "$(uname)" == Darwin ]]; then
+	    want pngpaste "just install installs it; host-image paste (Ctrl-V)"
+	else
+	    command -v wl-paste >/dev/null 2>&1 || want xclip "host-image paste (Ctrl-V) needs wl-paste (Wayland) or xclip (X11)"
+	fi
+	[[ "$(git -C "{{justfile_directory()}}" config core.hooksPath)" == .githooks ]] && echo "ok       pre-commit hook" || echo "optional pre-commit hook  (just install-hooks)"
+	exit $bad
+
+# Builds the TUI in release mode, finding Zig 0.15 itself (osh does this on its own)
+build:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	source "{{justfile_directory()}}/dev-env"
+	osh_use_zig || { echo "Zig 0.15 is required; run: just doctor" >&2; exit 1; }
+	cargo build --release --manifest-path "{{justfile_directory()}}/tui/Cargo.toml"
+
+# Runs the TUI unit tests; they need no OpenShell, gateway, or Docker
+test:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	source "{{justfile_directory()}}/dev-env"
+	osh_use_zig || { echo "Zig 0.15 is required; run: just doctor" >&2; exit 1; }
+	cargo test --manifest-path "{{justfile_directory()}}/tui/Cargo.toml"
+
+# Format check, clippy, and tests: run before every commit
+check:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	source "{{justfile_directory()}}/dev-env"
+	osh_use_zig || { echo "Zig 0.15 is required; run: just doctor" >&2; exit 1; }
+	manifest="{{justfile_directory()}}/tui/Cargo.toml"
+	cargo fmt --check --manifest-path "$manifest"
+	cargo clippy --all-targets --manifest-path "$manifest" -- -D warnings
+	cargo test --manifest-path "$manifest"
+
 # Installs or upgrades OpenShell (OPENSHELL_VERSION=v0.1.5 pins a release) and links osh into PATH
 install: link
 	#!/usr/bin/env bash
@@ -10,7 +63,9 @@ install: link
 
 	brew install e2fsprogs
 	# zig@0.15 builds osh's embedded terminal; pngpaste reads host clipboard images for Ctrl-V in a shell.
-	brew install zig@0.15 pngpaste
+	# On Linux install wl-clipboard (Wayland) or xclip (X11) with your package manager for that.
+	brew install zig@0.15
+	[[ "$(uname)" != Darwin ]] || brew install pngpaste
 	curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 
 	config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/openshell"
@@ -42,6 +97,7 @@ upgrade: install
 gateway-docker:
 	#!/usr/bin/env bash
 	set -euo pipefail
+	[[ "$(uname)" == Darwin ]] || { echo "gateway-docker is macOS only (launchd agent, Colima)" >&2; exit 1; }
 
 	service="$(readlink -f "{{justfile_directory()}}/gateway-docker-service")"
 	label="dev.guilospanck.openshell-docker"

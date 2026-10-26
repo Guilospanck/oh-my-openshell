@@ -1,0 +1,18 @@
+# Sourced (not run) by osh and the .justfile build recipes: finds a Zig 0.15 and sets the
+# libghostty-vt build flag. libghostty-vt builds only with Zig 0.15.
+# Uses a Zig 0.15 already on PATH (any OS, e.g. a release tarball), else Homebrew's zig@0.15
+# (macOS /opt/homebrew, Linuxbrew). Returns 1 when none is found.
+osh_use_zig() {
+  local d
+  if [[ "$(zig version 2>/dev/null)" != 0.15.* ]]; then
+    for d in "$(brew --prefix zig@0.15 2>/dev/null)/bin" /opt/homebrew/opt/zig@0.15/bin \
+      /home/linuxbrew/.linuxbrew/opt/zig@0.15/bin "$HOME/.linuxbrew/opt/zig@0.15/bin"; do
+      if [[ "$("$d/zig" version 2>/dev/null)" == 0.15.* ]]; then
+        PATH="$d:$PATH"
+        break
+      fi
+    done
+  fi
+  [[ "$(zig version 2>/dev/null)" == 0.15.* ]] || return 1
+  export LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast
+}

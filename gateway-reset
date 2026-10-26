@@ -18,6 +18,11 @@ case "$gateway" in
   *) echo "usage: gateway-reset openshell|openshell-docker" >&2; exit 2 ;;
 esac
 
+if [ "$kind" = docker ] && [ "$(uname)" != Darwin ]; then
+  echo "gateway-reset: the Docker gateway is macOS only (launchd agent, Colima)" >&2
+  exit 1
+fi
+
 # Docker (Colima) socket, the same one the gateway service uses.
 if [ -f "$config_home/gateway.env" ]; then
   # shellcheck disable=SC1091
