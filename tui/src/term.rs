@@ -671,11 +671,38 @@ fn start_script(dirs: &[String]) -> String {
     script
 }
 
+/// Host value of a git setting (repo-local first, then global), if set.
+fn host_git(key: &str) -> Option<String> {
+    cli::run("git", &["config".into(), "--get".into(), key.into()], &[])
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Exports that give sandbox git the host's author identity, so commits made there work
+/// without a `git config` step. Empty when the host has neither setting.
+fn git_identity_exports(name: Option<&str>, email: Option<&str>) -> String {
+    let quote = |v: &str| format!("'{}'", v.replace('\'', "'\\''"));
+    let mut out = String::new();
+    for (var, val) in [("NAME", name), ("EMAIL", email)] {
+        if let Some(v) = val {
+            for role in ["AUTHOR", "COMMITTER"] {
+                out.push_str(&format!("export GIT_{role}_{var}={}; ", quote(v)));
+            }
+        }
+    }
+    out
+}
+
 impl Session {
     /// `bash` in the sandbox with `~/.local/bin` on PATH, like the other in-sandbox commands.
-    /// A sandbox sharing the current project starts inside the shared folder.
+    /// A sandbox sharing the current project starts inside the shared folder. Git there uses
+    /// the host's `user.name` and `user.email`.
     pub fn open(sandbox: String, cols: u16, rows: u16) -> Result<Self, String> {
-        let script = start_script(&cli::start_dirs(&sandbox));
+        let script = git_identity_exports(
+            host_git("user.name").as_deref(),
+            host_git("user.email").as_deref(),
+        ) + &start_script(&cli::start_dirs(&sandbox));
         let args = cli::with_gateway(vec![
             "sandbox".into(),
             "exec".into(),
@@ -927,6 +954,15 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn git_identity_exports_quote_and_skip_unset() {
+        assert_eq!(git_identity_exports(None, None), "");
+        let s = git_identity_exports(Some("O'Neil"), Some("a@b.c"));
+        assert!(s.contains("export GIT_AUTHOR_NAME='O'\\''Neil'; "));
+        assert!(s.contains("export GIT_COMMITTER_EMAIL='a@b.c'; "));
+        assert_eq!(git_identity_exports(None, Some("a@b.c")).matches("export").count(), 2);
+    }
 
     fn vt() -> Vt {
         Vt::new(20, 5, mpsc::channel().0).unwrap()
