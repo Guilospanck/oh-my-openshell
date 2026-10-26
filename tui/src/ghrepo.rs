@@ -307,12 +307,17 @@ pub fn banner(list: &[&Tracked], now: u64) -> String {
     )
 }
 
-/// Environment that makes sandbox git use HTTPS for GitHub, whichever way `origin` is spelled:
-/// the provider only reaches `github.com:443`. Set per process so no repo config changes.
-pub fn https_rewrite_exports() -> &'static str {
-    "export GIT_CONFIG_COUNT=2 \
+/// Environment for sandbox git, set per process so no repo config changes: GitHub remotes use
+/// HTTPS whichever way `origin` is spelled (the provider only reaches `github.com:443`), and a
+/// credential helper hands git the provider's token. Git sends nothing on its own, GitHub
+/// rejects a Bearer token for git, and the proxy swaps the secret into a Basic header
+/// (`x-access-token:<placeholder>`) the client sends, so the helper supplies the placeholder.
+pub fn git_github_exports() -> &'static str {
+    r#"export GIT_CONFIG_COUNT=3 \
 GIT_CONFIG_KEY_0=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_0=git@github.com: \
-GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_1=ssh://git@github.com/; "
+GIT_CONFIG_KEY_1=url.https://github.com/.insteadOf GIT_CONFIG_VALUE_1=ssh://git@github.com/ \
+GIT_CONFIG_KEY_2=credential.https://github.com.helper \
+GIT_CONFIG_VALUE_2='!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN}; [ -n "$t" ] && echo username=x-access-token && echo password=$t; }; f'; "#
 }
 
 #[cfg(test)]
@@ -473,10 +478,17 @@ mod tests {
     }
 
     #[test]
-    fn https_rewrite_covers_scp_and_ssh_url_forms() {
-        let e = https_rewrite_exports();
-        assert!(e.contains("GIT_CONFIG_COUNT=2"));
+    fn git_exports_rewrite_remotes_and_hand_git_the_token() {
+        let e = git_github_exports();
+        assert!(e.contains("GIT_CONFIG_COUNT=3"));
         assert!(e.contains("GIT_CONFIG_VALUE_0=git@github.com:"));
         assert!(e.contains("GIT_CONFIG_VALUE_1=ssh://git@github.com/"));
+        assert!(e.contains("GIT_CONFIG_KEY_2=credential.https://github.com.helper"));
+        assert!(e.contains("username=x-access-token") && e.contains("${GITHUB_TOKEN:-$GH_TOKEN}"));
+        assert!(e.ends_with("; "), "must chain into the next command");
+        // The helper is single-quoted: nothing in it may expand when the shell exports it.
+        let helper = e.split("GIT_CONFIG_VALUE_2=").nth(1).unwrap();
+        assert!(helper.starts_with('\'') && helper.trim_end_matches("; ").ends_with('\''));
+        assert_eq!(helper.matches('\'').count(), 2);
     }
 }

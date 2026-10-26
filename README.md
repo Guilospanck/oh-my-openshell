@@ -216,9 +216,14 @@ token in, then offers to restart the running sandboxes that have the provider
 attached (stop and start: running programs end and `/tmp` is cleared, files in
 `/sandbox` are kept), since programs already running keep the old token. The expiry is
 kept in `~/.local/state/osh/tokens`; the token itself never touches argv or
-that file. Shells opened by osh rewrite `git@github.com:` remotes to HTTPS
-through `GIT_CONFIG_*` variables, because the provider only reaches
-`github.com:443`; the repo's `.git/config` on the host is not changed.
+that file. Shells opened by osh set `GIT_CONFIG_*` variables: `git@github.com:`
+remotes use HTTPS, because the provider only reaches `github.com:443`, and a
+credential helper gives git the provider's token as `x-access-token:<token>`
+(GitHub accepts Basic auth for git, not Bearer; the gateway swaps the real
+secret in). Without the helper git sends no credentials and fails with `could
+not read Username`. The repo's `.git/config` on the host is not changed, and
+programs that did not start in an osh shell (for example another `exec`) do not
+get this setup.
 
 ## Development and agents
 

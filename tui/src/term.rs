@@ -698,12 +698,13 @@ fn git_identity_exports(name: Option<&str>, email: Option<&str>) -> String {
 impl Session {
     /// `bash` in the sandbox with `~/.local/bin` on PATH, like the other in-sandbox commands.
     /// A sandbox sharing the current project starts inside the shared folder. Git there uses
-    /// the host's `user.name` and `user.email`, and GitHub remotes are fetched over HTTPS.
+    /// the host's `user.name` and `user.email`, GitHub remotes use HTTPS, and the provider's
+    /// token is handed to git.
     pub fn open(sandbox: String, cols: u16, rows: u16) -> Result<Self, String> {
         let script = git_identity_exports(
             host_git("user.name").as_deref(),
             host_git("user.email").as_deref(),
-        ) + ghrepo::https_rewrite_exports()
+        ) + ghrepo::git_github_exports()
             + &start_script(&cli::start_dirs(&sandbox));
         let args = cli::with_gateway(vec![
             "sandbox".into(),
