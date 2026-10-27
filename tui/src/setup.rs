@@ -1,5 +1,6 @@
 //! Turns facts about the host into an ordered list of install steps and runs them with consent.
 //! Planning is pure (Facts in, steps out); only `execute` touches the host, through `Host`.
+use crate::gwmodel::GwKind;
 use crate::platform::{gather, Facts, Host, Os, PkgMgr, RealHost, Runtime};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
@@ -22,6 +23,13 @@ pub struct Options {
     pub dry_run: bool,
     /// Which runtime to install when none exists; `None` means the user has not picked yet.
     pub runtime: Option<Runtime>,
+    /// The gateway types to set up; the first is the main one. Empty keeps the older behaviour
+    /// of choosing from `runtime` alone.
+    pub gateways: Vec<GwKind>,
+    /// Run steps with their output streamed to `Event::Line` instead of sharing the terminal.
+    pub capture: bool,
+    /// Run `sudo` as `sudo -n`: it fails instead of prompting (for a full-screen view).
+    pub sudo_noninteractive: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -429,15 +437,36 @@ pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
     p.steps
 }
 
+/// What happened while `execute_events` ran, so a screen can follow along.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Event {
+    Start(usize),
+    Line(usize, String),
+    Done(usize, Outcome),
+}
+
 pub fn execute(
     steps: &[Step],
     h: &dyn Host,
     o: &Options,
     ask: &mut dyn FnMut(&Step) -> Answer,
 ) -> Vec<StepResult> {
+    execute_events(steps, h, o, ask, &mut |_| {})
+}
+
+/// Runs the steps in order, reporting each step's start, its output lines (with `o.capture`) and
+/// its outcome to `on_event`.
+pub fn execute_events(
+    steps: &[Step],
+    h: &dyn Host,
+    o: &Options,
+    ask: &mut dyn FnMut(&Step) -> Answer,
+    on_event: &mut dyn FnMut(Event),
+) -> Vec<StepResult> {
     let mut results = Vec::new();
     let mut succeeded: Vec<&'static str> = Vec::new();
-    for step in steps {
+    for (i, step) in steps.iter().enumerate() {
+        on_event(Event::Start(i));
         let mut outcome = Outcome::Done;
         if step.after.is_some_and(|a| !succeeded.contains(&a)) {
             outcome = Outcome::Blocked;
@@ -450,8 +479,17 @@ pub fn execute(
         } else {
             let done = match &step.kind {
                 StepKind::Cmd { prog, args } => {
-                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                    h.run_inherit(prog, &args)
+                    let mut argv: Vec<&str> = args.iter().map(String::as_str).collect();
+                    let prog = prog.as_str();
+                    if o.sudo_noninteractive && prog == "sudo" {
+                        argv.insert(0, "-n");
+                    }
+                    if o.capture {
+                        let mut sink = |l: &str| on_event(Event::Line(i, l.to_string()));
+                        h.run_streaming(prog, &argv, &mut sink)
+                    } else {
+                        h.run_inherit(prog, &argv)
+                    }
                 }
                 StepKind::Write { path, content } => h.write(path, content),
                 StepKind::Manual(_) => Ok(()),
@@ -463,6 +501,7 @@ pub fn execute(
         if matches!(outcome, Outcome::Done | Outcome::DryRun) {
             succeeded.push(step.id);
         }
+        on_event(Event::Done(i, outcome.clone()));
         results.push(StepResult {
             id: step.id,
             outcome,
@@ -974,6 +1013,78 @@ mod tests {
         let steps = plan(&f, &Options::default());
         let openshell = steps.iter().find(|s| s.id == "openshell").unwrap();
         assert_eq!(openshell.after, Some("runtime-relogin"));
+    }
+
+    #[test]
+    fn execute_events_reports_start_lines_and_done() {
+        let mut h = FakeHost::default();
+        h.stream_lines.insert(
+            "sudo apt-get install -y tmux".into(),
+            vec!["Reading lists".into(), "Done".into()],
+        );
+        let f = facts(Os::Linux, PkgMgr::Apt);
+        let steps: Vec<Step> = plan(&f, &Options::default())
+            .into_iter()
+            .filter(|s| s.id == "tmux")
+            .collect();
+        let o = Options {
+            capture: true,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        let r = execute_events(&steps, &h, &o, &mut yes, &mut |e| events.push(e));
+        assert_eq!(r[0].outcome, Outcome::Done);
+        assert_eq!(
+            events,
+            vec![
+                Event::Start(0),
+                Event::Line(0, "Reading lists".into()),
+                Event::Line(0, "Done".into()),
+                Event::Done(0, Outcome::Done),
+            ]
+        );
+    }
+
+    #[test]
+    fn execute_events_reports_blocked_and_manual_steps_too() {
+        let h = FakeHost::default();
+        let steps = plan(&facts(Os::Linux, PkgMgr::Apt), &Options::default());
+        let mut events = Vec::new();
+        execute_events(&steps, &h, &Options::default(), &mut yes, &mut |e| {
+            events.push(e)
+        });
+        let done: Vec<_> = events
+            .iter()
+            .filter(|e| matches!(e, Event::Done(..)))
+            .collect();
+        assert_eq!(done.len(), steps.len(), "every step ends with a Done event");
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Done(_, Outcome::Manual))));
+    }
+
+    #[test]
+    fn sudo_noninteractive_rewrites_sudo_to_sudo_n() {
+        let h = FakeHost::default();
+        let f = facts(Os::Linux, PkgMgr::Apt);
+        let steps: Vec<Step> = plan(&f, &Options::default())
+            .into_iter()
+            .filter(|s| s.id == "tmux")
+            .collect();
+        let o = Options {
+            capture: true,
+            sudo_noninteractive: true,
+            ..Default::default()
+        };
+        execute_events(&steps, &h, &o, &mut yes, &mut |_| {});
+        assert!(
+            h.calls
+                .borrow()
+                .iter()
+                .any(|c| c == "sudo -n apt-get install -y tmux"),
+            "{:?}",
+            h.calls.borrow()
+        );
     }
 
     fn yes(_: &Step) -> Answer {

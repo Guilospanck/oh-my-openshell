@@ -50,6 +50,17 @@ pub trait Host {
     fn write(&self, path: &Path, content: &str) -> Result<(), String>;
     /// Like `run`, but the child shares the terminal, so prompts (sudo) and progress show.
     fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String>;
+    /// Runs a program with stdin closed, handing each line of its output (both streams) to `sink`
+    /// as it arrives. For showing progress inside a full-screen view.
+    fn run_streaming(
+        &self,
+        prog: &str,
+        args: &[&str],
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
+        let _ = sink;
+        self.run_inherit(prog, args)
+    }
 }
 
 pub struct RealHost;
@@ -158,6 +169,59 @@ impl Host for RealHost {
             std::fs::remove_file(path).map_err(err)?;
         }
         std::fs::write(path, content).map_err(err)
+    }
+
+    fn run_streaming(
+        &self,
+        prog: &str,
+        args: &[&str],
+        sink: &mut dyn FnMut(&str),
+    ) -> Result<(), String> {
+        use std::io::BufRead;
+        let mut child = Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{prog}: {e}"))?;
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let mut readers = Vec::new();
+        for pipe in [
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let tx = tx.clone();
+            readers.push(std::thread::spawn(move || {
+                for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                    if tx.send(line).is_err() {
+                        break;
+                    }
+                }
+            }));
+        }
+        drop(tx);
+        for line in rx {
+            sink(&line);
+        }
+        for r in readers {
+            let _ = r.join();
+        }
+        let st = child.wait().map_err(|e| format!("{prog}: {e}"))?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(format!("{prog} exited with {st}"))
+        }
     }
 
     fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String> {
@@ -416,6 +480,8 @@ pub mod testing {
         pub env: HashMap<String, String>,
         /// Command lines that fail with this message.
         pub fail_msgs: HashMap<String, String>,
+        /// Lines `run_streaming` delivers for a command line.
+        pub stream_lines: HashMap<String, Vec<String>>,
         /// Paths that exist, for `exists`.
         pub paths: HashSet<String>,
         pub calls: RefCell<Vec<String>>,
@@ -469,6 +535,19 @@ pub mod testing {
         }
         fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String> {
             self.run(prog, args).map(|_| ())
+        }
+        fn run_streaming(
+            &self,
+            prog: &str,
+            args: &[&str],
+            sink: &mut dyn FnMut(&str),
+        ) -> Result<(), String> {
+            let line = format!("{prog} {}", args.join(" ")).trim().to_string();
+            self.run(prog, args)?;
+            for l in self.stream_lines.get(&line).into_iter().flatten() {
+                sink(l);
+            }
+            Ok(())
         }
     }
 }
@@ -583,6 +662,22 @@ mod tests {
         assert_eq!(gather_for(&h, Os::MacOs).pkg, PkgMgr::None);
         let h = FakeHost::with_bins(&["brew"]);
         assert_eq!(gather_for(&h, Os::MacOs).pkg, PkgMgr::Brew);
+    }
+
+    #[test]
+    fn real_run_streaming_delivers_lines_from_both_streams_and_the_exit_status() {
+        let mut got: Vec<String> = Vec::new();
+        let r = RealHost.run_streaming("sh", &["-c", "echo out; echo err >&2"], &mut |l| {
+            got.push(l.to_string())
+        });
+        assert!(r.is_ok());
+        got.sort();
+        assert_eq!(got, ["err", "out"]);
+        let r = RealHost.run_streaming("sh", &["-c", "echo boom >&2; exit 3"], &mut |_| {});
+        assert!(r.unwrap_err().contains("exited"));
+        assert!(RealHost
+            .run_streaming("definitely-not-a-program", &[], &mut |_| {})
+            .is_err());
     }
 
     #[test]
