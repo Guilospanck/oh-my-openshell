@@ -7,6 +7,7 @@ mod clip;
 mod ghrepo;
 mod logview;
 mod platform;
+mod setup;
 mod term;
 mod ui;
 mod watch;
@@ -185,33 +186,69 @@ fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
     failed
 }
 
-/// Offer to install OpenShell before the dashboard opens. Returns false to quit.
-fn ensure_installed(dir: &Path) -> bool {
+/// Offer to set up the machine before the dashboard opens. Returns false to quit.
+fn ensure_installed() -> bool {
     while !cli::have("openshell") {
-        print!("openshell is not installed. Install it now? [Y/n] ");
-        let _ = io::stdout().flush();
-        let mut a = String::new();
-        let _ = io::stdin().read_line(&mut a);
-        if matches!(a.trim().to_lowercase().as_str(), "n" | "no") {
+        let a = {
+            print!("openshell is not installed. Set up this machine now? [Y/n] ");
+            let _ = io::stdout().flush();
+            let mut a = String::new();
+            let _ = io::stdin().read_line(&mut a);
+            a.trim().to_lowercase()
+        };
+        if matches!(a.as_str(), "n" | "no") {
             return false;
         }
-        if !cli::have("just") {
-            println!("`just` is required to run the installer (macOS: brew install just; Linux: your package manager or https://just.systems).");
+        if !setup::run(&setup::Options::default(), true) {
+            println!("Setup did not finish; see the output above.");
             return false;
-        }
-        let st = Command::new("just")
-            .arg("--justfile")
-            .arg(dir.join(".justfile"))
-            .arg("install")
-            .status();
-        if !st.map(|s| s.success()).unwrap_or(false) {
-            println!("Install failed; see the output above.");
         }
     }
     true
 }
 
+/// `osh doctor` and `osh setup [--yes] [--dry-run] [--runtime docker|podman]`; None for the dashboard.
+fn subcommand(args: &[String]) -> Option<i32> {
+    match args.first().map(String::as_str)? {
+        "doctor" => {
+            let (text, ok) = setup::doctor(&platform::gather(&platform::RealHost));
+            print!("{text}");
+            Some(if ok { 0 } else { 1 })
+        }
+        "setup" => {
+            let mut o = setup::Options::default();
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--yes" | "-y" => o.yes = true,
+                    "--dry-run" => o.dry_run = true,
+                    "--runtime" => {
+                        o.runtime = match it.next().map(String::as_str) {
+                            Some("docker") => Some(platform::Runtime::Docker),
+                            Some("podman") => Some(platform::Runtime::Podman),
+                            _ => {
+                                eprintln!("--runtime takes docker or podman");
+                                return Some(2);
+                            }
+                        }
+                    }
+                    other => {
+                        eprintln!("osh setup: unknown option {other}");
+                        return Some(2);
+                    }
+                }
+            }
+            Some(if setup::run(&o, false) { 0 } else { 1 })
+        }
+        _ => None,
+    }
+}
+
 fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = subcommand(&args) {
+        std::process::exit(code);
+    }
     let dir = assets::data_dir();
     // OSH_DIR is a checkout in development: its files are the source, not a copy to refresh.
     if std::env::var_os("OSH_DIR").is_none() {
@@ -224,7 +261,7 @@ fn main() -> io::Result<()> {
             Err(e) => eprintln!("osh: cannot write {}: {e}", dir.display()),
         }
     }
-    if !ensure_installed(&dir) {
+    if !ensure_installed() {
         return Ok(());
     }
     let (snap_tx, snap_rx) = mpsc::channel();

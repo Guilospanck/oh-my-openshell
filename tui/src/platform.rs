@@ -1,5 +1,4 @@
 //! What the host is and which tools it has, so setup can plan without touching anything.
-#![allow(dead_code)] // consumed by the setup tasks that follow; remove once wired
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -41,6 +40,9 @@ pub trait Host {
     /// Runs `prog` directly (never through a shell); `Ok` is stdout, `Err` a failure message.
     fn run(&self, prog: &str, args: &[&str]) -> Result<String, String>;
     fn read(&self, path: &Path) -> Option<String>;
+    fn env(&self, key: &str) -> Option<String>;
+    /// Like `run`, but the child shares the terminal, so prompts (sudo) and progress show.
+    fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String>;
 }
 
 pub struct RealHost;
@@ -72,6 +74,22 @@ impl Host for RealHost {
     fn read(&self, path: &Path) -> Option<String> {
         std::fs::read_to_string(path).ok()
     }
+
+    fn env(&self, key: &str) -> Option<String> {
+        std::env::var(key).ok()
+    }
+
+    fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String> {
+        let st = Command::new(prog)
+            .args(args)
+            .status()
+            .map_err(|e| format!("{prog}: {e}"))?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(format!("{prog} exited with {st}"))
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -92,6 +110,14 @@ pub struct Facts {
     pub pkg: PkgMgr,
     pub is_root: bool,
     pub has_sudo: bool,
+    pub user: String,
+    pub wayland: bool,
+    pub has_openshell: bool,
+    pub has_curl: bool,
+    pub has_tmux: bool,
+    pub has_gh: bool,
+    /// A tool that reads host clipboard images: pngpaste (macOS), wl-paste or xclip (Linux).
+    pub has_clipboard: bool,
     /// Binary on PATH, whether or not its daemon answers.
     pub runtimes_installed: Vec<Runtime>,
     /// `<bin> info` succeeded: usable right now. Docker first when both are.
@@ -172,6 +198,20 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
         pkg,
         is_root,
         has_sudo: h.which("sudo"),
+        user: h
+            .run("id", &["-un"])
+            .map(|o| o.trim().to_string())
+            .unwrap_or_default(),
+        wayland: h.env("XDG_SESSION_TYPE").is_some_and(|t| t == "wayland")
+            || h.env("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty()),
+        has_openshell: h.which("openshell"),
+        has_curl: h.which("curl"),
+        has_tmux: h.which("tmux"),
+        has_gh: h.which("gh"),
+        has_clipboard: match os {
+            Os::MacOs => h.which("pngpaste"),
+            Os::Linux => h.which("wl-paste") || h.which("xclip"),
+        },
         runtimes_installed,
         runtimes_ready,
     }
@@ -191,6 +231,7 @@ pub mod testing {
         /// Programs whose `run` fails; every other `run` succeeds with `outputs` or "".
         pub failing: HashSet<String>,
         pub outputs: HashMap<String, String>,
+        pub env: HashMap<String, String>,
         pub calls: RefCell<Vec<String>>,
     }
 
@@ -217,6 +258,12 @@ pub mod testing {
         }
         fn read(&self, path: &Path) -> Option<String> {
             self.files.get(path.to_str()?).cloned()
+        }
+        fn env(&self, key: &str) -> Option<String> {
+            self.env.get(key).cloned()
+        }
+        fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String> {
+            self.run(prog, args).map(|_| ())
         }
     }
 }
