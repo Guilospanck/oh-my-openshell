@@ -322,13 +322,20 @@ impl Planner<'_> {
                             .map(String::from)
                             .to_vec(),
                     );
+                    self.push("runtime-group", "Let your user run docker", kind, false);
+                    self.steps.last_mut().unwrap().after = Some("runtime");
+                    // The gateway runs as a user service, which keeps the groups it started with:
+                    // OpenShell's installer would wait for a connection that cannot happen yet.
                     self.push(
-                        "runtime-group",
-                        "Let your user run docker (log out and in afterwards)",
-                        kind,
+                        "runtime-relogin",
+                        "Apply the new group",
+                        StepKind::Manual(
+                            "log out and back in (or reboot) so the docker group reaches your user services, then run osh setup again"
+                                .into(),
+                        ),
                         false,
                     );
-                    self.steps.last_mut().unwrap().after = Some("runtime");
+                    self.steps.last_mut().unwrap().after = Some("runtime-group");
                 }
             }
         }
@@ -903,6 +910,32 @@ mod tests {
         assert!(pos("runtime-service") < pos("openshell"));
         let openshell = steps.iter().find(|s| s.id == "openshell").unwrap();
         assert_eq!(openshell.after, Some("runtime-service"));
+    }
+
+    #[test]
+    fn a_fresh_docker_install_stops_for_a_new_login_before_openshell() {
+        let o = Options {
+            runtime: Some(Runtime::Docker),
+            ..Default::default()
+        };
+        let steps = plan(&facts(Os::Linux, PkgMgr::Apt), &o);
+        let relogin = steps.iter().find(|s| s.id == "runtime-relogin").unwrap();
+        assert!(matches!(&relogin.kind, StepKind::Manual(t) if t.contains("log out")));
+        let openshell = steps.iter().find(|s| s.id == "openshell").unwrap();
+        assert_eq!(openshell.after, Some("runtime-relogin"));
+        // Root has no group to join, so nothing to wait for.
+        let mut root = facts(Os::Linux, PkgMgr::Apt);
+        root.is_root = true;
+        let steps = plan(&root, &o);
+        assert!(steps.iter().all(|s| s.id != "runtime-relogin"));
+        // Podman's socket is a user unit started right away: no new login.
+        let podman = Options {
+            runtime: Some(Runtime::Podman),
+            ..Default::default()
+        };
+        assert!(plan(&facts(Os::Linux, PkgMgr::Apt), &podman)
+            .iter()
+            .all(|s| s.id != "runtime-relogin"));
     }
 
     #[test]

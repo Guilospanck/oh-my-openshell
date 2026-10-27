@@ -30,6 +30,19 @@ without_yes="$(osh setup --runtime "$runtime" </dev/null 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && grep -q -- '--yes' <<<"$without_yes" && pass "without a terminal or --yes, nothing runs" || fail "setup refuses without a terminal" "rc=$rc"
 check "refusing installed nothing" bash -c '! command -v openshell'
 
+if [[ "$runtime" == docker ]]; then
+  # Joining the docker group only reaches the user's systemd services after a new login, and the
+  # gateway is one of them, so osh must stop and say so instead of installing OpenShell too early.
+  echo "== docker: the first setup stops for a new login"
+  osh setup --yes --runtime docker >"$log" 2>&1; rc=$?
+  [[ $rc -ne 0 ]] && grep -q 'log out and back in' "$log" \
+    && pass "the first setup asks for a new login" || { fail "the first setup asks for a new login" "rc=$rc"; tail -15 "$log"; }
+  check "OpenShell was not installed before the new login" bash -c '! command -v openshell'
+  # What a new login does for the user manager: restart it with the user's current groups.
+  sudo systemctl restart "user@$(id -u).service"
+  for _ in $(seq 20); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 1; done
+fi
+
 echo "== setup --yes --runtime $runtime (real packages, installer, systemd)"
 osh setup --yes --runtime "$runtime" >"$log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "setup exits 0" || {
