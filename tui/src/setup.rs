@@ -53,10 +53,18 @@ impl Step {
                 if prog == "sh" && args.first().is_some_and(|a| a == "-c") =>
             {
                 let script = args.get(1).map(String::as_str).unwrap_or("");
+                // Short scripts are shown whole (lines joined by `; `), long ones by their first
+                // line and `...`; either way quoted so a short one can be pasted into a shell.
                 if script.lines().count() <= 6 {
-                    format!("sh -c '{}'", script.lines().collect::<Vec<_>>().join("; "))
+                    format!(
+                        "sh -c {}",
+                        sh_quote(&script.lines().collect::<Vec<_>>().join("; "))
+                    )
                 } else {
-                    format!("sh -c '{} ...'", script.lines().next().unwrap_or(""))
+                    format!(
+                        "sh -c {}",
+                        sh_quote(&format!("{} ...", script.lines().next().unwrap_or("")))
+                    )
                 }
             }
             _ => self.command_line(),
@@ -493,6 +501,11 @@ pub fn doctor(f: &Facts) -> (String, bool) {
         }
     }
     (out, ok)
+}
+
+/// `text` as one shell word: single quotes, with each embedded `'` written as `'\''`.
+fn sh_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// "tool X is missing" with the exact command that installs it, for features that degrade.
@@ -934,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn display_shows_short_scripts_whole_and_long_ones_by_first_line() {
+    fn display_quotes_so_the_line_can_be_pasted_into_a_shell() {
         let sh = |script: &str| Step {
             id: "a",
             title: "t".into(),
@@ -946,10 +959,26 @@ mod tests {
             after: None,
         };
         assert_eq!(sh("echo hi").display(), "sh -c 'echo hi'");
+        // A single quote inside the script is closed, escaped and reopened.
+        assert_eq!(
+            sh("trap 'rm -f x' EXIT").display(),
+            r#"sh -c 'trap '\''rm -f x'\'' EXIT'"#
+        );
         assert_eq!(sh("set -e\nrm -rf x").display(), "sh -c 'set -e; rm -rf x'");
         let long = sh("1\n2\n3\n4\n5\n6\nrm -rf x");
         assert_eq!(long.display(), "sh -c '1 ...'");
         assert!(long.command_line().contains("rm -rf x"));
+    }
+
+    #[test]
+    fn sh_quote_round_trips_through_a_real_shell() {
+        for text in ["plain", "it's", "a b", "$(x) `y` \"z\"", "", "'"] {
+            let out = std::process::Command::new("sh")
+                .args(["-c", &format!("printf %s {}", sh_quote(text))])
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), text, "{text:?}");
+        }
     }
 
     /// Runs the OpenShell install script with a fake `curl` (and optionally a fake `openshell`).
