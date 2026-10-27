@@ -781,7 +781,11 @@ pub fn plan_gateways(
     existing: &[(String, u16)],
     is_bound: &dyn Fn(u16) -> bool,
 ) -> Result<Vec<Step>, String> {
-    use crate::gwmodel::{availability, next_port, GatewaySpec, State};
+    use crate::gwmodel::{availability, next_port, GatewaySpec, Registry, State};
+    // Without OpenShell nothing can be running, so whatever the registry says is left over from a
+    // run that stopped early (the registry is written before a service starts): start afresh.
+    let empty = Registry::default();
+    let reg = if f.has_openshell { reg } else { &empty };
     for k in &o.gateways {
         if let State::Unavailable(why) = availability(f, *k).state {
             return Err(format!("{}: {why}", k.label()));
@@ -842,10 +846,12 @@ pub fn plan_gateways(
         } else {
             crate::gwops::add_gateway_steps(f, p, h, &reg_now, &spec)
         };
+        // A gateway waits for the one before it (an extra needs the main's certificates and
+        // service); the first waits for OpenShell, or for its own prerequisites.
         let dep = if is_main && !f.has_openshell {
             Some("openshell")
         } else {
-            waits.get(i).copied().flatten().or(prev_last)
+            prev_last.or(waits.get(i).copied().flatten())
         };
         if let Some(first) = g.first_mut() {
             first.after = first.after.or(dep);
@@ -1890,6 +1896,84 @@ mod tests {
         assert!(
             steps.iter().all(|s| !s.id.contains("register")),
             "known to the CLI already"
+        );
+    }
+
+    #[test]
+    fn extras_wait_for_the_main_gatewarys_last_step() {
+        // If the main stops (a new login is needed, say), an extra must not be registered and
+        // started without it: its certificates come from the main.
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = false;
+        // Docker is installed but this user cannot use it yet; Podman is not installed at all,
+        // so the extra has prerequisite steps of its own that must not outrank the main.
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.runtimes_ready = vec![];
+        f.docker_permission_denied = true;
+        let steps = gw_plan(
+            &f,
+            &[GwKind::Docker, GwKind::Podman],
+            &crate::gwmodel::Registry::default(),
+            &[],
+        )
+        .unwrap();
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        let main_last = steps
+            .iter()
+            .rev()
+            .find(|s| s.id.starts_with("gw-docker"))
+            .unwrap()
+            .id;
+        let extra_first = steps
+            .iter()
+            .find(|s| s.id == "gw-registry" && s.after != Some("openshell"))
+            .unwrap_or_else(|| panic!("{ids:?}"));
+        let podman_first = steps
+            .iter()
+            .position(|s| s.id.starts_with("gw-podman"))
+            .unwrap();
+        // The extra's first step is the registry write right before its config.
+        let reg_before_podman = steps[..podman_first]
+            .iter()
+            .rev()
+            .find(|s| s.id == "gw-registry")
+            .unwrap();
+        assert_eq!(
+            reg_before_podman.after,
+            Some(main_last),
+            "{ids:?} / {extra_first:?}"
+        );
+    }
+
+    #[test]
+    fn a_stale_registry_is_ignored_when_openshell_is_not_installed() {
+        // A first run that stopped early can leave entries behind; with no OpenShell nothing runs,
+        // so the whole plan is needed, and the first type is the main again.
+        let mut f = running_facts();
+        f.has_openshell = false;
+        let stale = registered(&[
+            (GwKind::Docker, 17670, true),
+            (GwKind::Podman, 17671, false),
+        ]);
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+            &FakeHost::default(),
+            &gw_paths(),
+            &stale,
+            &[],
+            &|_| false,
+        )
+        .unwrap();
+        assert!(
+            steps.iter().any(|s| s.id == "openshell"),
+            "{:?}",
+            lines(&steps)
+        );
+        let t = lines(&steps).join("\n");
+        assert!(
+            t.contains("write /h/.config/openshell/gateway.toml"),
+            "the main is set up again: {t}"
         );
     }
 
