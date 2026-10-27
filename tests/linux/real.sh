@@ -7,7 +7,8 @@
 #   tests/linux/real.sh [podman|docker]     default: podman
 #
 # Needs Docker (privileged containers). Slow: it builds the Linux binary and installs real
-# packages. The container is removed at the end, pass or fail.
+# packages. The container is removed at the end, pass or fail, unless OSH_REAL_KEEP=1 is set
+# (then docker exec -u tester -it NAME bash lets you poke at it).
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -20,7 +21,11 @@ case "$(docker info --format '{{.Architecture}}')" in aarch64|arm64) arch=arm64 
 # Inside the repo: a container VM shares the home folder, not /var/folders.
 dist="$(mktemp -d "$repo/.real-dist.XXXXXX")"
 name="osh-real-$$"
-trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$dist"' EXIT
+if [[ -n "${OSH_REAL_KEEP:-}" ]]; then
+  echo "keeping container $name and $dist (remove them yourself)"
+else
+  trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$dist"' EXIT
+fi
 
 echo "== building the Linux release archive ($arch)"
 "$repo/scripts/release" v0.0.0-real --out "$dist" --no-host --linux "$arch" >"$dist/release.log" 2>&1 \

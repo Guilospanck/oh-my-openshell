@@ -350,6 +350,10 @@ pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
             false,
         );
     }
+    // OpenShell's installer waits for `openshell status` to report connected, and on Linux the
+    // gateway cannot connect before a container runtime works, so the runtime goes first there.
+    // (The macOS vm gateway needs none.)
+    let mut runtime_planned = false;
     if !f.has_openshell {
         let mut after = None;
         if !f.has_curl {
@@ -364,6 +368,20 @@ pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
                 false,
             );
         }
+        if f.os == Os::Linux {
+            let before = p.steps.len();
+            p.runtime(o);
+            runtime_planned = true;
+            let added = &mut p.steps[before..];
+            if let Some(first) = added.first_mut() {
+                first.after = first.after.or(after);
+            }
+            // What OpenShell waits for: the user's action, else the service, else the install.
+            let wait = ["runtime-relogin", "runtime-service", "runtime"]
+                .into_iter()
+                .find(|id| added.iter().any(|s| s.id == *id));
+            after = wait.or(after);
+        }
         p.push(
             "openshell",
             "Install OpenShell",
@@ -375,7 +393,9 @@ pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
         );
         p.steps.last_mut().unwrap().after = after;
     }
-    p.runtime(o);
+    if !runtime_planned {
+        p.runtime(o);
+    }
     if f.os == Os::MacOs && !f.has_clipboard && mac_brew {
         p.pkg(
             "pngpaste",
@@ -862,7 +882,50 @@ mod tests {
                 < ids.iter().position(|i| *i == "openshell").unwrap()
         );
         let openshell = steps.iter().find(|s| s.id == "openshell").unwrap();
-        assert_eq!(openshell.after, Some("curl"));
+        // No runtime was picked either, and that step sits between curl and OpenShell.
+        assert_eq!(openshell.after, Some("runtime"));
+        assert_eq!(
+            steps.iter().find(|s| s.id == "runtime").unwrap().after,
+            Some("curl")
+        );
+    }
+
+    #[test]
+    fn linux_installs_the_runtime_before_openshell_whose_installer_waits_for_the_gateway() {
+        let o = Options {
+            runtime: Some(Runtime::Podman),
+            ..Default::default()
+        };
+        let steps = plan(&facts(Os::Linux, PkgMgr::Apt), &o);
+        let ids = ids(&steps);
+        let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+        assert!(pos("runtime") < pos("openshell"));
+        assert!(pos("runtime-service") < pos("openshell"));
+        let openshell = steps.iter().find(|s| s.id == "openshell").unwrap();
+        assert_eq!(openshell.after, Some("runtime-service"));
+    }
+
+    #[test]
+    fn macos_keeps_openshell_first_since_the_vm_gateway_needs_no_runtime() {
+        let o = Options {
+            runtime: Some(Runtime::Podman),
+            ..Default::default()
+        };
+        let steps = plan(&facts(Os::MacOs, PkgMgr::Brew), &o);
+        let ids = ids(&steps);
+        assert!(
+            ids.iter().position(|i| *i == "openshell") < ids.iter().position(|i| *i == "runtime")
+        );
+    }
+
+    #[test]
+    fn openshell_waits_for_a_runtime_that_needs_the_user_to_act() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.docker_permission_denied = true;
+        let steps = plan(&f, &Options::default());
+        let openshell = steps.iter().find(|s| s.id == "openshell").unwrap();
+        assert_eq!(openshell.after, Some("runtime-relogin"));
     }
 
     fn yes(_: &Step) -> Answer {
