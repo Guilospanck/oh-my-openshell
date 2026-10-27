@@ -154,7 +154,7 @@ with_stubs "$OSH" gateway-reset >/dev/null 2>&1; rc=$?
 
 echo "== other subcommands"
 out="$(with_stubs "$OSH" gateway-docker </dev/null 2>&1)"; rc=$?
-[[ $rc -eq 2 && "$out" == *"not needed on Linux"* ]] && pass "gateway-docker is refused on Linux" || fail "gateway-docker is refused on Linux" "rc=$rc $out"
+[[ $rc -ne 0 && "$out" == *"Install the Docker gateway config"* && "$out" == *"--yes"* ]] && pass "gateway-docker is gateway add docker: it plans the Docker gateway and wants --yes without a terminal" || fail "gateway-docker plans an extra Docker gateway" "rc=$rc $out"
 fresh_home
 out="$(with_stubs "$OSH" sync-agents --dry-run 2>&1)"; rc=$?
 [[ $rc -eq 0 && "$out" == *"Dry run: nothing is installed"* ]] && pass "sync-agents --dry-run works with no agent setup" || fail "sync-agents --dry-run works" "rc=$rc $out"
