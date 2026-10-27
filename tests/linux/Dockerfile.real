@@ -8,5 +8,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 RUN useradd -m -s /bin/bash tester \
     && echo 'tester ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tester
+# Docker nested in a container cannot mount overlay on overlay; vfs works anywhere. A test-machine
+# setting only: a real host has no reason to need it. (Podman is unaffected.)
+RUN mkdir -p /etc/docker \
+    && echo '{"storage-driver":"vfs","features":{"containerd-snapshotter":false}}' > /etc/docker/daemon.json
 STOPSIGNAL SIGRTMIN+3
 CMD ["/sbin/init"]
