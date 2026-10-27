@@ -7,6 +7,7 @@ mod cli;
 mod clip;
 mod gateway;
 mod ghrepo;
+mod gwmodel;
 mod logview;
 mod platform;
 mod setup;
