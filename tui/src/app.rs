@@ -632,19 +632,26 @@ fn hit_label((gw, name): &(String, String)) -> String {
     format!("{name} on {gw}")
 }
 
+/// The banner rule: the built-in gateway config only counts as "out of date" when osh did not
+/// make the main gateway (a wizard-made main has its own generated config).
+fn config_stale_with(reg: &crate::gwmodel::Registry, differs: bool) -> bool {
+    differs && reg.main().is_none()
+}
+
 /// True when the installed `gateway.toml` is missing or differs from the one this host should run.
-fn config_stale() -> bool {
+fn config_stale(reg: &crate::gwmodel::Registry) -> bool {
     let os = if cfg!(target_os = "macos") {
         crate::platform::Os::MacOs
     } else {
         crate::platform::Os::Linux
     };
     let name = crate::gateway::config_name_for(os, cli::runtime());
-    crate::gateway::stale(
+    let differs = crate::gateway::stale(
         name,
         &crate::platform::RealHost,
         &crate::gateway::Paths::detect(),
-    )
+    );
+    config_stale_with(reg, differs)
 }
 
 /// The kind of gateway the installed `gateway.toml` runs, from its `compute_driver`.
@@ -714,7 +721,7 @@ impl App {
     ) -> Self {
         let registry = crate::gwmodel::Registry::load(&dir);
         App {
-            config_stale: config_stale(),
+            config_stale: config_stale(&registry),
             dir,
             tab: Tab::Sandboxes,
             snap: Snapshot::default(),
@@ -837,7 +844,7 @@ impl App {
                 self.open_session(name);
             }
         }
-        self.config_stale = config_stale();
+        self.config_stale = config_stale(&self.registry);
         for i in 0..4 {
             let len = [
                 self.snap.sandboxes.len(),
@@ -3437,6 +3444,21 @@ mod tests {
             port,
             main,
         }
+    }
+
+    #[test]
+    fn the_out_of_date_banner_is_not_shown_when_osh_made_the_main() {
+        let mut reg = crate::gwmodel::Registry::default();
+        assert!(
+            config_stale_with(&reg, true),
+            "nothing registered: the older rule applies"
+        );
+        assert!(!config_stale_with(&reg, false));
+        reg.add(spec(GwKind::Podman, 17670, true));
+        assert!(
+            !config_stale_with(&reg, true),
+            "the main's config is osh's own, not the built-in one"
+        );
     }
 
     #[test]

@@ -195,10 +195,27 @@ fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
 /// install to resume). Returns false when osh should exit instead of opening the dashboard.
 fn first_run(data: &Path) -> bool {
     let reg = gwmodel::Registry::load(data);
-    let known = setup::existing_gateways(&platform::RealHost).len();
-    let pending = gwmodel::Pending::load(data).is_some();
     let have = cli::have("openshell");
-    if !wizard::needs_wizard(have, known, reg.gateways.is_empty(), pending) {
+    let facts = platform::gather(&platform::RealHost);
+    // If the CLI cannot say which gateways exist, do not guess: the user's own gateway could be
+    // among them. Open the dashboard as it is.
+    let known = match setup::known_gateways(&facts, &platform::RealHost) {
+        Ok(k) => k,
+        Err(e) => {
+            if have {
+                eprintln!("osh: {e}");
+            }
+            return have;
+        }
+    };
+    // A remembered selection whose gateways all exist now has nothing to resume.
+    if let Some(p) = gwmodel::Pending::load(data) {
+        if setup::pending_is_stale(&p, &reg, &known) {
+            gwmodel::Pending::clear(data);
+        }
+    }
+    let pending = gwmodel::Pending::load(data).is_some();
+    if !wizard::needs_wizard(have, known.len(), reg.gateways.is_empty(), pending) {
         return true;
     }
     if !io::stdin().is_terminal() {
@@ -212,7 +229,8 @@ fn first_run(data: &Path) -> bool {
         Ok(wizard::Outcome::Cancelled) => return have,
         Ok(wizard::Outcome::NeedsAction(text)) => {
             println!("osh: {text}");
-            return false;
+            // Something is left to do, but if OpenShell and a gateway work, the dashboard still helps.
+            return have && !known.is_empty();
         }
         Err(e) => {
             eprintln!("osh: the set-up screen failed: {e}");

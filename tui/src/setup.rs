@@ -745,27 +745,59 @@ pub fn parse_gateways(text: &str) -> Result<Vec<GwKind>, String> {
     Ok(kinds)
 }
 
-/// The gateways the OpenShell CLI already knows, as (name, port), from `openshell gateway list`.
-pub fn existing_gateways(h: &dyn Host) -> Vec<(String, u16)> {
-    let Ok(text) = h.run("openshell", &["gateway", "list", "-o", "json"]) else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return Vec::new();
-    };
-    v.as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|g| {
-            let name = g["name"].as_str()?.to_string();
-            let port = g["endpoint"]
-                .as_str()
-                .and_then(|e| e.rsplit(':').next())
-                .and_then(|p| p.trim_end_matches('/').parse().ok())
-                .unwrap_or(0);
-            Some((name, port))
-        })
-        .collect()
+/// The gateways the OpenShell CLI already knows, as (name, port), from `openshell gateway list`;
+/// `None` when the listing cannot be read.
+pub fn existing_gateways(h: &dyn Host) -> Option<Vec<(String, u16)>> {
+    let text = h
+        .run("openshell", &["gateway", "list", "-o", "json"])
+        .ok()?;
+    let v = serde_json::from_str::<serde_json::Value>(&text).ok()?;
+    Some(
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|g| {
+                let name = g["name"].as_str()?.to_string();
+                let port = g["endpoint"]
+                    .as_str()
+                    .and_then(|e| e.rsplit(':').next())
+                    .and_then(|p| p.trim_end_matches('/').parse().ok())
+                    .unwrap_or(0);
+                Some((name, port))
+            })
+            .collect(),
+    )
+}
+
+/// The gateways the CLI knows, or an error when it cannot say. An unreadable listing must not be
+/// taken for "no gateways": osh would then make a new main over the user's own gateway. Without
+/// OpenShell there is nothing to list.
+pub fn known_gateways(f: &Facts, h: &dyn Host) -> Result<Vec<(String, u16)>, String> {
+    if !f.has_openshell {
+        return Ok(Vec::new());
+    }
+    existing_gateways(h).ok_or_else(|| {
+        "cannot read the list of gateways (`openshell gateway list -o json` failed); not changing anything"
+            .to_string()
+    })
+}
+
+/// The older single-gateway steps (the built-in config for this OS) only suit a machine where osh
+/// has registered no gateway; otherwise they would overwrite a wizard-made main's config.
+pub fn legacy_gateway_steps_allowed(reg: &crate::gwmodel::Registry) -> bool {
+    reg.gateways.is_empty()
+}
+
+/// A remembered selection whose gateways all exist now has nothing left to resume.
+pub fn pending_is_stale(
+    pending: &crate::gwmodel::Pending,
+    reg: &crate::gwmodel::Registry,
+    known: &[(String, u16)],
+) -> bool {
+    pending
+        .kinds
+        .iter()
+        .all(|k| reg.has_kind(*k) || known.iter().any(|(n, _)| n == k.name()))
 }
 
 /// The whole plan for the wanted gateway types: prerequisites, OpenShell, then each gateway's
@@ -797,20 +829,34 @@ pub fn plan_gateways(
         .copied()
         .filter(|k| !reg.has_kind(*k) && !existing.iter().any(|(n, _)| n == k.name()))
         .collect();
-    // Gateways osh already made that were asked for again: make sure they are running (a re-run
-    // resumes a stopped one), and leave the healthy ones alone.
+    // Gateways osh already made that were asked for again: make sure they work. A re-run resumes
+    // a stopped or half-registered one (and first brings back its runtime, if that is down) and
+    // leaves the healthy ones alone.
     let mut resume: Vec<Step> = Vec::new();
+    let mut revive = Planner::new(f);
     for k in &o.gateways {
         let Some(spec) = reg.gateways.iter().find(|g| g.kind == *k) else {
             continue;
         };
-        if spec.main {
-            let known = existing.iter().any(|(n, _)| *n == spec.name);
-            resume.extend(crate::gwops::main_gateway_steps(f, p, h, reg, spec, !known));
-        } else if !crate::gwops::extra_running(f.os, h, spec) {
-            resume.extend(crate::gwops::add_gateway_steps(f, p, h, reg, spec));
+        let known = existing.iter().any(|(n, _)| *n == spec.name);
+        let mut g = if spec.main {
+            crate::gwops::main_gateway_steps(f, p, h, reg, spec, !known)
+        } else if !known || !crate::gwops::extra_running(f.os, h, spec) {
+            crate::gwops::add_gateway_steps(f, p, h, reg, spec)
+        } else {
+            Vec::new()
+        };
+        if !g.is_empty() && availability(f, *k).state == State::NeedsInstall {
+            let wait = revive.kind_prereqs(*k, None);
+            if let Some(first) = g.first_mut() {
+                first.after = first.after.or(wait);
+            }
         }
+        resume.extend(g);
     }
+    let mut revived = revive.steps;
+    revived.extend(resume);
+    let mut resume = revived;
     if wanted.is_empty() {
         return Ok(resume);
     }
@@ -848,7 +894,10 @@ pub fn plan_gateways(
         };
         // A gateway waits for the one before it (an extra needs the main's certificates and
         // service); the first waits for OpenShell, or for its own prerequisites.
-        let dep = if is_main && !f.has_openshell {
+        let dep = if is_main && !f.has_openshell && f.os == Os::MacOs {
+            // On macOS the main's runtime is set up after OpenShell (the VM gateway needs none).
+            waits.get(i).copied().flatten().or(Some("openshell"))
+        } else if is_main && !f.has_openshell {
             Some("openshell")
         } else {
             prev_last.or(waits.get(i).copied().flatten())
@@ -871,7 +920,13 @@ pub fn run_gateways(o: &Options) -> i32 {
     let f = gather(&h);
     let p = crate::gateway::Paths::detect();
     let reg = crate::gwmodel::Registry::load(&p.data);
-    let existing = existing_gateways(&h);
+    let existing = match known_gateways(&f, &h) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("osh: {e}");
+            return 2;
+        }
+    };
     let bound = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
     match plan_gateways(&f, o, &h, &p, &reg, &existing, &bound) {
         Err(e) => {
@@ -1121,7 +1176,9 @@ pub fn run(o: &Options, required_only: bool) -> bool {
         steps.retain(|s| !s.optional);
     }
     let paths = crate::gateway::Paths::detect();
-    steps.extend(crate::gateway::plan(&f, &o, &h, &paths, false));
+    if legacy_gateway_steps_allowed(&crate::gwmodel::Registry::load(&paths.data)) {
+        steps.extend(crate::gateway::plan(&f, &o, &h, &paths, false));
+    }
     run_steps(&h, steps, &o, interactive)
 }
 
@@ -1863,6 +1920,134 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_macos_docker_main_waits_for_colima_to_be_started() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = false;
+        f.has_e2fsprogs = true;
+        let steps = gw_plan(
+            &f,
+            &[GwKind::Docker],
+            &crate::gwmodel::Registry::default(),
+            &[],
+        )
+        .unwrap();
+        let reg = steps.iter().find(|s| s.id == "gw-docker-registry").unwrap();
+        assert_eq!(
+            reg.after,
+            Some("colima-start"),
+            "{:?}",
+            steps.iter().map(|s| s.id).collect::<Vec<_>>()
+        );
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+        assert!(
+            pos("openshell") < pos("colima") && pos("colima-start") < pos("gw-docker-registry")
+        );
+    }
+
+    #[test]
+    fn a_resumed_macos_docker_main_gets_its_runtime_started_first() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = true;
+        f.colima = true; // installed, not running: docker does not answer
+        let reg = registered(&[(GwKind::Docker, 17670, true)]);
+        let mut h = FakeHost::default();
+        h.failing.insert("launchctl".into());
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &known_of(&reg),
+            &|_| false,
+        )
+        .unwrap();
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        assert!(ids.contains(&"colima-start"), "{ids:?}");
+        let first_gw = steps.iter().find(|s| s.id == "gw-docker-registry").unwrap();
+        assert_eq!(first_gw.after, Some("colima-start"), "{ids:?}");
+    }
+
+    #[test]
+    fn an_extra_the_cli_does_not_list_is_registered_again_even_if_its_service_runs() {
+        let f = running_facts();
+        let reg = registered(&[
+            (GwKind::Docker, 17670, true),
+            (GwKind::Podman, 17671, false),
+        ]);
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
+        );
+        // The main is known to the CLI, the extra is not; the extra's unit is active.
+        let known = [("openshell-docker".to_string(), 17670u16)];
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &known,
+            &|_| false,
+        )
+        .unwrap();
+        assert!(
+            steps.iter().any(|s| s.id == "gw-podman-register"),
+            "{:?}",
+            lines(&steps)
+        );
+    }
+
+    #[test]
+    fn an_unreadable_gateway_listing_is_an_error_not_an_empty_list() {
+        let mut h = FakeHost::default();
+        h.failing.insert("openshell".into());
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        assert!(known_gateways(&f, &h).unwrap_err().contains("gateway list"));
+        f.has_openshell = false;
+        assert!(
+            known_gateways(&f, &h).unwrap().is_empty(),
+            "no OpenShell, so no gateways"
+        );
+        let mut ok = FakeHost::default();
+        ok.outputs
+            .insert("openshell gateway list -o json".into(), "[]".into());
+        f.has_openshell = true;
+        assert!(known_gateways(&f, &ok).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_older_single_gateway_steps_are_for_machines_without_registered_gateways() {
+        assert!(legacy_gateway_steps_allowed(
+            &crate::gwmodel::Registry::default()
+        ));
+        assert!(!legacy_gateway_steps_allowed(&registered(&[(
+            GwKind::Podman,
+            17670,
+            true
+        )])));
+    }
+
+    #[test]
+    fn a_pending_selection_is_stale_once_every_kind_exists() {
+        let pending = crate::gwmodel::Pending {
+            kinds: vec![GwKind::Docker, GwKind::Podman],
+        };
+        let reg = registered(&[(GwKind::Docker, 17670, true)]);
+        assert!(!pending_is_stale(&pending, &reg, &[]));
+        let reg2 = registered(&[
+            (GwKind::Docker, 17670, true),
+            (GwKind::Podman, 17671, false),
+        ]);
+        assert!(pending_is_stale(&pending, &reg2, &[]));
+        let known = [("openshell-podman".to_string(), 17671u16)];
+        assert!(pending_is_stale(&pending, &reg, &known));
+    }
+
+    #[test]
     fn resuming_the_main_keeps_the_extras_in_the_registry() {
         let f = running_facts();
         let reg = registered(&[
@@ -2143,13 +2328,15 @@ mod tests {
             r#"[{"name":"openshell","endpoint":"https://127.0.0.1:17670","active":true},{"name":"openshell-docker","endpoint":"https://localhost:17671"}]"#.into(),
         );
         assert_eq!(
-            existing_gateways(&h),
+            existing_gateways(&h).unwrap(),
             vec![
                 ("openshell".to_string(), 17670),
                 ("openshell-docker".to_string(), 17671)
             ]
         );
-        assert!(existing_gateways(&FakeHost::default()).is_empty());
+        let mut failing = FakeHost::default();
+        failing.failing.insert("openshell".into());
+        assert!(existing_gateways(&failing).is_none());
     }
 
     #[test]

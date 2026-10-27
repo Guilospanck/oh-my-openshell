@@ -93,10 +93,13 @@ impl Wizard {
             planner,
         };
         if let Some(p) = pending {
+            // Kinds that exist already stay in the selection: the planner resumes them, which is
+            // how a half-finished gateway gets finished. Only ones that cannot work are dropped.
             for k in p.kinds {
-                if w.items.iter().any(|i| {
-                    i.kind == k && !i.existing && !matches!(i.avail.state, State::Unavailable(_))
-                }) {
+                if w.items
+                    .iter()
+                    .any(|i| i.kind == k && !matches!(i.avail.state, State::Unavailable(_)))
+                {
                     w.tick_order.push(k);
                 }
             }
@@ -865,7 +868,7 @@ pub fn finish(steps: &[Step], results: &[StepResult]) -> Outcome {
 
 /// Keeps the remembered selection for a resume, and forgets it once everything is set up.
 pub fn settle_pending(data: &Path, outcome: &Outcome) {
-    if *outcome == Outcome::Installed {
+    if matches!(outcome, Outcome::Installed | Outcome::Cancelled) {
         Pending::clear(data);
     }
 }
@@ -931,7 +934,10 @@ pub fn open(mode: Mode, data: &Path) -> Wizard {
     let f = gather(&h);
     let p = crate::gateway::Paths::detect();
     let reg = Registry::load(data);
-    let known = crate::setup::existing_gateways(&h);
+    // An unreadable listing is not "no gateways": plan nothing and say why.
+    let listing = crate::setup::known_gateways(&f, &h);
+    let list_error = listing.as_ref().err().cloned();
+    let known = listing.unwrap_or_default();
     let mut existing: Vec<GwKind> = reg.gateways.iter().map(|g| g.kind).collect();
     for (name, _) in &known {
         existing.extend(GwKind::parse(name));
@@ -946,9 +952,12 @@ pub fn open(mode: Mode, data: &Path) -> Wizard {
         existing.extend(driver.and_then(|d| GwKind::from_driver(&d)));
     }
     existing.dedup();
-    let has_main = reg.main().is_some() || !known.is_empty();
+    let has_main = reg.main().is_some() || !known.is_empty() || list_error.is_some();
     let (f2, reg2) = (f.clone(), reg);
     let planner: Planner = Box::new(move |kinds| {
+        if let Some(e) = &list_error {
+            return Err(e.clone());
+        }
         let o = Options {
             gateways: kinds.to_vec(),
             ..Default::default()
@@ -1008,15 +1017,21 @@ pub fn run(terminal: &mut DefaultTerminal, wizard: Wizard, data: &Path) -> io::R
         }
         match w.on_key(k.code) {
             Action::None => {}
-            Action::Quit => return Ok(Outcome::Cancelled),
+            Action::Quit => {
+                // Leaving means "not now": forget a remembered selection so osh does not keep opening.
+                settle_pending(data, &Outcome::Cancelled);
+                return Ok(Outcome::Cancelled);
+            }
             Action::Finish => return Ok(outcome),
             Action::Install(steps, kinds) => {
-                let _ = Pending { kinds }.save(data);
                 if steps.iter().any(privileged) && !warm_sudo(terminal) {
                     w.note = "sudo did not accept the password; nothing was run.".into();
                     w.screen = Screen::Review;
                     continue;
                 }
+                // Remember the selection only once something is about to run, so declining
+                // leaves no trace.
+                let _ = Pending { kinds }.save(data);
                 prog = Progress {
                     rows: vec![RowState::Pending; steps.len()],
                     ..Default::default()
@@ -1734,6 +1749,44 @@ mod tests {
             result("s", StepOutcome::Failed("no".into())),
         ];
         assert_eq!(finish(&steps, &results), Outcome::Installed);
+    }
+
+    #[test]
+    fn pending_kinds_that_already_exist_are_still_planned_so_they_can_resume() {
+        let pending = Pending {
+            kinds: vec![GwKind::Docker, GwKind::Podman],
+        };
+        let w = Wizard::new(
+            Mode::First,
+            linux_docker_ready(),
+            &[GwKind::Docker],
+            true,
+            Some(pending),
+            planner(),
+        );
+        assert_eq!(w.wanted(), [GwKind::Docker, GwKind::Podman]);
+        assert_eq!(w.screen, Screen::Review);
+    }
+
+    #[test]
+    fn quitting_forgets_a_pending_selection_but_a_stop_for_the_user_keeps_it() {
+        let d = std::env::temp_dir().join(format!("osh-wiz-quit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        Pending {
+            kinds: vec![GwKind::Docker],
+        }
+        .save(&d)
+        .unwrap();
+        settle_pending(&d, &Outcome::Cancelled);
+        assert!(Pending::load(&d).is_none());
+        Pending {
+            kinds: vec![GwKind::Docker],
+        }
+        .save(&d)
+        .unwrap();
+        settle_pending(&d, &Outcome::NeedsAction("log out".into()));
+        assert!(Pending::load(&d).is_some());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
