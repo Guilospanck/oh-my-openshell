@@ -67,7 +67,8 @@ if [[ ${#linux[@]} -gt 0 ]]; then
     case "$a" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac
     image="osh-release-$a"
     "$runtime" build --platform "linux/$a" -t "$image" "$repo/tests/linux"
-    work="$(mktemp -d)"
+    # Under $out, not /tmp: a container VM (Colima, Docker Desktop) shares the home folder, not /var.
+    work="$(mktemp -d "$out/.build.XXXXXX")"
     # The container compiles a copy of the tree (tracked and untracked files), not the host's target dir.
     (cd "$repo" && COPYFILE_DISABLE=1 git ls-files -z --cached --others --exclude-standard |
       COPYFILE_DISABLE=1 tar --null -T - -cf -) |

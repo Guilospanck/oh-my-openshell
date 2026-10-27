@@ -17,7 +17,8 @@ command -v docker >/dev/null 2>&1 || { echo "docker is required" >&2; exit 1; }
 docker info >/dev/null 2>&1 || { echo "the Docker daemon is not reachable" >&2; exit 1; }
 
 case "$(docker info --format '{{.Architecture}}')" in aarch64|arm64) arch=arm64 ;; *) arch=amd64 ;; esac
-dist="$(mktemp -d)"
+# Inside the repo: a container VM shares the home folder, not /var/folders.
+dist="$(mktemp -d "$repo/.real-dist.XXXXXX")"
 name="osh-real-$$"
 trap 'docker rm -f "$name" >/dev/null 2>&1 || true; rm -rf "$dist"' EXIT
 
