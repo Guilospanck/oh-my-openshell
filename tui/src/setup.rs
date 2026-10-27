@@ -985,9 +985,11 @@ mod tests {
         let steps = plan(&facts(Os::Linux, PkgMgr::Apt), &Options::default());
         let r = execute(&steps, &h, &Options::default(), &mut |_| Answer::No);
         assert!(h.calls.borrow().is_empty());
-        assert!(r
-            .iter()
-            .all(|r| matches!(r.outcome, Outcome::Declined | Outcome::Manual)));
+        // Steps behind the unresolved runtime choice are Blocked, not Declined.
+        assert!(r.iter().all(|r| matches!(
+            r.outcome,
+            Outcome::Declined | Outcome::Manual | Outcome::Blocked
+        )));
     }
 
     #[test]
