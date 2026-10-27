@@ -128,23 +128,13 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         (format!("  {} unreachable", app.snap.gateway), Color::Red)
     };
     spans.push(Span::styled(txt, Style::default().fg(color)));
-    let (link, link_color) = if app.linked {
-        ("linked in PATH ", Color::Green)
-    } else {
-        ("not linked (just link) ", Color::Yellow)
-    };
     if app.config_stale {
         spans.push(Span::styled(
-            "  gateway.toml out of date (just install)",
+            "  gateway.toml out of date (osh setup)",
             Style::default().fg(Color::Yellow),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
-    f.render_widget(
-        Paragraph::new(Line::styled(link, Style::default().fg(link_color)))
-            .alignment(Alignment::Right),
-        area,
-    );
 }
 
 fn table_state(i: usize) -> TableState {

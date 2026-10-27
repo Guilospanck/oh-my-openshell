@@ -41,6 +41,9 @@ pub trait Host {
     fn run(&self, prog: &str, args: &[&str]) -> Result<String, String>;
     fn read(&self, path: &Path) -> Option<String>;
     fn env(&self, key: &str) -> Option<String>;
+    /// Writes `content` to `path`, creating parent directories and replacing a symlink with a
+    /// regular file (the gateway refuses a symlinked config).
+    fn write(&self, path: &Path, content: &str) -> Result<(), String>;
     /// Like `run`, but the child shares the terminal, so prompts (sudo) and progress show.
     fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String>;
 }
@@ -77,6 +80,17 @@ impl Host for RealHost {
 
     fn env(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
+    }
+
+    fn write(&self, path: &Path, content: &str) -> Result<(), String> {
+        let err = |e: std::io::Error| format!("{}: {e}", path.display());
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(err)?;
+        }
+        if path.symlink_metadata().is_ok() {
+            std::fs::remove_file(path).map_err(err)?;
+        }
+        std::fs::write(path, content).map_err(err)
     }
 
     fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String> {
@@ -233,6 +247,7 @@ pub mod testing {
         pub outputs: HashMap<String, String>,
         pub env: HashMap<String, String>,
         pub calls: RefCell<Vec<String>>,
+        pub written: RefCell<Vec<(std::path::PathBuf, String)>>,
     }
 
     impl FakeHost {
@@ -262,6 +277,18 @@ pub mod testing {
         fn env(&self, key: &str) -> Option<String> {
             self.env.get(key).cloned()
         }
+        fn write(&self, path: &Path, content: &str) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push(format!("write {}", path.display()));
+            if self.failing.contains("write") {
+                return Err("write failed".into());
+            }
+            self.written
+                .borrow_mut()
+                .push((path.to_path_buf(), content.to_string()));
+            Ok(())
+        }
         fn run_inherit(&self, prog: &str, args: &[&str]) -> Result<(), String> {
             self.run(prog, args).map(|_| ())
         }
@@ -272,6 +299,23 @@ pub mod testing {
 mod tests {
     use super::testing::FakeHost;
     use super::*;
+
+    #[test]
+    fn real_write_replaces_a_symlink_with_a_regular_file() {
+        let d = std::env::temp_dir().join(format!("osh-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let target = d.join("target.toml");
+        std::fs::write(&target, "old").unwrap();
+        let link = d.join("sub/gateway.toml");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        RealHost.write(&link, "new").unwrap();
+        assert!(!link.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn os_release_ubuntu_is_apt() {

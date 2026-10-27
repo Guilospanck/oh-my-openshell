@@ -49,6 +49,7 @@ const FILES: &[(&str, &str)] = &[
         "gateway-podman.toml",
         include_str!("../../gateway-podman.toml"),
     ),
+    ("gateway.env", include_str!("../../gateway.env")),
     (
         "gateway-docker.toml",
         include_str!("../../gateway-docker.toml"),
@@ -62,6 +63,11 @@ pub struct Report {
     pub written: Vec<PathBuf>,
     /// Files the user changed since osh wrote them; left as they are.
     pub kept_user_edits: Vec<PathBuf>,
+}
+
+/// The embedded copy of a data file, by its path relative to the data directory.
+pub fn embedded(rel: &str) -> Option<&'static str> {
+    FILES.iter().find(|(r, _)| *r == rel).map(|(_, b)| *b)
 }
 
 /// `OSH_DIR` (a checkout, for development), else `$XDG_DATA_HOME/osh`, else `~/.local/share/osh`.

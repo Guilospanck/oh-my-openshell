@@ -2,6 +2,7 @@
 //! Planning is pure (Facts in, steps out); only `execute` touches the host, through `Host`.
 use crate::platform::{gather, Facts, Host, Os, PkgMgr, RealHost, Runtime};
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::path::PathBuf;
 
 pub const OPENSHELL_INSTALL: &str =
     "curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh";
@@ -18,6 +19,8 @@ pub struct Options {
 pub enum StepKind {
     /// Run a program directly, with these arguments (never through a shell, bar fixed scripts).
     Cmd { prog: String, args: Vec<String> },
+    /// Write a file in-process (config files), replacing any symlink there.
+    Write { path: PathBuf, content: String },
     /// Something osh cannot or must not do itself: the text tells the user what to do.
     Manual(String),
 }
@@ -37,6 +40,7 @@ impl Step {
     pub fn command_line(&self) -> String {
         match &self.kind {
             StepKind::Cmd { prog, args } => format!("{prog} {}", args.join(" ")),
+            StepKind::Write { path, .. } => format!("write {}", path.display()),
             StepKind::Manual(t) => t.clone(),
         }
     }
@@ -352,16 +356,21 @@ pub fn execute(
             outcome = Outcome::Blocked;
         } else if let StepKind::Manual(_) = step.kind {
             outcome = Outcome::Manual;
-        } else if let StepKind::Cmd { prog, args } = &step.kind {
-            if o.dry_run {
-                outcome = Outcome::DryRun;
-            } else if ask(step) == Answer::No {
-                outcome = Outcome::Declined;
-            } else {
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                if let Err(e) = h.run_inherit(prog, &args) {
-                    outcome = Outcome::Failed(e);
+        } else if o.dry_run {
+            outcome = Outcome::DryRun;
+        } else if ask(step) == Answer::No {
+            outcome = Outcome::Declined;
+        } else {
+            let done = match &step.kind {
+                StepKind::Cmd { prog, args } => {
+                    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+                    h.run_inherit(prog, &args)
                 }
+                StepKind::Write { path, content } => h.write(path, content),
+                StepKind::Manual(_) => Ok(()),
+            };
+            if let Err(e) = done {
+                outcome = Outcome::Failed(e);
             }
         }
         if matches!(outcome, Outcome::Done | Outcome::DryRun) {
@@ -485,6 +494,14 @@ pub fn run(o: &Options, required_only: bool) -> bool {
     if required_only {
         steps.retain(|s| !s.optional);
     }
+    let paths = crate::gateway::Paths::detect();
+    steps.extend(crate::gateway::plan(&f, &o, &h, &paths, false));
+    run_steps(&h, steps, &o, interactive)
+}
+
+/// Shows `steps`, runs them with consent per step, prints what is left. True when no required
+/// step failed or was left undone.
+pub fn run_steps(h: &dyn Host, steps: Vec<Step>, o: &Options, interactive: bool) -> bool {
     if steps.is_empty() {
         println!("Nothing to install: everything osh needs is present.");
         return true;
@@ -500,7 +517,7 @@ pub fn run(o: &Options, required_only: bool) -> bool {
     }
     let total = steps.len();
     let mut n = 0;
-    let results = execute(&steps, &h, &o, &mut |s| {
+    let results = execute(&steps, h, o, &mut |s| {
         n += 1;
         println!("\n[{n}/{total}] {}\n    $ {}", s.title, s.command_line());
         if o.yes || !interactive {

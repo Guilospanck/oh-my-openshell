@@ -4,6 +4,7 @@ mod app;
 mod assets;
 mod cli;
 mod clip;
+mod gateway;
 mod ghrepo;
 mod logview;
 mod platform;
@@ -23,7 +24,7 @@ use ratatui::crossterm::{
     terminal::supports_keyboard_enhancement,
 };
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::Path,
     process::Command,
     sync::{mpsc, Arc, Mutex},
@@ -240,7 +241,84 @@ fn subcommand(args: &[String]) -> Option<i32> {
             }
             Some(if setup::run(&o, false) { 0 } else { 1 })
         }
+        "upgrade" | "uninstall" | "gateway-docker" | "gateway-reset" | "gateway-service" => {
+            Some(gateway_command(args))
+        }
         _ => None,
+    }
+}
+
+/// Host-changing gateway commands. Each shows its steps and asks before running them.
+fn gateway_command(args: &[String]) -> i32 {
+    let h = platform::RealHost;
+    let f = platform::gather(&h);
+    let p = gateway::Paths::detect();
+    let o = setup::Options::default();
+    let interactive = io::stdin().is_terminal();
+    let steps = match args[0].as_str() {
+        "upgrade" => Ok(gateway::upgrade_steps(&f, &o, &h, &p)),
+        "gateway-docker" => gateway::docker_gateway_steps(&f, &p, &h),
+        "gateway-service" if args.get(1).map(String::as_str) == Some("docker") => {
+            let e = gateway::exec_docker_service(&p, &assets::data_dir());
+            eprintln!("osh: cannot start the gateway: {e}");
+            return 1;
+        }
+        "gateway-service" => Err("usage: osh gateway-service docker".to_string()),
+        "uninstall" => {
+            let steps = gateway::uninstall_steps(&f, &p);
+            println!(
+                "This will remove OpenShell, its services and these folders (sandboxes are lost):"
+            );
+            println!(
+                "  {}\n  {}\n  {}",
+                p.config_home.display(),
+                p.state.display(),
+                p.share.display()
+            );
+            if !confirmed("uninstall") {
+                eprintln!("aborted");
+                return 1;
+            }
+            Ok(steps)
+        }
+        _ => {
+            let Some(name) = args.get(1) else {
+                eprintln!("usage: osh gateway-reset <gateway>");
+                return 2;
+            };
+            // The dashboard asks its own question first and passes --confirmed.
+            if !args.iter().any(|a| a == "--confirmed") {
+                println!("This deletes every sandbox and provider on gateway {name}.");
+                if !confirmed("reset") {
+                    eprintln!("aborted");
+                    return 1;
+                }
+            }
+            gateway::reset_steps(&f, &p, name, f.runtime())
+        }
+    };
+    match steps {
+        Ok(steps) => {
+            let yes = setup::Options { yes: true, ..o };
+            i32::from(!setup::run_steps(&h, steps, &yes, interactive))
+        }
+        Err(e) => {
+            eprintln!("osh: {e}");
+            2
+        }
+    }
+}
+
+/// Asks the user to type `word`; `--yes` does not skip it, since these steps destroy data.
+fn confirmed(word: &str) -> bool {
+    print!("Type '{word}' to continue: ");
+    let _ = io::stdout().flush();
+    let mut a = String::new();
+    let _ = io::stdin().read_line(&mut a);
+    if word == "reset" {
+        gateway::confirm_reset(&a)
+    } else {
+        a.trim() == word
     }
 }
 
@@ -328,7 +406,7 @@ fn main() -> io::Result<()> {
                         "Ready".into()
                     } else {
                         if cfg!(target_os = "macos") {
-                            "Gateway unreachable: brew services start openshell (vm) or just gateway-docker".into()
+                            "Gateway unreachable: brew services start openshell (vm) or osh gateway-docker".into()
                         } else {
                             "Gateway unreachable: systemctl --user start openshell-gateway".into()
                         }

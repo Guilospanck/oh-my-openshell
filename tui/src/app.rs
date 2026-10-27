@@ -8,7 +8,7 @@ use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::{
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
     sync::{atomic::Ordering, mpsc::Sender, Arc, Mutex},
     thread,
@@ -396,9 +396,7 @@ pub struct SyncPlan {
 
 pub struct App {
     pub dir: PathBuf,
-    /// Whether an `osh` on PATH resolves to this checkout's launcher.
-    pub linked: bool,
-    /// Installed gateway.toml differs from the repo copy (`just install` copies it).
+    /// Installed gateway.toml differs from the one osh ships (`osh setup` installs it).
     pub config_stale: bool,
     pub tab: Tab,
     pub snap: Snapshot,
@@ -622,35 +620,23 @@ fn review_label(s: &watch::Seen) -> String {
     l
 }
 
-/// True when an `osh` found on PATH is this checkout's launcher.
 fn hit_label((gw, name): &(String, String)) -> String {
     format!("{name} on {gw}")
 }
 
-fn on_path(dir: &Path) -> bool {
-    let Ok(ours) = dir.join("osh").canonicalize() else {
-        return false;
+/// True when the installed `gateway.toml` is missing or differs from the one this host should run.
+fn config_stale() -> bool {
+    let os = if cfg!(target_os = "macos") {
+        crate::platform::Os::MacOs
+    } else {
+        crate::platform::Os::Linux
     };
-    std::env::var_os("PATH").is_some_and(|p| {
-        std::env::split_paths(&p).any(|d| d.join("osh").canonicalize().is_ok_and(|c| c == ours))
-    })
-}
-
-/// True when `gateway.toml` in the user config dir exists and differs from the repo's.
-fn config_stale(dir: &Path) -> bool {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-        });
-    match (
-        std::fs::read(dir.join("gateway.toml")),
-        std::fs::read(base.join("openshell/gateway.toml")),
-    ) {
-        (Ok(repo), Ok(installed)) => repo != installed,
-        (Ok(_), Err(_)) => true,
-        _ => false,
-    }
+    let name = crate::gateway::config_name_for(os, cli::runtime());
+    crate::gateway::stale(
+        name,
+        &crate::platform::RealHost,
+        &crate::gateway::Paths::detect(),
+    )
 }
 
 impl App {
@@ -661,8 +647,7 @@ impl App {
         done_tx: Sender<Done>,
     ) -> Self {
         App {
-            linked: on_path(&dir),
-            config_stale: config_stale(&dir),
+            config_stale: config_stale(),
             dir,
             tab: Tab::Sandboxes,
             snap: Snapshot::default(),
@@ -782,7 +767,7 @@ impl App {
                 self.open_session(name);
             }
         }
-        self.config_stale = config_stale(&self.dir);
+        self.config_stale = config_stale();
         for i in 0..4 {
             let len = [
                 self.snap.sandboxes.len(),
@@ -2754,9 +2739,10 @@ impl App {
                 }
             }
             ConfKind::ResetGateway(name) => {
+                let exe = std::env::current_exe().unwrap_or_else(|_| "osh".into());
                 self.job = Some(vec![Step {
-                    prog: self.dir.join("gateway-reset").to_string_lossy().into(),
-                    args: vec![name],
+                    prog: exe.to_string_lossy().into(),
+                    args: vec!["gateway-reset".into(), name, "--confirmed".into()],
                 }]);
             }
             ConfKind::DeleteProvider(name) => self.bg_msg(move || {
