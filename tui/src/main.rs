@@ -205,6 +205,10 @@ fn ensure_installed() -> bool {
             println!("Setup did not finish; see the output above.");
             return false;
         }
+        if !cli::have("openshell") {
+            println!("OpenShell is installed but not on PATH yet: open a new terminal (or add its folder to PATH) and run osh again.");
+            return false;
+        }
     }
     true
 }
@@ -302,8 +306,10 @@ fn gateway_command(args: &[String]) -> i32 {
     };
     match steps {
         Ok(steps) => {
-            let yes = setup::Options { yes: true, ..o };
-            i32::from(!setup::run_steps(&h, steps, &yes, interactive))
+            // Uninstall and reset were confirmed by typing; upgrade and gateway-docker ask per step.
+            let typed = matches!(args[0].as_str(), "uninstall" | "gateway-reset");
+            let o = setup::Options { yes: typed, ..o };
+            i32::from(!setup::run_steps(&h, steps, &o, interactive))
         }
         Err(e) => {
             eprintln!("osh: {e}");

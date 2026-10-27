@@ -1156,7 +1156,7 @@ pub fn sync_gen_profile(
     name: &str,
 ) -> Result<String, String> {
     let env = agents::Env::detect(dir, &sandbox_home(sandbox));
-    agents::gen_profile(&env, agent, sandbox, &gateway(), ids, name)
+    agents::gen_profile(&env, agent, sandbox, &gateway(), Some(ids), name)
 }
 
 /// What the gateway says when it will not merge a provider into the sandbox's policy,
@@ -1356,7 +1356,7 @@ pub fn sync_check(
     ids: &[String],
 ) -> Result<SyncCheck, String> {
     let env = agents::Env::detect(dir, "/workspace");
-    agents::check(&env, agent, sandbox, &gateway(), ids).and_then(|t| parse_check(&t))
+    agents::check(&env, agent, sandbox, &gateway(), Some(ids)).and_then(|t| parse_check(&t))
 }
 
 #[cfg(test)]

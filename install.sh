@@ -46,4 +46,8 @@ install -m 755 "$tmp/osh" "$bin_dir/osh"
 echo "Installed $bin_dir/osh"
 case ":$PATH:" in *":$bin_dir:"*) ;; *) echo "warning: $bin_dir is not on your PATH" >&2 ;; esac
 
-[ "${OSH_NO_SETUP:-}" = 1 ] || exec "$bin_dir/osh" setup
+[ "${OSH_NO_SETUP:-}" = 1 ] && exit 0
+# Piped into sh (curl ... | sh), stdin is the script, not the keyboard: hand setup the terminal so it can
+# ask before each step. Without one it refuses to run host-changing steps and says to pass --yes.
+if (exec </dev/tty) 2>/dev/null; then exec "$bin_dir/osh" setup </dev/tty; fi
+exec "$bin_dir/osh" setup

@@ -935,8 +935,22 @@ fn with_stage<T>(
     out
 }
 
-fn ids(only: &[String]) -> HashSet<String> {
-    only.iter().filter(|s| !s.is_empty()).cloned().collect()
+/// The ids picked with `--only`; `None` (no flag) means every default item.
+fn selection(only: Option<&[String]>) -> Option<HashSet<String>> {
+    only.map(|o| o.iter().filter(|s| !s.is_empty()).cloned().collect())
+}
+
+/// 3 when the check found access the policy blocks, as the Python original did; else 0.
+fn check_exit_code(json: &str) -> i32 {
+    let ok = serde_json::from_str::<Value>(json)
+        .ok()
+        .and_then(|v| v["ok"].as_bool())
+        .unwrap_or(false);
+    if ok {
+        0
+    } else {
+        3
+    }
 }
 
 fn pair_json(pairs: &[Pair]) -> Vec<Value> {
@@ -952,12 +966,12 @@ pub fn check(
     agent: &str,
     sandbox: &str,
     gateway: &str,
-    only: &[String],
+    only: Option<&[String]>,
 ) -> Result<String, String> {
     let rules = network_rules(sandbox, gateway)
         .map_err(|e| format!("cannot read the policy of {sandbox}: {e}"))?;
     with_stage(env, agent, |b| {
-        let result = preflight(&b.items, &rules, Some(&ids(only)));
+        let result = preflight(&b.items, &rules, selection(only).as_ref());
         let mut missing: Vec<Pair> = result.values().flatten().cloned().collect();
         missing.sort();
         missing.dedup();
@@ -978,7 +992,7 @@ pub fn gen_profile(
     agent: &str,
     sandbox: &str,
     gateway: &str,
-    only: &[String],
+    only: Option<&[String]>,
     name: &str,
 ) -> Result<String, String> {
     let ok_name = !name.is_empty()
@@ -996,7 +1010,7 @@ pub fn gen_profile(
     let rules = network_rules(sandbox, gateway)
         .map_err(|e| format!("cannot read the policy of {sandbox}: {e}"))?;
     with_stage(env, agent, |b| {
-        let mut missing: Vec<Pair> = preflight(&b.items, &rules, Some(&ids(only)))
+        let mut missing: Vec<Pair> = preflight(&b.items, &rules, selection(only).as_ref())
             .values()
             .flatten()
             .cloned()
@@ -1111,11 +1125,8 @@ pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
         String::new(),
         "both".to_string(),
     );
-    let (mut gateway, mut home, mut only) = (
-        String::new(),
-        "/workspace".to_string(),
-        Vec::<String>::new(),
-    );
+    let (mut gateway, mut home, mut only) =
+        (String::new(), "/workspace".to_string(), None::<Vec<String>>);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut next = || it.next().cloned().unwrap_or_default();
@@ -1127,7 +1138,9 @@ pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
             }
             "--name" => name = next(),
             "--agent" => agent = next(),
-            "--only" => only = next().split(',').map(String::from).collect(),
+            "--only" => only = Some(next().split(',').map(String::from).collect()),
+            // The Python took `--json` after a mode; the checks always print JSON.
+            "--json" => {}
             "--gateway" => gateway = next(),
             "--home" => home = next(),
             _ => {
@@ -1142,11 +1155,12 @@ pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
         return 2;
     }
     let env = Env::detect(data_dir, &home);
+    let only = only.as_deref();
     let res = match mode.as_str() {
         "--dry-run" => dry_run(&env, &agent),
         "--json" => manifest(&env, &agent),
-        "--preflight" => check(&env, &agent, &sandbox, &gateway, &only),
-        _ => gen_profile(&env, &agent, &sandbox, &gateway, &only, &name),
+        "--preflight" => check(&env, &agent, &sandbox, &gateway, only),
+        _ => gen_profile(&env, &agent, &sandbox, &gateway, only, &name),
     };
     match res {
         Ok(t) => {
@@ -1154,7 +1168,11 @@ pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
             if mode != "--dry-run" && mode != "--gen-profile" {
                 println!();
             }
-            0
+            if mode == "--preflight" {
+                check_exit_code(&t)
+            } else {
+                0
+            }
         }
         Err(e) => {
             eprintln!("{e}");
@@ -1293,9 +1311,23 @@ mod tests {
     }
 
     #[test]
+    fn no_only_flag_selects_every_default_item_not_nothing() {
+        assert_eq!(selection(None), None);
+        assert_eq!(selection(Some(&[])), Some(HashSet::new()));
+        let ids = ["a:b".to_string(), String::new()];
+        assert_eq!(selection(Some(&ids)), Some(["a:b".to_string()].into()));
+    }
+
+    #[test]
+    fn a_blocked_check_exits_3() {
+        assert_eq!(check_exit_code(r#"{"ok":false}"#), 3);
+        assert_eq!(check_exit_code(r#"{"ok":true}"#), 0);
+    }
+
+    #[test]
     fn gen_profile_rejects_a_bad_name_before_touching_the_gateway() {
         let env = env_with(Path::new("/nonexistent"));
-        assert!(gen_profile(&env, "both", "sb", "", &[], "Bad Name")
+        assert!(gen_profile(&env, "both", "sb", "", None, "Bad Name")
             .unwrap_err()
             .contains("--name"));
     }

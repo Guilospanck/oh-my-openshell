@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Stands in for the OpenShell installer download: with `-o FILE` it writes the "installer" there,
+# otherwise to stdout. The installer only records that it ran.
 . "$(dirname "$0")/_log"
 log "$@"
-echo "echo installer-ran >> \"$STUB_LOG\""
+script="echo installer-ran >> \"$STUB_LOG\""
+out=""
+while [[ $# -gt 0 ]]; do [[ "$1" == -o ]] && out="$2"; shift; done
+if [[ -n "$out" ]]; then echo "$script" > "$out"; else echo "$script"; fi

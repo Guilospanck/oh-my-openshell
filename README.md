@@ -31,7 +31,7 @@ a container runtime (Docker or Podman, only if neither exists; on Linux you pick
 with `--runtime` or at the prompt), and the optional tools: `tmux`, `gh` and a
 clipboard tool. It never installs silently: each step is shown first, and what
 it cannot do for you (no sudo, unknown distro, a stopped Docker daemon) is
-printed as the command to run yourself. Only OpenShell is required to open the
+printed as the command to run yourself. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the
 dashboard; image builds need a container runtime.
 
 Release binaries: `scripts/release` builds them locally (see Development). From a

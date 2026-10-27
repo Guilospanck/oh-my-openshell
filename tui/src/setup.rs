@@ -4,8 +4,17 @@ use crate::platform::{gather, Facts, Host, Os, PkgMgr, RealHost, Runtime};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
-pub const OPENSHELL_INSTALL: &str =
-    "curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh";
+/// Downloads OpenShell's installer to a file and runs it, so a failed or cut-off download fails
+/// the step (a `curl | sh` pipe reports the status of `sh`, which runs an empty script and
+/// succeeds), then checks that `openshell` can be found.
+pub const OPENSHELL_INSTALL: &str = concat!(
+    "set -e\n",
+    "t=\"$(mktemp)\"\n",
+    "trap 'rm -f \"$t\"' EXIT\n",
+    "curl -fLsS https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh -o \"$t\"\n",
+    "sh \"$t\"\n",
+    "command -v openshell >/dev/null || { echo \"openshell is not on PATH after the installer ran\" >&2; exit 1; }"
+);
 
 #[derive(Clone, Debug, Default)]
 pub struct Options {
@@ -44,9 +53,10 @@ impl Step {
                 if prog == "sh" && args.first().is_some_and(|a| a == "-c") =>
             {
                 let script = args.get(1).map(String::as_str).unwrap_or("");
-                match script.split_once('\n') {
-                    Some((first, _)) => format!("sh -c '{first} ...'"),
-                    None => format!("sh -c '{script}'"),
+                if script.lines().count() <= 6 {
+                    format!("sh -c '{}'", script.lines().collect::<Vec<_>>().join("; "))
+                } else {
+                    format!("sh -c '{} ...'", script.lines().next().unwrap_or(""))
                 }
             }
             _ => self.command_line(),
@@ -194,6 +204,35 @@ impl Planner<'_> {
     fn runtime(&mut self, o: &Options) {
         let f = self.f;
         if !f.runtimes_ready.is_empty() {
+            return;
+        }
+        if f.os == Os::Linux && f.podman_needs_socket {
+            // Podman answers but its API socket is off; the gateway needs it. No sudo: a user unit.
+            let kind = StepKind::Cmd {
+                prog: "systemctl".into(),
+                args: ["--user", "enable", "--now", "podman.socket"]
+                    .map(String::from)
+                    .to_vec(),
+            };
+            self.push("runtime", "Start the Podman API socket", kind, false);
+            return;
+        }
+        if f.os == Os::Linux && f.docker_permission_denied && !f.is_root && !f.user.is_empty() {
+            // The daemon is up; this user just cannot reach it yet.
+            let kind = self.privileged(
+                ["usermod", "-aG", "docker", f.user.as_str()]
+                    .map(String::from)
+                    .to_vec(),
+            );
+            self.push("runtime-group", "Let your user run docker", kind, false);
+            self.push(
+                "runtime-relogin",
+                "Apply the new group",
+                StepKind::Manual(
+                    "log out and back in (or run `newgrp docker`), then run osh again".into(),
+                ),
+                false,
+            );
             return;
         }
         if let Some(rt) = f.runtimes_installed.first().copied() {
@@ -537,6 +576,26 @@ pub fn run(o: &Options, required_only: bool) -> bool {
     run_steps(&h, steps, &o, interactive)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Consent {
+    /// Ask before each step.
+    Ask,
+    /// Run every step: `--yes`, or a dry run that changes nothing.
+    All,
+    /// Not a terminal and no `--yes`: nobody can answer, so nothing runs.
+    Refuse,
+}
+
+pub fn consent(o: &Options, interactive: bool) -> Consent {
+    if o.yes || o.dry_run {
+        Consent::All
+    } else if interactive {
+        Consent::Ask
+    } else {
+        Consent::Refuse
+    }
+}
+
 /// Shows `steps`, runs them with consent per step, prints what is left. True when no required
 /// step failed or was left undone.
 pub fn run_steps(h: &dyn Host, steps: Vec<Step>, o: &Options, interactive: bool) -> bool {
@@ -554,12 +613,19 @@ pub fn run_steps(h: &dyn Host, steps: Vec<Step>, o: &Options, interactive: bool)
             s.display()
         );
     }
+    let mode = consent(o, interactive);
+    if mode == Consent::Refuse {
+        eprintln!(
+            "\nnot a terminal, so nobody can approve these steps: rerun with --yes to run them"
+        );
+        return false;
+    }
     let total = steps.len();
     let mut n = 0;
     let results = execute(&steps, h, o, &mut |s| {
         n += 1;
         println!("\n[{n}/{total}] {}\n    $ {}", s.title, s.display());
-        if o.yes || !interactive {
+        if mode == Consent::All {
             return Answer::Yes;
         }
         match prompt("    Run it? [Y/n] ").as_str() {
@@ -598,6 +664,8 @@ mod tests {
             has_clipboard: false,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
+            podman_needs_socket: false,
+            docker_permission_denied: false,
         }
     }
 
@@ -866,27 +934,133 @@ mod tests {
     }
 
     #[test]
-    fn display_shortens_multi_line_scripts_but_keeps_one_liners() {
-        let one = Step {
+    fn display_shows_short_scripts_whole_and_long_ones_by_first_line() {
+        let sh = |script: &str| Step {
             id: "a",
             title: "t".into(),
             kind: StepKind::Cmd {
                 prog: "sh".into(),
-                args: vec!["-c".into(), "echo hi".into()],
+                args: vec!["-c".into(), script.into()],
             },
             optional: false,
             after: None,
         };
-        assert_eq!(one.display(), "sh -c 'echo hi'");
-        let multi = Step {
-            kind: StepKind::Cmd {
-                prog: "sh".into(),
-                args: vec!["-c".into(), "set -e\nrm -rf x".into()],
-            },
-            ..one
+        assert_eq!(sh("echo hi").display(), "sh -c 'echo hi'");
+        assert_eq!(sh("set -e\nrm -rf x").display(), "sh -c 'set -e; rm -rf x'");
+        let long = sh("1\n2\n3\n4\n5\n6\nrm -rf x");
+        assert_eq!(long.display(), "sh -c '1 ...'");
+        assert!(long.command_line().contains("rm -rf x"));
+    }
+
+    /// Runs the OpenShell install script with a fake `curl` (and optionally a fake `openshell`).
+    fn run_install_script(curl_body: &str, with_openshell: bool) -> std::process::Output {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!(
+            "osh-install-{}-{}",
+            std::process::id(),
+            curl_body.len() + usize::from(with_openshell)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let put = |name: &str, body: &str| {
+            let p = d.join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         };
-        assert_eq!(multi.display(), "sh -c 'set -e ...'");
-        assert!(multi.command_line().contains("rm -rf x"));
+        put("curl", curl_body);
+        if with_openshell {
+            put("openshell", "exit 0");
+        }
+        let out = std::process::Command::new("sh")
+            .args(["-c", OPENSHELL_INSTALL])
+            .env("PATH", format!("{}:/usr/bin:/bin", d.display()))
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&d);
+        out
+    }
+
+    #[test]
+    fn openshell_install_fails_when_the_download_fails() {
+        let out = run_install_script("exit 22", true);
+        assert!(!out.status.success(), "a failed curl must fail the step");
+    }
+
+    #[test]
+    fn openshell_install_fails_when_openshell_is_still_missing_afterwards() {
+        // curl writes a script that does nothing, so the installer "succeeds" without installing.
+        let out = run_install_script(
+            "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && echo : > \"$2\"; shift; done",
+            false,
+        );
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("openshell"));
+    }
+
+    #[test]
+    fn openshell_install_passes_when_the_installer_ran_and_openshell_exists() {
+        let out = run_install_script(
+            "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && echo : > \"$2\"; shift; done",
+            true,
+        );
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
+    fn consent_is_asked_with_a_terminal_and_refused_without_one_unless_yes() {
+        let ask = Options::default();
+        let yes = Options {
+            yes: true,
+            ..Default::default()
+        };
+        let dry = Options {
+            dry_run: true,
+            ..Default::default()
+        };
+        assert_eq!(consent(&ask, true), Consent::Ask);
+        assert_eq!(consent(&ask, false), Consent::Refuse);
+        assert_eq!(consent(&yes, false), Consent::All);
+        assert_eq!(consent(&yes, true), Consent::All);
+        assert_eq!(
+            consent(&dry, false),
+            Consent::All,
+            "a dry run changes nothing"
+        );
+    }
+
+    #[test]
+    fn plan_enables_the_podman_socket_when_podman_answers_without_it() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Podman];
+        f.podman_needs_socket = true;
+        let steps = plan(&f, &Options::default());
+        let s = steps.iter().find(|s| s.id == "runtime").unwrap();
+        assert_eq!(
+            s.command_line(),
+            "systemctl --user enable --now podman.socket"
+        );
+        assert!(!has(&steps, "apt-get install -y podman"));
+    }
+
+    #[test]
+    fn plan_adds_the_user_to_the_docker_group_on_permission_denied() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.docker_permission_denied = true;
+        let steps = plan(&f, &Options::default());
+        assert!(has(&steps, "sudo usermod -aG docker ana"));
+        let relogin = steps.iter().find(|s| s.id == "runtime-relogin").unwrap();
+        assert!(matches!(&relogin.kind, StepKind::Manual(t) if t.contains("log out")));
+        assert!(
+            !has(&steps, "systemctl start docker"),
+            "the daemon is already running"
+        );
     }
 
     #[test]

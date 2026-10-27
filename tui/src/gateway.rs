@@ -60,6 +60,8 @@ pub struct Paths {
     pub state: PathBuf,
     /// `~/.local/share/openshell`
     pub share: PathBuf,
+    /// The osh data dir: edited copies of the gateway configs there win over the embedded ones.
+    pub data: PathBuf,
     /// This binary, for the launchd agent to run.
     pub exe: PathBuf,
 }
@@ -77,6 +79,7 @@ impl Paths {
             config_home: xdg("XDG_CONFIG_HOME", ".config").join("openshell"),
             state: home.join(".local/state/openshell"),
             share: home.join(".local/share/openshell"),
+            data: assets::data_dir(),
             exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("osh")),
             home,
         }
@@ -143,25 +146,58 @@ pub fn config_name_for(os: Os, rt: Option<Runtime>) -> &'static str {
     }
 }
 
+/// The config to install: the data dir's copy (so edits there apply), else the embedded one.
+fn wanted_config(name: &str, h: &dyn Host, p: &Paths) -> String {
+    h.read(&p.data.join(name))
+        .unwrap_or_else(|| assets::embedded(name).unwrap_or_default().to_string())
+}
+
+fn service_running(os: Os, h: &dyn Host) -> bool {
+    match os {
+        Os::MacOs => h.run("openshell", &["status"]).is_ok(),
+        Os::Linux => h
+            .run(
+                "systemctl",
+                &["--user", "is-active", "--quiet", "openshell-gateway"],
+            )
+            .is_ok(),
+    }
+}
+
 /// Installs the gateway config and (re)starts the service. Empty when OpenShell is already
-/// installed, the config is current and `force` is off.
+/// installed, the config is current, the service is running and `force` is off. A config that
+/// is right but a service that is down still gets its restart steps, so a re-run resumes.
 pub fn plan(f: &Facts, o: &Options, h: &dyn Host, p: &Paths, force: bool) -> Vec<Step> {
     let name = config_name(f, o.runtime);
-    let wanted = assets::embedded(name).unwrap_or_default();
+    let wanted = wanted_config(name, h, p);
     let target = p.config_home.join("gateway.toml");
     let installing = !f.has_openshell;
-    let current = h.read(&target).is_some_and(|c| c == wanted);
-    if !force && !installing && current {
+    let installed = h.read(&target);
+    let current = installed.as_deref() == Some(wanted.as_str());
+    if !force && !installing && current && service_running(f.os, h) {
         return Vec::new();
     }
-    let mut steps = vec![step(
-        "gateway-config",
-        &format!("Install the gateway config ({name})"),
-        StepKind::Write {
-            path: target,
-            content: wanted.to_string(),
-        },
-    )];
+    let mut steps = Vec::new();
+    if !current {
+        if let Some(old) = installed.filter(|t| !t.is_empty()) {
+            steps.push(step(
+                "gateway-backup",
+                "Keep a copy of your gateway.toml before replacing it",
+                StepKind::Write {
+                    path: p.config_home.join("gateway.toml.osh-bak"),
+                    content: old,
+                },
+            ));
+        }
+        steps.push(step(
+            "gateway-config",
+            &format!("Install the gateway config ({name})"),
+            StepKind::Write {
+                path: target,
+                content: wanted,
+            },
+        ));
+    }
     match f.os {
         Os::MacOs if f.pkg == PkgMgr::Brew => steps.push(step(
             "gateway-restart",
@@ -515,14 +551,11 @@ fn gateway_binary() -> PathBuf {
 
 /// True when the installed gateway.toml is missing or differs from the embedded `name`.
 pub fn stale(name: &str, h: &dyn Host, p: &Paths) -> bool {
-    match (
-        assets::embedded(name),
-        h.read(&p.config_home.join("gateway.toml")),
-    ) {
-        (Some(w), Some(installed)) => w != installed,
-        (Some(_), None) => true,
-        _ => false,
+    if assets::embedded(name).is_none() {
+        return false;
     }
+    h.read(&p.config_home.join("gateway.toml"))
+        .is_none_or(|installed| installed != wanted_config(name, h, p))
 }
 
 #[cfg(test)]
@@ -550,6 +583,8 @@ mod tests {
             has_clipboard: true,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
+            podman_needs_socket: false,
+            docker_permission_denied: false,
         }
     }
 
@@ -559,6 +594,7 @@ mod tests {
             config_home: "/h/.config/openshell".into(),
             state: "/h/.local/state/openshell".into(),
             share: "/h/.local/share/openshell".into(),
+            data: "/h/.local/share/osh".into(),
             exe: "/usr/local/bin/osh".into(),
         }
     }
@@ -613,6 +649,65 @@ mod tests {
         assert!(!plan(&f, &Options::default(), &h, &paths(), true).is_empty());
         assert!(!stale("gateway-linux.toml", &h, &paths()));
         assert!(stale("gateway-podman.toml", &h, &paths()));
+    }
+
+    #[test]
+    fn plan_restarts_the_service_when_the_config_is_current_but_it_is_not_running() {
+        let wanted = assets::embedded("gateway-linux.toml").unwrap();
+        let mut h = FakeHost::default();
+        h.files
+            .insert("/h/.config/openshell/gateway.toml".into(), wanted.into());
+        h.failing.insert("systemctl".into());
+        let steps = plan(&facts(Os::Linux), &Options::default(), &h, &paths(), false);
+        let t = texts(&steps);
+        assert!(t.contains("systemctl --user restart openshell-gateway"));
+        assert!(!t.contains("write "), "the config is already right: {t}");
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            assets::embedded("gateway.toml").unwrap().into(),
+        );
+        h.failing.insert("openshell".into());
+        let steps = plan(&facts(Os::MacOs), &Options::default(), &h, &paths(), false);
+        assert!(texts(&steps).contains("brew services restart openshell"));
+    }
+
+    #[test]
+    fn plan_prefers_the_data_dir_copy_of_the_config() {
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.local/share/osh/gateway-linux.toml".into(),
+            "# mine\n".into(),
+        );
+        let steps = plan(&facts(Os::Linux), &Options::default(), &h, &paths(), false);
+        let StepKind::Write { content, .. } = &steps[0].kind else {
+            panic!("{:?}", steps[0])
+        };
+        assert_eq!(content, "# mine\n");
+        assert!(stale("gateway-linux.toml", &h, &paths()));
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            "# mine\n".into(),
+        );
+        assert!(!stale("gateway-linux.toml", &h, &paths()));
+    }
+
+    #[test]
+    fn plan_keeps_a_copy_of_a_hand_edited_installed_config() {
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            "# hand edit\n".into(),
+        );
+        let steps = plan(&facts(Os::Linux), &Options::default(), &h, &paths(), false);
+        let StepKind::Write { path, content } = &steps[0].kind else {
+            panic!("{:?}", steps[0])
+        };
+        assert_eq!(path, Path::new("/h/.config/openshell/gateway.toml.osh-bak"));
+        assert_eq!(content, "# hand edit\n");
+        assert!(
+            matches!(&steps[1].kind, StepKind::Write { path, .. } if path.ends_with("gateway.toml"))
+        );
     }
 
     #[test]

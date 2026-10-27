@@ -64,13 +64,14 @@ impl Host for RealHost {
         let out = Command::new(prog)
             .args(args)
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
             .output()
             .map_err(|e| format!("{prog}: {e}"))?;
         if out.status.success() {
             Ok(String::from_utf8_lossy(&out.stdout).into_owned())
         } else {
-            Err(format!("{prog} exited with {}", out.status))
+            let err = String::from_utf8_lossy(&out.stderr);
+            let first = err.lines().next().unwrap_or("");
+            Err(format!("{prog} exited with {}: {first}", out.status))
         }
     }
 
@@ -136,6 +137,12 @@ pub struct Facts {
     pub runtimes_installed: Vec<Runtime>,
     /// `<bin> info` succeeded: usable right now. Docker first when both are.
     pub runtimes_ready: Vec<Runtime>,
+    /// Linux: `podman info` answers but the user's `podman.socket` (the API OpenShell talks to)
+    /// is not active, so Podman is installed and usable but not ready for the gateway.
+    pub podman_needs_socket: bool,
+    /// `docker info` failed with "permission denied": the daemon is up but this user is not in
+    /// the docker group (the state right after installing Docker, until the next login).
+    pub docker_permission_denied: bool,
 }
 
 impl Facts {
@@ -207,11 +214,31 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
     let is_root = h.run("id", &["-u"]).is_ok_and(|o| o.trim() == "0");
     let all = [Runtime::Docker, Runtime::Podman];
     let runtimes_installed: Vec<Runtime> = all.into_iter().filter(|r| h.which(r.bin())).collect();
-    let runtimes_ready = runtimes_installed
-        .iter()
-        .copied()
-        .filter(|r| h.run(r.bin(), &["info"]).is_ok())
-        .collect();
+    let mut docker_permission_denied = false;
+    let mut podman_needs_socket = false;
+    let mut runtimes_ready = Vec::new();
+    for r in &runtimes_installed {
+        match h.run(r.bin(), &["info"]) {
+            Err(e) => {
+                docker_permission_denied |=
+                    *r == Runtime::Docker && e.contains("permission denied");
+            }
+            Ok(_) if *r == Runtime::Podman && os == Os::Linux => {
+                // Podman is daemonless: `info` works with no service. The gateway needs the socket.
+                if h.run(
+                    "systemctl",
+                    &["--user", "is-active", "--quiet", "podman.socket"],
+                )
+                .is_ok()
+                {
+                    runtimes_ready.push(*r);
+                } else {
+                    podman_needs_socket = true;
+                }
+            }
+            Ok(_) => runtimes_ready.push(*r),
+        }
+    }
     Facts {
         os,
         pkg,
@@ -233,6 +260,8 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
         },
         runtimes_installed,
         runtimes_ready,
+        podman_needs_socket,
+        docker_permission_denied,
     }
 }
 
@@ -251,6 +280,8 @@ pub mod testing {
         pub failing: HashSet<String>,
         pub outputs: HashMap<String, String>,
         pub env: HashMap<String, String>,
+        /// Command lines that fail with this message.
+        pub fail_msgs: HashMap<String, String>,
         pub calls: RefCell<Vec<String>>,
         pub written: RefCell<Vec<(std::path::PathBuf, String)>>,
     }
@@ -271,6 +302,9 @@ pub mod testing {
         fn run(&self, prog: &str, args: &[&str]) -> Result<String, String> {
             let line = format!("{prog} {}", args.join(" ")).trim().to_string();
             self.calls.borrow_mut().push(line.clone());
+            if let Some(m) = self.fail_msgs.get(&line) {
+                return Err(m.clone());
+            }
             if self.failing.contains(prog) || self.failing.contains(&line) {
                 return Err(format!("{line} failed"));
             }
@@ -356,6 +390,39 @@ mod tests {
         assert_eq!(f.runtimes_installed, vec![Runtime::Docker]);
         assert!(f.runtimes_ready.is_empty());
         assert_eq!(f.runtime(), None);
+    }
+
+    #[test]
+    fn podman_without_its_socket_is_not_ready() {
+        let mut h = FakeHost::with_bins(&["podman"]);
+        h.failing
+            .insert("systemctl --user is-active --quiet podman.socket".into());
+        let f = gather_for(&h, Os::Linux);
+        assert_eq!(f.runtimes_installed, vec![Runtime::Podman]);
+        assert!(f.runtimes_ready.is_empty());
+        assert!(f.podman_needs_socket);
+    }
+
+    #[test]
+    fn podman_on_macos_needs_no_socket_check() {
+        let mut h = FakeHost::with_bins(&["podman"]);
+        h.failing.insert("systemctl".into());
+        let f = gather_for(&h, Os::MacOs);
+        assert_eq!(f.runtimes_ready, vec![Runtime::Podman]);
+        assert!(!f.podman_needs_socket);
+    }
+
+    #[test]
+    fn docker_permission_denied_is_told_apart_from_a_stopped_daemon() {
+        let mut h = FakeHost::with_bins(&["docker"]);
+        h.fail_msgs.insert(
+            "docker info".into(),
+            "docker exited with 1: permission denied while trying to connect to the Docker daemon socket".into(),
+        );
+        assert!(gather_for(&h, Os::Linux).docker_permission_denied);
+        let mut h = FakeHost::with_bins(&["docker"]);
+        h.failing.insert("docker info".into());
+        assert!(!gather_for(&h, Os::Linux).docker_permission_denied);
     }
 
     #[test]
