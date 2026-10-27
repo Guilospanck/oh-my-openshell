@@ -1027,7 +1027,7 @@ mod tests {
         assert!(
             keep.contains("disable --now") && keep.contains("osh-gateway-openshell-podman.service")
         );
-        assert!(keep.contains("gateway remove openshell-podman"));
+        assert!(keep.contains("openshell gateway remove") && keep.contains("sh openshell-podman"));
         assert!(keep.contains("write /h/.local/share/osh/gateways.json"));
         assert!(
             !keep.contains("gateway-podman"),
