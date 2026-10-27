@@ -231,26 +231,47 @@ fn subcommand(args: &[String]) -> Option<i32> {
                 match a.as_str() {
                     "--yes" | "-y" => o.yes = true,
                     "--dry-run" => o.dry_run = true,
-                    "--runtime" => {
-                        o.runtime = match it.next().map(String::as_str) {
-                            Some("docker") => Some(platform::Runtime::Docker),
-                            Some("podman") => Some(platform::Runtime::Podman),
-                            _ => {
-                                eprintln!("--runtime takes docker or podman");
-                                return Some(2);
-                            }
+                    "--gateways" => match it.next().map(|l| setup::parse_gateways(l)) {
+                        Some(Ok(k)) => o.gateways = k,
+                        Some(Err(e)) => {
+                            eprintln!("osh setup: {e}");
+                            return Some(2);
                         }
-                    }
+                        None => {
+                            eprintln!("--gateways takes a list such as docker,podman");
+                            return Some(2);
+                        }
+                    },
+                    // The older flag: one runtime means one gateway of that type.
+                    "--runtime" => match it.next().and_then(|r| gwmodel::GwKind::parse(r)) {
+                        Some(k) if k != gwmodel::GwKind::Vm => o.gateways = vec![k],
+                        _ => {
+                            eprintln!("--runtime takes docker or podman");
+                            return Some(2);
+                        }
+                    },
                     other => {
                         eprintln!("osh setup: unknown option {other}");
                         return Some(2);
                     }
                 }
             }
+            if !o.gateways.is_empty() {
+                return Some(setup::run_gateways(&o));
+            }
             Some(if setup::run(&o, false) { 0 } else { 1 })
         }
+        "gateway-docker" => {
+            materialize_data();
+            let o = setup::Options {
+                gateways: vec![gwmodel::GwKind::Docker],
+                ..Default::default()
+            };
+            Some(setup::run_gateways(&o))
+        }
+        "gateway" => Some(gateway_add_remove(&args[1..])),
         "sync-agents" => Some(agents::cli_main(&args[1..], &assets::data_dir())),
-        "upgrade" | "uninstall" | "gateway-docker" | "gateway-reset" | "gateway-service" => {
+        "upgrade" | "uninstall" | "gateway-reset" | "gateway-service" => {
             Some(gateway_command(args))
         }
         _ => None,
@@ -267,13 +288,19 @@ fn gateway_command(args: &[String]) -> i32 {
     let interactive = io::stdin().is_terminal();
     let steps = match args[0].as_str() {
         "upgrade" => Ok(gateway::upgrade_steps(&f, &o, &h, &p)),
-        "gateway-docker" => gateway::docker_gateway_steps(&f, &p, &h),
         "gateway-service" if args.get(1).map(String::as_str) == Some("docker") => {
             let e = gateway::exec_docker_service(&p, &assets::data_dir());
             eprintln!("osh: cannot start the gateway: {e}");
             return 1;
         }
-        "gateway-service" => Err("usage: osh gateway-service docker".to_string()),
+        "gateway-service" => match args.get(1) {
+            Some(name) => {
+                let e = gwops::service_exec(name, &p);
+                eprintln!("osh: cannot start the gateway {name}: {e}");
+                return 1;
+            }
+            None => Err("usage: osh gateway-service <name>".to_string()),
+        },
         "uninstall" => {
             let steps = gateway::uninstall_steps(&f, &p);
             println!(
@@ -304,11 +331,16 @@ fn gateway_command(args: &[String]) -> i32 {
                     return 1;
                 }
             }
-            // Sweep with the runtime the installed gateway drives, not whichever answers first.
-            let driver = h
-                .read(&p.config_home.join("gateway.toml"))
-                .and_then(|t| gateway::driver_runtime(&t));
-            gateway::reset_steps(&f, &p, name, driver.or(f.runtime()))
+            let reg = gwmodel::Registry::load(&p.data);
+            if let Some(spec) = reg.get(name) {
+                Ok(gwops::reset_steps_for(&f, &p, spec, f.runtime()))
+            } else {
+                // Sweep with the runtime the installed gateway drives, not whichever answers first.
+                let driver = h
+                    .read(&p.config_home.join("gateway.toml"))
+                    .and_then(|t| gateway::driver_runtime(&t));
+                gateway::reset_steps(&f, &p, name, driver.or(f.runtime()))
+            }
         }
     };
     match steps {
@@ -320,6 +352,72 @@ fn gateway_command(args: &[String]) -> i32 {
         }
         Err(e) => {
             eprintln!("osh: {e}");
+            2
+        }
+    }
+}
+
+/// `osh gateway add <vm|docker|podman> [--yes] [--dry-run]` and
+/// `osh gateway remove <name> [--delete-data]`.
+fn gateway_add_remove(args: &[String]) -> i32 {
+    let usage = "usage: osh gateway add <vm|docker|podman> [--yes] [--dry-run] | osh gateway remove <name> [--delete-data]";
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let Some(kind) = args.get(1).and_then(|k| gwmodel::GwKind::parse(k)) else {
+                eprintln!("{usage}");
+                return 2;
+            };
+            materialize_data();
+            let o = setup::Options {
+                gateways: vec![kind],
+                yes: args.iter().any(|a| a == "--yes" || a == "-y"),
+                dry_run: args.iter().any(|a| a == "--dry-run"),
+                ..Default::default()
+            };
+            setup::run_gateways(&o)
+        }
+        Some("remove") => {
+            let Some(name) = args.get(1).filter(|n| !n.starts_with("--")) else {
+                eprintln!("{usage}");
+                return 2;
+            };
+            let delete = args.iter().any(|a| a == "--delete-data");
+            let h = platform::RealHost;
+            let f = platform::gather(&h);
+            let p = gateway::Paths::detect();
+            let reg = gwmodel::Registry::load(&p.data);
+            let steps = match gwops::remove_gateway_steps(&f, &p, &reg, name, delete) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("osh: {e}");
+                    return 2;
+                }
+            };
+            let word = if delete {
+                "remove and delete data"
+            } else {
+                "remove"
+            };
+            println!(
+                "This removes the gateway {name}{}.",
+                if delete {
+                    " and its data"
+                } else {
+                    " (its data stays)"
+                }
+            );
+            if !confirmed(word) {
+                eprintln!("aborted");
+                return 1;
+            }
+            let o = setup::Options {
+                yes: true,
+                ..Default::default()
+            };
+            i32::from(!setup::run_steps(&h, steps, &o, io::stdin().is_terminal()))
+        }
+        _ => {
+            eprintln!("{usage}");
             2
         }
     }

@@ -12,18 +12,6 @@ pub const DOCKER_GATEWAY: &str = "openshell-docker";
 /// Polls the gateway for up to 20 seconds, then prints its status either way.
 pub(crate) const WAIT_SCRIPT: &str = r#"for _ in $(seq 20); do openshell -g "$1" status >/dev/null 2>&1 && break; sleep 1; done; openshell -g "$1" status"#;
 
-/// Registers the Docker gateway, sharing the Homebrew gateway's client certificates.
-/// $1 = config dir. Keeps the previously selected gateway active.
-const DOCKER_REGISTER_SCRIPT: &str = r#"set -e
-mkdir -p "$1/gateways/openshell-docker"
-cp -R "$1/gateways/openshell/mtls" "$1/gateways/openshell-docker/"
-previous="$(cat "$1/active_gateway" 2>/dev/null || echo openshell)"
-if ! openshell gateway list -o json | grep -q '"openshell-docker"'; then
-  openshell gateway add https://localhost:17671 --local --name openshell-docker
-  openshell gateway select "$previous"
-fi
-sleep 3"#;
-
 /// Deletes the gateway's sandboxes through the gateway. $1 = gateway name.
 pub(crate) const DELETE_SANDBOXES_SCRIPT: &str = r#"if openshell -g "$1" status >/dev/null 2>&1; then
   openshell -g "$1" sandbox delete --all || echo "sandbox delete failed; sweeping leftovers next"
@@ -249,89 +237,6 @@ pub fn plan(f: &Facts, o: &Options, h: &dyn Host, p: &Paths, force: bool) -> Vec
         script(WAIT_SCRIPT, &["openshell"]),
     ));
     chain(steps, installing.then_some("openshell"))
-}
-
-/// The launchd agent that runs `osh gateway-service docker`.
-pub fn docker_gateway_plist(exe: &Path, logs: &Path) -> String {
-    let esc = |p: &Path| {
-        p.display()
-            .to_string()
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-    };
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>{DOCKER_LABEL}</string>
-  <key>ProgramArguments</key><array><string>{exe}</string><string>gateway-service</string><string>docker</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>StandardOutPath</key><string>{logs}/gateway.out.log</string>
-  <key>StandardErrorPath</key><string>{logs}/gateway.err.log</string>
-</dict></plist>
-"#,
-        exe = esc(exe),
-        logs = esc(logs)
-    )
-}
-
-/// macOS only: a second gateway on the Docker driver, which honours per-sandbox CPU/memory.
-/// Needs the Homebrew gateway to have run once, for the shared TLS material.
-pub fn docker_gateway_steps(f: &Facts, p: &Paths, h: &dyn Host) -> Result<Vec<Step>, String> {
-    if f.os != Os::MacOs {
-        return Err("not needed on Linux: its only gateway already uses the Docker driver".into());
-    }
-    let logs = p.state.join("gateway-docker");
-    let mut steps = vec![step(
-        "docker-gateway-plist",
-        "Write the launchd agent",
-        StepKind::Write {
-            path: p.plist(),
-            content: docker_gateway_plist(&p.exe, &logs),
-        },
-    )];
-    if h.read(&p.config_home.join("gateway.env")).is_none() {
-        steps.push(step(
-            "docker-gateway-env",
-            "Write gateway.env (Colima Docker socket)",
-            StepKind::Write {
-                path: p.config_home.join("gateway.env"),
-                content: assets::embedded("gateway.env").unwrap_or_default().into(),
-            },
-        ));
-    }
-    let plist = p.plist().to_string_lossy().into_owned();
-    steps.push(step(
-        "docker-gateway-logs",
-        "Create the log directory",
-        cmd("mkdir", &["-p", &logs.to_string_lossy()]),
-    ));
-    steps.push(step(
-        "docker-gateway-stop",
-        "Stop a running agent",
-        script(
-            r#"launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true"#,
-            &[DOCKER_LABEL],
-        ),
-    ));
-    steps.push(step(
-        "docker-gateway-start",
-        "Start the agent",
-        script(r#"launchctl bootstrap "gui/$(id -u)" "$1""#, &[&plist]),
-    ));
-    steps.push(step(
-        "docker-gateway-register",
-        "Register the gateway with the OpenShell CLI",
-        script(DOCKER_REGISTER_SCRIPT, &[&p.config_home.to_string_lossy()]),
-    ));
-    steps.push(step(
-        "docker-gateway-wait",
-        "Wait for the gateway to answer",
-        script(WAIT_SCRIPT, &[DOCKER_GATEWAY]),
-    ));
-    Ok(chain(steps, None))
 }
 
 /// Reinstalls OpenShell with its official installer, refreshes the config, restarts the
@@ -772,24 +677,6 @@ mod tests {
     }
 
     #[test]
-    fn plist_runs_the_osh_binary_as_the_gateway_service() {
-        let x = docker_gateway_plist(Path::new("/usr/local/bin/osh"), Path::new("/logs"));
-        assert!(x.contains(DOCKER_LABEL));
-        assert!(x.contains("<string>/usr/local/bin/osh</string><string>gateway-service</string><string>docker</string>"));
-        assert!(x.contains("/logs/gateway.err.log"));
-    }
-
-    #[test]
-    fn docker_gateway_is_macos_only() {
-        let h = FakeHost::default();
-        assert!(docker_gateway_steps(&facts(Os::Linux), &paths(), &h).is_err());
-        let steps = docker_gateway_steps(&facts(Os::MacOs), &paths(), &h).unwrap();
-        let t = texts(&steps);
-        assert!(t.contains("Library/LaunchAgents/dev.guilospanck.openshell-docker.plist"));
-        assert!(t.contains("write /h/.config/openshell/gateway.env"));
-    }
-
-    #[test]
     fn upgrade_reinstalls_openshell_and_restarts_the_docker_gateway_on_macos() {
         let h = FakeHost::default();
         let steps = upgrade_steps(&facts(Os::MacOs), &Options::default(), &h, &paths());
@@ -814,13 +701,6 @@ mod tests {
         );
         assert_eq!(driver_runtime("compute_driver = \"vm\""), None);
         assert_eq!(driver_runtime("# compute_driver = \"podman\"\n"), None);
-    }
-
-    #[test]
-    fn plist_escapes_xml_in_paths() {
-        let x = docker_gateway_plist(Path::new("/a&b/<osh>"), Path::new("/l\"x"));
-        assert!(x.contains("/a&amp;b/&lt;osh&gt;"));
-        assert!(!x.contains("a&b"));
     }
 
     #[test]

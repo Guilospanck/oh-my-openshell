@@ -1,7 +1,7 @@
 //! Turns facts about the host into an ordered list of install steps and runs them with consent.
 //! Planning is pure (Facts in, steps out); only `execute` touches the host, through `Host`.
 use crate::gwmodel::GwKind;
-use crate::platform::{gather, Facts, Host, Os, PkgMgr, RealHost, Runtime};
+use crate::platform::{gather, Facts, Host, Kvm, Os, PkgMgr, PodmanMachine, RealHost, Runtime};
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
@@ -131,14 +131,38 @@ fn install_prefix(pm: PkgMgr) -> Option<Vec<&'static str>> {
     })
 }
 
-struct Planner<'a> {
-    f: &'a Facts,
+struct Planner {
+    f: Facts,
     steps: Vec<Step>,
     apt_updated: bool,
+    /// Suffix for the ids of a second (third...) gateway type's prerequisite steps, so two
+    /// runtimes in one plan do not share `runtime`, `runtime-service`...
+    sfx: String,
+    kinds_planned: usize,
 }
 
-impl Planner<'_> {
+impl Planner {
+    fn new(f: &Facts) -> Planner {
+        Planner {
+            f: f.clone(),
+            steps: Vec::new(),
+            apt_updated: false,
+            sfx: String::new(),
+            kinds_planned: 0,
+        }
+    }
+
+    /// `base` with this gateway type's suffix, as a `&'static str` (a plan is built once per run).
+    fn rid(&self, base: &'static str) -> &'static str {
+        if self.sfx.is_empty() {
+            base
+        } else {
+            Box::leak(format!("{base}{}", self.sfx).into_boxed_str())
+        }
+    }
+
     fn push(&mut self, id: &'static str, title: &str, kind: StepKind, optional: bool) {
+        let id = self.rid(id);
         self.steps.push(Step {
             id,
             title: title.into(),
@@ -215,7 +239,7 @@ impl Planner<'_> {
     }
 
     fn runtime(&mut self, o: &Options) {
-        let f = self.f;
+        let f = self.f.clone();
         if !f.runtimes_ready.is_empty() {
             return;
         }
@@ -323,7 +347,8 @@ impl Planner<'_> {
                     ),
                 };
                 self.push(id, title, kind, false);
-                self.steps.last_mut().unwrap().after = Some("runtime");
+                let base = self.rid("runtime");
+                self.steps.last_mut().unwrap().after = Some(base);
                 if rt == Runtime::Docker && !f.is_root && !f.user.is_empty() {
                     let kind = self.privileged(
                         ["usermod", "-aG", "docker", f.user.as_str()]
@@ -331,7 +356,8 @@ impl Planner<'_> {
                             .to_vec(),
                     );
                     self.push("runtime-group", "Let your user run docker", kind, false);
-                    self.steps.last_mut().unwrap().after = Some("runtime");
+                    let base = self.rid("runtime");
+                    self.steps.last_mut().unwrap().after = Some(base);
                     // The gateway runs as a user service, which keeps the groups it started with:
                     // OpenShell's installer would wait for a connection that cannot happen yet.
                     self.push(
@@ -343,19 +369,285 @@ impl Planner<'_> {
                         ),
                         false,
                     );
-                    self.steps.last_mut().unwrap().after = Some("runtime-group");
+                    let group = self.rid("runtime-group");
+                    self.steps.last_mut().unwrap().after = Some(group);
                 }
             }
         }
     }
 }
 
+/// Steps one gateway type needs before its gateway can start. Returns the id the gateway should
+/// wait for. `first_after` is a dependency of the first step added (curl, say).
+impl Planner {
+    fn kind_prereqs(
+        &mut self,
+        kind: GwKind,
+        first_after: Option<&'static str>,
+    ) -> Option<&'static str> {
+        self.sfx = if self.kinds_planned == 0 {
+            String::new()
+        } else {
+            format!("-{}", self.kinds_planned + 1)
+        };
+        let before = self.steps.len();
+        let f = self.f.clone();
+        match kind {
+            GwKind::Docker | GwKind::Podman => {
+                let rt = if kind == GwKind::Docker {
+                    Runtime::Docker
+                } else {
+                    Runtime::Podman
+                };
+                if f.runtimes_ready.contains(&rt) {
+                    // Nothing to do.
+                } else if f.os == Os::MacOs {
+                    self.mac_runtime(rt);
+                } else {
+                    // The existing single-runtime logic, on a view of the facts that only knows `rt`.
+                    let mut view = f.clone();
+                    view.runtimes_ready.retain(|r| *r == rt);
+                    view.runtimes_installed.retain(|r| *r == rt);
+                    view.podman_needs_socket &= rt == Runtime::Podman;
+                    view.docker_permission_denied &= rt == Runtime::Docker;
+                    let saved = std::mem::replace(&mut self.f, view);
+                    self.runtime(&Options {
+                        runtime: Some(rt),
+                        ..Default::default()
+                    });
+                    self.f = saved;
+                }
+            }
+            GwKind::Vm => self.vm_prereqs(),
+        }
+        let added = &mut self.steps[before..];
+        if let Some(first) = added.first_mut() {
+            first.after = first.after.or(first_after);
+        }
+        let sfx = self.sfx.clone();
+        let find = |base: &str| {
+            let want = format!("{base}{sfx}");
+            added.iter().find(|s| s.id == want).map(|s| s.id)
+        };
+        let wait = [
+            "kvm-relogin",
+            "runtime-relogin",
+            "colima-start",
+            "docker-desktop",
+            "pm-start",
+            "runtime-service",
+            "runtime",
+            "kvm",
+        ]
+        .into_iter()
+        .find_map(find);
+        self.kinds_planned += 1;
+        self.sfx = String::new();
+        wait
+    }
+
+    fn mac_runtime(&mut self, rt: Runtime) {
+        let f = self.f.clone();
+        match rt {
+            Runtime::Docker if f.docker_desktop => self.push(
+                "docker-desktop",
+                "Start Docker Desktop",
+                StepKind::Manual(
+                    "start Docker Desktop and wait until it says it is running, then run osh again"
+                        .into(),
+                ),
+                false,
+            ),
+            Runtime::Docker => {
+                if !f.colima {
+                    self.pkg(
+                        "colima",
+                        "Install Colima and Docker",
+                        &["colima", "docker"],
+                        false,
+                    );
+                }
+                let after = (!f.colima).then(|| self.rid("colima"));
+                self.push(
+                    "colima-start",
+                    "Start Colima",
+                    StepKind::Cmd {
+                        prog: "colima".into(),
+                        args: vec!["start".into()],
+                    },
+                    false,
+                );
+                self.steps.last_mut().unwrap().after = after;
+            }
+            Runtime::Podman => {
+                let installed = f.runtimes_installed.contains(&Runtime::Podman);
+                if !installed {
+                    self.pkg("runtime", "Install Podman", &["podman"], false);
+                }
+                let mut after = (!installed).then(|| self.rid("runtime"));
+                if f.podman_machine == PodmanMachine::None {
+                    self.push(
+                        "pm-init",
+                        "Create the Podman machine",
+                        StepKind::Cmd {
+                            prog: "podman".into(),
+                            args: vec!["machine".into(), "init".into()],
+                        },
+                        false,
+                    );
+                    self.steps.last_mut().unwrap().after = after;
+                    after = Some(self.rid("pm-init"));
+                }
+                self.push(
+                    "pm-start",
+                    "Start the Podman machine",
+                    StepKind::Cmd {
+                        prog: "podman".into(),
+                        args: vec!["machine".into(), "start".into()],
+                    },
+                    false,
+                );
+                self.steps.last_mut().unwrap().after = after;
+            }
+        }
+    }
+
+    fn vm_prereqs(&mut self) {
+        let f = self.f.clone();
+        if f.os == Os::Linux {
+            match f.kvm {
+                Kvm::Absent => self.push(
+                    "kvm",
+                    "VM gateway needs /dev/kvm",
+                    StepKind::Manual(
+                        "the VM gateway needs /dev/kvm, which is missing: virtualization is off or unsupported on this machine".into(),
+                    ),
+                    false,
+                ),
+                Kvm::NoAccess if !f.is_root && !f.user.is_empty() => {
+                    let kind = self.privileged(["usermod", "-aG", "kvm", f.user.as_str()].map(String::from).to_vec());
+                    self.push("kvm-group", "Let your user use KVM", kind, false);
+                    self.push(
+                        "kvm-relogin",
+                        "Apply the new group",
+                        StepKind::Manual("log out and back in (or reboot) so the kvm group applies, then run osh setup again".into()),
+                        false,
+                    );
+                    let group = self.rid("kvm-group");
+                    self.steps.last_mut().unwrap().after = Some(group);
+                }
+                _ => {}
+            }
+        }
+        if !f.has_e2fsprogs && !self.steps.iter().any(|s| s.id == "e2fsprogs") {
+            self.pkg(
+                "e2fsprogs",
+                "Install e2fsprogs (the VM driver builds sandbox disks with it)",
+                &["e2fsprogs"],
+                false,
+            );
+        }
+    }
+}
+
+/// The plan when the wanted gateway types are known: each type's prerequisites (the main's before
+/// OpenShell on Linux, where OpenShell's installer waits for a connected gateway; the others'
+/// after it), OpenShell, and the optional tools. The gateways themselves are added by
+/// `plan_gateways`.
+fn plan_for_gateways(f: &Facts, o: &Options) -> (Vec<Step>, Vec<Option<&'static str>>) {
+    let mut p = Planner::new(f);
+    let mac_brew = f.os == Os::MacOs && f.pkg == PkgMgr::Brew;
+    if f.os == Os::MacOs && f.pkg == PkgMgr::None {
+        p.push(
+            "homebrew",
+            "Install Homebrew",
+            StepKind::Manual("install Homebrew from https://brew.sh, then run osh again".into()),
+            false,
+        );
+    }
+    let main = o.gateways[0];
+    let mut after = None;
+    if !f.has_openshell {
+        if !f.has_curl {
+            p.pkg("curl", "Install curl", &["curl"], false);
+            after = Some("curl");
+        }
+        if mac_brew && !f.has_e2fsprogs {
+            p.pkg(
+                "e2fsprogs",
+                "Install e2fsprogs (OpenShell needs 1.43+)",
+                &["e2fsprogs"],
+                false,
+            );
+        }
+    }
+    let mut openshell_after = after;
+    // The step each gateway type's own steps must wait for, in the order of `o.gateways`.
+    let mut waits: Vec<Option<&'static str>> = Vec::new();
+    if f.os == Os::Linux {
+        let wait = p.kind_prereqs(main, after);
+        openshell_after = wait.or(after);
+        waits.push(wait);
+    }
+    if !f.has_openshell {
+        p.push(
+            "openshell",
+            "Install OpenShell",
+            StepKind::Cmd {
+                prog: "sh".into(),
+                args: vec!["-c".into(), OPENSHELL_INSTALL.into()],
+            },
+            false,
+        );
+        p.steps.last_mut().unwrap().after = openshell_after;
+    }
+    if f.os == Os::MacOs {
+        let wait = p.kind_prereqs(main, (!f.has_openshell).then_some("openshell"));
+        waits.push(wait);
+    }
+    for k in &o.gateways[1..] {
+        let wait = p.kind_prereqs(*k, None);
+        waits.push(wait);
+    }
+    p.optional_tools();
+    (p.steps, waits)
+}
+
+impl Planner {
+    fn optional_tools(&mut self) {
+        let f = self.f.clone();
+        let mac_brew = f.os == Os::MacOs && f.pkg == PkgMgr::Brew;
+        if f.os == Os::MacOs && !f.has_clipboard && mac_brew {
+            self.pkg(
+                "pngpaste",
+                "Install pngpaste (paste host images with Ctrl-V)",
+                &["pngpaste"],
+                true,
+            );
+        }
+        if f.os == Os::Linux && !f.has_clipboard {
+            let tool = if f.wayland { "wl-clipboard" } else { "xclip" };
+            self.pkg(
+                "clipboard",
+                "Install a clipboard tool (paste host images with Ctrl-V)",
+                &[tool],
+                true,
+            );
+        }
+        if !f.has_tmux {
+            self.pkg("tmux", "Install tmux", &["tmux"], true);
+        }
+        if !f.has_gh {
+            self.pkg("gh", "Install the GitHub CLI", &["gh"], true);
+        }
+    }
+}
+
 pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
-    let mut p = Planner {
-        f,
-        steps: Vec::new(),
-        apt_updated: false,
-    };
+    if !o.gateways.is_empty() {
+        return plan_for_gateways(f, o).0;
+    }
+    let mut p = Planner::new(f);
     let mac_brew = f.os == Os::MacOs && f.pkg == PkgMgr::Brew;
     if f.os == Os::MacOs && f.pkg == PkgMgr::None {
         p.push(
@@ -435,6 +727,147 @@ pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
         p.pkg("gh", "Install the GitHub CLI", &["gh"], true);
     }
     p.steps
+}
+
+/// `docker,podman` as a list of gateway types, first = main. Also accepts `openshell-docker` etc.
+pub fn parse_gateways(text: &str) -> Result<Vec<GwKind>, String> {
+    let mut kinds: Vec<GwKind> = Vec::new();
+    for word in text.split(',').map(str::trim).filter(|w| !w.is_empty()) {
+        let k = GwKind::parse(word)
+            .ok_or_else(|| format!("{word} is not a gateway type; use vm, docker or podman"))?;
+        if !kinds.contains(&k) {
+            kinds.push(k);
+        }
+    }
+    if kinds.is_empty() {
+        return Err("name at least one gateway type: vm, docker or podman".into());
+    }
+    Ok(kinds)
+}
+
+/// The gateways the OpenShell CLI already knows, as (name, port), from `openshell gateway list`.
+pub fn existing_gateways(h: &dyn Host) -> Vec<(String, u16)> {
+    let Ok(text) = h.run("openshell", &["gateway", "list", "-o", "json"]) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|g| {
+            let name = g["name"].as_str()?.to_string();
+            let port = g["endpoint"]
+                .as_str()
+                .and_then(|e| e.rsplit(':').next())
+                .and_then(|p| p.trim_end_matches('/').parse().ok())
+                .unwrap_or(0);
+            Some((name, port))
+        })
+        .collect()
+}
+
+/// The whole plan for the wanted gateway types: prerequisites, OpenShell, then each gateway's
+/// config, service and registration. Types already registered by osh or known to the CLI are
+/// skipped. The first wanted type becomes the main gateway only when no gateway exists yet;
+/// otherwise every one is an extra. `Err` when a type cannot work on this machine.
+pub fn plan_gateways(
+    f: &Facts,
+    o: &Options,
+    h: &dyn Host,
+    p: &crate::gateway::Paths,
+    reg: &crate::gwmodel::Registry,
+    existing: &[(String, u16)],
+    is_bound: &dyn Fn(u16) -> bool,
+) -> Result<Vec<Step>, String> {
+    use crate::gwmodel::{availability, next_port, GatewaySpec, State};
+    for k in &o.gateways {
+        if let State::Unavailable(why) = availability(f, *k).state {
+            return Err(format!("{}: {why}", k.label()));
+        }
+    }
+    let wanted: Vec<GwKind> = o
+        .gateways
+        .iter()
+        .copied()
+        .filter(|k| !reg.has_kind(*k) && !existing.iter().any(|(n, _)| n == k.name()))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut o2 = o.clone();
+    o2.gateways = wanted.clone();
+    let (mut steps, waits) = plan_for_gateways(f, &o2);
+    let no_main = reg.main().is_none() && existing.is_empty();
+    let mut taken: Vec<u16> = reg
+        .gateways
+        .iter()
+        .map(|g| g.port)
+        .chain(existing.iter().map(|(_, p)| *p))
+        .collect();
+    let mut reg_now = reg.clone();
+    let mut prev_last: Option<&'static str> = None;
+    for (i, kind) in wanted.iter().enumerate() {
+        let is_main = i == 0 && no_main;
+        let port = if is_main {
+            17670
+        } else {
+            next_port(&taken, is_bound)
+        };
+        taken.push(port);
+        let spec = GatewaySpec {
+            name: kind.name().into(),
+            kind: *kind,
+            port,
+            main: is_main,
+        };
+        let mut g = if is_main {
+            let installing = !f.has_openshell || existing.is_empty();
+            crate::gwops::main_gateway_steps(f, p, h, &spec, installing)
+        } else {
+            crate::gwops::add_gateway_steps(f, p, h, &reg_now, &spec)
+        };
+        let dep = if is_main && !f.has_openshell {
+            Some("openshell")
+        } else {
+            waits.get(i).copied().flatten().or(prev_last)
+        };
+        if let Some(first) = g.first_mut() {
+            first.after = first.after.or(dep);
+        }
+        prev_last = g.last().map(|s| s.id);
+        reg_now.add(spec);
+        steps.extend(g);
+    }
+    Ok(steps)
+}
+
+/// Plans and runs the wanted gateway types on this machine (the `--gateways` and `gateway add`
+/// path). Returns the process exit code.
+pub fn run_gateways(o: &Options) -> i32 {
+    let h = RealHost;
+    let f = gather(&h);
+    let p = crate::gateway::Paths::detect();
+    let reg = crate::gwmodel::Registry::load(&p.data);
+    let existing = existing_gateways(&h);
+    let bound = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
+    match plan_gateways(&f, o, &h, &p, &reg, &existing, &bound) {
+        Err(e) => {
+            eprintln!("osh: {e}");
+            2
+        }
+        Ok(steps) if steps.is_empty() => {
+            println!("Nothing to do: those gateways are already set up.");
+            0
+        }
+        Ok(steps) => i32::from(!run_steps(
+            &h,
+            steps,
+            o,
+            !o.yes && io::stdin().is_terminal(),
+        )),
+    }
 }
 
 /// What happened while `execute_events` ran, so a screen can follow along.
@@ -748,6 +1181,7 @@ pub fn run_ok(steps: &[Step], results: &[StepResult], o: &Options) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gwmodel::GwKind;
     use crate::platform::testing::FakeHost;
     use crate::platform::{gather_for, Kvm, PkgMgr, PodmanMachine};
 
@@ -1013,6 +1447,382 @@ mod tests {
         let steps = plan(&f, &Options::default());
         let openshell = steps.iter().find(|s| s.id == "openshell").unwrap();
         assert_eq!(openshell.after, Some("runtime-relogin"));
+    }
+
+    fn gw_ids(steps: &[Step]) -> Vec<&'static str> {
+        steps.iter().map(|s| s.id).collect()
+    }
+
+    fn with_gateways(kinds: &[GwKind]) -> Options {
+        Options {
+            gateways: kinds.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn linux_main_prereqs_come_before_openshell_and_extras_after() {
+        let steps = plan(
+            &facts(Os::Linux, PkgMgr::Apt),
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+        );
+        let ids = gw_ids(&steps);
+        let pos = |id: &str| {
+            ids.iter()
+                .position(|i| *i == id)
+                .unwrap_or_else(|| panic!("{id} in {ids:?}"))
+        };
+        assert!(
+            pos("runtime") < pos("openshell"),
+            "the main's runtime first: {ids:?}"
+        );
+        assert!(
+            pos("openshell") < pos("runtime-2"),
+            "the extra's runtime after OpenShell: {ids:?}"
+        );
+        let docker = steps
+            .iter()
+            .find(|s| s.id == "runtime")
+            .unwrap()
+            .command_line();
+        assert!(docker.contains("docker.io"), "{docker}");
+        let podman = steps
+            .iter()
+            .find(|s| s.id == "runtime-2")
+            .unwrap()
+            .command_line();
+        assert!(podman.contains("podman"), "{podman}");
+    }
+
+    #[test]
+    fn every_step_id_is_unique_when_two_runtimes_are_planned() {
+        let steps = plan(
+            &facts(Os::Linux, PkgMgr::Apt),
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+        );
+        let mut ids = gw_ids(&steps);
+        let n = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "duplicate ids: {ids:?}");
+        for s in &steps {
+            if let Some(a) = s.after {
+                assert!(
+                    steps.iter().any(|x| x.id == a),
+                    "{} waits for missing {a}",
+                    s.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_ready_type_adds_no_prerequisite_steps() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.runtimes_ready = vec![Runtime::Docker];
+        let steps = plan(&f, &with_gateways(&[GwKind::Docker]));
+        assert!(!has(&steps, "docker"), "{:?}", lines(&steps));
+        assert!(steps.iter().all(|s| !s.id.starts_with("runtime")));
+    }
+
+    #[test]
+    fn vm_on_linux_needs_the_kvm_group_then_a_new_login() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        f.kvm = Kvm::NoAccess;
+        let steps = plan(&f, &with_gateways(&[GwKind::Vm]));
+        assert!(has(&steps, "sudo usermod -aG kvm ana"));
+        assert!(has(&steps, "apt-get install -y e2fsprogs"));
+        let relogin = steps.iter().find(|s| s.id == "kvm-relogin").unwrap();
+        assert!(matches!(&relogin.kind, StepKind::Manual(t) if t.contains("log out")));
+        assert_eq!(relogin.after, Some("kvm-group"));
+    }
+
+    #[test]
+    fn vm_without_kvm_is_a_manual_dead_end_with_the_reason() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        let steps = plan(&f, &with_gateways(&[GwKind::Vm]));
+        let s = steps.iter().find(|s| s.id == "kvm").unwrap();
+        assert!(matches!(&s.kind, StepKind::Manual(t) if t.contains("/dev/kvm")));
+    }
+
+    #[test]
+    fn plan_installs_colima_and_starts_it_for_docker_on_macos() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = true;
+        let steps = plan(&f, &with_gateways(&[GwKind::Docker]));
+        assert!(has(&steps, "brew install colima docker"));
+        let start = steps.iter().find(|s| s.id == "colima-start").unwrap();
+        assert_eq!(start.command_line(), "colima start");
+        assert_eq!(start.after, Some("colima"));
+    }
+
+    #[test]
+    fn docker_desktop_on_macos_asks_the_user_to_start_it() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = true;
+        f.docker_desktop = true;
+        let steps = plan(&f, &with_gateways(&[GwKind::Docker]));
+        let s = steps.iter().find(|s| s.id == "docker-desktop").unwrap();
+        assert!(matches!(&s.kind, StepKind::Manual(t) if t.contains("Docker Desktop")));
+        assert!(!has(&steps, "colima"));
+    }
+
+    #[test]
+    fn plan_inits_and_starts_the_podman_machine_on_macos() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Podman];
+        let steps = plan(&f, &with_gateways(&[GwKind::Podman]));
+        assert!(has(&steps, "podman machine init"));
+        assert!(has(&steps, "podman machine start"));
+        f.podman_machine = PodmanMachine::Stopped;
+        let steps = plan(&f, &with_gateways(&[GwKind::Podman]));
+        assert!(!has(&steps, "podman machine init") && has(&steps, "podman machine start"));
+    }
+
+    #[test]
+    fn vm_on_macos_installs_e2fsprogs_once_even_with_a_fresh_openshell() {
+        let steps = plan(
+            &facts(Os::MacOs, PkgMgr::Brew),
+            &with_gateways(&[GwKind::Vm]),
+        );
+        let n = steps.iter().filter(|s| s.id == "e2fsprogs").count();
+        assert_eq!(n, 1, "{:?}", lines(&steps));
+    }
+
+    #[test]
+    fn gateway_plans_still_offer_the_optional_tools() {
+        let steps = plan(
+            &facts(Os::Linux, PkgMgr::Apt),
+            &with_gateways(&[GwKind::Podman]),
+        );
+        assert!(steps.iter().any(|s| s.id == "tmux" && s.optional));
+    }
+
+    fn gw_paths() -> crate::gateway::Paths {
+        crate::gateway::Paths {
+            home: "/h".into(),
+            config_home: "/h/.config/openshell".into(),
+            state: "/h/.local/state/openshell".into(),
+            share: "/h/.local/share/openshell".into(),
+            data: "/h/.local/share/osh".into(),
+            exe: "/usr/local/bin/osh".into(),
+        }
+    }
+
+    fn gw_plan(
+        f: &Facts,
+        kinds: &[GwKind],
+        reg: &crate::gwmodel::Registry,
+        existing: &[(String, u16)],
+    ) -> Result<Vec<Step>, String> {
+        plan_gateways(
+            f,
+            &with_gateways(kinds),
+            &FakeHost::default(),
+            &gw_paths(),
+            reg,
+            existing,
+            &|_| false,
+        )
+    }
+
+    fn written_json(steps: &[Step]) -> Vec<String> {
+        steps
+            .iter()
+            .filter_map(|s| match &s.kind {
+                StepKind::Write { path, content } if path.ends_with("gateways.json") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gateways_flag_orders_main_first_and_names_gateways_after_their_type() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Docker, Runtime::Podman];
+        f.runtimes_ready = vec![Runtime::Docker, Runtime::Podman];
+        let steps = gw_plan(
+            &f,
+            &[GwKind::Podman, GwKind::Docker],
+            &crate::gwmodel::Registry::default(),
+            &[],
+        )
+        .unwrap();
+        let main_cfg = steps
+            .iter()
+            .find_map(|s| match &s.kind {
+                StepKind::Write { path, content } if path.ends_with("gateway.toml") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            main_cfg.contains("name = \"openshell-podman\""),
+            "the first is main: {main_cfg}"
+        );
+        let t = lines(&steps).join("\n");
+        assert!(t.contains("write /h/.local/share/osh/gateways/openshell-docker.toml"));
+        let regs = written_json(&steps);
+        assert!(
+            regs.last().unwrap().contains("\"openshell-podman\"")
+                && regs.last().unwrap().contains("17671")
+        );
+    }
+
+    #[test]
+    fn vm_without_kvm_is_refused_with_the_reason() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        let e = gw_plan(&f, &[GwKind::Vm], &crate::gwmodel::Registry::default(), &[]).unwrap_err();
+        assert!(e.contains("VM") && e.contains("/dev/kvm"), "{e}");
+    }
+
+    #[test]
+    fn an_existing_main_makes_every_ticked_type_an_extra_on_free_ports() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        f.kvm = Kvm::Usable;
+        f.has_e2fsprogs = true;
+        f.runtimes_installed = vec![Runtime::Podman];
+        f.runtimes_ready = vec![Runtime::Podman];
+        let mut reg = crate::gwmodel::Registry::default();
+        reg.add(crate::gwmodel::GatewaySpec {
+            name: "openshell-docker".into(),
+            kind: GwKind::Docker,
+            port: 17670,
+            main: true,
+        });
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Podman, GwKind::Vm]),
+            &FakeHost::default(),
+            &gw_paths(),
+            &reg,
+            &[],
+            &|p| p == 17671,
+        )
+        .unwrap();
+        let t = lines(&steps).join("\n");
+        assert!(
+            !t.contains("write /h/.config/openshell/gateway.toml"),
+            "no main steps: {t}"
+        );
+        let last = written_json(&steps).pop().unwrap();
+        assert!(last.contains("\"openshell-docker\"") && last.contains("\"openshell-podman\""));
+        assert!(
+            last.contains("17672") && last.contains("17673"),
+            "17671 is bound: {last}"
+        );
+    }
+
+    #[test]
+    fn kinds_already_registered_or_known_to_the_cli_are_skipped() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        let mut reg = crate::gwmodel::Registry::default();
+        reg.add(crate::gwmodel::GatewaySpec {
+            name: "openshell-podman".into(),
+            kind: GwKind::Podman,
+            port: 17670,
+            main: true,
+        });
+        let steps = gw_plan(&f, &[GwKind::Podman], &reg, &[]).unwrap();
+        assert!(steps.is_empty());
+        let legacy = [("openshell-docker".to_string(), 17671u16)];
+        assert!(gw_plan(
+            &f,
+            &[GwKind::Docker],
+            &crate::gwmodel::Registry::default(),
+            &legacy
+        )
+        .unwrap()
+        .is_empty());
+    }
+
+    #[test]
+    fn a_legacy_openshell_gateway_counts_as_an_existing_main() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Podman];
+        f.runtimes_ready = vec![Runtime::Podman];
+        let legacy = [("openshell".to_string(), 17670u16)];
+        let steps = gw_plan(
+            &f,
+            &[GwKind::Podman],
+            &crate::gwmodel::Registry::default(),
+            &legacy,
+        )
+        .unwrap();
+        let t = lines(&steps).join("\n");
+        assert!(
+            t.contains("osh-gateway-openshell-podman.service"),
+            "an extra, the legacy main is untouched: {t}"
+        );
+        assert!(!t.contains("write /h/.config/openshell/gateway.toml"));
+        assert!(written_json(&steps).last().unwrap().contains("17671"));
+    }
+
+    #[test]
+    fn gateway_steps_wait_for_openshell_and_for_their_prerequisites() {
+        let f = facts(Os::Linux, PkgMgr::Apt);
+        let steps = gw_plan(
+            &f,
+            &[GwKind::Podman],
+            &crate::gwmodel::Registry::default(),
+            &[],
+        )
+        .unwrap();
+        let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
+        let first_gw = steps
+            .iter()
+            .find(|s| s.id.starts_with("gw-podman"))
+            .unwrap();
+        assert_eq!(first_gw.after, Some("openshell"));
+        for s in &steps {
+            if let Some(a) = s.after {
+                assert!(ids.contains(&a), "{} waits for missing {a}", s.id);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_gateways_accepts_a_list_of_types_in_order() {
+        assert_eq!(
+            parse_gateways("docker,podman").unwrap(),
+            vec![GwKind::Docker, GwKind::Podman]
+        );
+        assert_eq!(parse_gateways("openshell-vm").unwrap(), vec![GwKind::Vm]);
+        assert_eq!(
+            parse_gateways("docker,docker").unwrap(),
+            vec![GwKind::Docker]
+        );
+        assert!(parse_gateways("docker,lxc").unwrap_err().contains("lxc"));
+        assert!(parse_gateways("").is_err());
+    }
+
+    #[test]
+    fn existing_gateways_are_read_from_the_cli_listing() {
+        let mut h = FakeHost::default();
+        h.outputs.insert(
+            "openshell gateway list -o json".into(),
+            r#"[{"name":"openshell","endpoint":"https://127.0.0.1:17670","active":true},{"name":"openshell-docker","endpoint":"https://localhost:17671"}]"#.into(),
+        );
+        assert_eq!(
+            existing_gateways(&h),
+            vec![
+                ("openshell".to_string(), 17670),
+                ("openshell-docker".to_string(), 17671)
+            ]
+        );
+        assert!(existing_gateways(&FakeHost::default()).is_empty());
     }
 
     #[test]
