@@ -191,6 +191,7 @@ pub fn detect_pkg(h: &dyn Host, os: Os) -> PkgMgr {
         Os::Linux => {
             let from_release = h
                 .read(Path::new("/etc/os-release"))
+                .or_else(|| h.read(Path::new("/usr/lib/os-release")))
                 .map_or(PkgMgr::None, |t| parse_os_release(&t));
             if from_release != PkgMgr::None {
                 from_release
@@ -444,6 +445,14 @@ mod tests {
         assert_eq!(gather_for(&h, Os::MacOs).pkg, PkgMgr::None);
         let h = FakeHost::with_bins(&["brew"]);
         assert_eq!(gather_for(&h, Os::MacOs).pkg, PkgMgr::Brew);
+    }
+
+    #[test]
+    fn os_release_falls_back_to_usr_lib() {
+        let mut h = FakeHost::default();
+        h.files
+            .insert("/usr/lib/os-release".into(), "ID=fedora\n".into());
+        assert_eq!(gather_for(&h, Os::Linux).pkg, PkgMgr::Dnf);
     }
 
     #[test]

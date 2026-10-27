@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-. "$(dirname "$0")/_log"
+. "$(dirname "$0")/../stubs/_log"
 log "$@"
 case "$1" in --version) echo "openshell 0.0.0-stub" ;; esac; exit 0

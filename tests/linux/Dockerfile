@@ -5,14 +5,14 @@ ARG BASE=ubuntu:24.04
 FROM ${BASE}
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN . /etc/os-release \
+RUN { . /etc/os-release || . /usr/lib/os-release; } \
     && case "$ID" in \
         ubuntu|debian) apt-get update \
             && apt-get install --yes --no-install-recommends bash build-essential ca-certificates curl git jq xz-utils \
             && rm -rf /var/lib/apt/lists/* ;; \
         fedora) dnf install -y bash gcc gcc-c++ make ca-certificates curl git jq xz tar gzip findutils which \
             && dnf clean all ;; \
-        arch) pacman -Sy --noconfirm --needed base-devel bash ca-certificates curl git jq xz ;; \
+        arch|archarm) pacman -Sy --noconfirm --needed base-devel bash ca-certificates curl git jq xz ;; \
         *) echo "unsupported distro $ID" >&2; exit 1 ;; \
     esac
 

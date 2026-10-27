@@ -9,6 +9,7 @@ set -uo pipefail
 REPO="${REPO:-/work}"
 STUBS="$REPO/tests/linux/stubs"
 STUBS_DOCKER="$REPO/tests/linux/stubs-docker"
+STUBS_OPENSHELL="$REPO/tests/linux/stubs-openshell"
 J=(just --justfile "$REPO/.justfile")
 fails=0
 
@@ -28,9 +29,12 @@ fresh_home() {
   unset XDG_STATE_HOME
   : > "$STUB_LOG"
 }
-with_stubs() { PATH="$STUBS:$PATH" "$@"; }
+# The stubs; openshell itself appears in $HOME/.installed only once the stubbed installer has run.
+with_stubs() { PATH="$STUBS:$HOME/.installed:$PATH" "$@"; }
+# A machine that already has OpenShell.
+with_openshell_stub() { PATH="$STUBS:$STUBS_OPENSHELL:$PATH" "$@"; }
 # Adds a docker that answers `info` and lists one container and volume: a "ready" Docker runtime.
-with_docker_stub() { PATH="$STUBS_DOCKER:$STUBS:$PATH" "$@"; }
+with_docker_stub() { PATH="$STUBS_DOCKER:$STUBS:$STUBS_OPENSHELL:$PATH" "$@"; }
 skips=0
 skip() { echo "skip $1${2:+: $2}"; skips=$((skips + 1)); }
 
@@ -60,11 +64,11 @@ echo "== real: just check and build"
   && pass "just build produces osh-tui" || { fail "just build"; tail -20 /tmp/build.log; }
 
 OSH="$REPO/tui/target/release/osh-tui"
-. /etc/os-release
+{ . /etc/os-release || . /usr/lib/os-release; }
 case "$ID" in
   ubuntu|debian) docker_pkg_line='apt-get install -y docker.io' ;;
   fedora) docker_pkg_line='dnf install -y moby-engine' ;;
-  arch) docker_pkg_line='pacman -S --noconfirm --needed docker' ;;
+  arch|archarm) docker_pkg_line='pacman -S --noconfirm --needed docker' ;;
 esac
 
 echo "== real: osh doctor and setup --dry-run (nothing installed)"
@@ -86,7 +90,7 @@ fresh_home
 case "$ID" in
   ubuntu|debian) refresh=(apt-get update) ;;
   fedora) refresh=(dnf makecache -q) ;;
-  arch) refresh=(pacman -Sy --noconfirm) ;;
+  arch|archarm) refresh=(pacman -Sy --noconfirm) ;;
 esac
 if ! "${refresh[@]}" >/dev/null 2>&1; then
   skip "real package installs" "the package index cannot be refreshed in this container (mirror or network), so installs would fail for reasons outside osh"
