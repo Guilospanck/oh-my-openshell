@@ -242,6 +242,41 @@ pub fn plan(f: &Facts, o: &Options, h: &dyn Host, p: &Paths, force: bool) -> Vec
 /// Reinstalls OpenShell with its official installer, refreshes the config, restarts the
 /// service, and restarts the Docker gateway agent when it exists.
 pub fn upgrade_steps(f: &Facts, o: &Options, h: &dyn Host, p: &Paths) -> Vec<Step> {
+    upgrade_steps_for(f, o, h, p, &crate::gwmodel::Registry::load(&p.data))
+}
+
+/// `upgrade_steps` for a given registry. With a main osh created, the upgrade keeps that main's
+/// own config and restarts it and its extras; the older single-gateway behaviour (the built-in
+/// config for this OS) is only for machines osh's wizard never set up.
+pub fn upgrade_steps_for(
+    f: &Facts,
+    o: &Options,
+    h: &dyn Host,
+    p: &Paths,
+    reg: &crate::gwmodel::Registry,
+) -> Vec<Step> {
+    if let Some(main) = reg.main() {
+        let mut steps = vec![step(
+            "openshell",
+            "Install the latest OpenShell",
+            cmd("sh", &["-c", crate::setup::OPENSHELL_INSTALL]),
+        )];
+        let mut g = crate::gwops::main_gateway_steps_forced(f, p, h, reg, main);
+        if let Some(first) = g.first_mut() {
+            first.after = Some("openshell");
+        }
+        let mut prev = g.last().map(|s| s.id);
+        steps.extend(g);
+        for extra in reg.gateways.iter().filter(|x| !x.main) {
+            let mut r = crate::gwops::restart_extra_steps(f, extra);
+            if let Some(first) = r.first_mut() {
+                first.after = prev;
+            }
+            prev = r.last().map(|s| s.id);
+            steps.extend(r);
+        }
+        return steps;
+    }
     let mut f = f.clone();
     f.has_openshell = false;
     let mut steps = vec![step(
@@ -711,6 +746,84 @@ mod tests {
         let r = execute(&steps, &h, &Options::default(), &mut |_| Answer::Yes);
         assert!(r.iter().all(|r| r.outcome == Outcome::Done));
         assert_eq!(h.written.borrow().len(), 1);
+    }
+
+    fn reg_with(
+        main: crate::gwmodel::GwKind,
+        extra: Option<crate::gwmodel::GwKind>,
+    ) -> crate::gwmodel::Registry {
+        let mut r = crate::gwmodel::Registry::default();
+        r.add(crate::gwmodel::GatewaySpec {
+            name: main.name().into(),
+            kind: main,
+            port: 17670,
+            main: true,
+        });
+        if let Some(k) = extra {
+            r.add(crate::gwmodel::GatewaySpec {
+                name: k.name().into(),
+                kind: k,
+                port: 17671,
+                main: false,
+            });
+        }
+        r
+    }
+
+    #[test]
+    fn upgrade_keeps_a_wizard_made_mains_config_and_restarts_the_extras() {
+        use crate::gwmodel::GwKind;
+        let h = FakeHost::default();
+        let reg = reg_with(GwKind::Podman, Some(GwKind::Docker));
+        let steps = upgrade_steps_for(&facts(Os::Linux), &Options::default(), &h, &paths(), &reg);
+        let t = texts(&steps);
+        assert!(t.contains(crate::setup::OPENSHELL_INSTALL));
+        let cfg = steps.iter().find_map(|s| match &s.kind {
+            StepKind::Write { path, content } if path.ends_with("gateway.toml") => {
+                Some(content.as_str())
+            }
+            _ => None,
+        });
+        assert!(
+            cfg.is_some_and(|c| c.contains("name = \"openshell-podman\"")),
+            "the main's own config, not gateway-linux.toml: {t}"
+        );
+        assert!(
+            t.contains("systemctl --user restart osh-gateway-openshell-docker.service"),
+            "{t}"
+        );
+    }
+
+    #[test]
+    fn upgrade_on_macos_with_a_docker_main_never_starts_the_homebrew_service() {
+        use crate::gwmodel::GwKind;
+        let h = FakeHost::default();
+        let reg = reg_with(GwKind::Docker, None);
+        let t = texts(&upgrade_steps_for(
+            &facts(Os::MacOs),
+            &Options::default(),
+            &h,
+            &paths(),
+            &reg,
+        ));
+        assert!(!t.contains("brew services restart openshell"), "{t}");
+        assert!(t.contains("dev.guilospanck.openshell-docker"), "{t}");
+    }
+
+    #[test]
+    fn upgrade_without_a_registry_main_keeps_the_older_behaviour() {
+        let h = FakeHost::default();
+        let t = texts(&upgrade_steps_for(
+            &facts(Os::MacOs),
+            &Options::default(),
+            &h,
+            &paths(),
+            &crate::gwmodel::Registry::default(),
+        ));
+        assert!(
+            t.contains("brew services restart openshell") && t.contains("launchctl kickstart"),
+            "{t}"
+        );
     }
 
     #[test]

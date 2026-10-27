@@ -43,9 +43,12 @@ pub fn agent_plist_path(p: &Paths, name: &str) -> PathBuf {
         .join(format!("{}.plist", agent_label(name)))
 }
 
-/// The main gateway keeps the packaged service's database; extras get their own.
-pub fn db_dir(p: &Paths, spec: &GatewaySpec) -> PathBuf {
-    if spec.main {
+/// The main gateway keeps the packaged service's database; extras get their own. On macOS only
+/// the VM main is the Homebrew service: a Docker or Podman main is osh's own agent, so it must
+/// not open the VM gateway's database with another driver.
+pub fn db_dir_for(p: &Paths, os: Os, spec: &GatewaySpec) -> PathBuf {
+    let packaged = spec.main && !(os == Os::MacOs && spec.kind != GwKind::Vm);
+    if packaged {
         p.state.join("gateway")
     } else {
         p.state.join(format!("gateway-{}", spec.kind.driver()))
@@ -126,6 +129,7 @@ pub fn launchd_plist(spec: &GatewaySpec, exe: &Path, logs: &Path) -> String {
 <plist version="1.0"><dict>
   <key>Label</key><string>{label}</string>
   <key>ProgramArguments</key><array><string>{exe}</string><string>gateway-service</string><string>{name}</string></array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>{logs}/gateway.out.log</string>
@@ -139,9 +143,11 @@ pub fn launchd_plist(spec: &GatewaySpec, exe: &Path, logs: &Path) -> String {
     )
 }
 
-pub fn registry_write_step(reg: &Registry, p: &Paths) -> Step {
+/// Writes `gateways.json`. `id` is per gateway (`sid(spec, "registry")`): a shared id would let a
+/// later gateway's steps count the earlier gateway's write as their own dependency.
+pub fn registry_write_step(reg: &Registry, p: &Paths, id: &'static str) -> Step {
     step(
-        "gw-registry",
+        id,
         "Remember this gateway",
         StepKind::Write {
             path: p.data.join("gateways.json"),
@@ -223,8 +229,11 @@ fn own_service_steps(
             ));
         }
         Os::MacOs => {
-            let logs = db_dir(p, spec);
-            if spec.kind == GwKind::Docker && h.read(&p.config_home.join("gateway.env")).is_none() {
+            let logs = db_dir_for(p, f.os, spec);
+            if spec.kind == GwKind::Docker
+                && !f.docker_desktop
+                && h.read(&p.config_home.join("gateway.env")).is_none()
+            {
                 steps.push(st(
                     spec,
                     "env",
@@ -310,6 +319,27 @@ pub fn extra_running(os: Os, h: &dyn Host, spec: &GatewaySpec) -> bool {
     }
 }
 
+/// Restarts an osh-run extra's own service (after OpenShell was upgraded).
+pub fn restart_extra_steps(f: &Facts, spec: &GatewaySpec) -> Vec<Step> {
+    vec![match f.os {
+        Os::Linux => st(
+            spec,
+            "restart",
+            &format!("Restart the {} gateway", spec.kind.label()),
+            cmd("systemctl", &["--user", "restart", &unit_name(&spec.name)]),
+        ),
+        Os::MacOs => st(
+            spec,
+            "restart",
+            &format!("Restart the {} gateway", spec.kind.label()),
+            script(
+                r#"launchctl kickstart -k "gui/$(id -u)/$1""#,
+                &[&agent_label(&spec.name)],
+            ),
+        ),
+    }]
+}
+
 /// Adds an extra gateway: its own config, service and CLI registration, then the registry entry.
 /// Certificates are shared with the main gateway (or the legacy `openshell`).
 pub fn add_gateway_steps(
@@ -336,10 +366,11 @@ pub fn add_gateway_steps(
     // service started before the entry exists crash-loops.
     let mut after = reg.clone();
     after.add(spec.clone());
-    let mut steps = vec![registry_write_step(&after, p)];
+    let reg_id = sid(spec, "registry");
+    let mut steps = vec![registry_write_step(&after, p, reg_id)];
     let mut rest = own_service_steps(f, p, h, spec, Some(register), Vec::new());
     if let Some(first) = rest.first_mut() {
-        first.after = Some("gw-registry");
+        first.after = Some(reg_id);
     }
     steps.extend(rest);
     steps
@@ -357,6 +388,29 @@ pub fn main_gateway_steps(
     reg: &Registry,
     spec: &GatewaySpec,
     installing: bool,
+) -> Vec<Step> {
+    main_steps(f, p, h, reg, spec, installing, false)
+}
+
+/// Like `main_gateway_steps`, but always restarts the service (after an OpenShell upgrade).
+pub fn main_gateway_steps_forced(
+    f: &Facts,
+    p: &Paths,
+    h: &dyn Host,
+    reg: &Registry,
+    spec: &GatewaySpec,
+) -> Vec<Step> {
+    main_steps(f, p, h, reg, spec, false, true)
+}
+
+fn main_steps(
+    f: &Facts,
+    p: &Paths,
+    h: &dyn Host,
+    reg: &Registry,
+    spec: &GatewaySpec,
+    installing: bool,
+    force: bool,
 ) -> Vec<Step> {
     let register = installing.then(|| {
         script(
@@ -380,7 +434,7 @@ pub fn main_gateway_steps(
         let wanted = gateway_toml(spec, f.os);
         let installed = h.read(&target);
         let current = installed.as_deref() == Some(wanted.as_str());
-        if !installing && current && gateway::service_running(f.os, h) {
+        if !force && !installing && current && gateway::service_running(f.os, h) {
             return Vec::new();
         }
         let mut steps = Vec::new();
@@ -457,10 +511,11 @@ pub fn main_gateway_steps(
         chain(steps, None)
     };
     // Registry first, as for extras: the macOS agent reads it when it starts.
-    let mut steps = vec![registry_write_step(&after, p)];
+    let reg_id = sid(spec, "registry");
+    let mut steps = vec![registry_write_step(&after, p, reg_id)];
     let mut rest = rest;
     if let Some(first) = rest.first_mut() {
-        first.after = first.after.or(Some("gw-registry"));
+        first.after = first.after.or(Some(reg_id));
     }
     steps.extend(rest);
     steps
@@ -576,12 +631,15 @@ pub fn remove_gateway_steps(
             &spec,
             "rmdata",
             "Delete its data",
-            cmd("rm", &["-rf", &db_dir(p, &spec).to_string_lossy()]),
+            cmd(
+                "rm",
+                &["-rf", &db_dir_for(p, f.os, &spec).to_string_lossy()],
+            ),
         ));
     }
     let mut after = reg.clone();
     after.remove(name);
-    steps.push(registry_write_step(&after, p));
+    steps.push(registry_write_step(&after, p, "gw-registry-remove"));
     Ok(chain(steps, None))
 }
 
@@ -632,7 +690,7 @@ pub fn reset_steps_for(f: &Facts, p: &Paths, spec: &GatewaySpec, rt: Option<Runt
         )
     };
     let db = |ext: &str| {
-        db_dir(p, spec)
+        db_dir_for(p, f.os, spec)
             .join(format!("openshell.db{ext}"))
             .to_string_lossy()
             .into_owned()
@@ -692,7 +750,7 @@ pub fn service_exec(name: &str, p: &Paths) -> std::io::Error {
             c.env(k, v);
         }
     }
-    let dir = db_dir(p, &spec);
+    let dir = db_dir_for(p, os, &spec);
     let _ = std::fs::create_dir_all(&dir);
     if std::env::var_os("OPENSHELL_LOCAL_TLS_DIR").is_none() {
         c.env("OPENSHELL_LOCAL_TLS_DIR", tls_dir(p, os));
@@ -1180,21 +1238,122 @@ mod tests {
             &spec(GwKind::Podman, 17670, true),
             true,
         );
-        assert_eq!(linux[0].id, "gw-registry");
+        assert_eq!(linux[0].id, "gw-podman-registry");
         assert!(linux
             .iter()
             .all(|s| s.after.is_none() || ids(&linux).contains(&s.after.unwrap())));
     }
 
     #[test]
-    fn db_tls_and_unit_locations() {
-        let p = paths();
+    fn each_gateways_registry_write_has_its_own_id() {
+        // One shared id let an extra's later steps run after the main's registry write had
+        // succeeded, even though the extra's own write was blocked.
+        let h = FakeHost::default();
+        let main = main_gateway_steps(
+            &facts(Os::Linux),
+            &paths(),
+            &h,
+            &Registry::default(),
+            &spec(GwKind::Docker, 17670, true),
+            true,
+        );
+        let extra = add_gateway_steps(
+            &facts(Os::Linux),
+            &paths(),
+            &h,
+            &Registry::default(),
+            &spec(GwKind::Podman, 17671, false),
+        );
+        assert_eq!(main[0].id, "gw-docker-registry");
+        assert_eq!(extra[0].id, "gw-podman-registry");
         assert_eq!(
-            db_dir(&p, &spec(GwKind::Docker, 17670, true)),
+            extra[1].after,
+            Some("gw-podman-registry"),
+            "the extra's service steps wait for its own write"
+        );
+    }
+
+    #[test]
+    fn launchd_agents_get_a_path_that_finds_homebrew() {
+        let x = launchd_plist(
+            &spec(GwKind::Podman, 17671, false),
+            Path::new("/osh"),
+            Path::new("/logs"),
+        );
+        assert!(
+            x.contains("<key>EnvironmentVariables</key>") && x.contains("/opt/homebrew/bin"),
+            "{x}"
+        );
+    }
+
+    #[test]
+    fn docker_desktop_users_do_not_get_a_colima_socket_file() {
+        let h = FakeHost::default();
+        let mut f = facts(Os::MacOs);
+        f.docker_desktop = true;
+        let steps = add_gateway_steps(
+            &f,
+            &paths(),
+            &h,
+            &Registry::default(),
+            &spec(GwKind::Docker, 17671, false),
+        );
+        assert!(!texts(&steps).contains("gateway.env"));
+        f.docker_desktop = false;
+        let steps = add_gateway_steps(
+            &f,
+            &paths(),
+            &h,
+            &Registry::default(),
+            &spec(GwKind::Docker, 17671, false),
+        );
+        assert!(texts(&steps).contains("write /h/.config/openshell/gateway.env"));
+    }
+
+    #[test]
+    fn a_macos_docker_or_podman_main_has_its_own_database_not_the_homebrew_one() {
+        let p = paths();
+        let mac_main = |k| GatewaySpec {
+            name: GwKind::name(k).into(),
+            kind: k,
+            port: 17670,
+            main: true,
+        };
+        assert_eq!(
+            db_dir_for(&p, Os::MacOs, &mac_main(GwKind::Docker)),
+            Path::new("/h/.local/state/openshell/gateway-docker")
+        );
+        assert_eq!(
+            db_dir_for(&p, Os::MacOs, &mac_main(GwKind::Podman)),
+            Path::new("/h/.local/state/openshell/gateway-podman")
+        );
+        assert_eq!(
+            db_dir_for(&p, Os::MacOs, &mac_main(GwKind::Vm)),
             Path::new("/h/.local/state/openshell/gateway")
         );
         assert_eq!(
-            db_dir(&p, &spec(GwKind::Vm, 17671, false)),
+            db_dir_for(&p, Os::Linux, &mac_main(GwKind::Docker)),
+            Path::new("/h/.local/state/openshell/gateway")
+        );
+    }
+
+    #[test]
+    fn restarting_an_extra_uses_its_own_service() {
+        let sp = spec(GwKind::Podman, 17671, false);
+        assert!(texts(&restart_extra_steps(&facts(Os::Linux), &sp))
+            .contains("systemctl --user restart osh-gateway-openshell-podman.service"));
+        assert!(texts(&restart_extra_steps(&facts(Os::MacOs), &sp)).contains("kickstart"));
+    }
+
+    #[test]
+    fn db_tls_and_unit_locations() {
+        let p = paths();
+        assert_eq!(
+            db_dir_for(&p, Os::Linux, &spec(GwKind::Docker, 17670, true)),
+            Path::new("/h/.local/state/openshell/gateway")
+        );
+        assert_eq!(
+            db_dir_for(&p, Os::Linux, &spec(GwKind::Vm, 17671, false)),
             Path::new("/h/.local/state/openshell/gateway-vm")
         );
         assert_eq!(

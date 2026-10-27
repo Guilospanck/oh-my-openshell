@@ -1964,23 +1964,49 @@ mod tests {
             .id;
         let extra_first = steps
             .iter()
-            .find(|s| s.id == "gw-registry" && s.after != Some("openshell"))
+            .find(|s| s.id == "gw-podman-registry")
             .unwrap_or_else(|| panic!("{ids:?}"));
-        let podman_first = steps
+        assert_eq!(extra_first.after, Some(main_last), "{ids:?}");
+    }
+
+    #[test]
+    fn when_the_main_fails_nothing_of_an_extra_runs() {
+        // Reproduced by the final review: the extra's own registry write was Blocked, but its
+        // service steps ran because a shared id had already succeeded for the main.
+        let f = running_facts();
+        let mut h = FakeHost::default();
+        h.failing
+            .insert("systemctl --user restart openshell-gateway".into());
+        let reg = crate::gwmodel::Registry::default();
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &[],
+            &|_| false,
+        )
+        .unwrap();
+        let o = Options {
+            yes: true,
+            ..Default::default()
+        };
+        let results = execute(&steps, &h, &o, &mut |_| Answer::Yes);
+        let podman: Vec<_> = steps
             .iter()
-            .position(|s| s.id.starts_with("gw-podman"))
-            .unwrap();
-        // The extra's first step is the registry write right before its config.
-        let reg_before_podman = steps[..podman_first]
-            .iter()
-            .rev()
-            .find(|s| s.id == "gw-registry")
-            .unwrap();
-        assert_eq!(
-            reg_before_podman.after,
-            Some(main_last),
-            "{ids:?} / {extra_first:?}"
-        );
+            .zip(&results)
+            .filter(|(s, _)| s.id.starts_with("gw-podman"))
+            .collect();
+        assert!(!podman.is_empty());
+        for (s, r) in podman {
+            assert_eq!(
+                r.outcome,
+                Outcome::Blocked,
+                "{} ran although the main failed",
+                s.id
+            );
+        }
     }
 
     #[test]
@@ -2085,7 +2111,7 @@ mod tests {
         )
         .unwrap();
         let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
-        let first_gw = steps.iter().find(|s| s.id == "gw-registry").unwrap();
+        let first_gw = steps.iter().find(|s| s.id == "gw-podman-registry").unwrap();
         assert_eq!(first_gw.after, Some("openshell"));
         for s in &steps {
             if let Some(a) = s.after {
