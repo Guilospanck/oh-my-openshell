@@ -64,7 +64,7 @@ echo "== real: just check and build"
   && pass "just build produces osh-tui" || { fail "just build"; tail -20 /tmp/build.log; }
 
 OSH="$REPO/tui/target/release/osh-tui"
-{ . /etc/os-release || . /usr/lib/os-release; }
+if [[ -f /etc/os-release ]]; then . /etc/os-release; else . /usr/lib/os-release; fi
 case "$ID" in
   ubuntu|debian) docker_pkg_line='apt-get install -y docker.io' ;;
   fedora) docker_pkg_line='dnf install -y moby-engine' ;;

@@ -5,7 +5,7 @@ ARG BASE=ubuntu:24.04
 FROM ${BASE}
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN { . /etc/os-release || . /usr/lib/os-release; } \
+RUN if [ -f /etc/os-release ]; then . /etc/os-release; else . /usr/lib/os-release; fi \
     && case "$ID" in \
         ubuntu|debian) apt-get update \
             && apt-get install --yes --no-install-recommends bash build-essential ca-certificates curl git jq xz-utils \
