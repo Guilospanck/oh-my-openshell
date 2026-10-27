@@ -495,6 +495,9 @@ pub fn doctor(f: &Facts) -> (String, bool) {
     } else {
         let note = if f.runtimes_installed.is_empty() {
             "osh setup --runtime docker|podman installs one".to_string()
+        } else if f.docker_permission_denied {
+            "docker is running but this user is not allowed to use docker yet; log out and back in"
+                .to_string()
         } else {
             "installed but not answering; start it".to_string()
         };
@@ -690,10 +693,17 @@ pub fn run_steps(h: &dyn Host, steps: Vec<Step>, o: &Options, interactive: bool)
     if !text.is_empty() {
         println!("\n{text}");
     }
-    steps
-        .iter()
-        .zip(&results)
-        .all(|(s, r)| s.optional || matches!(r.outcome, Outcome::Done | Outcome::DryRun))
+    run_ok(&steps, &results, o)
+}
+
+/// True when no required step failed or was left undone. A dry run changes nothing, so listing
+/// steps only the user can do is not a failure there.
+pub fn run_ok(steps: &[Step], results: &[StepResult], o: &Options) -> bool {
+    o.dry_run
+        || steps
+            .iter()
+            .zip(results)
+            .all(|(s, r)| s.optional || matches!(r.outcome, Outcome::Done | Outcome::DryRun))
 }
 
 #[cfg(test)]
@@ -1239,6 +1249,51 @@ mod tests {
         assert!(text.contains("MISSING  openshell"));
         assert!(text.contains("MISSING  container runtime"));
         assert!(text.contains("optional tmux"));
+    }
+
+    #[test]
+    fn doctor_tells_a_permission_problem_from_a_stopped_daemon() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.docker_permission_denied = true;
+        let (text, ok) = doctor(&f);
+        assert!(!ok);
+        assert!(
+            text.contains("not allowed to use docker") && text.contains("log out"),
+            "{text}"
+        );
+        f.docker_permission_denied = false;
+        assert!(doctor(&f).0.contains("not answering"));
+    }
+
+    #[test]
+    fn a_dry_run_succeeds_even_when_it_lists_steps_only_the_user_can_do() {
+        let steps = plan(&facts(Os::Linux, PkgMgr::Apt), &Options::default());
+        let results: Vec<StepResult> = steps
+            .iter()
+            .map(|s| StepResult {
+                id: s.id,
+                outcome: Outcome::DryRun,
+            })
+            .collect();
+        let dry = Options {
+            dry_run: true,
+            ..Default::default()
+        };
+        assert!(run_ok(&steps, &results, &dry));
+        // A real run with the runtime choice still open did not finish.
+        let manual: Vec<StepResult> = steps
+            .iter()
+            .map(|s| StepResult {
+                id: s.id,
+                outcome: if matches!(s.kind, StepKind::Manual(_)) {
+                    Outcome::Manual
+                } else {
+                    Outcome::Done
+                },
+            })
+            .collect();
+        assert!(!run_ok(&steps, &manual, &Options::default()));
     }
 
     #[test]

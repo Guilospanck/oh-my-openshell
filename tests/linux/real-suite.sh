@@ -3,7 +3,8 @@
 set -uo pipefail
 
 runtime="${1:-podman}"
-fails=0
+phase="${2:-}"
+fails="${PREV_FAILS:-0}"
 pass() { echo "ok   $1"; }
 fail() { echo "FAIL $1${2:+: $2}"; fails=$((fails + 1)); }
 check() { local name="$1"; shift; if "$@" >/dev/null 2>&1; then pass "$name"; else fail "$name"; fi; }
@@ -30,7 +31,7 @@ without_yes="$(osh setup --runtime "$runtime" </dev/null 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && grep -q -- '--yes' <<<"$without_yes" && pass "without a terminal or --yes, nothing runs" || fail "setup refuses without a terminal" "rc=$rc"
 check "refusing installed nothing" bash -c '! command -v openshell'
 
-if [[ "$runtime" == docker ]]; then
+if [[ "$runtime" == docker && "$phase" != after-login ]]; then
   # Joining the docker group only reaches the user's systemd services after a new login, and the
   # gateway is one of them, so osh must stop and say so instead of installing OpenShell too early.
   echo "== docker: the first setup stops for a new login"
@@ -41,6 +42,10 @@ if [[ "$runtime" == docker ]]; then
   # What a new login does for the user manager: restart it with the user's current groups.
   sudo systemctl restart "user@$(id -u).service"
   for _ in $(seq 20); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 1; done
+  # And a new login is a new process tree with the new groups: carry on in one.
+  exec sudo -u tester -H env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" \
+    "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" "PATH=$PATH" "PREV_FAILS=$fails" \
+    bash "$0" docker after-login
 fi
 
 echo "== setup --yes --runtime $runtime (real packages, installer, systemd)"
