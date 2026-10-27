@@ -77,15 +77,17 @@ out="$(env PATH=/usr/bin:/bin "$OSH" doctor 2>&1)"; rc=$?
 [[ $rc -eq 1 ]] && pass "doctor exits 1 when OpenShell is missing" || fail "doctor exits 1 when OpenShell is missing" "rc=$rc"
 grep -q 'MISSING  openshell' <<<"$out" && pass "doctor reports openshell missing" || fail "doctor reports openshell missing" "$out"
 grep -q 'MISSING  container runtime' <<<"$out" && pass "doctor reports the runtime missing" || fail "doctor reports the runtime missing"
-out="$(with_stubs "$OSH" setup --dry-run --runtime docker </dev/null 2>&1)"; rc=$?
+out="$(with_stubs "$OSH" setup --dry-run --gateways docker,podman </dev/null 2>&1)"; rc=$?
 [[ $rc -eq 0 ]] && pass "setup --dry-run exits 0" || fail "setup --dry-run exits 0" "rc=$rc $out"
 grep -q "$docker_pkg_line" <<<"$out" && pass "dry-run plans this distro's docker package" || fail "dry-run plans this distro's docker package" "$out"
 grep -q 'OpenShell/main/install.sh' <<<"$out" && pass "dry-run plans the OpenShell installer" || fail "dry-run plans the OpenShell installer"
 command -v docker >/dev/null 2>&1 && fail "dry-run must not install docker" || pass "dry-run installs nothing"
 out="$(with_stubs "$OSH" setup --dry-run </dev/null 2>&1)"
-grep -q -- '--runtime docker or --runtime podman' <<<"$out" && pass "without a pick, setup asks for --runtime" || fail "without a pick, setup asks for --runtime" "$out"
+grep -q -- '--gateways docker or --gateways podman' <<<"$out" && pass "without a pick, setup asks for --gateways" || fail "without a pick, setup asks for --gateways" "$out"
+out="$(with_stubs "$OSH" setup --gateways vm --dry-run </dev/null 2>&1)"; rc=$?
+[[ $rc -eq 2 ]] && grep -q '/dev/kvm' <<<"$out" && pass "the VM type is refused where there is no KVM" || fail "the VM type is refused where there is no KVM" "rc=$rc $out"
 
-echo "== real packages: osh setup --yes --runtime podman"
+echo "== real packages: osh setup --yes --gateways podman"
 fresh_home
 case "$ID" in
   ubuntu|debian) refresh=(apt-get update) ;;
@@ -95,13 +97,15 @@ esac
 if ! "${refresh[@]}" >/dev/null 2>&1; then
   skip "real package installs" "the package index cannot be refreshed in this container (mirror or network), so installs would fail for reasons outside osh"
 else
-with_stubs "$OSH" setup --yes --runtime podman >"$HOME/out.log" 2>&1; rc=$?
+with_stubs "$OSH" setup --yes --gateways podman >"$HOME/out.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "setup exits 0" || { fail "setup exits 0" "rc=$rc"; tail -25 "$HOME/out.log"; }
 for tool in podman tmux gh xclip; do
   check "setup installed $tool with the distro's package manager" command -v "$tool"
 done
 check "setup ran the OpenShell installer" logged installer-ran
-check "setup wrote the Podman gateway config" cmp "$REPO/gateway-podman.toml" "$XDG_CONFIG_HOME/openshell/gateway.toml"
+check "setup wrote a Podman gateway config named after its type" grep -q 'name = "openshell-podman"' "$XDG_CONFIG_HOME/openshell/gateway.toml"
+check "the Podman config drives podman" grep -q 'compute_driver = "podman"' "$XDG_CONFIG_HOME/openshell/gateway.toml"
+check "setup remembered the gateway" grep -q openshell-podman "$HOME/.local/share/osh/gateways.json"
 check "setup enabled the Podman socket" logged "systemctl --user enable --now podman.socket"
 check "setup enabled the gateway service" logged "systemctl --user enable openshell-gateway"
 check "setup restarted the gateway service" logged "systemctl --user restart openshell-gateway"
@@ -110,7 +114,7 @@ a="$(line_of installer-ran)"; b="$(line_of 'systemctl --user restart openshell-g
 check "setup wrote the embedded providers to the data dir" test -f "$HOME/.local/share/osh/providers/npm.yaml"
 check "setup does not touch Homebrew or launchd" bash -c "! grep -E '^(brew|launchctl) ' '$STUB_LOG'"
 echo "my edit" > "$HOME/.local/share/osh/providers/npm.yaml"
-with_stubs "$OSH" setup --yes --runtime podman >/dev/null 2>&1
+with_stubs "$OSH" setup --yes --gateways podman >/dev/null 2>&1
 [[ "$(cat "$HOME/.local/share/osh/providers/npm.yaml")" == "my edit" ]] && pass "a user-edited provider survives a second run" || fail "a user-edited provider survives a second run"
 fi
 

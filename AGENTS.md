@@ -34,6 +34,9 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 | `tui/src/platform.rs` | `Os`, `PkgMgr`, `Runtime` (Docker/Podman), the `Host` trait (the only door to the host; `FakeHost` in tests) and `Facts` |
 | `tui/src/setup.rs` | Pure planner (`plan`: Facts in, `Step`s out), `execute` with consent, `doctor`, `hint` |
 | `tui/src/gateway.rs` | Gateway config install, service restart, macOS Docker gateway (launchd), reset, upgrade, uninstall: all as `Step`s |
+| `tui/src/gwmodel.rs` | `GwKind` (vm/docker/podman, named `openshell-<kind>`), `GatewaySpec`, the registry `<data>/gateways.json` (what osh created), port allocation, `availability(Facts, kind)` (what each type needs on this machine), the wizard's pending selection |
+| `tui/src/gwops.rs` | Per-gateway config text, systemd unit / launchd agent text, and the add / main / remove / reset steps for a gateway of any kind; `osh gateway-service NAME` |
+| `tui/src/wizard.rs` | The set-up wizard: pure state machine (`Wizard::on_key`), `draw` (ratatui, measured columns; tested on `TestBackend`), and the runner that executes the plan on a thread with live progress |
 | `tui/src/assets.rs` | Files embedded with `include_str!` (providers, Dockerfiles, gateway configs, `.gitleaks.toml`) and written to the data dir; user edits are kept |
 | `tui/src/agents.rs` | The `sync-agents` logic (manifest, policy preflight, generated profile); golden fixture in `tui/fixtures/` |
 | `osh`, `dev-env` | Developer launcher: rebuilds `tui/` when sources are newer than the binary, sets `OSH_DIR` to the checkout, execs the binary. `dev-env` is the shared Zig 0.15 lookup |
@@ -55,10 +58,14 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   runtime only when neither Docker nor Podman exists. Linux needs Zig 0.15
   (PATH or Linuxbrew) to build and `wl-paste` or `xclip` for image paste.
 - New host-touching code goes through `Host` and returns `Step`s, so it is
-  unit-tested with `FakeHost`. Branch on `Os` / `PkgMgr` / `cfg!(target_os)`.
+  unit-tested with `FakeHost`. Gateways are named after their type
+  (`openshell-vm|docker|podman`); the first one set up is the main (17670), the rest are
+  extras. Never rename, restart or reconfigure a gateway that is not in the registry. Branch on `Os` / `PkgMgr` / `cfg!(target_os)`.
 - `just test-linux` (Docker; `tests/linux/`) runs the real build, clippy and
   tests on Ubuntu, Fedora and Arch, and `osh setup` with real package installs
-  (OpenShell installer, systemd and the container runtime daemons stubbed). It
+  (OpenShell installer, systemd and the container runtime daemons stubbed); `just test-linux-real
+  podman|docker` boots a systemd machine with nothing stubbed and runs the two-gateway
+  scenarios (add, remove, reset, uninstall). It
   proves our commands are right for each distro, not that OpenShell's packages
   and systemd unit behave as assumed; a real Linux host is still untested.
 - Keep new code portable: no BSD-only or GNU-only flags without a branch on
