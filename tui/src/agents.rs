@@ -916,11 +916,16 @@ fn build(env: &Env, agents: &[&str], stage: &Path) -> Result<Built, String> {
 
 fn mkdtemp() -> Result<PathBuf, String> {
     use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // Two stagings in one process can start in the same nanosecond (parallel tests did), so the
+    // name carries a counter as well.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let dir = std::env::temp_dir().join(format!("sync-agents-{}-{nanos}", std::process::id()));
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("sync-agents-{}-{nanos}-{n}", std::process::id()));
     fs::DirBuilder::new()
         .mode(0o700)
         .create(&dir)
@@ -1553,6 +1558,18 @@ mod tests {
             serde_json::from_str(include_str!("../fixtures/agents-golden.json")).unwrap();
         let _ = fs::remove_dir_all(&root);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn staging_directories_never_collide() {
+        let dirs: Vec<PathBuf> = (0..50).map(|_| mkdtemp().unwrap()).collect();
+        let mut sorted = dirs.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), dirs.len());
+        for d in dirs {
+            let _ = fs::remove_dir_all(d);
+        }
     }
 
     #[test]
