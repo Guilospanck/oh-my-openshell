@@ -139,14 +139,9 @@ pub enum Freshness {
 /// Image label holding the hash of the Dockerfile the image was built from.
 pub const HASH_LABEL: &str = "osh.dockerfile-hash";
 
-/// FNV-1a 64-bit of the Dockerfile contents; stable across Rust versions.
+/// Hash of the Dockerfile contents, recorded on the image to tell when it is stale.
 pub fn dockerfile_hash(file: &Path) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in fs::read(file).unwrap_or_default() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
+    crate::assets::hash(&fs::read(file).unwrap_or_default())
 }
 
 /// `docker build` arguments that record the Dockerfile hash on the image.

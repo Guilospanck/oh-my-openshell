@@ -1,6 +1,7 @@
 //! osh: ratatui front end for OpenShell. Dashboard of sandboxes with live
 //! status, embedded sandbox shells, plus creating, providers, profiles and images.
 mod app;
+mod assets;
 mod cli;
 mod clip;
 mod ghrepo;
@@ -22,24 +23,11 @@ use ratatui::crossterm::{
 };
 use std::{
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::Path,
     process::Command,
     sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
-
-fn config_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("OSH_DIR") {
-        return PathBuf::from(d);
-    }
-    // Fall back to the symlinked config directory.
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
-        });
-    base.join("openshell")
-}
 
 fn pause() {
     print!("\nPress Enter to return to osh...");
@@ -224,7 +212,18 @@ fn ensure_installed(dir: &Path) -> bool {
 }
 
 fn main() -> io::Result<()> {
-    let dir = config_dir();
+    let dir = assets::data_dir();
+    // OSH_DIR is a checkout in development: its files are the source, not a copy to refresh.
+    if std::env::var_os("OSH_DIR").is_none() {
+        match assets::materialize(&dir) {
+            Ok(r) => {
+                for p in r.kept_user_edits {
+                    eprintln!("osh: keeping your edited {}", p.display());
+                }
+            }
+            Err(e) => eprintln!("osh: cannot write {}: {e}", dir.display()),
+        }
+    }
     if !ensure_installed(&dir) {
         return Ok(());
     }
@@ -330,6 +329,7 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     #[test]
     fn sandbox_paths_follow_the_current_folder_inside_the_share() {
         assert_eq!(
