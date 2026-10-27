@@ -8,8 +8,7 @@ dotfiles checkout.
 
 ## Setup and verify
 
-Building and testing work on macOS and Linux; the gateway services and
-installer are macOS-first (see Platforms). Check prerequisites first (read-only):
+Building and testing work on macOS and Linux (see Platforms). Check prerequisites first (read-only):
 
 ```sh
 just doctor      # cargo, just, gitleaks, Zig 0.15 required; openshell, docker, pngpaste optional
@@ -31,34 +30,40 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 
 | Path | What |
 | --- | --- |
-| `tui/src/` | Rust TUI (crate `osh-tui`). `main.rs` event loop, `app.rs` state and tabs, `ui.rs` drawing, `cli.rs` wrappers around the `openshell` CLI, `term.rs` embedded shells (libghostty-vt + portable-pty), `watch.rs` log watcher for blocked requests, `logview.rs`, `clip.rs` clipboard |
-| `osh`, `dev-env` | Bash launcher: rebuilds `tui/` when sources are newer than the binary, sets `OSH_DIR`, execs the binary. `dev-env` is the shared Zig 0.15 lookup, sourced by `osh` and the justfile |
-| `.justfile` | All entry points (install, gateways, providers, hooks, dev checks) |
+| `tui/src/` | Rust TUI (crate `osh-tui`). `main.rs` event loop and subcommands (`doctor`, `setup`, `upgrade`, `uninstall`, `gateway-docker`, `gateway-reset`, `sync-agents`), `app.rs` state and tabs, `ui.rs` drawing, `cli.rs` wrappers around the `openshell` and container runtime CLIs, `term.rs` embedded shells (libghostty-vt + portable-pty), `watch.rs` log watcher, `logview.rs`, `clip.rs` clipboard |
+| `tui/src/platform.rs` | `Os`, `PkgMgr`, `Runtime` (Docker/Podman), the `Host` trait (the only door to the host; `FakeHost` in tests) and `Facts` |
+| `tui/src/setup.rs` | Pure planner (`plan`: Facts in, `Step`s out), `execute` with consent, `doctor`, `hint` |
+| `tui/src/gateway.rs` | Gateway config install, service restart, macOS Docker gateway (launchd), reset, upgrade, uninstall: all as `Step`s |
+| `tui/src/assets.rs` | Files embedded with `include_str!` (providers, Dockerfiles, gateway configs, `.gitleaks.toml`) and written to the data dir; user edits are kept |
+| `tui/src/agents.rs` | The `sync-agents` logic (manifest, policy preflight, generated profile); golden fixture in `tui/fixtures/` |
+| `osh`, `dev-env` | Developer launcher: rebuilds `tui/` when sources are newer than the binary, sets `OSH_DIR` to the checkout, execs the binary. `dev-env` is the shared Zig 0.15 lookup |
+| `.justfile` | Developer entry points: checks and build, thin wrappers over `osh setup|upgrade|uninstall|gateway-docker`, hooks |
+| `scripts/release` | Local release build (archives per platform); the GitHub workflow runs the same script |
 | `providers/*.yaml` | OpenShell provider profiles (network policy per service). Imported with `openshell provider profile import` |
 | `images/Dockerfile-*` | Sandbox images built from the Images tab |
-| `sync-agents` | Python 3: manifest of the host's Claude Code / pi setup to reproduce in a sandbox |
-| `gateway.toml` (macOS vm), `gateway-linux.toml`, `gateway-docker.toml` + `gateway-docker-service` (macOS), `gateway-reset` | Gateway config and services |
+| `gateway.toml` (macOS vm), `gateway-linux.toml`, `gateway-podman.toml`, `gateway-docker.toml`, `gateway.env` | Gateway configs, embedded in the binary |
 | `git-hooks/check-secrets`, `.githooks/`, `.gitleaks.toml` | Pre-commit secret/PII scan (Gitleaks) |
 
 ## Platforms
 
 - macOS: vm gateway (Homebrew service, `gateway.toml`) plus an optional
-  Docker gateway (launchd, Colima, `gateway-docker.toml`,
-  `gateway-docker-service`).
-- Linux: one gateway, the packaged `openshell-gateway` systemd user service on
-  the Docker driver (`gateway-linux.toml`). `just install`, `uninstall`,
-  `gateway-reset` and the TUI hints branch on `uname` / `cfg!(target_os)`.
-  `just gateway-docker` is a no-op there. Linux needs Docker Engine, Zig 0.15
-  (PATH or Linuxbrew) and `wl-paste` or `xclip` for image paste.
+  Docker gateway (launchd agent that runs `osh gateway-service docker`, Colima,
+  `gateway-docker.toml`).
+- Linux: one gateway, the packaged `openshell-gateway` systemd user service,
+  on the Docker driver (`gateway-linux.toml`) or the Podman driver
+  (`gateway-podman.toml`, untested on a real host). `osh setup` installs a
+  runtime only when neither Docker nor Podman exists. Linux needs Zig 0.15
+  (PATH or Linuxbrew) to build and `wl-paste` or `xclip` for image paste.
+- New host-touching code goes through `Host` and returns `Step`s, so it is
+  unit-tested with `FakeHost`. Branch on `Os` / `PkgMgr` / `cfg!(target_os)`.
 - `just test-linux` (Docker; `tests/linux/`) runs the real build, clippy and
-  tests on Ubuntu, and the Linux `install`, `uninstall` and `gateway-reset`
-  paths against stubbed `curl`, `systemctl`, `docker` and `openshell`. Run it
-  after changing any of those. It proves our scripts call the right commands,
-  not that OpenShell's packages and systemd unit behave as assumed; a real
-  Linux host with Docker Engine is still untested.
+  tests on Ubuntu, Fedora and Arch, and `osh setup` with real package installs
+  (OpenShell installer, systemd and the container runtime daemons stubbed). It
+  proves our commands are right for each distro, not that OpenShell's packages
+  and systemd unit behave as assumed; a real Linux host is still untested.
 - Keep new code portable: no BSD-only or GNU-only flags without a branch on
   `uname` / `cfg!(target_os)`, no hard-coded `/opt/homebrew` outside the macOS
-  files above.
+  code paths.
 
 ## Rules
 
@@ -71,8 +76,8 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   tokens: the pre-commit hook blocks them, and a missing `gitleaks` blocks the
   commit too. Do not bypass with `--no-verify`.
 - Ask first before running anything that changes the host or running
-  OpenShell state: `just install`, `upgrade`, `uninstall`, `gateway-docker`,
-  `gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
+  OpenShell state: `osh setup|upgrade|uninstall|gateway-docker` (and the `just`
+  wrappers), `osh gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
   (it is interactive and talks to the live gateway), and any
   `openshell sandbox|provider|policy` write command. Read-only ones
   (`openshell status`, `... list`, `provider profile lint`) are fine.
