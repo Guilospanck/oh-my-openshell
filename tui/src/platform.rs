@@ -488,6 +488,40 @@ pub mod testing {
         pub written: RefCell<Vec<(std::path::PathBuf, String)>>,
     }
 
+    /// A bare machine for `os` (nothing installed but OpenShell and the optional tools).
+    pub fn sample_facts(os: Os) -> Facts {
+        Facts {
+            os,
+            pkg: if os == Os::MacOs {
+                PkgMgr::Brew
+            } else {
+                PkgMgr::Apt
+            },
+            is_root: false,
+            has_sudo: true,
+            user: "ana".into(),
+            wayland: false,
+            has_openshell: true,
+            has_curl: true,
+            has_tmux: true,
+            has_gh: true,
+            has_clipboard: true,
+            runtimes_installed: vec![],
+            runtimes_ready: vec![],
+            podman_needs_socket: false,
+            docker_permission_denied: false,
+            kvm: if os == Os::MacOs {
+                Kvm::Usable
+            } else {
+                Kvm::Absent
+            },
+            colima: false,
+            docker_desktop: false,
+            podman_machine: PodmanMachine::None,
+            has_e2fsprogs: false,
+        }
+    }
+
     impl FakeHost {
         pub fn with_bins(bins: &[&str]) -> Self {
             FakeHost {

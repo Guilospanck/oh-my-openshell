@@ -15,6 +15,7 @@ mod setup;
 mod term;
 mod ui;
 mod watch;
+mod wizard;
 
 use app::{App, Done, Failed, Step};
 use ratatui::crossterm::{
