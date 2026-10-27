@@ -2843,6 +2843,9 @@ impl App {
             return false;
         }
         let Some(png) = clip::host_image() else {
+            if let Some(hint) = clip::missing_tool_hint() {
+                self.status = hint;
+            }
             return false;
         };
         let Some(s) = self.session() else {
@@ -2881,6 +2884,10 @@ impl App {
             Tab::Gateways => self.gateway_key(code),
             Tab::Images => {
                 if code == KeyCode::Char('b') || code == KeyCode::Enter {
+                    if cli::runtime().is_none() {
+                        self.status = "No running container runtime: start Docker or Podman, or run `osh setup --runtime docker|podman`".into();
+                        return;
+                    }
                     if let Some(img) = self.snap.images.get(self.current()) {
                         self.job = Some(vec![Step {
                             prog: cli::runtime_bin().into(),

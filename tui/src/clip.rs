@@ -46,6 +46,26 @@ pub fn host_image() -> Option<Vec<u8>> {
     })
 }
 
+/// Why pasting found nothing, when the cause is a missing clipboard tool.
+pub fn missing_tool_hint() -> Option<String> {
+    if READERS.iter().any(|(prog, _)| cli::have(prog)) {
+        return None;
+    }
+    let host = crate::platform::RealHost;
+    let os = if cfg!(target_os = "macos") {
+        crate::platform::Os::MacOs
+    } else {
+        crate::platform::Os::Linux
+    };
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty());
+    Some(crate::setup::hint(
+        "clipboard",
+        os,
+        crate::platform::detect_pkg(&host, os),
+        wayland,
+    ))
+}
+
 /// The sandbox user's HOME, on `gateway`.
 fn sandbox_home(gateway: &str, sandbox: &str) -> Result<String, String> {
     let mut args: Vec<String> = Vec::new();

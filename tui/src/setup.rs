@@ -440,6 +440,28 @@ pub fn doctor(f: &Facts) -> (String, bool) {
     (out, ok)
 }
 
+/// "tool X is missing" with the exact command that installs it, for features that degrade.
+/// `tool` is a command name, or `clipboard` for the image-paste tool.
+pub fn hint(tool: &'static str, os: Os, pkg: PkgMgr, wayland: bool) -> String {
+    let (label, tool) = match (tool, os) {
+        ("clipboard", Os::MacOs) => ("a clipboard tool", "pngpaste"),
+        ("clipboard", Os::Linux) if wayland => ("a clipboard tool", "wl-clipboard"),
+        ("clipboard", Os::Linux) => ("a clipboard tool", "xclip"),
+        (t, _) => (t, t),
+    };
+    let name = pkg_name(tool, pkg);
+    match install_prefix(pkg) {
+        None => format!("{label} is not installed: install {name} with your package manager"),
+        Some(prefix) => {
+            let sudo = if pkg == PkgMgr::Brew { "" } else { "sudo " };
+            format!(
+                "{label} is not installed: {sudo}{} {name}",
+                prefix.join(" ")
+            )
+        }
+    }
+}
+
 /// What happened, for the end of a run: failures and the things left to the user.
 pub fn summary(steps: &[Step], results: &[StepResult]) -> String {
     let mut out = String::new();
@@ -800,6 +822,30 @@ mod tests {
         let steps = plan(&facts(Os::MacOs, PkgMgr::None), &Options::default());
         let r = execute(&steps, &h, &Options::default(), &mut yes);
         assert_eq!(r[0].outcome, Outcome::Manual);
+    }
+
+    #[test]
+    fn hint_names_the_install_command_for_the_package_manager() {
+        assert_eq!(
+            hint("tmux", Os::Linux, PkgMgr::Apt, false),
+            "tmux is not installed: sudo apt-get install -y tmux"
+        );
+        assert_eq!(
+            hint("gh", Os::Linux, PkgMgr::Pacman, false),
+            "gh is not installed: sudo pacman -S --noconfirm --needed github-cli"
+        );
+        assert_eq!(
+            hint("tmux", Os::MacOs, PkgMgr::Brew, false),
+            "tmux is not installed: brew install tmux"
+        );
+        assert!(hint("tmux", Os::Linux, PkgMgr::None, false).contains("your package manager"));
+    }
+
+    #[test]
+    fn clipboard_hint_names_the_tool_for_the_os() {
+        assert!(hint("clipboard", Os::MacOs, PkgMgr::Brew, false).contains("brew install pngpaste"));
+        assert!(hint("clipboard", Os::Linux, PkgMgr::Apt, false).contains("xclip"));
+        assert!(hint("clipboard", Os::Linux, PkgMgr::Apt, true).contains("wl-clipboard"));
     }
 
     #[test]

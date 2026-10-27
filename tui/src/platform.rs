@@ -176,8 +176,9 @@ pub fn gather(h: &dyn Host) -> Facts {
     gather_for(h, os)
 }
 
-pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
-    let pkg = match os {
+/// The package manager this host installs software with.
+pub fn detect_pkg(h: &dyn Host, os: Os) -> PkgMgr {
+    match os {
         Os::MacOs if h.which("brew") => PkgMgr::Brew,
         Os::MacOs => PkgMgr::None,
         Os::Linux => {
@@ -198,7 +199,11 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
                 .map_or(PkgMgr::None, |(_, p)| p)
             }
         }
-    };
+    }
+}
+
+pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
+    let pkg = detect_pkg(h, os);
     let is_root = h.run("id", &["-u"]).is_ok_and(|o| o.trim() == "0");
     let all = [Runtime::Docker, Runtime::Podman];
     let runtimes_installed: Vec<Runtime> = all.into_iter().filter(|r| h.which(r.bin())).collect();
