@@ -43,5 +43,9 @@ for d in "${distros[@]}"; do
   fi
 done
 
+# The release workflow cannot run without CI credits, but it can be linted.
+echo "######## .github/workflows (actionlint)"
+docker run --rm -v "$repo:/repo:ro" -w /repo rhysd/actionlint:1.7.7 -color || failed+=("actionlint")
+
 if [[ ${#failed[@]} -gt 0 ]]; then echo "FAILED distros: ${failed[*]}" >&2; exit 1; fi
 echo "all distros passed: ${distros[*]}"

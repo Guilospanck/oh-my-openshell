@@ -65,7 +65,9 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   tests on Ubuntu, Fedora and Arch, and `osh setup` with real package installs
   (OpenShell installer, systemd and the container runtime daemons stubbed); `just test-linux-real
   podman|docker` boots a systemd machine with nothing stubbed and runs the two-gateway
-  scenarios (add, remove, reset, uninstall). It
+  scenarios (add, remove, reset, uninstall); the podman run also drives the wizard in a real
+  pseudo-terminal. `just test-linux` also parses the launchd plists with Python's `plistlib` and lints
+  the release workflow with actionlint. It
   proves our commands are right for each distro, not that OpenShell's packages
   and systemd unit behave as assumed; a real Linux host is still untested.
 - Keep new code portable: no BSD-only or GNU-only flags without a branch on

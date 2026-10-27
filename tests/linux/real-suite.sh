@@ -61,8 +61,19 @@ if [[ "$runtime" == docker && "$phase" != after-login ]]; then
     bash "$0" docker after-login
 fi
 
+if [[ "$runtime" == podman ]]; then
+  # The wizard in a real pseudo-terminal: quitting installs nothing, then a full guided install.
+  echo "== the wizard: quit, then a guided install of podman"
+  python3 /repo/tests/linux/wizard-drive.py quit >"$log" 2>&1 && pass "the wizard opens and quits cleanly" || { fail "wizard quit"; tail -30 "$log"; }
+  check "quitting the wizard installed nothing" bash -c '! command -v openshell'
+  check "quitting the wizard left no pending selection" test ! -e "$data/wizard.json"
+  python3 /repo/tests/linux/wizard-drive.py install >"$log" 2>&1; rc=$?
+  [[ $rc -eq 0 ]] && pass "the wizard installs podman end to end" || { fail "the wizard installs podman end to end" "rc=$rc"; tail -40 "$log"; }
+  check "the wizard cleared its pending selection" test ! -e "$data/wizard.json"
+else
 echo "== setup --gateways $gateways --yes (real packages, installer, systemd)"
 osh setup --gateways "$gateways" --yes >"$log" 2>&1; rc=$?
+fi
 [[ $rc -eq 0 ]] && pass "setup exits 0" || {
   fail "setup exits 0" "rc=$rc"
   grep -E '^(\[[0-9]+/[0-9]+\]|failed:|skipped|do yourself|declined|openshell:|Failed|cp:|E:)' "$log" | head -70

@@ -175,6 +175,22 @@ rm -rf "$HOME/bin"; echo "0000  file" > "$archive.sha256"
 env "${install_env[@]}" sh "$REPO/install.sh" >"$HOME/out.log" 2>&1 && fail "install.sh rejects a bad checksum" || pass "install.sh rejects a bad checksum"
 check "a bad checksum installs nothing" test ! -e "$HOME/bin/osh"
 
+echo "== launchd agents parse as real property lists (macOS cannot run here)"
+plists="$(mktemp -d)"
+(cd "$REPO/tui" && source ../dev-env && osh_use_zig && OSH_DUMP_PLISTS="$plists" cargo test dump_plists_when_asked >"$HOME/out.log" 2>&1) \
+  || { fail "dumping the plists" ; tail -15 "$HOME/out.log"; }
+for k in vm docker podman; do
+  python3 - "$plists/openshell-$k.plist" <<'PY' && pass "the $k agent plist parses and runs gateway-service" || fail "the $k agent plist parses"
+import plistlib, sys
+d = plistlib.load(open(sys.argv[1], "rb"))
+name = sys.argv[1].rsplit("/", 1)[1][:-6]
+assert d["Label"] == "dev.guilospanck." + name, d["Label"]
+assert d["ProgramArguments"][1:] == ["gateway-service", name], d["ProgramArguments"]
+assert d["ProgramArguments"][0] == "/Users/me/My Apps/a&b/osh", d["ProgramArguments"]
+assert d["RunAtLoad"] is True and "PATH" in d["EnvironmentVariables"]
+PY
+done
+
 echo
 [[ $skips -eq 0 ]] || echo "$skips scenario(s) skipped (see above)"
 if [[ $fails -eq 0 ]]; then echo "all Linux tests passed"; else echo "$fails Linux test(s) failed"; exit 1; fi

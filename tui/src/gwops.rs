@@ -893,6 +893,23 @@ mod tests {
         assert!(esc.contains("/a&amp;b"));
     }
 
+    /// `OSH_DUMP_PLISTS=dir cargo test dump_plists` writes every launchd agent we generate, so the
+    /// Linux container suite can parse them with a real plist reader (macOS cannot run there).
+    #[test]
+    fn dump_plists_when_asked() {
+        let Some(dir) = std::env::var_os("OSH_DUMP_PLISTS") else {
+            return;
+        };
+        for kind in [GwKind::Vm, GwKind::Docker, GwKind::Podman] {
+            let x = launchd_plist(
+                &spec(kind, 17671, false),
+                Path::new("/Users/me/My Apps/a&b/osh"),
+                Path::new("/Users/me/Library/Logs"),
+            );
+            std::fs::write(Path::new(&dir).join(format!("{}.plist", kind.name())), x).unwrap();
+        }
+    }
+
     #[test]
     fn adding_an_extra_on_linux_writes_config_unit_enables_registers_and_waits() {
         let h = FakeHost::default();
