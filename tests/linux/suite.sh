@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Linux test suite. Runs inside the container built by tests/linux/Dockerfile, in a copy of the
-# repo at /work (see run.sh). Real: just doctor, build, check. Stubbed (tests/linux/stubs on PATH,
-# every call logged to $STUB_LOG): the install, uninstall and gateway-reset paths, whose real
-# tools (OpenShell packages, systemd, Docker) are not in the container.
+# Linux test suite. Runs inside the container built by tests/linux/Dockerfile (one per distro), in a
+# copy of the repo at /work (see run.sh). Real: just doctor, build, check, and the osh binary with the
+# distro's own package manager. Stubbed (tests/linux/stubs on PATH, every call logged to $STUB_LOG):
+# the OpenShell installer (curl), systemctl, docker, openshell, whose real versions (OpenShell
+# packages, systemd, a container daemon) are not in the container.
 set -uo pipefail
 
 REPO="${REPO:-/work}"
 STUBS="$REPO/tests/linux/stubs"
+STUBS_DOCKER="$REPO/tests/linux/stubs-docker"
 J=(just --justfile "$REPO/.justfile")
 fails=0
 
@@ -27,6 +29,10 @@ fresh_home() {
   : > "$STUB_LOG"
 }
 with_stubs() { PATH="$STUBS:$PATH" "$@"; }
+# Adds a docker that answers `info` and lists one container and volume: a "ready" Docker runtime.
+with_docker_stub() { PATH="$STUBS_DOCKER:$STUBS:$PATH" "$@"; }
+skips=0
+skip() { echo "skip $1${2:+: $2}"; skips=$((skips + 1)); }
 
 [[ "$(uname)" == Linux ]] || { echo "suite.sh must run on Linux" >&2; exit 2; }
 
@@ -53,35 +59,74 @@ echo "== real: just check and build"
 "${J[@]}" build >/tmp/build.log 2>&1 && [[ -x "$REPO/tui/target/release/osh-tui" ]] \
   && pass "just build produces osh-tui" || { fail "just build"; tail -20 /tmp/build.log; }
 
-echo "== stubbed: just install"
+OSH="$REPO/tui/target/release/osh-tui"
+. /etc/os-release
+case "$ID" in
+  ubuntu|debian) docker_pkg_line='apt-get install -y docker.io' ;;
+  fedora) docker_pkg_line='dnf install -y moby-engine' ;;
+  arch) docker_pkg_line='pacman -S --noconfirm --needed docker' ;;
+esac
+
+echo "== real: osh doctor and setup --dry-run (nothing installed)"
 fresh_home
-with_stubs "${J[@]}" install >"$HOME/out.log" 2>&1; rc=$?
-[[ $rc -eq 0 ]] && pass "install exits 0" || { fail "install exits 0" "rc=$rc"; tail -15 "$HOME/out.log"; }
-check "install copies gateway-linux.toml as gateway.toml" cmp "$REPO/gateway-linux.toml" "$XDG_CONFIG_HOME/openshell/gateway.toml"
-check "install links osh" test -L "$HOME/.local/bin/osh"
-check "install ran the official installer" logged installer-ran
-check "install enables the user service" logged "systemctl --user enable openshell-gateway"
-check "install restarts the user service" logged "systemctl --user restart openshell-gateway"
-check "install does not touch Homebrew or launchd" bash -c "! grep -E '^(brew|launchctl) ' '$STUB_LOG'"
+out="$(env PATH=/usr/bin:/bin "$OSH" doctor 2>&1)"; rc=$?
+[[ $rc -eq 1 ]] && pass "doctor exits 1 when OpenShell is missing" || fail "doctor exits 1 when OpenShell is missing" "rc=$rc"
+grep -q 'MISSING  openshell' <<<"$out" && pass "doctor reports openshell missing" || fail "doctor reports openshell missing" "$out"
+grep -q 'MISSING  container runtime' <<<"$out" && pass "doctor reports the runtime missing" || fail "doctor reports the runtime missing"
+out="$(with_stubs "$OSH" setup --dry-run --runtime docker </dev/null 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && pass "setup --dry-run exits 0" || fail "setup --dry-run exits 0" "rc=$rc $out"
+grep -q "$docker_pkg_line" <<<"$out" && pass "dry-run plans this distro's docker package" || fail "dry-run plans this distro's docker package" "$out"
+grep -q 'openshell/main/install.sh' <<<"$out" && pass "dry-run plans the OpenShell installer" || fail "dry-run plans the OpenShell installer"
+command -v docker >/dev/null 2>&1 && fail "dry-run must not install docker" || pass "dry-run installs nothing"
+out="$(with_stubs "$OSH" setup --dry-run </dev/null 2>&1)"
+grep -q -- '--runtime docker or --runtime podman' <<<"$out" && pass "without a pick, setup asks for --runtime" || fail "without a pick, setup asks for --runtime" "$out"
+
+echo "== real packages: osh setup --yes --runtime podman"
+fresh_home
+case "$ID" in
+  ubuntu|debian) refresh=(apt-get update) ;;
+  fedora) refresh=(dnf makecache -q) ;;
+  arch) refresh=(pacman -Sy --noconfirm) ;;
+esac
+if ! "${refresh[@]}" >/dev/null 2>&1; then
+  skip "real package installs" "the package index cannot be refreshed in this container (mirror or network), so installs would fail for reasons outside osh"
+else
+with_stubs "$OSH" setup --yes --runtime podman >"$HOME/out.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && pass "setup exits 0" || { fail "setup exits 0" "rc=$rc"; tail -25 "$HOME/out.log"; }
+for tool in podman tmux gh xclip; do
+  check "setup installed $tool with the distro's package manager" command -v "$tool"
+done
+check "setup ran the OpenShell installer" logged installer-ran
+check "setup wrote the Podman gateway config" cmp "$REPO/gateway-podman.toml" "$XDG_CONFIG_HOME/openshell/gateway.toml"
+check "setup enabled the Podman socket" logged "systemctl --user enable --now podman.socket"
+check "setup enabled the gateway service" logged "systemctl --user enable openshell-gateway"
+check "setup restarted the gateway service" logged "systemctl --user restart openshell-gateway"
 a="$(line_of installer-ran)"; b="$(line_of 'systemctl --user restart openshell-gateway')"
 [[ -n "$a" && -n "$b" && "$a" -lt "$b" ]] && pass "installer runs before the service restart" || fail "installer runs before the service restart"
-grep -q 'Docker Engine not found' "$HOME/out.log" && fail "install warns about Docker although a docker stub exists" || pass "no Docker warning when docker exists"
+check "setup wrote the embedded providers to the data dir" test -f "$HOME/.local/share/osh/providers/npm.yaml"
+check "setup does not touch Homebrew or launchd" bash -c "! grep -E '^(brew|launchctl) ' '$STUB_LOG'"
+echo "my edit" > "$HOME/.local/share/osh/providers/npm.yaml"
+with_stubs "$OSH" setup --yes --runtime podman >/dev/null 2>&1
+[[ "$(cat "$HOME/.local/share/osh/providers/npm.yaml")" == "my edit" ]] && pass "a user-edited provider survives a second run" || fail "a user-edited provider survives a second run"
+fi
 
-echo "== stubbed: just uninstall"
-printf 'uninstall\n' | with_stubs "${J[@]}" uninstall >"$HOME/out.log" 2>&1; rc=$?
+echo "== stubbed: osh uninstall"
+printf 'uninstall\n' | with_stubs "$OSH" uninstall >"$HOME/out.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "uninstall exits 0" || { fail "uninstall exits 0" "rc=$rc"; tail -15 "$HOME/out.log"; }
 check "uninstall disables the user service" logged "systemctl --user disable --now openshell-gateway"
 check "uninstall removes the config dir" test ! -e "$XDG_CONFIG_HOME/openshell"
-check "uninstall removes the osh link" test ! -e "$HOME/.local/bin/osh"
 check "uninstall prints the package removal commands" grep -q 'apt remove' "$HOME/out.log"
+check "uninstall keeps the osh data dir" test -d "$HOME/.local/share/osh"
 fresh_home; mkdir -p "$XDG_CONFIG_HOME/openshell"
-printf 'no\n' | with_stubs "${J[@]}" uninstall >/dev/null 2>&1 && fail "uninstall aborts on a wrong answer" || pass "uninstall aborts on a wrong answer"
+printf 'no\n' | with_stubs "$OSH" uninstall >/dev/null 2>&1 && fail "uninstall aborts on a wrong answer" || pass "uninstall aborts on a wrong answer"
 check "an aborted uninstall keeps the config dir" test -d "$XDG_CONFIG_HOME/openshell"
 
-echo "== stubbed: gateway-reset"
+echo "== stubbed: osh gateway-reset"
 fresh_home; mkdir -p "$HOME/.local/state/openshell/gateway" "$HOME/.local/state/openshell/docker-sandbox-tokens"
 touch "$HOME/.local/state/openshell/gateway/openshell.db" "$HOME/.local/state/openshell/docker-sandbox-tokens/t"
-with_stubs "$REPO/gateway-reset" openshell >"$HOME/out.log" 2>&1; rc=$?
+printf 'no\n' | with_stubs "$OSH" gateway-reset openshell >/dev/null 2>&1 && fail "reset aborts on a wrong answer" || pass "reset aborts on a wrong answer"
+check "an aborted reset keeps the database" test -e "$HOME/.local/state/openshell/gateway/openshell.db"
+printf 'reset\n' | with_docker_stub "$OSH" gateway-reset openshell >"$HOME/out.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "gateway-reset openshell exits 0" || { fail "gateway-reset openshell exits 0" "rc=$rc"; tail -15 "$HOME/out.log"; }
 check "reset deletes sandboxes through the gateway" logged "openshell -g openshell sandbox delete --all"
 check "reset stops the user service" logged "systemctl --user stop openshell-gateway"
@@ -93,19 +138,34 @@ check "reset removes the labelled volumes" grep -q '^docker volume rm vol1' "$ST
 check "reset deletes the database" test ! -e "$HOME/.local/state/openshell/gateway/openshell.db"
 check "reset clears the sandbox tokens" test ! -e "$HOME/.local/state/openshell/docker-sandbox-tokens/t"
 check "reset does not use Colima or launchd" bash -c "! grep -E 'colima|launchctl|brew' '$STUB_LOG' '$HOME/out.log'"
-with_stubs "$REPO/gateway-reset" openshell-docker >/dev/null 2>&1; rc=$?
+with_stubs "$OSH" gateway-reset openshell-docker --confirmed >/dev/null 2>&1; rc=$?
 [[ $rc -eq 2 ]] && pass "gateway-reset openshell-docker is refused on Linux (exit 2)" || fail "gateway-reset openshell-docker is refused" "rc=$rc"
-with_stubs "$REPO/gateway-reset" >/dev/null 2>&1; rc=$?
+with_stubs "$OSH" gateway-reset >/dev/null 2>&1; rc=$?
 [[ $rc -eq 2 ]] && pass "gateway-reset without a name prints usage (exit 2)" || fail "gateway-reset without a name" "rc=$rc"
 
-echo "== stubbed: other recipes"
-out="$(with_stubs "${J[@]}" gateway-docker 2>&1)"; rc=$?
-[[ $rc -eq 0 && "$out" == *"Not needed on Linux"* ]] && pass "gateway-docker is a no-op on Linux" || fail "gateway-docker is a no-op on Linux" "rc=$rc $out"
+echo "== other subcommands"
+out="$(with_stubs "$OSH" gateway-docker </dev/null 2>&1)"; rc=$?
+[[ $rc -eq 2 && "$out" == *"not needed on Linux"* ]] && pass "gateway-docker is refused on Linux" || fail "gateway-docker is refused on Linux" "rc=$rc $out"
 fresh_home
-nodocker="$(mktemp -d)"
-for f in "$STUBS"/*; do [[ "$(basename "$f")" == docker ]] || ln -s "$f" "$nodocker/"; done
-PATH="$nodocker:$PATH" "${J[@]}" install >"$HOME/out.log" 2>&1
-grep -q 'Docker Engine not found' "$HOME/out.log" && pass "install warns when Docker is missing" || fail "install warns when Docker is missing"
+out="$(with_stubs "$OSH" sync-agents --dry-run 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$out" == *"Dry run: nothing is installed"* ]] && pass "sync-agents --dry-run works with no agent setup" || fail "sync-agents --dry-run works" "rc=$rc $out"
+
+echo "== real: scripts/release and install.sh against a local release"
+fresh_home
+dist="$(mktemp -d)"
+"$REPO/scripts/release" v0.0.0-test --out "$dist" >"$HOME/out.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && pass "scripts/release builds this machine's archive" || { fail "scripts/release" "rc=$rc"; tail -15 "$HOME/out.log"; }
+arch="$(uname -m)"; [[ "$arch" == arm64 ]] && arch=aarch64
+archive="$dist/osh-v0.0.0-test-linux-$arch.tar.gz"
+check "release writes the archive and its checksum" bash -c "test -f '$archive' && test -f '$archive.sha256'"
+install_env=(OSH_VERSION=v0.0.0-test "OSH_RELEASE_BASE=file://$dist" "OSH_BIN_DIR=$HOME/bin" OSH_NO_SETUP=1)
+env "${install_env[@]}" sh "$REPO/install.sh" >"$HOME/out.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && pass "install.sh installs from a local release" || { fail "install.sh" "rc=$rc"; tail -15 "$HOME/out.log"; }
+check "the installed osh runs" bash -c "'$HOME/bin/osh' doctor | grep -q openshell"
+rm -rf "$HOME/bin"; echo "0000  file" > "$archive.sha256"
+env "${install_env[@]}" sh "$REPO/install.sh" >"$HOME/out.log" 2>&1 && fail "install.sh rejects a bad checksum" || pass "install.sh rejects a bad checksum"
+check "a bad checksum installs nothing" test ! -e "$HOME/bin/osh"
 
 echo
+[[ $skips -eq 0 ]] || echo "$skips scenario(s) skipped (see above)"
 if [[ $fails -eq 0 ]]; then echo "all Linux tests passed"; else echo "$fails Linux test(s) failed"; exit 1; fi

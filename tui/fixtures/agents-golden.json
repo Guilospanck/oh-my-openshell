@@ -101,16 +101,16 @@
     {
       "agents": {
         "claude-code": [
-          "uv tool install graphifyy==0.9.82",
+          "uv tool install graphifyy==1.2.3",
           "graphify install"
         ],
         "pi": [
-          "uv tool install graphifyy==0.9.82",
+          "uv tool install graphifyy==1.2.3",
           "graphify install --platform pi"
         ]
       },
       "default": true,
-      "detail": "graphifyy 0.9.82 (PyPI; needs python 3.10+ and uv in the image)",
+      "detail": "graphifyy 1.2.3 (PyPI; needs python 3.10+ and uv in the image)",
       "group": "packages",
       "id": "packages:graphify",
       "kind": "run",

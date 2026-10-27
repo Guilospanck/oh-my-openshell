@@ -26,7 +26,7 @@ use ratatui::crossterm::{
 };
 use std::{
     io::{self, IsTerminal, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Arc, Mutex},
     time::Duration,
@@ -218,6 +218,7 @@ fn subcommand(args: &[String]) -> Option<i32> {
             Some(if ok { 0 } else { 1 })
         }
         "setup" => {
+            materialize_data();
             let mut o = setup::Options::default();
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
@@ -324,11 +325,8 @@ fn confirmed(word: &str) -> bool {
     }
 }
 
-fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if let Some(code) = subcommand(&args) {
-        std::process::exit(code);
-    }
+/// Writes the embedded providers, Dockerfiles and configs to the data dir, and returns it.
+fn materialize_data() -> PathBuf {
     let dir = assets::data_dir();
     // OSH_DIR is a checkout in development: its files are the source, not a copy to refresh.
     if std::env::var_os("OSH_DIR").is_none() {
@@ -341,6 +339,15 @@ fn main() -> io::Result<()> {
             Err(e) => eprintln!("osh: cannot write {}: {e}", dir.display()),
         }
     }
+    dir
+}
+
+fn main() -> io::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = subcommand(&args) {
+        std::process::exit(code);
+    }
+    let dir = materialize_data();
     if !ensure_installed() {
         return Ok(());
     }
@@ -446,7 +453,7 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+
     #[test]
     fn sandbox_paths_follow_the_current_folder_inside_the_share() {
         assert_eq!(

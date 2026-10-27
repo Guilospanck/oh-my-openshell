@@ -444,14 +444,17 @@ pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
         ),
     ));
     if f.os == Os::Linux {
-        steps.push(step(
+        let mut s = step(
             "uninstall-packages",
             "Remove the OpenShell packages",
             StepKind::Manual(
                 "Debian/Ubuntu: sudo apt remove 'openshell*'    Fedora/RHEL: sudo dnf remove 'openshell*'"
                     .into(),
             ),
-        ));
+        );
+        // Left to the user, so it must not make the run count as failed.
+        s.optional = true;
+        steps.push(s);
     }
     chain(steps, None)
 }
@@ -718,6 +721,15 @@ mod tests {
             "rm -rf /h/.config/openshell /h/.local/state/openshell /h/.local/share/openshell"
         ));
         assert!(t.contains("apt remove"));
+    }
+
+    #[test]
+    fn uninstall_manual_package_removal_does_not_fail_the_run() {
+        let steps = uninstall_steps(&facts(Os::Linux), &paths());
+        assert!(steps
+            .iter()
+            .filter(|s| matches!(s.kind, StepKind::Manual(_)))
+            .all(|s| s.optional));
     }
 
     #[test]

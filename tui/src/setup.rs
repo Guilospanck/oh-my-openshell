@@ -37,6 +37,22 @@ pub struct Step {
 }
 
 impl Step {
+    /// `command_line` for the screen: a multi-line `sh -c` script shows its first line only.
+    pub fn display(&self) -> String {
+        match &self.kind {
+            StepKind::Cmd { prog, args }
+                if prog == "sh" && args.first().is_some_and(|a| a == "-c") =>
+            {
+                let script = args.get(1).map(String::as_str).unwrap_or("");
+                match script.split_once('\n') {
+                    Some((first, _)) => format!("sh -c '{first} ...'"),
+                    None => format!("sh -c '{script}'"),
+                }
+            }
+            _ => self.command_line(),
+        }
+    }
+
     pub fn command_line(&self) -> String {
         match &self.kind {
             StepKind::Cmd { prog, args } => format!("{prog} {}", args.join(" ")),
@@ -528,20 +544,21 @@ pub fn run_steps(h: &dyn Host, steps: Vec<Step>, o: &Options, interactive: bool)
         println!("Nothing to install: everything osh needs is present.");
         return true;
     }
-    println!("osh will set up this machine ({} steps):", steps.len());
+    println!("osh will run {} steps:", steps.len());
     for (i, s) in steps.iter().enumerate() {
         println!(
-            "  {}. {}{}",
+            "  {}. {}{}\n       $ {}",
             i + 1,
             s.title,
-            if s.optional { " (optional)" } else { "" }
+            if s.optional { " (optional)" } else { "" },
+            s.display()
         );
     }
     let total = steps.len();
     let mut n = 0;
     let results = execute(&steps, h, o, &mut |s| {
         n += 1;
-        println!("\n[{n}/{total}] {}\n    $ {}", s.title, s.command_line());
+        println!("\n[{n}/{total}] {}\n    $ {}", s.title, s.display());
         if o.yes || !interactive {
             return Answer::Yes;
         }
@@ -846,6 +863,30 @@ mod tests {
         assert!(hint("clipboard", Os::MacOs, PkgMgr::Brew, false).contains("brew install pngpaste"));
         assert!(hint("clipboard", Os::Linux, PkgMgr::Apt, false).contains("xclip"));
         assert!(hint("clipboard", Os::Linux, PkgMgr::Apt, true).contains("wl-clipboard"));
+    }
+
+    #[test]
+    fn display_shortens_multi_line_scripts_but_keeps_one_liners() {
+        let one = Step {
+            id: "a",
+            title: "t".into(),
+            kind: StepKind::Cmd {
+                prog: "sh".into(),
+                args: vec!["-c".into(), "echo hi".into()],
+            },
+            optional: false,
+            after: None,
+        };
+        assert_eq!(one.display(), "sh -c 'echo hi'");
+        let multi = Step {
+            kind: StepKind::Cmd {
+                prog: "sh".into(),
+                args: vec!["-c".into(), "set -e\nrm -rf x".into()],
+            },
+            ..one
+        };
+        assert_eq!(multi.display(), "sh -c 'set -e ...'");
+        assert!(multi.command_line().contains("rm -rf x"));
     }
 
     #[test]

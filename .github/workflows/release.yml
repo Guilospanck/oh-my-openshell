@@ -1,0 +1,36 @@
+# Builds the release archives with the same script a local release uses (scripts/release), one
+# runner per platform, then publishes them. Not exercised while Actions credits are exhausted:
+# use `scripts/release vX.Y.Z --linux amd64 arm64` and `gh release create` by hand until then.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-14, macos-13, ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - run: scripts/release "$GITHUB_REF_NAME" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: osh-${{ matrix.os }}
+          path: dist/*
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

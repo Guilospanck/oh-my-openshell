@@ -51,7 +51,7 @@ check:
 	cargo clippy --all-targets --manifest-path "$manifest" -- -D warnings
 	cargo test --manifest-path "$manifest"
 
-# Runs the Linux test suite in Docker (real build and checks, stubbed install/uninstall/gateway-reset)
+# Runs the Linux test suite in Docker on Ubuntu, Fedora and Arch (--distro NAME for one); real build, checks and package installs, stubbed OpenShell and systemd
 test-linux *args:
 	@"{{justfile_directory()}}/tests/linux/run.sh" {{args}}
 

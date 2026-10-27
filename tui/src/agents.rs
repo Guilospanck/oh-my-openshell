@@ -54,6 +54,8 @@ pub struct Env {
     pub gitleaks_config: PathBuf,
     /// The project whose Claude memory is offered for upload.
     pub memory_repo: PathBuf,
+    /// graphify's version when already known; otherwise `graphify --version` is run.
+    pub graphify_version: Option<String>,
     /// OpenShell sets HOME inside sandboxes (`/workspace` on docker, `/sandbox` on vm).
     pub sandbox_home: String,
 }
@@ -73,6 +75,7 @@ impl Env {
             providers_dir: data_dir.join("providers"),
             gitleaks_config: data_dir.join(".gitleaks.toml"),
             memory_repo,
+            graphify_version: None,
             sandbox_home: sandbox_home.trim_end_matches('/').to_string(),
         }
     }
@@ -301,8 +304,10 @@ fn packages(env: &Env) -> Vec<Item> {
     if !env.claude.join("skills/graphify").exists() {
         return vec![];
     }
-    let out = run_out("graphify", &["--version"]);
-    let version = out.split_whitespace().last().unwrap_or("?").to_string();
+    let version = env.graphify_version.clone().unwrap_or_else(|| {
+        let out = run_out("graphify", &["--version"]);
+        out.split_whitespace().last().unwrap_or("?").to_string()
+    });
     let install = format!("uv tool install graphifyy=={version}");
     vec![item(
         "packages",
@@ -1176,6 +1181,7 @@ mod tests {
             providers_dir: repo().join("providers"),
             gitleaks_config: repo().join(".gitleaks.toml"),
             memory_repo: repo(),
+            graphify_version: Some("1.2.3".into()),
             sandbox_home: "/workspace".into(),
         }
     }
