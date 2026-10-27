@@ -815,7 +815,7 @@ mod tests {
         assert!(t.contains("write /h/.config/systemd/user/osh-gateway-openshell-podman.service"));
         assert!(t.contains("systemctl --user daemon-reload"));
         assert!(t.contains("systemctl --user enable --now osh-gateway-openshell-podman.service"));
-        assert!(t.contains("openshell gateway add") && t.contains("gateway.json") == false);
+        assert!(t.contains("openshell gateway add") && !t.contains("gateway.json"));
         assert!(t.contains("write /h/.local/share/osh/gateways.json"));
         let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
         let pos = |needle: &str| ids.iter().position(|i| i.contains(needle)).unwrap();
