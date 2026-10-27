@@ -214,6 +214,604 @@ impl Wizard {
     }
 }
 
+// ---- drawing ------------------------------------------------------------------------------
+
+use crate::gwmodel::Need;
+use crate::platform::{Kvm, Os, Runtime};
+use crate::setup::StepKind;
+use ratatui::{
+    layout::{Constraint, Direction, Layout, Margin, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Padding, Paragraph, Wrap},
+    Frame,
+};
+use std::time::Duration;
+
+/// How far the install has got, for the Install and Done screens. The runner updates it.
+#[derive(Clone, Debug, Default)]
+pub struct Progress {
+    /// One per step of the plan, in order.
+    pub rows: Vec<RowState>,
+    /// The latest lines of output of the step being run (the command first).
+    pub now: Vec<String>,
+    pub finished: bool,
+    /// Every required step succeeded.
+    pub ok: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RowState {
+    Pending,
+    Running,
+    Done(Duration),
+    /// A command failed; the text says how.
+    Failed(String),
+    /// Something only the user can do.
+    Manual(String),
+}
+
+const ACCENT: Color = Color::Cyan;
+const OK: Color = Color::Green;
+const WARN: Color = Color::Yellow;
+const BAD: Color = Color::Red;
+const DIM: Color = Color::DarkGray;
+
+fn fg(c: Color) -> Style {
+    Style::default().fg(c)
+}
+
+fn bold() -> Style {
+    Style::default().add_modifier(Modifier::BOLD)
+}
+
+fn dim(t: impl Into<String>) -> Span<'static> {
+    Span::styled(t.into(), fg(DIM))
+}
+
+fn plain(t: impl Into<String>) -> Span<'static> {
+    Span::raw(t.into())
+}
+
+/// Lines from rows of cells with every column padded to its widest cell, so columns line up in
+/// every row. Columns in `right` are right-aligned; the last column is not padded.
+fn table(rows: Vec<Vec<Span<'static>>>, gap: usize, right: &[usize]) -> Vec<Line<'static>> {
+    let n = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let widths: Vec<usize> = (0..n)
+        .map(|i| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(Span::width)
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    rows.into_iter()
+        .map(|r| {
+            let last = r.len().saturating_sub(1);
+            let mut spans = Vec::new();
+            for (i, cell) in r.into_iter().enumerate() {
+                let pad = widths[i] - cell.width();
+                if right.contains(&i) {
+                    spans.push(plain(" ".repeat(pad)));
+                    spans.push(cell);
+                } else {
+                    spans.push(cell);
+                    if i != last {
+                        spans.push(plain(" ".repeat(pad)));
+                    }
+                }
+                if i != last {
+                    spans.push(plain(" ".repeat(gap)));
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn mark(ok: bool) -> Span<'static> {
+    if ok {
+        Span::styled("✓", fg(OK))
+    } else {
+        Span::styled("✗", fg(WARN))
+    }
+}
+
+fn boxed(title: &str) -> Block<'static> {
+    Block::bordered()
+        .title(format!(" {title} "))
+        .padding(Padding::horizontal(1))
+}
+
+fn step_number(w: &Wizard) -> usize {
+    match w.screen {
+        Screen::Machine => 1,
+        Screen::Gateways => 2,
+        Screen::Review => 3,
+        Screen::Install | Screen::Done => 4,
+    }
+}
+
+fn header(w: &Wizard) -> Line<'static> {
+    let n = step_number(w);
+    let mut spans = vec![Span::styled(" oh-my-openshell ", bold()), dim("set up    ")];
+    for (i, name) in ["Machine", "Gateways", "Review", "Install"]
+        .iter()
+        .enumerate()
+    {
+        let (dot, style) = if i + 1 < n {
+            ("●", fg(ACCENT))
+        } else if i + 1 == n {
+            ("●", fg(ACCENT).add_modifier(Modifier::BOLD))
+        } else {
+            ("○", fg(DIM))
+        };
+        spans.push(Span::styled(format!("{dot} "), style));
+        let label = if i + 1 == n {
+            Span::styled(*name, bold())
+        } else if i + 1 < n {
+            plain(*name)
+        } else {
+            dim(*name)
+        };
+        spans.push(label);
+        spans.push(plain("  "));
+    }
+    Line::from(spans)
+}
+
+fn hints(w: &Wizard, p: &Progress) -> &'static str {
+    match w.screen {
+        Screen::Machine => "enter  continue    q  quit",
+        Screen::Gateways => "↑↓ move   space tick   enter continue   esc back   q quit",
+        Screen::Review => "Commands are shown as they run.   enter  Install   b  back   q  quit",
+        Screen::Install if p.finished => "enter  continue",
+        Screen::Install => "working… the command being run is shown below",
+        Screen::Done => "enter  open the dashboard",
+    }
+}
+
+pub fn draw(f: &mut Frame, w: &Wizard, p: &Progress) {
+    let area = f.area().inner(Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(area);
+    f.render_widget(Paragraph::new(header(w)), rows[0]);
+    match w.screen {
+        Screen::Machine => draw_machine(f, w, rows[1]),
+        Screen::Gateways => draw_gateways(f, w, rows[1]),
+        Screen::Review => draw_review(f, w, rows[1]),
+        Screen::Install => draw_install(f, w, p, rows[1]),
+        Screen::Done => draw_done(f, w, p, rows[1]),
+    }
+    if !w.note.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(w.note.clone(), fg(WARN))),
+            rows[2],
+        );
+    }
+    f.render_widget(Paragraph::new(dim(hints(w, p))), rows[3]);
+}
+
+fn runtime_line(f: &Facts, rt: Runtime) -> Vec<Span<'static>> {
+    let name = if rt == Runtime::Docker {
+        "Docker"
+    } else {
+        "Podman"
+    };
+    if f.runtimes_ready.contains(&rt) {
+        vec![mark(true), plain(name), dim("running")]
+    } else if f.runtimes_installed.contains(&rt) {
+        vec![mark(false), plain(name), dim("installed, not answering")]
+    } else {
+        vec![mark(false), plain(name), dim("not installed")]
+    }
+}
+
+fn draw_machine(f: &mut Frame, w: &Wizard, area: Rect) {
+    let facts = &w.facts;
+    let os = match facts.os {
+        Os::MacOs => "macOS",
+        Os::Linux => "Linux",
+    };
+    let mut rows = vec![vec![
+        mark(true),
+        plain(os),
+        plain(format!("package manager {:?}", facts.pkg).to_lowercase()),
+    ]];
+    if facts.os == Os::Linux {
+        let sudo = if facts.is_root || facts.has_sudo {
+            (true, "you will be asked for your password")
+        } else {
+            (
+                false,
+                "not available: steps needing root are shown for you to run",
+            )
+        };
+        rows.push(vec![mark(sudo.0), plain("sudo"), dim(sudo.1)]);
+    }
+    rows.push(runtime_line(facts, Runtime::Docker));
+    rows.push(runtime_line(facts, Runtime::Podman));
+    let kvm = match (facts.os, facts.kvm) {
+        (Os::MacOs, _) => (true, "Hypervisor.framework", "VMs"),
+        (_, Kvm::Usable) => (true, "usable", "KVM (/dev/kvm)"),
+        (_, Kvm::NoAccess) => (
+            false,
+            "present, but your user cannot use it yet",
+            "KVM (/dev/kvm)",
+        ),
+        (_, Kvm::Absent) => (
+            false,
+            "virtualization is off or unsupported",
+            "KVM (/dev/kvm)",
+        ),
+    };
+    rows.push(vec![mark(kvm.0), plain(kvm.2), dim(kvm.1)]);
+    rows.push(if facts.has_openshell {
+        vec![mark(true), plain("OpenShell"), dim("installed")]
+    } else {
+        vec![
+            mark(false),
+            plain("OpenShell"),
+            dim("not installed: osh will install it"),
+        ]
+    });
+    let lines = table(rows, 2, &[]);
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(lines.len() as u16 + 2),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    f.render_widget(
+        Paragraph::new("Here is what I found on this machine. Nothing is changed yet."),
+        v[0],
+    );
+    f.render_widget(Paragraph::new(lines).block(boxed("What I found")), v[1]);
+}
+
+fn status_word(i: &Item, f: &Facts) -> Span<'static> {
+    if i.existing {
+        return dim("added");
+    }
+    match &i.avail.state {
+        State::Ready => Span::styled("ready", fg(OK)),
+        State::NeedsInstall => Span::styled("needs install", fg(WARN)),
+        State::Unavailable(_) if i.kind == GwKind::Vm && f.kvm == Kvm::Absent => dim("no KVM"),
+        State::Unavailable(_) => dim("unavailable"),
+    }
+}
+
+fn need_rows(needs: &[Need]) -> Vec<Vec<Span<'static>>> {
+    needs
+        .iter()
+        .map(|n| vec![mark(n.ok), plain(n.text.clone()), dim(n.action.clone())])
+        .collect()
+}
+
+fn draw_gateways(f: &mut Frame, w: &Wizard, area: Rect) {
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(area);
+    let intro = if w.mode == Mode::First {
+        "Pick the gateways you want. The first one you tick becomes your main one."
+    } else {
+        "Pick the gateways to add."
+    };
+    f.render_widget(Paragraph::new(intro), v[0]);
+    let wide = area.width >= 70;
+    // Build the list and the details first, so the boxes can be sized to what they hold.
+    let rows: Vec<Vec<Span<'static>>> = w
+        .items
+        .iter()
+        .map(|i| {
+            let off = i.existing || matches!(i.avail.state, State::Unavailable(_));
+            let tick = if off {
+                "[-]"
+            } else if i.ticked {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            let name = if i.kind == GwKind::Vm {
+                "VM"
+            } else {
+                i.kind.label()
+            };
+            let status = status_word(i, &w.facts);
+            if off {
+                vec![dim(format!("{tick} {name}")), status]
+            } else if i.ticked {
+                vec![Span::styled(format!("{tick} {name}"), fg(OK)), status]
+            } else {
+                vec![plain(format!("{tick} {name}")), status]
+            }
+        })
+        .collect();
+    let mut lines = table(rows, 2, &[]);
+    // The highlighted row is coloured across the whole box, not only under its text.
+    let inner = 30usize.saturating_sub(4);
+    for (idx, line) in lines.iter_mut().enumerate() {
+        if idx == w.cursor {
+            let pad = inner.saturating_sub(line.width());
+            line.spans.push(plain(" ".repeat(pad)));
+            *line = line
+                .clone()
+                .patch_style(Style::default().bg(Color::Blue).fg(Color::White));
+        }
+    }
+    if w.mode == Mode::First || w.main_kind().is_some() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(dim("1st ticked = main")));
+    }
+    let item = &w.items[w.cursor];
+    let mut d: Vec<Line<'static>> = vec![Line::raw(item.kind.describe()), Line::raw("")];
+    if item.existing {
+        d.push(Line::from(dim("Already set up on this machine.")));
+    } else if let State::Unavailable(why) = &item.avail.state {
+        d.push(Line::from(Span::styled(why.clone(), fg(WARN))));
+    } else {
+        d.push(Line::from(Span::styled("What it needs", bold())));
+        d.extend(table(need_rows(&item.avail.needs), 2, &[]));
+    }
+    let want = (lines.len().max(d.len() + 1) + 2).max(9) as u16;
+    let body = Rect {
+        height: want.min(v[1].height),
+        ..v[1]
+    };
+    let panes = if wide {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(30), Constraint::Min(0)])
+            .split(body)
+    } else {
+        Layout::default()
+            .constraints([Constraint::Min(0)])
+            .split(body)
+    };
+    f.render_widget(Paragraph::new(lines).block(boxed("Gateways")), panes[0]);
+    if wide {
+        f.render_widget(
+            Paragraph::new(d)
+                .wrap(Wrap { trim: false })
+                .block(boxed(item.kind.label())),
+            panes[1],
+        );
+    }
+}
+
+fn privileged(s: &Step) -> bool {
+    matches!(&s.kind, StepKind::Cmd { prog, .. } if prog == "sudo")
+}
+
+fn draw_review(f: &mut Frame, w: &Wizard, area: Rect) {
+    let kinds = w.wanted();
+    let main = w.main_kind();
+    let names: Vec<String> = kinds
+        .iter()
+        .map(|k| {
+            if Some(*k) == main {
+                format!("{} (main)", k.name())
+            } else {
+                k.name().to_string()
+            }
+        })
+        .collect();
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(area);
+    let plan_area = Rect {
+        height: (w.steps.len() as u16 + 2).min(v[1].height),
+        ..v[1]
+    };
+    let n = kinds.len();
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::raw(format!(
+                "You will get {n} gateway{}: {}",
+                if n == 1 { "" } else { "s" },
+                names.join(", ")
+            )),
+            Line::raw(format!("I will run these {} steps:", w.steps.len())),
+        ]),
+        v[0],
+    );
+    let room = (v[1].height as usize).saturating_sub(2).max(1);
+    let shown = w.steps.len().min(room);
+    let mut rows: Vec<Vec<Span<'static>>> = w
+        .steps
+        .iter()
+        .take(if shown < w.steps.len() {
+            shown.saturating_sub(1)
+        } else {
+            shown
+        })
+        .enumerate()
+        .map(|(i, s)| {
+            vec![
+                Span::styled((i + 1).to_string(), bold()),
+                plain(s.title.clone()),
+                dim(if privileged(s) { "sudo" } else { "" }),
+            ]
+        })
+        .collect();
+    if shown < w.steps.len() {
+        rows.push(vec![
+            plain(""),
+            dim(format!("… and {} more", w.steps.len() - rows.len())),
+            plain(""),
+        ]);
+    }
+    f.render_widget(
+        Paragraph::new(table(rows, 2, &[0])).block(boxed("Plan")),
+        plan_area,
+    );
+}
+
+fn draw_install(f: &mut Frame, w: &Wizard, p: &Progress, area: Rect) {
+    let done = p
+        .rows
+        .iter()
+        .filter(|r| matches!(r, RowState::Done(_)))
+        .count();
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(w.steps.len() as u16 + 2),
+            Constraint::Min(0),
+            Constraint::Length(6),
+        ])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            plain("Working… "),
+            dim(format!("({done} of {} done)", w.steps.len())),
+        ])),
+        v[0],
+    );
+    let rows: Vec<Vec<Span<'static>>> = w
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let state = p.rows.get(i).cloned().unwrap_or(RowState::Pending);
+            let (icon, num, title, time) = match state {
+                RowState::Done(d) => (
+                    mark(true),
+                    bold(),
+                    plain(s.title.clone()),
+                    dim(format!("{}s", d.as_secs())),
+                ),
+                RowState::Running => (
+                    Span::styled("⠹", fg(ACCENT)),
+                    bold(),
+                    plain(s.title.clone()),
+                    plain(""),
+                ),
+                RowState::Failed(_) => (
+                    Span::styled("✗", fg(BAD)),
+                    bold(),
+                    Span::styled(s.title.clone(), fg(BAD)),
+                    plain(""),
+                ),
+                RowState::Manual(_) => (
+                    Span::styled("!", fg(WARN)),
+                    bold(),
+                    Span::styled(s.title.clone(), fg(WARN)),
+                    plain(""),
+                ),
+                RowState::Pending => (dim("·"), fg(DIM), dim(s.title.clone()), plain("")),
+            };
+            vec![icon, Span::styled((i + 1).to_string(), num), title, time]
+        })
+        .collect();
+    f.render_widget(
+        Paragraph::new(table(rows, 2, &[3])).block(boxed("Progress")),
+        v[1],
+    );
+    let now: Vec<Line<'static>> = p
+        .now
+        .iter()
+        .rev()
+        .take(4)
+        .rev()
+        .map(|l| Line::from(dim(l.clone())))
+        .collect();
+    f.render_widget(Paragraph::new(now).block(boxed("Now running")), v[3]);
+}
+
+fn draw_done(f: &mut Frame, w: &Wizard, p: &Progress, area: Rect) {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if p.ok {
+        lines.push(Line::from(vec![
+            Span::styled("All set.", fg(OK)),
+            plain(" Your gateways:"),
+        ]));
+        lines.push(Line::raw(""));
+        let main = w.main_kind();
+        let rows: Vec<Vec<Span<'static>>> = w
+            .wanted()
+            .iter()
+            .map(|k| {
+                vec![
+                    Span::styled("●", fg(OK)),
+                    Span::styled(k.name(), bold()),
+                    dim(if Some(*k) == main { "main" } else { "" }),
+                    plain(k.driver()),
+                    Span::styled("running", fg(OK)),
+                ]
+            })
+            .collect();
+        let rows = table(rows, 3, &[]);
+        let h = rows.len() as u16 + 2;
+        let v = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Length(h),
+                Constraint::Min(0),
+            ])
+            .split(area);
+        f.render_widget(Paragraph::new(lines), v[0]);
+        f.render_widget(Paragraph::new(rows).block(boxed("Gateways")), v[1]);
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::raw(""),
+                Line::from(vec![
+                    plain("Next: create a sandbox with "),
+                    Span::styled("n", bold()),
+                    plain(" on the Sandboxes tab."),
+                ]),
+                Line::from(vec![
+                    plain("Add more gateways any time on the Gateways tab with "),
+                    Span::styled("a", bold()),
+                    plain("."),
+                ]),
+            ]),
+            v[2],
+        );
+    } else {
+        lines.push(Line::from(Span::styled(
+            "Finished, with something left to do:",
+            fg(WARN),
+        )));
+        lines.push(Line::raw(""));
+        for (i, s) in w.steps.iter().enumerate() {
+            match p.rows.get(i) {
+                Some(RowState::Failed(e)) => lines.push(Line::from(vec![
+                    Span::styled("✗ ", fg(BAD)),
+                    plain(format!("{}: {e}", s.title)),
+                ])),
+                Some(RowState::Manual(t)) => lines.push(Line::from(vec![
+                    Span::styled("! ", fg(WARN)),
+                    plain(format!("{}: {t}", s.title)),
+                ])),
+                _ => {}
+            }
+        }
+        lines.push(Line::raw(""));
+        lines.push(Line::from(dim(
+            "Do that, then run osh setup again: it carries on where it stopped.",
+        )));
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,5 +1041,368 @@ mod tests {
             w.on_key(KeyCode::Up);
         }
         assert_eq!(w.cursor, 0);
+    }
+
+    // ---- drawing --------------------------------------------------------------------------
+
+    use ratatui::{backend::TestBackend, style::Color, Terminal};
+    use std::time::Duration;
+
+    fn render(
+        w: &Wizard,
+        p: &Progress,
+        width: u16,
+        height: u16,
+    ) -> (Vec<String>, ratatui::buffer::Buffer) {
+        let mut term = Terminal::new(TestBackend::new(width, height)).unwrap();
+        term.draw(|f| draw(f, w, p)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let rows = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        (rows, buf)
+    }
+
+    fn progress() -> Progress {
+        Progress {
+            rows: vec![
+                RowState::Done(Duration::from_secs(12)),
+                RowState::Done(Duration::from_secs(9)),
+                RowState::Running,
+                RowState::Pending,
+            ],
+            now: vec![
+                "$ systemctl --user enable --now podman.socket".into(),
+                "Created symlink".into(),
+            ],
+            finished: false,
+            ok: false,
+        }
+    }
+
+    fn named_step(title: &str) -> Step {
+        Step {
+            id: "s",
+            title: title.into(),
+            kind: StepKind::Manual("m".into()),
+            optional: false,
+            after: None,
+        }
+    }
+
+    fn wizard_with(screen: Screen) -> Wizard {
+        let mut w = Wizard::new(
+            Mode::First,
+            linux_docker_ready(),
+            &[],
+            false,
+            None,
+            planner(),
+        );
+        cursor_to(&mut w, GwKind::Docker);
+        press(&mut w, &[KeyCode::Enter, KeyCode::Char(' ')]);
+        cursor_to(&mut w, GwKind::Podman);
+        press(&mut w, &[KeyCode::Char(' ')]);
+        w.steps = [
+            "Install OpenShell",
+            "Install podman",
+            "Enable the podman socket",
+            "Check both answer",
+        ]
+        .iter()
+        .map(|t| named_step(t))
+        .collect();
+        w.screen = screen;
+        w
+    }
+
+    /// Every box's left and right edges run straight down: rows between a top-left corner and its
+    /// bottom-left corner have a vertical bar at the corner's column, and likewise on the right.
+    fn assert_boxes_aligned(rows: &[String]) {
+        let grid: Vec<Vec<char>> = rows.iter().map(|r| r.chars().collect()).collect();
+        for (y, row) in grid.iter().enumerate() {
+            for (x, c) in row.iter().enumerate() {
+                if *c != '┌' {
+                    continue;
+                }
+                let right = row[x..]
+                    .iter()
+                    .position(|c| *c == '┐')
+                    .map(|i| i + x)
+                    .expect("top edge ends with ┐");
+                let mut yy = y + 1;
+                loop {
+                    let r = grid.get(yy).unwrap_or_else(|| {
+                        panic!("box at ({x},{y}) never closes:\n{}", rows.join("\n"))
+                    });
+                    match r.get(x) {
+                        Some('└') => {
+                            assert_eq!(
+                                r.get(right),
+                                Some(&'┘'),
+                                "bottom-right corner off:\n{}",
+                                rows.join("\n")
+                            );
+                            break;
+                        }
+                        Some('│') => assert_eq!(
+                            r.get(right),
+                            Some(&'│'),
+                            "right edge off at row {yy}:\n{}",
+                            rows.join("\n")
+                        ),
+                        other => {
+                            panic!("left edge off at row {yy}: {other:?}\n{}", rows.join("\n"))
+                        }
+                    }
+                    yy += 1;
+                }
+            }
+        }
+    }
+
+    fn all_text(rows: &[String]) -> String {
+        rows.join("\n")
+    }
+
+    #[test]
+    fn machine_screen_lists_what_was_found() {
+        let w = wizard_with(Screen::Machine);
+        let (rows, _) = render(&w, &progress(), 80, 24);
+        let t = all_text(&rows);
+        assert!(
+            t.contains("What I found") && t.contains("apt") && t.contains("sudo"),
+            "{t}"
+        );
+        assert!(
+            t.contains("Docker")
+                && t.contains("Podman")
+                && t.contains("KVM")
+                && t.contains("OpenShell"),
+            "{t}"
+        );
+        assert!(t.contains("continue"), "key hints: {t}");
+        assert_boxes_aligned(&rows);
+    }
+
+    #[test]
+    fn gateways_screen_shows_list_and_details_for_the_highlighted_type() {
+        let mut w = wizard_with(Screen::Gateways);
+        cursor_to(&mut w, GwKind::Podman);
+        let (rows, _) = render(&w, &progress(), 80, 24);
+        let t = all_text(&rows);
+        assert!(
+            t.contains("[x] Docker") && t.contains("[x] Podman") && t.contains("[-] VM"),
+            "{t}"
+        );
+        assert!(
+            t.contains("What it needs") && t.contains("podman") && t.contains("will be installed"),
+            "{t}"
+        );
+        assert!(t.contains("1st ticked = main"), "{t}");
+        assert_boxes_aligned(&rows);
+    }
+
+    #[test]
+    fn every_box_row_has_equal_width_at_80_columns() {
+        for screen in [
+            Screen::Machine,
+            Screen::Gateways,
+            Screen::Review,
+            Screen::Install,
+            Screen::Done,
+        ] {
+            let mut w = wizard_with(screen);
+            w.screen = screen;
+            let mut p = progress();
+            p.finished = screen == Screen::Done;
+            p.ok = true;
+            let (rows, _) = render(&w, &p, 80, 24);
+            assert_boxes_aligned(&rows);
+            let widths: std::collections::BTreeSet<usize> = rows
+                .iter()
+                .map(|r| r.trim_start())
+                .filter(|r| r.starts_with('┌') || r.starts_with('│') || r.starts_with('└'))
+                .map(|r| r.trim_end().chars().count())
+                .collect();
+            assert!(
+                widths.len() <= 2,
+                "{screen:?}: full-width boxes differ in width {widths:?}\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn columns_line_up_in_the_review_and_install_screens() {
+        let w = wizard_with(Screen::Install);
+        let (rows, _) = render(&w, &progress(), 80, 24);
+        let twelve = rows.iter().find(|r| r.contains("12s")).unwrap();
+        let nine = rows.iter().find(|r| r.contains(" 9s")).unwrap();
+        let end = |r: &str, needle: &str| r.find(needle).unwrap() + needle.len();
+        assert_eq!(
+            end(twelve, "12s"),
+            end(nine, "9s"),
+            "times are right-aligned:\n{}",
+            all_text(&rows)
+        );
+        let titles = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .unwrap()
+                .find(needle)
+                .unwrap()
+        };
+        assert_eq!(titles("Install OpenShell"), titles("Install podman"));
+        let w = wizard_with(Screen::Review);
+        let (rows, _) = render(&w, &progress(), 80, 24);
+        let pos = |needle: &str| {
+            rows.iter()
+                .find(|r| r.contains(needle))
+                .unwrap()
+                .find(needle)
+                .unwrap()
+        };
+        assert_eq!(
+            pos("Install OpenShell"),
+            pos("Install podman"),
+            "{}",
+            all_text(&rows)
+        );
+    }
+
+    #[test]
+    fn install_screen_shows_progress_and_the_command_being_run() {
+        let w = wizard_with(Screen::Install);
+        let (rows, _) = render(&w, &progress(), 80, 24);
+        let t = all_text(&rows);
+        assert!(t.contains("Progress") && t.contains("Now running"), "{t}");
+        assert!(
+            t.contains("systemctl --user enable --now podman.socket"),
+            "{t}"
+        );
+        assert!(t.contains("✓") && t.contains("·"), "{t}");
+    }
+
+    #[test]
+    fn unavailable_row_is_dim_and_shows_the_reason() {
+        let mut w = wizard_with(Screen::Gateways);
+        cursor_to(&mut w, GwKind::Vm);
+        let (rows, buf) = render(&w, &progress(), 80, 24);
+        let y = rows.iter().position(|r| r.contains("[-] VM")).unwrap();
+        let x = rows[y].find("[-] VM").unwrap();
+        assert_eq!(buf[(x as u16, y as u16)].fg, Color::DarkGray);
+        let t = all_text(&rows);
+        assert!(t.contains("no KVM") && t.contains("/dev/kvm"), "{t}");
+    }
+
+    #[test]
+    fn stacked_layout_under_70_columns_has_no_details_pane() {
+        let w = wizard_with(Screen::Gateways);
+        let (rows, _) = render(&w, &progress(), 60, 20);
+        let t = all_text(&rows);
+        assert!(!t.contains("What it needs"), "{t}");
+        assert!(t.contains("Docker") && t.contains("Podman"), "{t}");
+        assert_boxes_aligned(&rows);
+    }
+
+    #[test]
+    fn nothing_panics_on_any_screen_at_small_sizes() {
+        for screen in [
+            Screen::Machine,
+            Screen::Gateways,
+            Screen::Review,
+            Screen::Install,
+            Screen::Done,
+        ] {
+            for (w_, h_) in [(80, 24), (60, 20), (40, 12), (20, 6), (120, 40)] {
+                let mut w = wizard_with(screen);
+                w.note = "a note that is long enough to need wrapping or truncating at small sizes"
+                    .into();
+                let mut p = progress();
+                p.finished = true;
+                render(&w, &p, w_, h_);
+                p.ok = true;
+                render(&w, &p, w_, h_);
+            }
+        }
+    }
+
+    #[test]
+    fn done_screen_lists_gateways_and_what_is_left_to_do() {
+        let w = wizard_with(Screen::Done);
+        let mut p = progress();
+        p.finished = true;
+        p.ok = true;
+        p.rows = vec![RowState::Done(Duration::from_secs(1)); 4];
+        let (rows, _) = render(&w, &p, 80, 24);
+        let t = all_text(&rows);
+        assert!(
+            t.contains("All set")
+                && t.contains("openshell-docker")
+                && t.contains("openshell-podman")
+                && t.contains("main"),
+            "{t}"
+        );
+        assert!(t.contains("open the dashboard"), "{t}");
+        let mut p = progress();
+        p.finished = true;
+        p.ok = false;
+        p.rows = vec![
+            RowState::Done(Duration::from_secs(1)),
+            RowState::Manual("log out and back in, then run osh setup again".into()),
+            RowState::Failed("apt-get exited with 100".into()),
+            RowState::Pending,
+        ];
+        let (rows, _) = render(&w, &p, 80, 24);
+        let t = all_text(&rows);
+        assert!(
+            t.contains("log out and back in") && t.contains("apt-get exited"),
+            "{t}"
+        );
+        assert!(!t.contains("All set"), "{t}");
+    }
+
+    #[test]
+    fn review_marks_privileged_steps_and_names_the_main_gateway() {
+        let mut w = wizard_with(Screen::Review);
+        w.steps[0].kind = StepKind::Cmd {
+            prog: "sudo".into(),
+            args: vec!["apt-get".into()],
+        };
+        let (rows, _) = render(&w, &progress(), 80, 24);
+        let t = all_text(&rows);
+        assert!(t.contains("sudo"), "{t}");
+        assert!(t.contains("openshell-docker") && t.contains("main"), "{t}");
+        assert!(t.contains("Install") && t.contains("enter"), "{t}");
+    }
+
+    /// `OSH_PRINT_WIZARD=1 cargo test print_screens -- --nocapture` shows every screen as text.
+    #[test]
+    fn print_screens_when_asked() {
+        if std::env::var_os("OSH_PRINT_WIZARD").is_none() {
+            return;
+        }
+        for screen in [
+            Screen::Machine,
+            Screen::Gateways,
+            Screen::Review,
+            Screen::Install,
+            Screen::Done,
+        ] {
+            let mut w = wizard_with(screen);
+            cursor_to(&mut w, GwKind::Podman);
+            let mut p = progress();
+            if screen == Screen::Done {
+                p.finished = true;
+                p.ok = true;
+            }
+            let (rows, _) = render(&w, &p, 80, 24);
+            println!("===== {screen:?}\n{}", rows.join("\n"));
+        }
     }
 }
