@@ -65,8 +65,7 @@ echo "== setup --gateways $gateways --yes (real packages, installer, systemd)"
 osh setup --gateways "$gateways" --yes >"$log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "setup exits 0" || {
   fail "setup exits 0" "rc=$rc"
-  sed -n '/Install OpenShell$/,/^\[[0-9]*\/[0-9]*\]/p' "$log" | head -60
-  tail -12 "$log"
+  grep -E '^(\[[0-9]+/[0-9]+\]|failed:|skipped|do yourself|declined|openshell:|Failed|cp:|E:)' "$log" | head -70
 }
 check "openshell is installed" openshell --version
 check "the runtime is installed" command -v "$runtime"
