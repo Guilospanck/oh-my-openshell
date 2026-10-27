@@ -10,7 +10,7 @@ pub const DOCKER_LABEL: &str = "dev.guilospanck.openshell-docker";
 pub const DOCKER_GATEWAY: &str = "openshell-docker";
 
 /// Polls the gateway for up to 20 seconds, then prints its status either way.
-const WAIT_SCRIPT: &str = r#"for _ in $(seq 20); do openshell -g "$1" status >/dev/null 2>&1 && break; sleep 1; done; openshell -g "$1" status"#;
+pub(crate) const WAIT_SCRIPT: &str = r#"for _ in $(seq 20); do openshell -g "$1" status >/dev/null 2>&1 && break; sleep 1; done; openshell -g "$1" status"#;
 
 /// Registers the Docker gateway, sharing the Homebrew gateway's client certificates.
 /// $1 = config dir. Keeps the previously selected gateway active.
@@ -25,7 +25,7 @@ fi
 sleep 3"#;
 
 /// Deletes the gateway's sandboxes through the gateway. $1 = gateway name.
-const DELETE_SANDBOXES_SCRIPT: &str = r#"if openshell -g "$1" status >/dev/null 2>&1; then
+pub(crate) const DELETE_SANDBOXES_SCRIPT: &str = r#"if openshell -g "$1" status >/dev/null 2>&1; then
   openshell -g "$1" sandbox delete --all || echo "sandbox delete failed; sweeping leftovers next"
 else
   echo "gateway not reachable; sweeping leftovers next"
@@ -33,7 +33,7 @@ fi"#;
 
 /// Removes leftover containers and volumes of a Docker or Podman driver.
 /// $1 = runtime binary, $2 = state dir, $3 = config dir, $4 = darwin flag.
-const SWEEP_CONTAINERS_SCRIPT: &str = r#"[ -f "$3/gateway.env" ] && { set -a; . "$3/gateway.env"; set +a; }
+pub(crate) const SWEEP_CONTAINERS_SCRIPT: &str = r#"[ -f "$3/gateway.env" ] && { set -a; . "$3/gateway.env"; set +a; }
 [ "$4" = darwin ] && export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.colima/docker.sock}"
 if command -v "$1" >/dev/null 2>&1 && "$1" info >/dev/null 2>&1; then
   for f in label=openshell.ai/managed-by=openshell label=openshell.managed=true; do
@@ -48,7 +48,7 @@ fi
 rm -rf "$2"/docker-sandbox-tokens/*"#;
 
 /// vm driver microVMs are child processes; kill orphans, drop their state. $1 = state dir.
-const SWEEP_VMS_SCRIPT: &str = r#"pkill -f "$1/vm-driver/sandboxes" 2>/dev/null || true
+pub(crate) const SWEEP_VMS_SCRIPT: &str = r#"pkill -f "$1/vm-driver/sandboxes" 2>/dev/null || true
 rm -rf "$1"/vm-driver/sandboxes/*"#;
 
 #[derive(Clone, Debug)]
@@ -108,7 +108,7 @@ impl Paths {
     }
 }
 
-fn step(id: &'static str, title: &str, kind: StepKind) -> Step {
+pub(crate) fn step(id: &'static str, title: &str, kind: StepKind) -> Step {
     Step {
         id,
         title: title.into(),
@@ -118,7 +118,7 @@ fn step(id: &'static str, title: &str, kind: StepKind) -> Step {
     }
 }
 
-fn cmd(prog: &str, args: &[&str]) -> StepKind {
+pub(crate) fn cmd(prog: &str, args: &[&str]) -> StepKind {
     StepKind::Cmd {
         prog: prog.into(),
         args: args.iter().map(|a| a.to_string()).collect(),
@@ -127,13 +127,13 @@ fn cmd(prog: &str, args: &[&str]) -> StepKind {
 
 /// `sh -c SCRIPT sh ARG...`: a fixed script with its inputs as positional parameters, never
 /// spliced into the script text.
-fn script(body: &str, args: &[&str]) -> StepKind {
+pub(crate) fn script(body: &str, args: &[&str]) -> StepKind {
     let mut a = vec!["-c", body, "sh"];
     a.extend_from_slice(args);
     cmd("sh", &a)
 }
 
-fn chain(mut steps: Vec<Step>, first_after: Option<&'static str>) -> Vec<Step> {
+pub(crate) fn chain(mut steps: Vec<Step>, first_after: Option<&'static str>) -> Vec<Step> {
     let mut prev = first_after;
     for s in &mut steps {
         s.after = prev;
@@ -168,7 +168,7 @@ fn wanted_config(name: &str, h: &dyn Host, p: &Paths) -> String {
         .unwrap_or_else(|| assets::embedded(name).unwrap_or_default().to_string())
 }
 
-fn service_running(os: Os, h: &dyn Host) -> bool {
+pub(crate) fn service_running(os: Os, h: &dyn Host) -> bool {
     match os {
         Os::MacOs => h.run("openshell", &["status"]).is_ok(),
         Os::Linux => h
@@ -572,7 +572,7 @@ pub fn exec_docker_service(p: &Paths, data: &Path) -> std::io::Error {
 }
 
 /// `openshell-gateway` from the Homebrew prefix, else from PATH.
-fn gateway_binary() -> PathBuf {
+pub(crate) fn gateway_binary() -> PathBuf {
     std::process::Command::new("brew")
         .args(["--prefix", "openshell"])
         .output()
