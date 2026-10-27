@@ -598,6 +598,7 @@ pub fn stale(name: &str, h: &dyn Host, p: &Paths) -> bool {
 mod tests {
     use super::*;
     use crate::platform::testing::FakeHost;
+    use crate::platform::{Kvm, PodmanMachine};
     use crate::setup::{execute, Answer, Outcome};
 
     fn facts(os: Os) -> Facts {
@@ -621,6 +622,11 @@ mod tests {
             runtimes_ready: vec![],
             podman_needs_socket: false,
             docker_permission_denied: false,
+            kvm: Kvm::Absent,
+            colima: false,
+            docker_desktop: false,
+            podman_machine: PodmanMachine::None,
+            has_e2fsprogs: false,
         }
     }
 

@@ -40,6 +40,7 @@ impl Runtime {
 /// The only door to the host, so planning and detection run against a fake in tests.
 pub trait Host {
     fn which(&self, bin: &str) -> bool;
+    fn exists(&self, path: &Path) -> bool;
     /// Runs `prog` directly (never through a shell); `Ok` is stdout, `Err` a failure message.
     fn run(&self, prog: &str, args: &[&str]) -> Result<String, String>;
     fn read(&self, path: &Path) -> Option<String>;
@@ -136,6 +137,10 @@ impl Host for RealHost {
         self.run_timeout(prog, args, RUN_LIMIT)
     }
 
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+
     fn read(&self, path: &Path) -> Option<String> {
         std::fs::read_to_string(path).ok()
     }
@@ -180,6 +185,24 @@ fn is_executable(_: &Path) -> bool {
     true
 }
 
+/// Whether this machine can run microVMs for the VM gateway.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kvm {
+    /// Linux without `/dev/kvm`: virtualization is off or unsupported.
+    Absent,
+    /// `/dev/kvm` exists but this user cannot open it (not in the `kvm` group yet).
+    NoAccess,
+    Usable,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PodmanMachine {
+    /// No machine, or not macOS (Linux runs Podman natively).
+    None,
+    Stopped,
+    Running,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Facts {
     pub os: Os,
@@ -204,6 +227,14 @@ pub struct Facts {
     /// `docker info` failed with "permission denied": the daemon is up but this user is not in
     /// the docker group (the state right after installing Docker, until the next login).
     pub docker_permission_denied: bool,
+    pub kvm: Kvm,
+    /// macOS: Colima is installed (a Docker runtime in a VM).
+    pub colima: bool,
+    /// macOS: Docker Desktop is installed.
+    pub docker_desktop: bool,
+    pub podman_machine: PodmanMachine,
+    /// `mke2fs` is available, which the VM driver needs to build sandbox disks.
+    pub has_e2fsprogs: bool,
 }
 
 impl Facts {
@@ -308,6 +339,35 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
             Ok(_) => runtimes_ready.push(*r),
         }
     }
+    let kvm = match os {
+        Os::MacOs => Kvm::Usable,
+        Os::Linux if !h.exists(Path::new("/dev/kvm")) => Kvm::Absent,
+        Os::Linux
+            if h.run("test", &["-r", "/dev/kvm", "-a", "-w", "/dev/kvm"])
+                .is_ok() =>
+        {
+            Kvm::Usable
+        }
+        Os::Linux => Kvm::NoAccess,
+    };
+    let has_e2fsprogs = [
+        "/usr/sbin/mke2fs",
+        "/sbin/mke2fs",
+        "/opt/homebrew/opt/e2fsprogs/sbin/mke2fs",
+        "/usr/local/opt/e2fsprogs/sbin/mke2fs",
+    ]
+    .iter()
+    .any(|p| h.exists(Path::new(p)))
+        || h.which("mke2fs");
+    let podman_machine = if os == Os::MacOs && h.which("podman") {
+        match h.run("podman", &["machine", "list", "--format", "{{.Running}}"]) {
+            Ok(o) if o.lines().any(|l| l.trim() == "true") => PodmanMachine::Running,
+            Ok(o) if o.lines().any(|l| l.trim() == "false") => PodmanMachine::Stopped,
+            _ => PodmanMachine::None,
+        }
+    } else {
+        PodmanMachine::None
+    };
     Facts {
         os,
         pkg,
@@ -331,6 +391,11 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
         runtimes_ready,
         podman_needs_socket,
         docker_permission_denied,
+        kvm,
+        colima: h.which("colima"),
+        docker_desktop: os == Os::MacOs && h.exists(Path::new("/Applications/Docker.app")),
+        podman_machine,
+        has_e2fsprogs,
     }
 }
 
@@ -351,6 +416,8 @@ pub mod testing {
         pub env: HashMap<String, String>,
         /// Command lines that fail with this message.
         pub fail_msgs: HashMap<String, String>,
+        /// Paths that exist, for `exists`.
+        pub paths: HashSet<String>,
         pub calls: RefCell<Vec<String>>,
         pub written: RefCell<Vec<(std::path::PathBuf, String)>>,
     }
@@ -367,6 +434,9 @@ pub mod testing {
     impl Host for FakeHost {
         fn which(&self, bin: &str) -> bool {
             self.bins.contains(bin)
+        }
+        fn exists(&self, path: &Path) -> bool {
+            path.to_str().is_some_and(|p| self.paths.contains(p))
         }
         fn run(&self, prog: &str, args: &[&str]) -> Result<String, String> {
             let line = format!("{prog} {}", args.join(" ")).trim().to_string();
@@ -513,6 +583,71 @@ mod tests {
         assert_eq!(gather_for(&h, Os::MacOs).pkg, PkgMgr::None);
         let h = FakeHost::with_bins(&["brew"]);
         assert_eq!(gather_for(&h, Os::MacOs).pkg, PkgMgr::Brew);
+    }
+
+    #[test]
+    fn kvm_absent_when_dev_kvm_is_missing() {
+        let h = FakeHost::default();
+        assert_eq!(gather_for(&h, Os::Linux).kvm, Kvm::Absent);
+        assert_eq!(
+            gather_for(&h, Os::MacOs).kvm,
+            Kvm::Usable,
+            "macOS uses Hypervisor.framework"
+        );
+    }
+
+    #[test]
+    fn kvm_no_access_when_present_but_not_usable() {
+        let mut h = FakeHost::default();
+        h.paths.insert("/dev/kvm".into());
+        assert_eq!(gather_for(&h, Os::Linux).kvm, Kvm::Usable);
+        h.failing.insert("test".into());
+        assert_eq!(gather_for(&h, Os::Linux).kvm, Kvm::NoAccess);
+    }
+
+    #[test]
+    fn colima_docker_desktop_and_e2fsprogs_are_detected() {
+        let mut h = FakeHost::with_bins(&["colima"]);
+        h.paths.insert("/Applications/Docker.app".into());
+        h.paths
+            .insert("/opt/homebrew/opt/e2fsprogs/sbin/mke2fs".into());
+        let f = gather_for(&h, Os::MacOs);
+        assert!(f.colima && f.docker_desktop && f.has_e2fsprogs);
+        let bare = gather_for(&FakeHost::default(), Os::MacOs);
+        assert!(!bare.colima && !bare.docker_desktop && !bare.has_e2fsprogs);
+        let mut linux = FakeHost::default();
+        linux.paths.insert("/usr/sbin/mke2fs".into());
+        assert!(gather_for(&linux, Os::Linux).has_e2fsprogs);
+    }
+
+    #[test]
+    fn podman_machine_state_is_parsed() {
+        let mut h = FakeHost::with_bins(&["podman"]);
+        assert_eq!(
+            gather_for(&h, Os::MacOs).podman_machine,
+            PodmanMachine::None
+        );
+        h.outputs.insert(
+            "podman machine list --format {{.Running}}".into(),
+            "false\n".into(),
+        );
+        assert_eq!(
+            gather_for(&h, Os::MacOs).podman_machine,
+            PodmanMachine::Stopped
+        );
+        h.outputs.insert(
+            "podman machine list --format {{.Running}}".into(),
+            "true\n".into(),
+        );
+        assert_eq!(
+            gather_for(&h, Os::MacOs).podman_machine,
+            PodmanMachine::Running
+        );
+        assert_eq!(
+            gather_for(&h, Os::Linux).podman_machine,
+            PodmanMachine::None,
+            "Linux has no machine"
+        );
     }
 
     #[test]

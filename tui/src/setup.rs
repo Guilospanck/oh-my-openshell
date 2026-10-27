@@ -710,7 +710,7 @@ pub fn run_ok(steps: &[Step], results: &[StepResult], o: &Options) -> bool {
 mod tests {
     use super::*;
     use crate::platform::testing::FakeHost;
-    use crate::platform::{gather_for, PkgMgr};
+    use crate::platform::{gather_for, Kvm, PkgMgr, PodmanMachine};
 
     fn facts(os: Os, pkg: PkgMgr) -> Facts {
         Facts {
@@ -729,6 +729,11 @@ mod tests {
             runtimes_ready: vec![],
             podman_needs_socket: false,
             docker_permission_denied: false,
+            kvm: Kvm::Absent,
+            colima: false,
+            docker_desktop: false,
+            podman_machine: PodmanMachine::None,
+            has_e2fsprogs: false,
         }
     }
 

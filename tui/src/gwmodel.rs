@@ -1,5 +1,6 @@
 //! What a gateway is to osh: its kind, its name and port, and the registry of the ones osh made.
 #![allow(dead_code)] // used by the tasks that follow in the plan; remove when wired (Task 7)
+use crate::platform::{Facts, Kvm, Os, PodmanMachine, Runtime};
 use serde_json::{json, Value};
 use std::{fs, io, path::Path};
 
@@ -146,6 +147,142 @@ impl Registry {
     }
 }
 
+/// One line of "what it needs": met (`ok`) or not, and what osh will do about it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Need {
+    pub text: String,
+    pub ok: bool,
+    /// Empty when the need is met.
+    pub action: String,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum State {
+    Ready,
+    /// Something is missing that osh installs, enables, starts, or asks the user to do.
+    NeedsInstall,
+    /// Cannot work on this machine; the text says why.
+    Unavailable(String),
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Availability {
+    pub state: State,
+    pub needs: Vec<Need>,
+}
+
+fn need(text: &str, ok: bool, action: &str) -> Need {
+    Need {
+        text: text.into(),
+        ok,
+        action: if ok { String::new() } else { action.into() },
+    }
+}
+
+fn finish(needs: Vec<Need>) -> Availability {
+    let state = if needs.iter().all(|n| n.ok) {
+        State::Ready
+    } else {
+        State::NeedsInstall
+    };
+    Availability { state, needs }
+}
+
+/// What it takes to run a gateway of kind `k` on this machine, from the facts alone.
+pub fn availability(f: &Facts, k: GwKind) -> Availability {
+    let mac = f.os == Os::MacOs;
+    match k {
+        GwKind::Vm => {
+            let mut needs = Vec::new();
+            if !mac {
+                match f.kvm {
+                    Kvm::Absent => {
+                        return Availability {
+                            state: State::Unavailable(
+                                "no /dev/kvm: virtualization is off or unsupported on this machine"
+                                    .into(),
+                            ),
+                            needs: Vec::new(),
+                        }
+                    }
+                    Kvm::NoAccess => needs.push(need(
+                        "KVM access",
+                        false,
+                        "your user will join the kvm group (log out and back in after)",
+                    )),
+                    Kvm::Usable => needs.push(need("KVM access", true, "")),
+                }
+            }
+            needs.push(need("e2fsprogs", f.has_e2fsprogs, "will be installed"));
+            finish(needs)
+        }
+        GwKind::Docker => {
+            if f.runtimes_ready.contains(&Runtime::Docker) {
+                return finish(vec![need("Docker running", true, "")]);
+            }
+            let installed = f.runtimes_installed.contains(&Runtime::Docker);
+            let mut needs = Vec::new();
+            if mac {
+                if f.docker_desktop {
+                    needs.push(need(
+                        "Docker Desktop running",
+                        false,
+                        "start Docker Desktop yourself",
+                    ));
+                } else {
+                    needs.push(need("docker + Colima", f.colima, "will be installed"));
+                    needs.push(need("Colima running", false, "will be started"));
+                }
+            } else if f.docker_permission_denied {
+                needs.push(need(
+                    "docker group",
+                    false,
+                    "your user will join the docker group (log out and back in after)",
+                ));
+            } else if installed {
+                needs.push(need(
+                    "Docker daemon running",
+                    false,
+                    "start it: sudo systemctl start docker",
+                ));
+            } else {
+                needs.push(need("docker", false, "will be installed"));
+                needs.push(need(
+                    "docker group",
+                    false,
+                    "your user will join the docker group (log out and back in after)",
+                ));
+            }
+            finish(needs)
+        }
+        GwKind::Podman => {
+            if f.runtimes_ready.contains(&Runtime::Podman) {
+                return finish(vec![need("Podman running", true, "")]);
+            }
+            let installed = f.runtimes_installed.contains(&Runtime::Podman);
+            let mut needs = vec![need("podman", installed, "will be installed")];
+            if mac {
+                let action = match f.podman_machine {
+                    PodmanMachine::Stopped => "will be started",
+                    _ => "will be created and started",
+                };
+                needs.push(need(
+                    "podman machine",
+                    f.podman_machine == PodmanMachine::Running,
+                    action,
+                ));
+            } else {
+                needs.push(need(
+                    "podman.socket",
+                    installed && !f.podman_needs_socket,
+                    "will be enabled",
+                ));
+            }
+            finish(needs)
+        }
+    }
+}
+
 /// The lowest port from 17671 for an extra gateway whose port, health port (+10) and metrics port
 /// (+20) are all free: not in `taken` and, for the gateway port, not currently bound.
 pub fn next_port(taken: &[u16], is_bound: &dyn Fn(u16) -> bool) -> u16 {
@@ -194,7 +331,158 @@ impl Pending {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::PkgMgr;
     use std::path::PathBuf;
+
+    fn facts(os: Os) -> Facts {
+        Facts {
+            os,
+            pkg: if os == Os::MacOs {
+                PkgMgr::Brew
+            } else {
+                PkgMgr::Apt
+            },
+            is_root: false,
+            has_sudo: true,
+            user: "ana".into(),
+            wayland: false,
+            has_openshell: true,
+            has_curl: true,
+            has_tmux: true,
+            has_gh: true,
+            has_clipboard: true,
+            runtimes_installed: vec![],
+            runtimes_ready: vec![],
+            podman_needs_socket: false,
+            docker_permission_denied: false,
+            kvm: if os == Os::MacOs {
+                Kvm::Usable
+            } else {
+                Kvm::Absent
+            },
+            colima: false,
+            docker_desktop: false,
+            podman_machine: PodmanMachine::None,
+            has_e2fsprogs: false,
+        }
+    }
+
+    fn unmet(a: &Availability) -> Vec<&str> {
+        a.needs
+            .iter()
+            .filter(|n| !n.ok)
+            .map(|n| n.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn vm_is_unavailable_without_kvm_with_a_reason() {
+        let a = availability(&facts(Os::Linux), GwKind::Vm);
+        match a.state {
+            State::Unavailable(why) => assert!(why.contains("/dev/kvm"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn vm_needs_the_kvm_group_when_present_but_not_accessible() {
+        let mut f = facts(Os::Linux);
+        f.kvm = Kvm::NoAccess;
+        let a = availability(&f, GwKind::Vm);
+        assert_eq!(a.state, State::NeedsInstall);
+        assert!(unmet(&a).iter().any(|t| t.contains("KVM")));
+        assert!(unmet(&a).iter().any(|t| t.contains("e2fsprogs")));
+        f.kvm = Kvm::Usable;
+        f.has_e2fsprogs = true;
+        assert_eq!(availability(&f, GwKind::Vm).state, State::Ready);
+    }
+
+    #[test]
+    fn vm_on_macos_only_needs_e2fsprogs() {
+        let mut f = facts(Os::MacOs);
+        assert_eq!(unmet(&availability(&f, GwKind::Vm)), ["e2fsprogs"]);
+        f.has_e2fsprogs = true;
+        assert_eq!(availability(&f, GwKind::Vm).state, State::Ready);
+    }
+
+    #[test]
+    fn docker_ready_when_the_daemon_answers() {
+        let mut f = facts(Os::Linux);
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.runtimes_ready = vec![Runtime::Docker];
+        let a = availability(&f, GwKind::Docker);
+        assert_eq!(a.state, State::Ready);
+        assert!(a.needs.iter().all(|n| n.ok && n.action.is_empty()));
+    }
+
+    #[test]
+    fn docker_on_linux_needs_install_group_and_login() {
+        let a = availability(&facts(Os::Linux), GwKind::Docker);
+        assert_eq!(a.state, State::NeedsInstall);
+        let u = unmet(&a);
+        assert!(
+            u.contains(&"docker") && u.iter().any(|t| t.contains("docker group")),
+            "{u:?}"
+        );
+        let mut f = facts(Os::Linux);
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.docker_permission_denied = true;
+        let u = availability(&f, GwKind::Docker);
+        assert!(unmet(&u).iter().any(|t| t.contains("docker group")));
+        assert!(!unmet(&u).contains(&"docker"));
+    }
+
+    #[test]
+    fn docker_on_macos_offers_colima_or_asks_to_start_docker_desktop() {
+        let a = availability(&facts(Os::MacOs), GwKind::Docker);
+        assert!(unmet(&a).iter().any(|t| t.contains("Colima")));
+        let mut f = facts(Os::MacOs);
+        f.docker_desktop = true;
+        let a = availability(&f, GwKind::Docker);
+        let n = a.needs.iter().find(|n| !n.ok).unwrap();
+        assert!(
+            n.text.contains("Docker Desktop") && n.action.contains("yourself"),
+            "{n:?}"
+        );
+        let mut f = facts(Os::MacOs);
+        f.colima = true;
+        let u = unmet(&availability(&f, GwKind::Docker)).join("|");
+        assert!(
+            u.contains("Colima running") && !u.contains("colima install"),
+            "{u}"
+        );
+    }
+
+    #[test]
+    fn podman_on_linux_needs_the_package_and_its_socket() {
+        let a = availability(&facts(Os::Linux), GwKind::Podman);
+        assert_eq!(unmet(&a), ["podman", "podman.socket"]);
+        let mut f = facts(Os::Linux);
+        f.runtimes_installed = vec![Runtime::Podman];
+        f.podman_needs_socket = true;
+        assert_eq!(unmet(&availability(&f, GwKind::Podman)), ["podman.socket"]);
+    }
+
+    #[test]
+    fn podman_on_macos_needs_the_machine() {
+        let mut f = facts(Os::MacOs);
+        f.runtimes_installed = vec![Runtime::Podman];
+        assert_eq!(unmet(&availability(&f, GwKind::Podman)), ["podman machine"]);
+        f.podman_machine = PodmanMachine::Stopped;
+        let a = availability(&f, GwKind::Podman);
+        assert!(a
+            .needs
+            .iter()
+            .any(|n| n.text == "podman machine" && n.action.contains("started")));
+    }
+
+    #[test]
+    fn a_need_that_is_met_has_no_action() {
+        let mut f = facts(Os::MacOs);
+        f.has_e2fsprogs = true;
+        let a = availability(&f, GwKind::Vm);
+        assert!(a.needs[0].ok && a.needs[0].action.is_empty());
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("osh-gw-{name}-{}", std::process::id()));
