@@ -406,6 +406,43 @@ pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
             ));
         }
     }
+    // The gateways osh created: their services (extras), then osh's own record of them.
+    let units = p
+        .config_home
+        .parent()
+        .unwrap_or(&p.home)
+        .join("systemd/user");
+    match f.os {
+        Os::Linux => steps.push(step(
+            "uninstall-extras",
+            "Remove the gateways osh created",
+            script(
+                r#"for u in "$1"/osh-gateway-*.service; do [ -e "$u" ] || continue; systemctl --user disable --now "$(basename "$u")" 2>/dev/null || true; rm -f "$u"; done; systemctl --user daemon-reload 2>/dev/null || true"#,
+                &[&units.to_string_lossy()],
+            ),
+        )),
+        Os::MacOs => steps.push(step(
+            "uninstall-extras",
+            "Remove the gateways osh created",
+            script(
+                r#"for a in "$1"/dev.guilospanck.openshell-*.plist; do [ -e "$a" ] || continue; launchctl bootout "gui/$(id -u)/$(basename "$a" .plist)" 2>/dev/null || true; rm -f "$a"; done"#,
+                &[&p.home.join("Library/LaunchAgents").to_string_lossy()],
+            ),
+        )),
+    }
+    steps.push(step(
+        "uninstall-registry",
+        "Forget the gateways osh created",
+        cmd(
+            "rm",
+            &[
+                "-rf",
+                &p.data.join("gateways").to_string_lossy(),
+                &p.data.join("gateways.json").to_string_lossy(),
+                &p.data.join("wizard.json").to_string_lossy(),
+            ],
+        ),
+    ));
     // rm -rf does not follow symlinks, so linked config entries only lose the link.
     steps.push(step(
         "uninstall-files",
@@ -771,6 +808,20 @@ mod tests {
             "rm -rf /h/.config/openshell /h/.local/state/openshell /h/.local/share/openshell"
         ));
         assert!(t.contains("apt remove"));
+    }
+
+    #[test]
+    fn uninstall_removes_osh_managed_gateway_services_and_the_registry() {
+        let linux = texts(&uninstall_steps(&facts(Os::Linux), &paths()));
+        assert!(linux.contains("osh-gateway-*.service"), "{linux}");
+        assert!(
+            linux.contains("/h/.local/share/osh/gateways.json"),
+            "{linux}"
+        );
+        assert!(linux.contains("/h/.local/share/osh/gateways"), "{linux}");
+        let mac = texts(&uninstall_steps(&facts(Os::MacOs), &paths()));
+        assert!(mac.contains("dev.guilospanck.openshell-"), "{mac}");
+        assert!(mac.contains("/h/.local/share/osh/gateways.json"), "{mac}");
     }
 
     #[test]

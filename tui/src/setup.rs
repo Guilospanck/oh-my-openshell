@@ -291,7 +291,7 @@ impl Planner {
                     "runtime",
                     "Install a container runtime",
                     StepKind::Manual(
-                        "no container runtime found: rerun with --runtime docker or --runtime podman"
+                        "no container runtime found: rerun with --gateways docker or --gateways podman"
                             .into(),
                     ),
                     false,
@@ -793,8 +793,21 @@ pub fn plan_gateways(
         .copied()
         .filter(|k| !reg.has_kind(*k) && !existing.iter().any(|(n, _)| n == k.name()))
         .collect();
+    // Gateways osh already made that were asked for again: make sure they are running (a re-run
+    // resumes a stopped one), and leave the healthy ones alone.
+    let mut resume: Vec<Step> = Vec::new();
+    for k in &o.gateways {
+        let Some(spec) = reg.gateways.iter().find(|g| g.kind == *k) else {
+            continue;
+        };
+        if spec.main {
+            resume.extend(crate::gwops::main_gateway_steps(f, p, h, spec, false));
+        } else if !crate::gwops::extra_running(f.os, h, spec) {
+            resume.extend(crate::gwops::add_gateway_steps(f, p, h, reg, spec));
+        }
+    }
     if wanted.is_empty() {
-        return Ok(Vec::new());
+        return Ok(resume);
     }
     let mut o2 = o.clone();
     o2.gateways = wanted.clone();
@@ -840,7 +853,8 @@ pub fn plan_gateways(
         reg_now.add(spec);
         steps.extend(g);
     }
-    Ok(steps)
+    resume.extend(steps);
+    Ok(resume)
 }
 
 /// Plans and runs the wanted gateway types on this machine (the `--gateways` and `gateway add`
@@ -966,7 +980,7 @@ pub fn doctor(f: &Facts) -> (String, bool) {
         line("ok", &format!("container runtime ({})", rt.bin()), "");
     } else {
         let note = if f.runtimes_installed.is_empty() {
-            "osh setup --runtime docker|podman installs one".to_string()
+            "osh setup --gateways docker|podman|vm sets one up".to_string()
         } else if f.docker_permission_denied {
             "docker is running but this user is not allowed to use docker yet; log out and back in"
                 .to_string()
@@ -1262,7 +1276,7 @@ mod tests {
     fn plan_linux_without_a_pick_asks_for_one() {
         let steps = plan(&facts(Os::Linux, PkgMgr::Apt), &Options::default());
         assert!(steps.iter().any(|s| s.id == "runtime"
-            && matches!(s.kind, StepKind::Manual(ref t) if t.contains("--runtime"))));
+            && matches!(s.kind, StepKind::Manual(ref t) if t.contains("--gateways"))));
     }
 
     #[test]
@@ -1734,7 +1748,22 @@ mod tests {
             port: 17670,
             main: true,
         });
-        let steps = gw_plan(&f, &[GwKind::Podman], &reg, &[]).unwrap();
+        // The registered main is healthy: its config is current and its service runs.
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            crate::gwops::gateway_toml(reg.get("openshell-podman").unwrap(), Os::Linux),
+        );
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Podman]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &[],
+            &|_| false,
+        )
+        .unwrap();
         assert!(steps.is_empty());
         let legacy = [("openshell-docker".to_string(), 17671u16)];
         assert!(gw_plan(
@@ -1745,6 +1774,113 @@ mod tests {
         )
         .unwrap()
         .is_empty());
+    }
+
+    fn registered(kinds: &[(GwKind, u16, bool)]) -> crate::gwmodel::Registry {
+        let mut reg = crate::gwmodel::Registry::default();
+        for (k, port, main) in kinds {
+            reg.add(crate::gwmodel::GatewaySpec {
+                name: k.name().into(),
+                kind: *k,
+                port: *port,
+                main: *main,
+            });
+        }
+        reg
+    }
+
+    fn running_facts() -> Facts {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Docker, Runtime::Podman];
+        f.runtimes_ready = vec![Runtime::Docker, Runtime::Podman];
+        f
+    }
+
+    #[test]
+    fn healthy_registered_gateways_need_nothing() {
+        let f = running_facts();
+        let reg = registered(&[
+            (GwKind::Docker, 17670, true),
+            (GwKind::Podman, 17671, false),
+        ]);
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
+        );
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &[],
+            &|_| false,
+        )
+        .unwrap();
+        assert!(steps.is_empty(), "{:?}", lines(&steps));
+    }
+
+    #[test]
+    fn a_registered_main_whose_service_is_down_gets_its_restart_steps() {
+        let f = running_facts();
+        let reg = registered(&[(GwKind::Docker, 17670, true)]);
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
+        );
+        h.failing.insert("systemctl".into());
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &[],
+            &|_| false,
+        )
+        .unwrap();
+        assert!(lines(&steps)
+            .join("\n")
+            .contains("systemctl --user restart openshell-gateway"));
+    }
+
+    #[test]
+    fn a_registered_extra_that_is_not_running_is_started_again() {
+        let f = running_facts();
+        let reg = registered(&[
+            (GwKind::Docker, 17670, true),
+            (GwKind::Podman, 17671, false),
+        ]);
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
+        );
+        h.failing.insert(
+            "systemctl --user is-active --quiet osh-gateway-openshell-podman.service".into(),
+        );
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &[],
+            &|_| false,
+        )
+        .unwrap();
+        let t = lines(&steps).join("\n");
+        assert!(
+            t.contains("enable --now osh-gateway-openshell-podman.service"),
+            "{t}"
+        );
+        assert!(
+            !t.contains("openshell-gateway"),
+            "the healthy main is left alone: {t}"
+        );
     }
 
     #[test]

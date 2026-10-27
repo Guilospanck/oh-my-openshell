@@ -288,6 +288,28 @@ fn own_service_steps(
     chain(steps, None)
 }
 
+/// Whether an osh-run extra's service is active right now.
+pub fn extra_running(os: Os, h: &dyn Host, spec: &GatewaySpec) -> bool {
+    match os {
+        Os::Linux => h
+            .run(
+                "systemctl",
+                &["--user", "is-active", "--quiet", &unit_name(&spec.name)],
+            )
+            .is_ok(),
+        Os::MacOs => {
+            let target = format!("gui/{}/{}", "$(id -u)", agent_label(&spec.name));
+            // `launchctl print` needs the real uid; ask `id` rather than a shell.
+            let uid = h
+                .run("id", &["-u"])
+                .map(|o| o.trim().to_string())
+                .unwrap_or_default();
+            let target = target.replace("$(id -u)", &uid);
+            h.run("launchctl", &["print", &target]).is_ok()
+        }
+    }
+}
+
 /// Adds an extra gateway: its own config, service and CLI registration, then the registry entry.
 /// Certificates are shared with the main gateway (or the legacy `openshell`).
 pub fn add_gateway_steps(
