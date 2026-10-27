@@ -15,7 +15,7 @@ log="$HOME/out.log"
 echo "== install osh from the local release"
 OSH_VERSION=v0.0.0-real OSH_RELEASE_BASE=file:///dist OSH_NO_SETUP=1 sh /repo/install.sh >"$log" 2>&1 \
   && pass "install.sh installs the release" || { fail "install.sh" ; tail -10 "$log"; }
-check "osh runs" osh doctor
+check "osh is on PATH" command -v osh
 
 echo "== doctor before setup"
 out="$(osh doctor 2>&1)"; rc=$?

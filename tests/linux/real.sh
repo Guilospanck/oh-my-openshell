@@ -39,11 +39,13 @@ for _ in $(seq 60); do
   sleep 1
 done
 [[ $ready -eq 1 ]] || { echo "systemd did not come up (state: ${state:-none})"; docker logs "$name" | tail -20; exit 1; }
+# The image already has a user at UID 1000, so look the id up.
+uid="$(docker exec "$name" id -u tester)"
 docker exec "$name" loginctl enable-linger tester
-docker exec "$name" bash -c 'systemctl start "user@$(id -u tester).service"'
-sleep 2
+docker exec "$name" systemctl start "user@${uid}.service"
+for _ in $(seq 20); do docker exec "$name" test -S "/run/user/$uid/bus" && break; sleep 1; done
 
 echo "== running the suite as an ordinary user"
-docker exec -u tester -e XDG_RUNTIME_DIR=/run/user/1000 \
-  -e DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+docker exec -u tester -e XDG_RUNTIME_DIR="/run/user/$uid" \
+  -e DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
   "$name" bash /repo/tests/linux/real-suite.sh "$runtime"

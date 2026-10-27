@@ -56,10 +56,7 @@ impl Step {
                 // Short scripts are shown whole (lines joined by `; `), long ones by their first
                 // line and `...`; either way quoted so a short one can be pasted into a shell.
                 if script.lines().count() <= 6 {
-                    format!(
-                        "sh -c {}",
-                        sh_quote(&script.lines().collect::<Vec<_>>().join("; "))
-                    )
+                    format!("sh -c {}", sh_quote(&one_line(script)))
                 } else {
                     format!(
                         "sh -c {}",
@@ -501,6 +498,22 @@ pub fn doctor(f: &Facts) -> (String, bool) {
         }
     }
     (out, ok)
+}
+
+/// A short script on one line: lines are joined with `; `, except after a word that expects the
+/// next line to continue the command (`then`, `else`, `do`, `{`, `&&`, `||`, `|`).
+fn one_line(script: &str) -> String {
+    let mut out = String::new();
+    for line in script.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !out.is_empty() {
+            let open = ["then", "else", "do", "{", "&&", "||", "|"]
+                .iter()
+                .any(|w| out.ends_with(w));
+            out.push_str(if open { " " } else { "; " });
+        }
+        out.push_str(line);
+    }
+    out
 }
 
 /// `text` as one shell word: single quotes, with each embedded `'` written as `'\''`.
@@ -965,6 +978,16 @@ mod tests {
             r#"sh -c 'trap '\''rm -f x'\'' EXIT'"#
         );
         assert_eq!(sh("set -e\nrm -rf x").display(), "sh -c 'set -e; rm -rf x'");
+        // After `then`, `else`, `do`, `{`, `&&`, `||` the next line continues the same command.
+        let branchy = sh("if a; then\n  b\nelse\n  c\nfi");
+        assert_eq!(branchy.display(), "sh -c 'if a; then b; else c; fi'");
+        let shown = branchy.display();
+        let word = shown.strip_prefix("sh -c ").unwrap();
+        let parsed = std::process::Command::new("sh")
+            .args(["-n", "-c", &format!("sh -c {word}")])
+            .status()
+            .unwrap();
+        assert!(parsed.success(), "the shown line must parse as shell");
         let long = sh("1\n2\n3\n4\n5\n6\nrm -rf x");
         assert_eq!(long.display(), "sh -c '1 ...'");
         assert!(long.command_line().contains("rm -rf x"));
