@@ -32,7 +32,11 @@ check "refusing installed nothing" bash -c '! command -v openshell'
 
 echo "== setup --yes --runtime $runtime (real packages, installer, systemd)"
 osh setup --yes --runtime "$runtime" >"$log" 2>&1; rc=$?
-[[ $rc -eq 0 ]] && pass "setup exits 0" || { fail "setup exits 0" "rc=$rc"; tail -40 "$log"; show_gateway_log; }
+[[ $rc -eq 0 ]] && pass "setup exits 0" || {
+  fail "setup exits 0" "rc=$rc"
+  sed -n '/Install OpenShell$/,/^\[[0-9]*\/[0-9]*\]/p' "$log" | head -60
+  tail -12 "$log"
+}
 check "openshell is installed" openshell --version
 check "the runtime is installed" command -v "$runtime"
 case "$runtime" in podman) want=gateway-podman.toml ;; docker) want=gateway-linux.toml ;; esac
@@ -45,7 +49,7 @@ grep -q 'Connected' <<<"$out" && pass "openshell status says Connected" || { fai
 out="$(osh doctor 2>&1)"; rc=$?
 [[ $rc -eq 0 ]] && pass "doctor is green after setup" || fail "doctor is green after setup" "$out"
 real_validate="$(openshell-gateway config preflight --path "$HOME/.config/openshell/gateway.toml" 2>&1)"; rc=$?
-[[ $rc -eq 0 ]] && pass "the real gateway accepts the installed config" || fail "gateway config preflight" "$real_validate"
+[[ $rc -eq 0 ]] && pass "the real gateway accepts the installed config" || { fail "gateway config preflight"; echo "$real_validate" | head -20; }
 
 echo "== setup again does nothing"
 out="$(osh setup --yes --runtime "$runtime" 2>&1)"; rc=$?
