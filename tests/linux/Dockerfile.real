@@ -1,0 +1,12 @@
+# A machine with systemd as PID 1 and an ordinary sudo user, for tests/linux/real.sh. Nothing
+# osh needs is installed here: osh setup does that, as it would on a fresh Ubuntu host.
+FROM ubuntu:24.04
+ENV container=docker DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends systemd systemd-sysv dbus dbus-user-session \
+        sudo curl ca-certificates iproute2 uidmap \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd -m -s /bin/bash tester \
+    && echo 'tester ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/tester
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]

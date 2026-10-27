@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/release VERSION [--out DIR] [--linux ARCH...]
+# scripts/release VERSION [--out DIR] [--no-host] [--linux ARCH...]
 #
 # Builds the osh release archive for this machine, and with --linux also for Linux in containers
 # (ARCH: amd64, arm64; needs Docker or Podman). The GitHub workflow runs this same script on one
@@ -10,6 +10,7 @@
 #
 # Writes dist/osh-VERSION-OS-ARCH.tar.gz and a .sha256 next to each (OS: darwin|linux, ARCH:
 # x86_64|aarch64). Never uploads: it prints the `gh release create` command to run yourself.
+# --no-host skips this machine's own archive (used to build only the Linux ones).
 # Linux archives are built on Ubuntu 24.04, so they need glibc 2.39 or newer.
 set -euo pipefail
 
@@ -19,8 +20,10 @@ version="${1:-}"
 shift
 out="$repo/dist"
 linux=()
+host=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --no-host) host=0 ;;
     --out) out="$(mkdir -p "$2" && cd "$2" && pwd)"; shift ;;
     --linux) shift; while [[ $# -gt 0 && "$1" != --* ]]; do
         case "$1" in amd64|arm64) linux+=("$1") ;; *) echo "unknown architecture $1" >&2; exit 2 ;; esac; shift
@@ -48,11 +51,13 @@ package() {
 host_arch() { case "$(uname -m)" in arm64|aarch64) echo aarch64 ;; *) echo x86_64 ;; esac; }
 
 # This machine.
-# shellcheck source=../dev-env
-source "$repo/dev-env"
-osh_use_zig || { echo "scripts/release: Zig 0.15 is required (run: just doctor)" >&2; exit 1; }
-cargo build --release --manifest-path "$repo/tui/Cargo.toml"
-package "$repo/tui/target/release/osh-tui" "$(uname | tr '[:upper:]' '[:lower:]')" "$(host_arch)"
+if [[ $host -eq 1 ]]; then
+  # shellcheck source=../dev-env
+  source "$repo/dev-env"
+  osh_use_zig || { echo "scripts/release: Zig 0.15 is required (run: just doctor)" >&2; exit 1; }
+  cargo build --release --manifest-path "$repo/tui/Cargo.toml"
+  package "$repo/tui/target/release/osh-tui" "$(uname | tr '[:upper:]' '[:lower:]')" "$(host_arch)"
+fi
 
 # Linux, in containers.
 if [[ ${#linux[@]} -gt 0 ]]; then

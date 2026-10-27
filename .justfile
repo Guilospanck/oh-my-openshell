@@ -58,6 +58,10 @@ test-linux *args:
 # Developer wrappers: the logic lives in the osh binary (`osh setup`, `osh upgrade`, ...). They run the
 # checkout's launcher, which rebuilds osh when its sources changed.
 
+# Real, unstubbed Linux test: a systemd container, real packages, OpenShell and a real gateway (podman|docker)
+test-linux-real runtime="podman":
+	@"{{justfile_directory()}}/tests/linux/real.sh" {{runtime}}
+
 # Installs OpenShell, a container runtime and the gateway for this OS (asks before each step)
 install *args:
 	@"{{justfile_directory()}}/osh" setup {{args}}
