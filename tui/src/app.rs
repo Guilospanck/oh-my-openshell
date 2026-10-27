@@ -1740,7 +1740,7 @@ impl App {
             .find(|i| i.tag == plan.image && !i.built)
         {
             steps.push(Step {
-                prog: "docker".into(),
+                prog: cli::runtime_bin().into(),
                 args: cli::build_args(&self.dir, &img.file, &img.tag),
             });
         }
@@ -2581,9 +2581,9 @@ impl App {
         !self.snap.driver.is_empty() && self.snap.driver != "vm"
     }
 
-    /// Only the vm and docker gateways in this repo allow host mounts.
+    /// Only the vm, docker and podman gateways in this repo allow host mounts.
     fn shares_supported(&self) -> bool {
-        matches!(self.snap.driver.as_str(), "vm" | "docker")
+        matches!(self.snap.driver.as_str(), "vm" | "docker" | "podman")
     }
 
     fn ask_share(&mut self, plan: Plan) {
@@ -2897,7 +2897,7 @@ impl App {
                 if code == KeyCode::Char('b') || code == KeyCode::Enter {
                     if let Some(img) = self.snap.images.get(self.current()) {
                         self.job = Some(vec![Step {
-                            prog: "docker".into(),
+                            prog: cli::runtime_bin().into(),
                             args: cli::build_args(&self.dir, &img.file, &img.tag),
                         }]);
                     }

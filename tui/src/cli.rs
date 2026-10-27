@@ -1,5 +1,6 @@
-//! Thin wrappers around the `openshell`, `docker` and `just` CLIs.
+//! Thin wrappers around the `openshell` and container runtime (`docker` or `podman`) CLIs.
 use crate::ghrepo::{self, GhRepo, Tracked};
+use crate::platform::{self, Runtime};
 use serde_json::Value;
 use std::{
     fs,
@@ -7,7 +8,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         mpsc::{Receiver, Sender},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::Duration,
@@ -144,6 +145,23 @@ pub fn dockerfile_hash(file: &Path) -> String {
     crate::assets::hash(&fs::read(file).unwrap_or_default())
 }
 
+static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
+
+/// The container runtime to drive, found once: a ready Docker, else a ready Podman.
+pub fn runtime() -> Option<Runtime> {
+    *RUNTIME.get_or_init(|| platform::gather(&platform::RealHost).runtime())
+}
+
+/// Program for image builds and container inspection. Falls back to `docker` when no runtime
+/// answers, so the failure reads like the familiar "command not found".
+pub fn runtime_bin() -> &'static str {
+    bin_for(runtime())
+}
+
+fn bin_for(rt: Option<Runtime>) -> &'static str {
+    rt.map_or("docker", Runtime::bin)
+}
+
 /// `docker build` arguments that record the Dockerfile hash on the image.
 pub fn build_args(dir: &Path, file: &Path, tag: &str) -> Vec<String> {
     vec![
@@ -159,7 +177,7 @@ pub fn build_args(dir: &Path, file: &Path, tag: &str) -> Vec<String> {
 }
 
 fn image_freshness(tag: &str, file: &Path) -> Freshness {
-    let label = Command::new("docker")
+    let label = Command::new(runtime_bin())
         .args([
             "image",
             "inspect",
@@ -687,7 +705,7 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
     snap.gateway = gateway();
     for file in dockerfiles(dir) {
         let tag = dockerfile_tag(&file);
-        let built = Command::new("docker")
+        let built = Command::new(runtime_bin())
             .args(["image", "inspect", &tag])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -779,7 +797,7 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
 /// config, or, for the vm driver, from the gateway-wide size on its process line.
 fn limits(driver: &str, sandbox: &str) -> String {
     match driver {
-        "docker" => {
+        "docker" | "podman" => {
             docker_limits(sandbox).unwrap_or_else(|| "unknown (container not found)".into())
         }
         "vm" => vm_limits().unwrap_or_else(|| "unknown".into()),
@@ -789,7 +807,7 @@ fn limits(driver: &str, sandbox: &str) -> String {
 
 fn docker_limits(sandbox: &str) -> Option<String> {
     let names = run(
-        "docker",
+        runtime_bin(),
         &[
             "ps".into(),
             "-a".into(),
@@ -804,7 +822,7 @@ fn docker_limits(sandbox: &str) -> Option<String> {
         n.starts_with("openshell-") && n.contains(&needle) && !n.ends_with("-supervisor")
     })?;
     let out = run(
-        "docker",
+        runtime_bin(),
         &[
             "inspect".into(),
             container.into(),
@@ -1405,6 +1423,17 @@ pub fn sync_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_programs_follow_the_selected_runtime() {
+        assert_eq!(bin_for(Some(Runtime::Podman)), "podman");
+        assert_eq!(bin_for(Some(Runtime::Docker)), "docker");
+    }
+
+    #[test]
+    fn without_a_runtime_the_familiar_docker_error_shows() {
+        assert_eq!(bin_for(None), "docker");
+    }
 
     #[test]
     fn profile_json_becomes_permissions() {

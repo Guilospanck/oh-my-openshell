@@ -46,6 +46,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../gateway-linux.toml"),
     ),
     (
+        "gateway-podman.toml",
+        include_str!("../../gateway-podman.toml"),
+    ),
+    (
         "gateway-docker.toml",
         include_str!("../../gateway-docker.toml"),
     ),
