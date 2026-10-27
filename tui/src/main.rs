@@ -5,6 +5,7 @@ mod cli;
 mod clip;
 mod ghrepo;
 mod logview;
+mod platform;
 mod term;
 mod ui;
 mod watch;
