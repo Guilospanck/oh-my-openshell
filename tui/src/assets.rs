@@ -88,9 +88,7 @@ fn resolve(
     if let Some(d) = osh_dir.filter(|d| !d.is_empty()) {
         return PathBuf::from(d);
     }
-    let base = xdg
-        .filter(|d| !d.is_empty())
-        .map(PathBuf::from)
+    let base = crate::platform::absolute(xdg)
         .unwrap_or_else(|| PathBuf::from(home.unwrap_or_default()).join(".local/share"));
     base.join("osh")
 }
@@ -121,6 +119,8 @@ pub fn materialize(dir: &Path) -> io::Result<Report> {
         let on_disk = fs::read(&path).ok().map(|b| hash(&b));
         let recorded = manifest.get(*rel).and_then(Value::as_str).map(String::from);
         match on_disk {
+            // Recorded as written once and gone now: the user removed it on purpose.
+            None if recorded.is_some() => continue,
             Some(d) if d == new => {
                 manifest.insert((*rel).into(), new.into());
                 continue;
@@ -200,6 +200,27 @@ mod tests {
         assert_eq!(r.kept_user_edits, vec![p.clone()]);
         assert_eq!(fs::read_to_string(&p).unwrap(), "my edit");
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn materialize_does_not_bring_back_a_file_the_user_deleted() {
+        let d = tmp("deleted");
+        materialize(&d).unwrap();
+        let p = d.join("providers/npm.yaml");
+        fs::remove_file(&p).unwrap();
+        let r = materialize(&d).unwrap();
+        assert!(!p.exists());
+        assert!(r.written.is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn data_dir_ignores_a_relative_xdg_data_home() {
+        let s = |v: &str| Some(std::ffi::OsString::from(v));
+        assert_eq!(
+            resolve(None, s("rel"), s("/h")),
+            PathBuf::from("/h/.local/share/osh")
+        );
     }
 
     #[test]

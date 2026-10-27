@@ -24,7 +24,7 @@ osh sync-agents --dry-run   # preview what a sandbox would get from your agent s
 
 `osh` is a single binary. The provider profiles, sandbox Dockerfiles and gateway
 configs are embedded in it and written to `~/.local/share/osh` on first run
-(your edits to those files are kept on upgrade; add your own `images/Dockerfile-*`
+(your edits to those files are kept on upgrade, and a file you delete stays deleted; remove `.osh-manifest.json` there to restore the defaults; add your own `images/Dockerfile-*`
 and `providers/*.yaml` there). Setup detects the OS and package manager (Homebrew,
 apt, dnf, pacman, zypper) and installs OpenShell, the gateway config and service,
 a container runtime (Docker or Podman, only if neither exists; on Linux you pick

@@ -67,22 +67,38 @@ pub struct Paths {
 }
 
 impl Paths {
+    /// From the process environment. Exits when HOME is not an absolute path: every path below
+    /// hangs off it, and relative ones would act on the current directory.
     pub fn detect() -> Paths {
-        let home = PathBuf::from(std::env::var_os("HOME").unwrap_or_default());
-        let xdg = |var: &str, fallback: &str| {
-            std::env::var_os(var)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-                .unwrap_or_else(|| home.join(fallback))
-        };
-        Paths {
-            config_home: xdg("XDG_CONFIG_HOME", ".config").join("openshell"),
+        let data = Some(assets::data_dir());
+        Paths::from_env(
+            std::env::var_os("HOME"),
+            std::env::var_os("XDG_CONFIG_HOME"),
+            data,
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("osh: {e}");
+            std::process::exit(1);
+        })
+    }
+
+    pub fn from_env(
+        home: Option<std::ffi::OsString>,
+        xdg_config: Option<std::ffi::OsString>,
+        data: Option<PathBuf>,
+    ) -> Result<Paths, String> {
+        let home = crate::platform::valid_home(home)
+            .ok_or("HOME is not set to an absolute path; refusing to touch relative paths")?;
+        Ok(Paths {
+            config_home: crate::platform::absolute(xdg_config)
+                .unwrap_or_else(|| home.join(".config"))
+                .join("openshell"),
             state: home.join(".local/state/openshell"),
             share: home.join(".local/share/openshell"),
-            data: assets::data_dir(),
+            data: data.unwrap_or_else(|| home.join(".local/share/osh")),
             exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("osh")),
             home,
-        }
+        })
     }
 
     fn plist(&self) -> PathBuf {
@@ -237,6 +253,13 @@ pub fn plan(f: &Facts, o: &Options, h: &dyn Host, p: &Paths, force: bool) -> Vec
 
 /// The launchd agent that runs `osh gateway-service docker`.
 pub fn docker_gateway_plist(exe: &Path, logs: &Path) -> String {
+    let esc = |p: &Path| {
+        p.display()
+            .to_string()
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -249,8 +272,8 @@ pub fn docker_gateway_plist(exe: &Path, logs: &Path) -> String {
   <key>StandardErrorPath</key><string>{logs}/gateway.err.log</string>
 </dict></plist>
 "#,
-        exe = exe.display(),
-        logs = logs.display()
+        exe = esc(exe),
+        logs = esc(logs)
     )
 }
 
@@ -335,6 +358,19 @@ pub fn upgrade_steps(f: &Facts, o: &Options, h: &dyn Host, p: &Paths) -> Vec<Ste
         steps.push(s);
     }
     steps
+}
+
+/// The container runtime the installed gateway.toml drives, from its `compute_driver` line.
+pub fn driver_runtime(config: &str) -> Option<Runtime> {
+    let line = config
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("compute_driver"))?;
+    match line.split('"').nth(1)? {
+        "docker" => Some(Runtime::Docker),
+        "podman" => Some(Runtime::Podman),
+        _ => None,
+    }
 }
 
 /// Typed confirmation for wiping a gateway: even `--yes` does not skip it.
@@ -758,6 +794,39 @@ mod tests {
         assert_eq!(steps[1].after, Some("openshell"));
         let linux = upgrade_steps(&facts(Os::Linux), &Options::default(), &h, &paths());
         assert!(!texts(&linux).contains("launchctl"));
+    }
+
+    #[test]
+    fn the_installed_config_decides_which_runtime_a_reset_sweeps() {
+        assert_eq!(
+            driver_runtime("[openshell.gateway]\ncompute_driver = \"podman\"\n"),
+            Some(Runtime::Podman)
+        );
+        assert_eq!(
+            driver_runtime("compute_driver = \"docker\""),
+            Some(Runtime::Docker)
+        );
+        assert_eq!(driver_runtime("compute_driver = \"vm\""), None);
+        assert_eq!(driver_runtime("# compute_driver = \"podman\"\n"), None);
+    }
+
+    #[test]
+    fn plist_escapes_xml_in_paths() {
+        let x = docker_gateway_plist(Path::new("/a&b/<osh>"), Path::new("/l\"x"));
+        assert!(x.contains("/a&amp;b/&lt;osh&gt;"));
+        assert!(!x.contains("a&b"));
+    }
+
+    #[test]
+    fn paths_need_an_absolute_home() {
+        assert!(Paths::from_env(None, None, None).is_err());
+        assert!(Paths::from_env(Some("rel".into()), None, None).is_err());
+        let p = Paths::from_env(Some("/h".into()), Some("relative".into()), None).unwrap();
+        assert_eq!(p.config_home, PathBuf::from("/h/.config/openshell"));
+        let p =
+            Paths::from_env(Some("/h".into()), Some("/c".into()), Some("/d/osh".into())).unwrap();
+        assert_eq!(p.config_home, PathBuf::from("/c/openshell"));
+        assert_eq!(p.data, PathBuf::from("/d/osh"));
     }
 
     #[test]

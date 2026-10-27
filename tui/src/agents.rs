@@ -369,8 +369,19 @@ fn memory_dir(env: &Env) -> PathBuf {
     env.claude.join("projects").join(slug).join("memory")
 }
 
-/// Copies a tree, following symlinks and skipping dangling ones and `.DS_Store`.
+/// Copies a tree, following symlinks and skipping dangling ones, `.DS_Store`, anything that is
+/// not a regular file or directory (a FIFO would block the copy), and a directory already being
+/// copied higher up (a symlink loop).
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+    copy_tree_in(from, to, &mut Vec::new())
+}
+
+fn copy_tree_in(from: &Path, to: &Path, active: &mut Vec<PathBuf>) -> io::Result<()> {
+    let real = fs::canonicalize(from)?;
+    if active.contains(&real) {
+        return Ok(());
+    }
+    active.push(real);
     fs::create_dir_all(to)?;
     for e in fs::read_dir(from)? {
         let e = e?;
@@ -383,11 +394,12 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
         };
         let dst = to.join(e.file_name());
         if meta.is_dir() {
-            copy_tree(&src, &dst)?;
-        } else {
+            copy_tree_in(&src, &dst, active)?;
+        } else if meta.is_file() {
             fs::copy(&src, &dst)?;
         }
     }
+    active.pop();
     Ok(())
 }
 
@@ -523,16 +535,23 @@ pub fn fnmatch(pat: &str, name: &str) -> bool {
             Some('*') => (0..=n.len()).any(|i| go(&p[1..], &n[i..])),
             Some('?') => !n.is_empty() && go(&p[1..], &n[1..]),
             Some('[') => {
-                let Some(close) = p.iter().skip(2).position(|c| *c == ']').map(|i| i + 2) else {
+                // As Python's translate: a leading `!` negates, and a `]` right after it (or
+                // after `[`) is part of the set, so the closing `]` is searched from there.
+                let neg = p.get(1) == Some(&'!');
+                let start = 1 + usize::from(neg);
+                let from = start + usize::from(p.get(start) == Some(&']'));
+                let Some(close) = p
+                    .iter()
+                    .skip(from)
+                    .position(|c| *c == ']')
+                    .map(|i| i + from)
+                else {
                     return !n.is_empty() && n[0] == '[' && go(&p[1..], &n[1..]);
                 };
                 if n.is_empty() {
                     return false;
                 }
-                let (neg, set) = match p[1] {
-                    '!' => (true, &p[2..close]),
-                    _ => (false, &p[1..close]),
-                };
+                let set = &p[start..close];
                 let mut hit = false;
                 let mut i = 0;
                 while i < set.len() {
@@ -644,7 +663,7 @@ fn profile_table(env: &Env, anonymous: bool) -> Vec<Profile> {
             continue;
         };
         let mut binaries: Vec<String> = Vec::new();
-        if let Some(i) = lines.iter().position(|l| *l == "binaries:") {
+        if let Some(i) = lines.iter().position(|l| l.starts_with("binaries:")) {
             binaries = lines[i + 1..]
                 .iter()
                 .filter_map(|l| {
@@ -693,12 +712,15 @@ fn profile_table(env: &Env, anonymous: bool) -> Vec<Profile> {
                 .unwrap_or(443);
             eps.push((host.to_string(), port, binaries.clone()));
         }
+        // The first `env_vars:` followed by a `[...]` on one line; a mention in a comment is skipped.
         let keys = text
-            .find("env_vars:")
-            .map(|i| &text[i + "env_vars:".len()..])
-            .and_then(|r| r.trim_start().strip_prefix('['))
-            .and_then(|r| r.split_once(']'))
-            .map(|(inner, _)| bracket_list(inner))
+            .match_indices("env_vars:")
+            .find_map(|(i, _)| {
+                let rest = text[i + "env_vars:".len()..].trim_start();
+                let inner = rest.strip_prefix('[')?;
+                let line = inner.lines().next().unwrap_or("");
+                line.split_once(']').map(|(list, _)| bracket_list(list))
+            })
             .unwrap_or_default();
         found.push(Profile {
             id: id.to_string(),
@@ -1220,6 +1242,73 @@ mod tests {
             "/sandbox/.uv/python/3.12/bin/python"
         ));
         assert!(!fnmatch("github.com", "api.github.com"));
+    }
+
+    #[test]
+    fn fnmatch_brackets_follow_python_for_a_leading_bang_and_bracket() {
+        assert!(fnmatch("[!]a]", "b"));
+        assert!(!fnmatch("[!]a]", "a"));
+        assert!(!fnmatch("[!]a]", "]"));
+        assert!(fnmatch("[]a]", "]"));
+        assert!(fnmatch("[!", "[!"), "unterminated: literal");
+        assert!(fnmatch("[", "["));
+    }
+
+    fn profiles_dir(name: &str, files: &[(&str, &str)]) -> Env {
+        let d = std::env::temp_dir().join(format!("osh-prof-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        for (f, body) in files {
+            fs::write(d.join(f), body).unwrap();
+        }
+        Env {
+            providers_dir: d,
+            ..env_with(Path::new("/nonexistent"))
+        }
+    }
+
+    #[test]
+    fn profile_parser_tolerates_comments_after_binaries_and_a_commented_env_vars() {
+        let env = profiles_dir(
+            "lenient",
+            &[(
+                "p.yaml",
+                "id:   gh2\ncredentials:\n  - name: t\n    # env_vars: see below\n    env_vars: [A, B]\nendpoints:\n  - host: h.io\n    port: 8443\nbinaries:  # who may connect\n  - /usr/bin/x\n  - /usr/bin/y   \n",
+            )],
+        );
+        let p = &profile_table(&env, false)[0];
+        assert_eq!(p.id, "gh2");
+        assert_eq!(p.keys, ["A", "B"]);
+        assert_eq!(
+            p.eps,
+            [(
+                "h.io".to_string(),
+                8443,
+                vec!["/usr/bin/x".to_string(), "/usr/bin/y".to_string()]
+            )]
+        );
+        let _ = fs::remove_dir_all(&env.providers_dir);
+    }
+
+    #[test]
+    fn copy_tree_survives_a_symlink_loop_and_skips_fifos() {
+        let d = tmp("loop");
+        let from = d.join("skill");
+        fs::create_dir_all(&from).unwrap();
+        fs::write(from.join("SKILL.md"), "x").unwrap();
+        std::os::unix::fs::symlink(&from, from.join("loop")).unwrap();
+        let ok = Command::new("mkfifo")
+            .arg(from.join("pipe"))
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let to = d.join("out");
+        copy_tree(&from, &to).unwrap();
+        assert_eq!(fs::read_to_string(to.join("SKILL.md")).unwrap(), "x");
+        assert!(!to.join("pipe").exists(), "a FIFO is not a file to upload");
+        assert!(!to.join("loop/loop/loop").exists(), "the loop is cut");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

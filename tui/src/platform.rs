@@ -1,6 +1,9 @@
 //! What the host is and which tools it has, so setup can plan without touching anything.
-use std::path::Path;
+use std::ffi::OsString;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Os {
@@ -50,6 +53,75 @@ pub trait Host {
 
 pub struct RealHost;
 
+/// A path from the environment, if it is non-empty and absolute (the XDG rule; a relative one
+/// would move files into whatever the current directory is).
+pub fn absolute(v: Option<OsString>) -> Option<PathBuf> {
+    v.map(PathBuf::from).filter(|p| p.is_absolute())
+}
+
+/// `$HOME`, if usable. Everything osh writes or removes is relative to it.
+pub fn valid_home(v: Option<OsString>) -> Option<PathBuf> {
+    absolute(v)
+}
+
+/// Long enough for `docker info` on a slow machine, short enough that a wedged daemon does not
+/// freeze the dashboard for good.
+const RUN_LIMIT: Duration = Duration::from_secs(15);
+
+impl RealHost {
+    /// Runs a program, killing it after `limit`. `Err` carries the first line of stderr.
+    pub fn run_timeout(
+        &self,
+        prog: &str,
+        args: &[&str],
+        limit: Duration,
+    ) -> Result<String, String> {
+        let mut child = Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{prog}: {e}"))?;
+        let drain = |mut pipe: Box<dyn Read + Send>| {
+            std::thread::spawn(move || {
+                let mut v = Vec::new();
+                let _ = pipe.read_to_end(&mut v);
+                v
+            })
+        };
+        let out = drain(Box::new(child.stdout.take().unwrap()));
+        let err = drain(Box::new(child.stderr.take().unwrap()));
+        let deadline = Instant::now() + limit;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break s,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "{prog} timed out after {}s",
+                        limit.as_secs().max(1)
+                    ));
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => return Err(format!("{prog}: {e}")),
+            }
+        };
+        let stdout = out.join().unwrap_or_default();
+        let stderr = err.join().unwrap_or_default();
+        if status.success() {
+            Ok(String::from_utf8_lossy(&stdout).into_owned())
+        } else {
+            let text = String::from_utf8_lossy(&stderr);
+            Err(format!(
+                "{prog} exited with {status}: {}",
+                text.lines().next().unwrap_or("")
+            ))
+        }
+    }
+}
+
 impl Host for RealHost {
     fn which(&self, bin: &str) -> bool {
         std::env::var_os("PATH").is_some_and(|p| {
@@ -61,18 +133,7 @@ impl Host for RealHost {
     }
 
     fn run(&self, prog: &str, args: &[&str]) -> Result<String, String> {
-        let out = Command::new(prog)
-            .args(args)
-            .stdin(Stdio::null())
-            .output()
-            .map_err(|e| format!("{prog}: {e}"))?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            let err = String::from_utf8_lossy(&out.stderr);
-            let first = err.lines().next().unwrap_or("");
-            Err(format!("{prog} exited with {}: {first}", out.status))
-        }
+        self.run_timeout(prog, args, RUN_LIMIT)
     }
 
     fn read(&self, path: &Path) -> Option<String> {
@@ -214,7 +275,14 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
     let pkg = detect_pkg(h, os);
     let is_root = h.run("id", &["-u"]).is_ok_and(|o| o.trim() == "0");
     let all = [Runtime::Docker, Runtime::Podman];
-    let runtimes_installed: Vec<Runtime> = all.into_iter().filter(|r| h.which(r.bin())).collect();
+    // Fedora's podman-docker package installs a `docker` that is podman: not a second runtime.
+    let docker_is_podman = h.which("docker")
+        && h.run("docker", &["--version"])
+            .is_ok_and(|o| o.to_lowercase().contains("podman"));
+    let runtimes_installed: Vec<Runtime> = all
+        .into_iter()
+        .filter(|r| h.which(r.bin()) && !(*r == Runtime::Docker && docker_is_podman))
+        .collect();
     let mut docker_permission_denied = false;
     let mut podman_needs_socket = false;
     let mut runtimes_ready = Vec::new();
@@ -445,6 +513,54 @@ mod tests {
         assert_eq!(gather_for(&h, Os::MacOs).pkg, PkgMgr::None);
         let h = FakeHost::with_bins(&["brew"]);
         assert_eq!(gather_for(&h, Os::MacOs).pkg, PkgMgr::Brew);
+    }
+
+    #[test]
+    fn home_must_be_a_non_empty_absolute_path() {
+        let o = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(valid_home(o("/home/ana")), Some(PathBuf::from("/home/ana")));
+        assert_eq!(valid_home(o("")), None);
+        assert_eq!(valid_home(o("relative/dir")), None);
+        assert_eq!(valid_home(None), None);
+    }
+
+    #[test]
+    fn xdg_dirs_must_be_absolute_to_count() {
+        let o = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(absolute(o("/x")), Some(PathBuf::from("/x")));
+        assert_eq!(absolute(o("x")), None);
+        assert_eq!(absolute(o("")), None);
+    }
+
+    #[test]
+    fn run_gives_up_on_a_command_that_hangs() {
+        let t = std::time::Instant::now();
+        let r = RealHost.run_timeout("sleep", &["5"], std::time::Duration::from_millis(200));
+        assert!(r.unwrap_err().contains("timed out"));
+        assert!(t.elapsed() < std::time::Duration::from_secs(3));
+        let ok = RealHost.run_timeout("echo", &["hi"], std::time::Duration::from_secs(5));
+        assert_eq!(ok.unwrap().trim(), "hi");
+    }
+
+    #[test]
+    fn docker_that_is_podman_in_disguise_counts_as_podman() {
+        let mut h = FakeHost::with_bins(&["docker", "podman"]);
+        h.outputs.insert(
+            "docker --version".into(),
+            "Emulate Docker CLI using podman. Create /etc/containers/nodocker to quiet msg.\npodman version 5.0".into(),
+        );
+        let f = gather_for(&h, Os::Linux);
+        assert_eq!(f.runtimes_installed, vec![Runtime::Podman]);
+        assert_eq!(f.runtime(), Some(Runtime::Podman));
+        let mut real = FakeHost::with_bins(&["docker"]);
+        real.outputs.insert(
+            "docker --version".into(),
+            "Docker version 27.1.1, build abc".into(),
+        );
+        assert_eq!(
+            gather_for(&real, Os::Linux).runtime(),
+            Some(Runtime::Docker)
+        );
     }
 
     #[test]

@@ -257,6 +257,7 @@ fn subcommand(args: &[String]) -> Option<i32> {
 
 /// Host-changing gateway commands. Each shows its steps and asks before running them.
 fn gateway_command(args: &[String]) -> i32 {
+    use platform::Host as _;
     let h = platform::RealHost;
     let f = platform::gather(&h);
     let p = gateway::Paths::detect();
@@ -301,7 +302,11 @@ fn gateway_command(args: &[String]) -> i32 {
                     return 1;
                 }
             }
-            gateway::reset_steps(&f, &p, name, f.runtime())
+            // Sweep with the runtime the installed gateway drives, not whichever answers first.
+            let driver = h
+                .read(&p.config_home.join("gateway.toml"))
+                .and_then(|t| gateway::driver_runtime(&t));
+            gateway::reset_steps(&f, &p, name, driver.or(f.runtime()))
         }
     };
     match steps {
@@ -349,6 +354,10 @@ fn materialize_data() -> PathBuf {
 }
 
 fn main() -> io::Result<()> {
+    if platform::valid_home(std::env::var_os("HOME")).is_none() {
+        eprintln!("osh: HOME is not set to an absolute path; refusing to run");
+        std::process::exit(1);
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     if let Some(code) = subcommand(&args) {
         std::process::exit(code);
