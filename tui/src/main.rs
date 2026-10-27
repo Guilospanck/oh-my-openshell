@@ -1,5 +1,6 @@
 //! osh: ratatui front end for OpenShell. Dashboard of sandboxes with live
 //! status, embedded sandbox shells, plus creating, providers, profiles and images.
+mod agents;
 mod app;
 mod assets;
 mod cli;
@@ -241,6 +242,7 @@ fn subcommand(args: &[String]) -> Option<i32> {
             }
             Some(if setup::run(&o, false) { 0 } else { 1 })
         }
+        "sync-agents" => Some(agents::cli_main(&args[1..], &assets::data_dir())),
         "upgrade" | "uninstall" | "gateway-docker" | "gateway-reset" | "gateway-service" => {
             Some(gateway_command(args))
         }

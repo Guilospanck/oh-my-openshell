@@ -50,6 +50,7 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../gateway-podman.toml"),
     ),
     ("gateway.env", include_str!("../../gateway.env")),
+    (".gitleaks.toml", include_str!("../../.gitleaks.toml")),
     (
         "gateway-docker.toml",
         include_str!("../../gateway-docker.toml"),

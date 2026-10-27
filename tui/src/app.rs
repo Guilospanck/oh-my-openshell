@@ -1542,7 +1542,7 @@ impl App {
             let n = sync.manifest.findings.unwrap_or(0);
             self.cleanup_sync_stage();
             self.modal = Some(Modal::Info(format!(
-                "The secret scan found {n} finding(s) in the files that would be uploaded. Run `sync-agents --json` and review the staged files, or deselect the uploads (own-skills, context)."
+                "The secret scan found {n} finding(s) in the files that would be uploaded. Run `osh sync-agents --json` and review the staged files, or deselect the uploads (own-skills, context)."
             )));
             return;
         }

@@ -316,11 +316,3 @@ uninstall:
 	    echo "OpenShell state removed. Repo checkout left in place. Remove the packages yourself:"
 	    echo "  Debian/Ubuntu: sudo apt remove 'openshell*'    Fedora/RHEL: sudo dnf remove 'openshell*'"
 	fi
-
-# Show how the host's agent setup (Claude Code and pi) would be reproduced in a sandbox:
-# install commands where an installer exists, uploads otherwise. Only --dry-run and
-# --json and --preflight SANDBOX [--gateway NAME] are implemented; none installs, copies or
-# uploads anything. --preflight checks the install steps' network needs against the sandbox policy.
-# Example: just sync-agents --dry-run --agent pi
-sync-agents *args:
-	@"{{justfile_directory()}}/sync-agents" {{args}}
