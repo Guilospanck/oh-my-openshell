@@ -1,5 +1,4 @@
 //! What a gateway is to osh: its kind, its name and port, and the registry of the ones osh made.
-#![allow(dead_code)] // used by the tasks that follow in the plan; remove when wired (Task 7)
 use crate::platform::{Facts, Kvm, Os, PodmanMachine, Runtime};
 use serde_json::{json, Value};
 use std::{fs, io, path::Path};
@@ -119,6 +118,8 @@ impl Registry {
         serde_json::to_string_pretty(&json!({"gateways": list})).unwrap_or_default() + "\n"
     }
 
+    /// The plan writes the registry through a `Write` step; this is for tests.
+    #[cfg(test)]
     pub fn save(&self, dir: &Path) -> io::Result<()> {
         fs::create_dir_all(dir)?;
         fs::write(dir.join(REGISTRY), self.to_json())

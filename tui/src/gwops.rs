@@ -1,5 +1,4 @@
 //! Per-gateway operations: the config, service and registration steps for a gateway of any kind,
-#![allow(dead_code)] // wired in by the planner and the wizard (Tasks 4 and 7)
 //! as `Step`s (nothing here touches the host; `setup::execute` does).
 use crate::assets;
 use crate::gateway::{self, chain, cmd, script, step, Paths, WAIT_SCRIPT};

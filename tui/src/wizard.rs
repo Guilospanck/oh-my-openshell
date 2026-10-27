@@ -1,5 +1,4 @@
 //! The set-up wizard: which gateway types to create, what each needs, and the plan to get there.
-#![allow(dead_code)] // drawn and run by Tasks 6 and 7 of the plan; remove when wired
 //! This file holds the screens' state machine (pure, so it is unit-tested), their drawing, and the
 //! runner that executes the plan.
 use crate::gwmodel::{availability, Availability, GwKind, Pending, State};
@@ -812,6 +811,281 @@ fn draw_done(f: &mut Frame, w: &Wizard, p: &Progress, area: Rect) {
     }
 }
 
+// ---- running the plan ---------------------------------------------------------------------
+
+use crate::platform::RealHost;
+use crate::setup::{Event as SetupEvent, Options, Outcome as StepOutcome, StepResult};
+use ratatui::{
+    crossterm::event::{self, Event as TermEvent, KeyEventKind},
+    DefaultTerminal,
+};
+use std::{
+    io,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    time::Instant,
+};
+
+/// How the wizard ended.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    /// Everything required was set up.
+    Installed,
+    /// The user left before installing anything.
+    Cancelled,
+    /// The install stopped at something only the user can do, or failed; the text says what.
+    NeedsAction(String),
+}
+
+/// Whether a run counts as done, or what is left: the first manual, failed or blocked step.
+pub fn finish(steps: &[Step], results: &[StepResult]) -> Outcome {
+    if crate::setup::run_ok(steps, results, &Options::default()) {
+        return Outcome::Installed;
+    }
+    for (s, r) in steps.iter().zip(results) {
+        if s.optional {
+            continue;
+        }
+        match &r.outcome {
+            StepOutcome::Manual => {
+                return Outcome::NeedsAction(format!("{}: {}", s.title, s.command_line()))
+            }
+            StepOutcome::Failed(e) => return Outcome::NeedsAction(format!("{}: {e}", s.title)),
+            StepOutcome::Blocked | StepOutcome::Declined => {
+                return Outcome::NeedsAction(format!("{}: an earlier step did not finish", s.title))
+            }
+            StepOutcome::Done | StepOutcome::DryRun => {}
+        }
+    }
+    Outcome::NeedsAction("some steps did not finish".into())
+}
+
+/// Keeps the remembered selection for a resume, and forgets it once everything is set up.
+pub fn settle_pending(data: &Path, outcome: &Outcome) {
+    if *outcome == Outcome::Installed {
+        Pending::clear(data);
+    }
+}
+
+/// Should osh open the wizard at start-up? When OpenShell is missing, when it has no gateway at
+/// all (and osh made none), or to resume a stopped install.
+pub fn needs_wizard(
+    has_openshell: bool,
+    cli_gateways: usize,
+    registry_empty: bool,
+    pending: bool,
+) -> bool {
+    !has_openshell || pending || (cli_gateways == 0 && registry_empty)
+}
+
+/// Updates the progress view for one executor event.
+pub fn apply_event(p: &mut Progress, steps: &[Step], e: &SetupEvent, elapsed: Duration) {
+    match e {
+        SetupEvent::Start(i) => {
+            if let Some(r) = p.rows.get_mut(*i) {
+                *r = RowState::Running;
+            }
+            p.now.clear();
+            if let Some(s) = steps.get(*i) {
+                p.now.push(format!("$ {}", s.display()));
+            }
+        }
+        SetupEvent::Line(_, l) => {
+            p.now.push(l.clone());
+            if p.now.len() > 40 {
+                p.now.remove(0);
+            }
+        }
+        SetupEvent::Done(i, outcome) => {
+            let state = match outcome {
+                StepOutcome::Done | StepOutcome::DryRun => RowState::Done(elapsed),
+                StepOutcome::Failed(e) => RowState::Failed(e.clone()),
+                StepOutcome::Manual => {
+                    RowState::Manual(steps.get(*i).map(Step::command_line).unwrap_or_default())
+                }
+                StepOutcome::Blocked | StepOutcome::Declined => {
+                    RowState::Failed("waiting on an earlier step that did not finish".into())
+                }
+            };
+            if let Some(r) = p.rows.get_mut(*i) {
+                *r = state;
+            }
+        }
+    }
+}
+
+enum Msg {
+    Event(SetupEvent),
+    Finished(Vec<StepResult>),
+}
+
+/// The wizard for this machine: its facts, the gateways that already exist, and a planner that
+/// builds the real plan for whatever is ticked.
+pub fn open(mode: Mode, data: &Path) -> Wizard {
+    use crate::gwmodel::Registry;
+    use crate::platform::{gather, Host};
+    let h = RealHost;
+    let f = gather(&h);
+    let p = crate::gateway::Paths::detect();
+    let reg = Registry::load(data);
+    let known = crate::setup::existing_gateways(&h);
+    let mut existing: Vec<GwKind> = reg.gateways.iter().map(|g| g.kind).collect();
+    for (name, _) in &known {
+        existing.extend(GwKind::parse(name));
+    }
+    // The legacy main (`openshell`) is whatever its gateway.toml says it drives.
+    if known.iter().any(|(n, _)| n == "openshell") {
+        let driver = h.read(&p.config_home.join("gateway.toml")).and_then(|t| {
+            t.lines()
+                .find(|l| l.trim_start().starts_with("compute_driver"))
+                .and_then(|l| l.split('"').nth(1).map(String::from))
+        });
+        existing.extend(driver.and_then(|d| GwKind::from_driver(&d)));
+    }
+    existing.dedup();
+    let has_main = reg.main().is_some() || !known.is_empty();
+    let (f2, reg2) = (f.clone(), reg);
+    let planner: Planner = Box::new(move |kinds| {
+        let o = Options {
+            gateways: kinds.to_vec(),
+            ..Default::default()
+        };
+        let bound = |port: u16| std::net::TcpListener::bind(("127.0.0.1", port)).is_err();
+        crate::setup::plan_gateways(&f2, &o, &RealHost, &p, &reg2, &known, &bound)
+    });
+    Wizard::new(mode, f, &existing, has_main, Pending::load(data), planner)
+}
+
+/// Runs the wizard full-screen on its own (the first-run and `osh setup` path).
+pub fn run_modal(mode: Mode, data: &Path) -> io::Result<Outcome> {
+    let mut terminal = ratatui::init();
+    let r = run(&mut terminal, open(mode, data), data);
+    ratatui::restore();
+    r
+}
+
+/// Runs the wizard on `terminal` until the user finishes or leaves. `planner` turns the ticked
+/// types into steps. The install itself runs on a thread with its output streamed to the screen.
+pub fn run(terminal: &mut DefaultTerminal, wizard: Wizard, data: &Path) -> io::Result<Outcome> {
+    let mut w = wizard;
+    let mut prog = Progress::default();
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let mut steps_running: Vec<Step> = Vec::new();
+    let mut started = Instant::now();
+    let mut outcome = Outcome::Cancelled;
+    let keepalive = Arc::new(AtomicBool::new(false));
+    loop {
+        terminal.draw(|f| draw(f, &w, &prog))?;
+        while let Ok(m) = rx.try_recv() {
+            match m {
+                Msg::Event(e) => {
+                    if matches!(e, SetupEvent::Start(_)) {
+                        started = Instant::now();
+                    }
+                    apply_event(&mut prog, &steps_running, &e, started.elapsed());
+                }
+                Msg::Finished(results) => {
+                    keepalive.store(false, Ordering::Relaxed);
+                    outcome = finish(&steps_running, &results);
+                    settle_pending(data, &outcome);
+                    prog.finished = true;
+                    prog.ok = outcome == Outcome::Installed;
+                    w.show_done();
+                }
+            }
+        }
+        if !event::poll(Duration::from_millis(80))? {
+            continue;
+        }
+        let TermEvent::Key(k) = event::read()? else {
+            continue;
+        };
+        if k.kind != KeyEventKind::Press {
+            continue;
+        }
+        match w.on_key(k.code) {
+            Action::None => {}
+            Action::Quit => return Ok(Outcome::Cancelled),
+            Action::Finish => return Ok(outcome),
+            Action::Install(steps, kinds) => {
+                let _ = Pending { kinds }.save(data);
+                if steps.iter().any(privileged) && !warm_sudo(terminal) {
+                    w.note = "sudo did not accept the password; nothing was run.".into();
+                    w.screen = Screen::Review;
+                    continue;
+                }
+                prog = Progress {
+                    rows: vec![RowState::Pending; steps.len()],
+                    ..Default::default()
+                };
+                steps_running = steps.clone();
+                keepalive.store(true, Ordering::Relaxed);
+                spawn_keepalive(keepalive.clone());
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let o = Options {
+                        yes: true,
+                        capture: true,
+                        sudo_noninteractive: true,
+                        ..Default::default()
+                    };
+                    let tx2 = tx.clone();
+                    let results = crate::setup::execute_events(
+                        &steps,
+                        &RealHost,
+                        &o,
+                        &mut |_| crate::setup::Answer::Yes,
+                        &mut |e| {
+                            let _ = tx2.send(Msg::Event(e));
+                        },
+                    );
+                    let _ = tx.send(Msg::Finished(results));
+                });
+            }
+        }
+    }
+}
+
+/// Leaves the full-screen view for one `sudo -v` password prompt on the real terminal, so the
+/// install can then run `sudo -n`. False when sudo refused.
+fn warm_sudo(terminal: &mut DefaultTerminal) -> bool {
+    if std::process::Command::new("sudo")
+        .args(["-n", "-v"])
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return true;
+    }
+    ratatui::restore();
+    println!("osh needs your password once for the steps marked sudo.");
+    let ok = std::process::Command::new("sudo")
+        .arg("-v")
+        .status()
+        .is_ok_and(|s| s.success());
+    *terminal = ratatui::init();
+    ok
+}
+
+/// Refreshes the sudo ticket every 50 seconds while the install runs.
+fn spawn_keepalive(on: Arc<AtomicBool>) {
+    std::thread::spawn(move || {
+        let mut waited = 0;
+        while on.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_secs(1));
+            waited += 1;
+            if waited >= 50 {
+                waited = 0;
+                let _ = std::process::Command::new("sudo")
+                    .args(["-n", "-v"])
+                    .status();
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1046,8 +1320,6 @@ mod tests {
     // ---- drawing --------------------------------------------------------------------------
 
     use ratatui::{backend::TestBackend, style::Color, Terminal};
-    use std::time::Duration;
-
     fn render(
         w: &Wizard,
         p: &Progress,
@@ -1404,5 +1676,144 @@ mod tests {
             let (rows, _) = render(&w, &p, 80, 24);
             println!("===== {screen:?}\n{}", rows.join("\n"));
         }
+    }
+
+    // ---- runner helpers ---------------------------------------------------------------------
+
+    fn result(id: &'static str, outcome: StepOutcome) -> StepResult {
+        StepResult { id, outcome }
+    }
+
+    #[test]
+    fn finish_reports_success_when_every_required_step_is_done() {
+        let steps = vec![named_step("a"), named_step("b")];
+        let results = vec![
+            result("s", StepOutcome::Done),
+            result("s", StepOutcome::Done),
+        ];
+        assert_eq!(finish(&steps, &results), Outcome::Installed);
+    }
+
+    #[test]
+    fn runner_reports_needs_action_for_a_manual_step() {
+        let mut manual = named_step("Apply the new group");
+        manual.kind = StepKind::Manual("log out and back in".into());
+        let steps = vec![named_step("a"), manual];
+        let results = vec![
+            result("s", StepOutcome::Done),
+            result("s", StepOutcome::Manual),
+        ];
+        match finish(&steps, &results) {
+            Outcome::NeedsAction(t) => assert!(t.contains("log out and back in"), "{t}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_step_is_needs_action_with_its_error() {
+        let steps = vec![named_step("Install podman")];
+        let results = vec![result(
+            "s",
+            StepOutcome::Failed("apt-get exited with 100".into()),
+        )];
+        match finish(&steps, &results) {
+            Outcome::NeedsAction(t) => {
+                assert!(t.contains("Install podman") && t.contains("apt-get"), "{t}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_optional_step_that_failed_does_not_fail_the_install() {
+        let mut tmux = named_step("Install tmux");
+        tmux.optional = true;
+        let steps = vec![named_step("a"), tmux];
+        let results = vec![
+            result("s", StepOutcome::Done),
+            result("s", StepOutcome::Failed("no".into())),
+        ];
+        assert_eq!(finish(&steps, &results), Outcome::Installed);
+    }
+
+    #[test]
+    fn pending_file_is_cleared_only_on_success() {
+        let d = std::env::temp_dir().join(format!("osh-wiz-pending-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        Pending {
+            kinds: vec![GwKind::Docker],
+        }
+        .save(&d)
+        .unwrap();
+        settle_pending(&d, &Outcome::NeedsAction("x".into()));
+        assert!(Pending::load(&d).is_some(), "kept for a resume");
+        settle_pending(&d, &Outcome::Installed);
+        assert!(Pending::load(&d).is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn progress_rows_follow_the_events() {
+        let mut p = Progress {
+            rows: vec![RowState::Pending; 2],
+            ..Default::default()
+        };
+        let steps = vec![named_step("a"), named_step("b")];
+        apply_event(
+            &mut p,
+            &steps,
+            &crate::setup::Event::Start(0),
+            Duration::ZERO,
+        );
+        assert_eq!(p.rows[0], RowState::Running);
+        apply_event(
+            &mut p,
+            &steps,
+            &crate::setup::Event::Line(0, "hello".into()),
+            Duration::ZERO,
+        );
+        assert_eq!(p.now.last().unwrap(), "hello");
+        apply_event(
+            &mut p,
+            &steps,
+            &crate::setup::Event::Done(0, StepOutcome::Done),
+            Duration::from_secs(3),
+        );
+        assert_eq!(p.rows[0], RowState::Done(Duration::from_secs(3)));
+        apply_event(
+            &mut p,
+            &steps,
+            &crate::setup::Event::Done(1, StepOutcome::Failed("boom".into())),
+            Duration::ZERO,
+        );
+        assert_eq!(p.rows[1], RowState::Failed("boom".into()));
+        apply_event(
+            &mut p,
+            &steps,
+            &crate::setup::Event::Done(1, StepOutcome::Blocked),
+            Duration::ZERO,
+        );
+        assert!(matches!(&p.rows[1], RowState::Failed(t) if t.contains("earlier step")));
+    }
+
+    #[test]
+    fn the_wizard_opens_on_first_run_or_to_resume_but_not_otherwise() {
+        assert!(needs_wizard(false, 0, true, false), "no OpenShell");
+        assert!(
+            needs_wizard(true, 0, true, false),
+            "OpenShell but no gateway at all"
+        );
+        assert!(
+            needs_wizard(true, 1, false, true),
+            "a stopped install to resume"
+        );
+        assert!(
+            !needs_wizard(true, 1, true, false),
+            "a legacy gateway exists"
+        );
+        assert!(
+            !needs_wizard(true, 0, false, false),
+            "the registry has gateways"
+        );
     }
 }

@@ -191,27 +191,37 @@ fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
     failed
 }
 
-/// Offer to set up the machine before the dashboard opens. Returns false to quit.
-fn ensure_installed() -> bool {
-    while !cli::have("openshell") {
-        let a = {
-            print!("openshell is not installed. Set up this machine now? [Y/n] ");
-            let _ = io::stdout().flush();
-            let mut a = String::new();
-            let _ = io::stdin().read_line(&mut a);
-            a.trim().to_lowercase()
-        };
-        if matches!(a.as_str(), "n" | "no") {
+/// Opens the set-up wizard before the dashboard when this looks like a first run (or a stopped
+/// install to resume). Returns false when osh should exit instead of opening the dashboard.
+fn first_run(data: &Path) -> bool {
+    let reg = gwmodel::Registry::load(data);
+    let known = setup::existing_gateways(&platform::RealHost).len();
+    let pending = gwmodel::Pending::load(data).is_some();
+    let have = cli::have("openshell");
+    if !wizard::needs_wizard(have, known, reg.gateways.is_empty(), pending) {
+        return true;
+    }
+    if !io::stdin().is_terminal() {
+        if !have {
+            eprintln!("osh: OpenShell is not installed. Run `osh setup --gateways docker` (or podman, vm) to set it up.");
+        }
+        return have;
+    }
+    match wizard::run_modal(wizard::Mode::First, data) {
+        Ok(wizard::Outcome::Installed) => {}
+        Ok(wizard::Outcome::Cancelled) => return have,
+        Ok(wizard::Outcome::NeedsAction(text)) => {
+            println!("osh: {text}");
             return false;
         }
-        if !setup::run(&setup::Options::default(), true) {
-            println!("Setup did not finish; see the output above.");
+        Err(e) => {
+            eprintln!("osh: the set-up screen failed: {e}");
             return false;
         }
-        if !cli::have("openshell") {
-            println!("OpenShell is installed but not on PATH yet: open a new terminal (or add its folder to PATH) and run osh again.");
-            return false;
-        }
+    }
+    if !cli::have("openshell") {
+        println!("OpenShell is installed but not on PATH yet: open a new terminal (or add its folder to PATH) and run osh again.");
+        return false;
     }
     true
 }
@@ -259,6 +269,21 @@ fn subcommand(args: &[String]) -> Option<i32> {
             }
             if !o.gateways.is_empty() {
                 return Some(setup::run_gateways(&o));
+            }
+            // Without flags and with a terminal, `osh setup` is the guided wizard.
+            if !o.yes && !o.dry_run && io::stdin().is_terminal() {
+                let data = assets::data_dir();
+                return Some(match wizard::run_modal(wizard::Mode::First, &data) {
+                    Ok(wizard::Outcome::Installed | wizard::Outcome::Cancelled) => 0,
+                    Ok(wizard::Outcome::NeedsAction(t)) => {
+                        println!("osh: {t}");
+                        1
+                    }
+                    Err(e) => {
+                        eprintln!("osh: the set-up screen failed: {e}");
+                        1
+                    }
+                });
             }
             Some(if setup::run(&o, false) { 0 } else { 1 })
         }
@@ -464,7 +489,7 @@ fn main() -> io::Result<()> {
         std::process::exit(code);
     }
     let dir = materialize_data();
-    if !ensure_installed() {
+    if !first_run(&dir) {
         return Ok(());
     }
     let (snap_tx, snap_rx) = mpsc::channel();
@@ -554,6 +579,24 @@ fn main() -> io::Result<()> {
                 terminal = ratatui::init();
                 terminal.clear()?;
                 app.finish_job(failed);
+                app.reload_gateways();
+                app.refresh();
+            }
+            if let Some(mode) = app.wizard_request.take() {
+                if captured {
+                    host_modes(false, keys);
+                    captured = false;
+                }
+                let data = app.dir.clone();
+                match wizard::run(&mut terminal, wizard::open(mode, &data), &data) {
+                    Ok(wizard::Outcome::NeedsAction(t)) => {
+                        app.status = format!("Gateway setup stopped: {t}")
+                    }
+                    Ok(wizard::Outcome::Installed) => app.status = "Gateways set up".into(),
+                    _ => {}
+                }
+                terminal.clear()?;
+                app.reload_gateways();
                 app.refresh();
             }
         }

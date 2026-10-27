@@ -11,13 +11,14 @@ here, not in the dotfiles checkout.
 ## osh
 
 ```sh
-osh            # the dashboard; offers to set up this machine first if OpenShell is missing
+osh            # the dashboard; the first time, a guided screen sets up your gateways
 osh doctor     # read-only: what is installed, what is missing
-osh setup      # install what is missing, asking before each step (--yes, --dry-run,
-               # --runtime docker|podman to choose the container runtime to install)
+osh setup      # the guided screen again (needs a terminal); or, without one:
+osh setup --gateways docker,podman --yes   # the first listed is the main gateway
+osh gateway add vm|docker|podman           # one more gateway
+osh gateway remove NAME [--delete-data]    # remove a gateway osh created (typed confirmation)
 osh upgrade    # reinstall OpenShell, refresh the gateway config, restart the service
 osh uninstall  # remove OpenShell, its services and folders (asks first; sandboxes are lost)
-osh gateway-docker          # macOS: a second gateway on the Docker driver
 osh gateway-reset NAME      # wipe a gateway's sandboxes and database (typed confirmation)
 osh sync-agents --dry-run   # preview what a sandbox would get from your agent setup
 ```
@@ -25,11 +26,15 @@ osh sync-agents --dry-run   # preview what a sandbox would get from your agent s
 `osh` is a single binary. The provider profiles, sandbox Dockerfiles and gateway
 configs are embedded in it and written to `~/.local/share/osh` on first run
 (your edits to those files are kept on upgrade, and a file you delete stays deleted; remove `.osh-manifest.json` there to restore the defaults; add your own `images/Dockerfile-*`
-and `providers/*.yaml` there). Setup detects the OS and package manager (Homebrew,
-apt, dnf, pacman, zypper) and installs OpenShell, the gateway config and service,
-a container runtime (Docker or Podman, only if neither exists; on Linux you pick
-with `--runtime` or at the prompt), and the optional tools: `tmux`, `gh` and a
-clipboard tool. It never installs silently: each step is shown first, and what
+and `providers/*.yaml` there). The first time you run `osh` (and with `osh setup`) a guided screen walks you
+through it: **Machine** (what was found), **Gateways** (tick the types you want;
+each says what it needs and what osh will install for it), **Review** (every
+step, with `sudo` marked), **Install** (live progress) and **Done**. Setup
+detects the OS and package manager (Homebrew, apt, dnf, pacman, zypper) and
+installs OpenShell, the gateway configs and services, whatever each ticked type
+needs (Docker Engine, Podman, Colima, a Podman machine, `e2fsprogs`, KVM access),
+and the optional tools: `tmux`, `gh` and a clipboard tool. `--runtime docker|podman`
+is an alias for `--gateways docker|podman`. It never installs silently: each step is shown first, and what
 it cannot do for you (no sudo, unknown distro, a stopped Docker daemon) is
 printed as the command to run yourself. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the
 dashboard; image builds need a container runtime.
@@ -50,7 +55,7 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 | Providers | create from a `providers/*.yaml` profile or a read/write GitHub repo token (`n`), update credentials (`u`; renews a repo token), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated |
-| Gateways | switch (`g` / `Enter`), wipe and restart empty (`d`) |
+| Gateways | switch (`g` / `Enter`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
 
 Credentials are read from the environment when exported, else prompted hidden;
 they never go through argv. The footer shows the keys for the current tab.
@@ -129,19 +134,33 @@ sandbox closes. The host needs `pngpaste` (macOS; `osh setup` installs it),
 
 ## Gateways
 
-- **Linux**: one gateway, `openshell`, the packaged `openshell-gateway`
-  systemd user service on the Docker driver (honours CPU/memory limits).
-  `osh setup` runs the official installer (deb/rpm; needs `sudo`) and copies
-  `gateway-linux.toml` (Docker) or `gateway-podman.toml` (Podman) to
-  `~/.config/openshell/gateway.toml`. The Podman config is untested on a real host.
-  Logs: `journalctl --user -u openshell-gateway`. The two gateways below are
-  macOS only.
-- **vm** (default on macOS, Homebrew service, libkrun): fixed size per VM.
-- **docker** (`openshell-docker`, Colima): honours per-sandbox CPU/memory
-  limits, weaker isolation. Needs the Homebrew gateway run once for shared TLS.
+A gateway is where sandboxes run, and each is named after its type: `openshell-vm`,
+`openshell-docker`, `openshell-podman`. You can have several side by side, on
+macOS and on Linux. The first one you create is the **main** gateway (port 17670, the
+one the CLI uses by default); the others get the next free ports (17671 and up).
 
-Config: `gateway.toml`, `gateway-docker.toml`. Providers and profiles are
-per gateway.
+| Type | What it is | Needs |
+| --- | --- | --- |
+| VM | each sandbox in its own microVM; strongest isolation, fixed size per VM | macOS: `e2fsprogs`. Linux: `/dev/kvm` usable by your user (osh adds you to the `kvm` group and asks for a new login) and `e2fsprogs`; unavailable, with the reason, where there is no KVM |
+| Docker | sandboxes as containers; honours per-sandbox CPU/memory | Linux: Docker Engine, the `docker` service, your user in the `docker` group (new login). macOS: Colima (installed and started) or Docker Desktop (you start it) |
+| Podman | like Docker, daemonless and rootless | Linux: `podman` and its user `podman.socket`. macOS: `podman` and a Podman machine (created and started) |
+
+The Gateways tab lists them with their type and port. `a` adds one (the same screen,
+showing only the types you do not have), `x` removes one osh created, `d` wipes one.
+The main gateway cannot be removed while others exist. A gateway you had before osh
+managed it (for example `openshell` or `openshell-docker` from an older setup) is left
+exactly as it is: it is listed, can be selected and wiped, but osh will not rename,
+reconfigure or remove it.
+
+osh keeps each gateway's config in `~/.local/share/osh/gateways/NAME.toml` (edit it; your
+changes are kept) and remembers the ones it made in `gateways.json` there. Extras run as
+a systemd user unit `osh-gateway-NAME` (Linux) or a launchd agent (macOS); the main runs as
+OpenShell's own service (on macOS a Docker or Podman main runs as its own launchd agent
+instead of the Homebrew service). Logs on Linux:
+`journalctl --user -u openshell-gateway` or `-u osh-gateway-NAME`. Providers and
+profiles are per gateway. The Podman and VM gateways have only been tested up to a
+connected gateway on Linux, never booting a real microVM, and nothing here has run
+on a real Linux desktop.
 
 ## Claude Code provider
 
