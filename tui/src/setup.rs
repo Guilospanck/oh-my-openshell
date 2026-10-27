@@ -806,7 +806,7 @@ pub fn plan_gateways(
         };
         if spec.main {
             let known = existing.iter().any(|(n, _)| *n == spec.name);
-            resume.extend(crate::gwops::main_gateway_steps(f, p, h, spec, !known));
+            resume.extend(crate::gwops::main_gateway_steps(f, p, h, reg, spec, !known));
         } else if !crate::gwops::extra_running(f.os, h, spec) {
             resume.extend(crate::gwops::add_gateway_steps(f, p, h, reg, spec));
         }
@@ -842,7 +842,7 @@ pub fn plan_gateways(
         };
         let mut g = if is_main {
             let installing = !f.has_openshell || existing.is_empty();
-            crate::gwops::main_gateway_steps(f, p, h, &spec, installing)
+            crate::gwops::main_gateway_steps(f, p, h, &reg_now, &spec, installing)
         } else {
             crate::gwops::add_gateway_steps(f, p, h, &reg_now, &spec)
         };
@@ -1860,6 +1860,44 @@ mod tests {
         assert!(lines(&steps)
             .join("\n")
             .contains("systemctl --user restart openshell-gateway"));
+    }
+
+    #[test]
+    fn resuming_the_main_keeps_the_extras_in_the_registry() {
+        let f = running_facts();
+        let reg = registered(&[
+            (GwKind::Docker, 17670, true),
+            (GwKind::Podman, 17671, false),
+        ]);
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
+        );
+        h.failing
+            .insert("systemctl --user is-active --quiet openshell-gateway".into());
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &known_of(&reg),
+            &|_| false,
+        )
+        .unwrap();
+        let written = written_json(&steps);
+        assert!(
+            !written.is_empty(),
+            "the main's steps write the registry: {:?}",
+            lines(&steps)
+        );
+        for w in written {
+            assert!(
+                w.contains("openshell-docker") && w.contains("openshell-podman"),
+                "an extra was dropped: {w}"
+            );
+        }
     }
 
     #[test]

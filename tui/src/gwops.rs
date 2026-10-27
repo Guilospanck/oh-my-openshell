@@ -354,6 +354,7 @@ pub fn main_gateway_steps(
     f: &Facts,
     p: &Paths,
     h: &dyn Host,
+    reg: &Registry,
     spec: &GatewaySpec,
     installing: bool,
 ) -> Vec<Step> {
@@ -363,7 +364,8 @@ pub fn main_gateway_steps(
             &[&p.config_home.to_string_lossy(), &spec.name],
         )
     });
-    let mut after = Registry::default();
+    // The registry as it will be: what is there plus this main (never dropping the extras).
+    let mut after = reg.clone();
     after.add(spec.clone());
     let rest = if f.os == Os::MacOs && spec.kind != GwKind::Vm {
         let stop = st(
@@ -958,6 +960,7 @@ mod tests {
             &facts(Os::Linux),
             &paths(),
             &h,
+            &Registry::default(),
             &spec(GwKind::Podman, 17670, true),
             true,
         );
@@ -987,6 +990,7 @@ mod tests {
             &facts(Os::Linux),
             &paths(),
             &h,
+            &Registry::default(),
             &spec(GwKind::Docker, 17670, true),
             false,
         );
@@ -1000,6 +1004,7 @@ mod tests {
             &facts(Os::MacOs),
             &paths(),
             &h,
+            &Registry::default(),
             &spec(GwKind::Docker, 17670, true),
             true,
         );
@@ -1011,6 +1016,7 @@ mod tests {
             &facts(Os::MacOs),
             &paths(),
             &h,
+            &Registry::default(),
             &spec(GwKind::Vm, 17670, true),
             true,
         );
@@ -1156,6 +1162,7 @@ mod tests {
             &facts(Os::MacOs),
             &paths(),
             &h,
+            &Registry::default(),
             &spec(GwKind::Docker, 17670, true),
             true,
         );
@@ -1169,6 +1176,7 @@ mod tests {
             &facts(Os::Linux),
             &paths(),
             &h,
+            &Registry::default(),
             &spec(GwKind::Podman, 17670, true),
             true,
         );
