@@ -76,7 +76,7 @@ grep -q 'MISSING  container runtime' <<<"$out" && pass "doctor reports the runti
 out="$(with_stubs "$OSH" setup --dry-run --runtime docker </dev/null 2>&1)"; rc=$?
 [[ $rc -eq 0 ]] && pass "setup --dry-run exits 0" || fail "setup --dry-run exits 0" "rc=$rc $out"
 grep -q "$docker_pkg_line" <<<"$out" && pass "dry-run plans this distro's docker package" || fail "dry-run plans this distro's docker package" "$out"
-grep -q 'openshell/main/install.sh' <<<"$out" && pass "dry-run plans the OpenShell installer" || fail "dry-run plans the OpenShell installer"
+grep -q 'OpenShell/main/install.sh' <<<"$out" && pass "dry-run plans the OpenShell installer" || fail "dry-run plans the OpenShell installer"
 command -v docker >/dev/null 2>&1 && fail "dry-run must not install docker" || pass "dry-run installs nothing"
 out="$(with_stubs "$OSH" setup --dry-run </dev/null 2>&1)"
 grep -q -- '--runtime docker or --runtime podman' <<<"$out" && pass "without a pick, setup asks for --runtime" || fail "without a pick, setup asks for --runtime" "$out"
@@ -111,6 +111,7 @@ with_stubs "$OSH" setup --yes --runtime podman >/dev/null 2>&1
 fi
 
 echo "== stubbed: osh uninstall"
+with_stubs "$OSH" setup --dry-run </dev/null >/dev/null 2>&1 # writes the data dir
 printf 'uninstall\n' | with_stubs "$OSH" uninstall >"$HOME/out.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "uninstall exits 0" || { fail "uninstall exits 0" "rc=$rc"; tail -15 "$HOME/out.log"; }
 check "uninstall disables the user service" logged "systemctl --user disable --now openshell-gateway"

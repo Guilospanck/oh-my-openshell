@@ -1,5 +1,5 @@
 # Linux test environment with the build prerequisites that `just doctor` checks.
-# Built and run by tests/linux/run.sh for each distro (BASE = ubuntu:24.04, fedora:41, archlinux:latest);
+# Built and run by tests/linux/run.sh for each distro (BASE = ubuntu:24.04, fedora:41, an Arch image);
 # not a sandbox image.
 ARG BASE=ubuntu:24.04
 FROM ${BASE}

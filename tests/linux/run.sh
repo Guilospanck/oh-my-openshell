@@ -8,7 +8,9 @@
 set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-declare -A bases=([ubuntu]=ubuntu:24.04 [fedora]=fedora:41 [arch]=archlinux:latest)
+# The official archlinux image is amd64 only; lopsided/archlinux is the multi-arch community build.
+case "$(uname -m)" in arm64|aarch64) arch_base=lopsided/archlinux:latest ;; *) arch_base=archlinux:latest ;; esac
+declare -A bases=([ubuntu]=ubuntu:24.04 [fedora]=fedora:41 [arch]="$arch_base")
 distros=(ubuntu fedora arch)
 rebuild=0
 
