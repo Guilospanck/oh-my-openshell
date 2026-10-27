@@ -801,7 +801,8 @@ pub fn plan_gateways(
             continue;
         };
         if spec.main {
-            resume.extend(crate::gwops::main_gateway_steps(f, p, h, spec, false));
+            let known = existing.iter().any(|(n, _)| *n == spec.name);
+            resume.extend(crate::gwops::main_gateway_steps(f, p, h, spec, !known));
         } else if !crate::gwops::extra_running(f.os, h, spec) {
             resume.extend(crate::gwops::add_gateway_steps(f, p, h, reg, spec));
         }
@@ -1760,7 +1761,7 @@ mod tests {
             &h,
             &gw_paths(),
             &reg,
-            &[],
+            &known_of(&reg),
             &|_| false,
         )
         .unwrap();
@@ -1789,6 +1790,14 @@ mod tests {
         reg
     }
 
+    /// What `openshell gateway list` shows once the registered gateways are set up.
+    fn known_of(reg: &crate::gwmodel::Registry) -> Vec<(String, u16)> {
+        reg.gateways
+            .iter()
+            .map(|g| (g.name.clone(), g.port))
+            .collect()
+    }
+
     fn running_facts() -> Facts {
         let mut f = facts(Os::Linux, PkgMgr::Apt);
         f.has_openshell = true;
@@ -1815,7 +1824,7 @@ mod tests {
             &h,
             &gw_paths(),
             &reg,
-            &[],
+            &known_of(&reg),
             &|_| false,
         )
         .unwrap();
@@ -1838,13 +1847,50 @@ mod tests {
             &h,
             &gw_paths(),
             &reg,
-            &[],
+            &known_of(&reg),
             &|_| false,
         )
         .unwrap();
         assert!(lines(&steps)
             .join("\n")
             .contains("systemctl --user restart openshell-gateway"));
+    }
+
+    #[test]
+    fn a_registered_main_the_cli_does_not_know_yet_is_registered_on_the_next_run() {
+        // The registry is written before the service starts; a run that stopped in between
+        // leaves an entry the CLI never heard of.
+        let f = running_facts();
+        let reg = registered(&[(GwKind::Docker, 17670, true)]);
+        let h = FakeHost::default();
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &[],
+            &|_| false,
+        )
+        .unwrap();
+        let t = lines(&steps).join("\n");
+        assert!(t.contains("sh -c"), "{t}");
+        assert!(steps.iter().any(|s| s.id.contains("register")), "{t}");
+        let known = [("openshell-docker".to_string(), 17670u16)];
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &known,
+            &|_| false,
+        )
+        .unwrap();
+        assert!(
+            steps.iter().all(|s| !s.id.contains("register")),
+            "known to the CLI already"
+        );
     }
 
     #[test]
@@ -1868,7 +1914,7 @@ mod tests {
             &h,
             &gw_paths(),
             &reg,
-            &[],
+            &known_of(&reg),
             &|_| false,
         )
         .unwrap();
@@ -1917,10 +1963,7 @@ mod tests {
         )
         .unwrap();
         let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
-        let first_gw = steps
-            .iter()
-            .find(|s| s.id.starts_with("gw-podman"))
-            .unwrap();
+        let first_gw = steps.iter().find(|s| s.id == "gw-registry").unwrap();
         assert_eq!(first_gw.after, Some("openshell"));
         for s in &steps {
             if let Some(a) = s.after {

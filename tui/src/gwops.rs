@@ -332,12 +332,16 @@ pub fn add_gateway_steps(
             &certs,
         ],
     );
-    let mut steps = own_service_steps(f, p, h, spec, Some(register), Vec::new());
+    // The registry entry comes first: `osh gateway-service NAME` looks NAME up in it, so a
+    // service started before the entry exists crash-loops.
     let mut after = reg.clone();
     after.add(spec.clone());
-    let mut w = registry_write_step(&after, p);
-    w.after = steps.last().map(|s| s.id);
-    steps.push(w);
+    let mut steps = vec![registry_write_step(&after, p)];
+    let mut rest = own_service_steps(f, p, h, spec, Some(register), Vec::new());
+    if let Some(first) = rest.first_mut() {
+        first.after = Some("gw-registry");
+    }
+    steps.extend(rest);
     steps
 }
 
@@ -361,7 +365,7 @@ pub fn main_gateway_steps(
     });
     let mut after = Registry::default();
     after.add(spec.clone());
-    let mut steps = if f.os == Os::MacOs && spec.kind != GwKind::Vm {
+    let rest = if f.os == Os::MacOs && spec.kind != GwKind::Vm {
         let stop = st(
             spec,
             "stop-brew",
@@ -450,9 +454,13 @@ pub fn main_gateway_steps(
         ));
         chain(steps, None)
     };
-    let mut w = registry_write_step(&after, p);
-    w.after = steps.last().map(|s| s.id);
-    steps.push(w);
+    // Registry first, as for extras: the macOS agent reads it when it starts.
+    let mut steps = vec![registry_write_step(&after, p)];
+    let mut rest = rest;
+    if let Some(first) = rest.first_mut() {
+        first.after = first.after.or(Some("gw-registry"));
+    }
+    steps.extend(rest);
     steps
 }
 
@@ -1123,6 +1131,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_registry_entry_is_written_before_the_service_starts() {
+        // `osh gateway-service NAME` looks NAME up in the registry, so a service started before
+        // the entry exists crash-loops.
+        let h = FakeHost::default();
+        let ids = |steps: &[Step]| steps.iter().map(|s| s.id).collect::<Vec<_>>();
+        let extra = add_gateway_steps(
+            &facts(Os::Linux),
+            &paths(),
+            &h,
+            &Registry::default(),
+            &spec(GwKind::Podman, 17671, false),
+        );
+        let i = ids(&extra);
+        let pos = |needle: &str| i.iter().position(|x| x.contains(needle)).unwrap();
+        assert!(pos("registry") < pos("enable"), "{i:?}");
+        assert!(extra
+            .iter()
+            .all(|s| s.after.is_none() || i.contains(&s.after.unwrap())));
+        let main = main_gateway_steps(
+            &facts(Os::MacOs),
+            &paths(),
+            &h,
+            &spec(GwKind::Docker, 17670, true),
+            true,
+        );
+        let i = ids(&main);
+        let pos = |needle: &str| i.iter().position(|x| x.contains(needle)).unwrap();
+        assert!(
+            pos("registry") < pos("enable"),
+            "the macOS agent main reads the registry too: {i:?}"
+        );
+        let linux = main_gateway_steps(
+            &facts(Os::Linux),
+            &paths(),
+            &h,
+            &spec(GwKind::Podman, 17670, true),
+            true,
+        );
+        assert_eq!(linux[0].id, "gw-registry");
+        assert!(linux
+            .iter()
+            .all(|s| s.after.is_none() || ids(&linux).contains(&s.after.unwrap())));
     }
 
     #[test]
