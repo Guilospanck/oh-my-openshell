@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 pub const DOCKER_LABEL: &str = "dev.guilospanck.openshell-docker";
 pub const DOCKER_GATEWAY: &str = "openshell-docker";
 
-/// Polls the gateway for up to 20 seconds, then prints its status either way.
-pub(crate) const WAIT_SCRIPT: &str = r#"for _ in $(seq 20); do openshell -g "$1" status >/dev/null 2>&1 && break; sleep 1; done; openshell -g "$1" status"#;
+/// Polls the gateway for up to 90 seconds (it returns as soon as the gateway answers), then
+/// prints its status either way. A launchd agent's first start on a fresh Mac took over 20.
+pub(crate) const WAIT_SCRIPT: &str = r#"for _ in $(seq 90); do openshell -g "$1" status >/dev/null 2>&1 && break; sleep 1; done; openshell -g "$1" status"#;
 
 /// Deletes the gateway's sandboxes through the gateway. $1 = gateway name.
 pub(crate) const DELETE_SANDBOXES_SCRIPT: &str = r#"if openshell -g "$1" status >/dev/null 2>&1; then
@@ -591,6 +592,12 @@ mod tests {
     use crate::platform::testing::FakeHost;
     use crate::platform::{Kvm, PodmanMachine};
     use crate::setup::{execute, Answer, Outcome};
+
+    #[test]
+    fn the_wait_gives_a_first_start_time_and_reports_the_status_at_the_end() {
+        assert!(WAIT_SCRIPT.contains("$(seq 90)") && WAIT_SCRIPT.contains("&& break"));
+        assert!(WAIT_SCRIPT.ends_with(r#"openshell -g "$1" status"#));
+    }
 
     fn facts(os: Os) -> Facts {
         Facts {
