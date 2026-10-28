@@ -134,6 +134,9 @@ check "the Podman extra got the next port" grep -qx 'openshell-podman https://lo
 
 echo "== gateway-reset of an agent-run extra and of the Homebrew main"
 : > "$STUB_LOG"
+# A live sandbox token of the Docker extra, where OpenShell's Docker driver keeps them.
+mkdir -p "$HOME_T/.local/state/openshell/docker-sandbox-tokens/default/sb"
+: > "$HOME_T/.local/state/openshell/docker-sandbox-tokens/default/sb/sandbox.jwt"
 printf 'reset\n' | osh_mac gateway-reset openshell-podman >"$HOME_T/out.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "resetting the Podman extra exits 0" || { fail "resetting the Podman extra" "rc=$rc"; tail -20 "$HOME_T/out.log"; }
 before "the extra is booted out, then bootstrapped again" \
@@ -146,9 +149,11 @@ a="$(ran 'Stop the gateway')"; b="$(ran 'Remove leftover sandbox runtimes')"; c=
 [[ -n "$a" && -n "$b" && -n "$c" && "$a" -lt "$b" && "$b" -lt "$c" ]] && pass "the sweep runs between stop and start" || fail "the sweep runs between stop and start"
 check "the sweep reached the Podman outside Homebrew" bash -c "! grep -q 'podman unreachable' '$HOME_T/out.log'"
 check "the sweep removed the leftover containers" logged "podman rm -f def456"
-# The Docker extra drives a runtime too, so the sweep is the shared one: stopped leftovers only.
-check "the shared sweep only lists stopped containers" grep -q -- '^podman ps -aq .*--filter status=exited' "$STUB_LOG"
-check "the shared sweep keeps the volumes" bash -c "! grep -q '^podman volume rm' '$STUB_LOG'"
+# The Docker extra drives another runtime, so Podman is this gateway's alone: the whole sweep, but
+# never the Docker gateway's sandbox tokens.
+check "the sweep on its own runtime lists every managed container" bash -c "grep -q -- '^podman ps -aq --filter label=openshell.ai/managed-by=openshell\$' '$STUB_LOG'"
+check "the sweep on its own runtime removes the volumes" grep -q '^podman volume' "$STUB_LOG"
+check "the Podman reset keeps the Docker gateway's sandbox tokens" test -e "$HOME_T/.local/state/openshell/docker-sandbox-tokens/default/sb/sandbox.jwt"
 check "the reset never touches the Homebrew service" bash -c "! grep -q '^brew services' '$STUB_LOG'"
 : > "$STUB_LOG"
 printf 'reset\n' | osh_mac gateway-reset openshell-vm >"$HOME_T/out.log" 2>&1; rc=$?
@@ -190,6 +195,39 @@ before "the Homebrew service is stopped before the agent starts" "brew services 
 check "the Docker main's agent was loaded" test -e "$HOME_T/.launchd/dev.guilospanck.openshell-docker"
 check "the Docker main is on 17670" grep -qx 'openshell-docker https://127.0.0.1:17670' "$HOME_T/.openshell-gateways"
 check "it never restarts the Homebrew service" bash -c "! grep -q '^brew services restart' '$STUB_LOG'"
+
+echo "== an openshell-docker agent left on the deleted gateway-docker-service is repaired"
+fresh_home
+osh_mac setup --gateways vm --yes </dev/null >"$HOME_T/out.log" 2>&1 || fail "setup --gateways vm" "$(tail -5 "$HOME_T/out.log")"
+# What the older `just gateway-docker` left behind: an agent on a script that no longer exists,
+# loaded (launchd keeps retrying it), and the CLI registration it made.
+legacy_plist="$agents/dev.guilospanck.openshell-docker.plist"
+mkdir -p "$agents" "$HOME_T/.launchd"
+cat > "$legacy_plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.guilospanck.openshell-docker</string>
+  <key>ProgramArguments</key><array><string>$HOME_T/gone/oh-my-openshell/gateway-docker-service</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+PLIST
+cp "$legacy_plist" "$HOME_T/.launchd/dev.guilospanck.openshell-docker"
+echo "openshell-docker https://localhost:17671" >> "$HOME_T/.openshell-gateways"
+: > "$STUB_LOG"
+# `osh gateway-docker` is `setup --gateways docker` that asks per step; --yes runs it unattended.
+osh_mac setup --gateways docker --yes </dev/null >"$HOME_T/out.log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && pass "setup --gateways docker exits 0" || { fail "setup --gateways docker exits 0" "rc=$rc"; tail -20 "$HOME_T/out.log"; }
+check "it does not stop at 'Nothing to do'" bash -c "! grep -q 'Nothing to do' '$HOME_T/out.log'"
+check "the repaired agent runs this osh" bash -c "[ \"\$(plutil -extract ProgramArguments.0 raw -o - '$legacy_plist')\" = '$OSH' ]"
+check "as gateway-service docker" bash -c "[ \"\$(plutil -extract ProgramArguments.1 raw -o - '$legacy_plist') \$(plutil -extract ProgramArguments.2 raw -o - '$legacy_plist')\" = 'gateway-service docker' ]"
+check "the repaired plist passes plutil -lint" plutil -lint -s "$legacy_plist"
+before "the old agent is booted out before the repaired one starts" \
+  "launchctl bootout gui/$uid/dev.guilospanck.openshell-docker" "launchctl bootstrap gui/$uid $legacy_plist"
+check "the repaired agent is loaded" test -e "$HOME_T/.launchd/dev.guilospanck.openshell-docker"
+check "osh did not add a second Docker gateway" bash -c "[ \"\$(grep -c '^openshell-docker ' '$HOME_T/.openshell-gateways')\" = 1 ]"
+out="$(osh_mac setup --gateways docker --yes </dev/null 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$out" == *"Nothing to do"* ]] && pass "once repaired, there is nothing to do" || fail "once repaired, there is nothing to do" "rc=$rc $out"
 
 echo "== the sandbox held: nothing outside the test folder changed"
 check "no stand-in was bypassed by a real brew or launchctl" bash -c "! grep -E 'Operation not permitted' '$work'/home.*/out.log"
