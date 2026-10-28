@@ -297,7 +297,7 @@ pub fn availability(f: &Facts, k: GwKind) -> Availability {
 }
 
 /// The lowest port from 17671 for an extra gateway whose port, health port (+10) and metrics port
-/// (+20) are all free: not in `taken` and, for the gateway port, not currently bound.
+/// (+20) are all free: not in `taken` and not currently bound.
 pub fn next_port(taken: &[u16], is_bound: &dyn Fn(u16) -> bool) -> u16 {
     let used = |p: u16| taken.contains(&p);
     (17671..)
@@ -306,6 +306,8 @@ pub fn next_port(taken: &[u16], is_bound: &dyn Fn(u16) -> bool) -> u16 {
                 && !used(p + 10)
                 && !used(p + 20)
                 && !is_bound(*p)
+                && !is_bound(p + 10)
+                && !is_bound(p + 20)
                 // Nobody else's health or metrics port may be this one's gateway port.
                 && !taken.iter().any(|t| t + 10 == *p || t + 20 == *p)
         })
@@ -609,6 +611,13 @@ mod tests {
         assert_eq!(next_port(&[17661], &|_| false), 17672);
         // 17681 is 17671's health port.
         assert_eq!(next_port(&[17681], &|_| false), 17672);
+        // Something already listening on a candidate's health or metrics port rules it out.
+        assert_eq!(next_port(&[], &|p| p == 17681), 17672);
+        assert_eq!(next_port(&[], &|p| p == 17691), 17672);
+        assert_eq!(
+            next_port(&[], &|p| p == 17681 || p == 17682 || p == 17693),
+            17674
+        );
     }
 
     #[test]

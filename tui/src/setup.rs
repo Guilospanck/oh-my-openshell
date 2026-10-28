@@ -875,6 +875,15 @@ pub fn plan_gateways(
     for (i, kind) in wanted.iter().enumerate() {
         let is_main = i == 0 && no_main;
         let port = if is_main {
+            // A fresh install has nothing of ours listening, so a busy main port, health port
+            // or metrics port belongs to something else and the gateway would never come up.
+            if !f.has_openshell {
+                if let Some(busy) = [17670u16, 17680, 17690].into_iter().find(|p| is_bound(*p)) {
+                    return Err(format!(
+                        "port {busy} is already in use, which the main gateway needs (it uses 17670, 17680 and 17690); stop what listens there and retry"
+                    ));
+                }
+            }
             17670
         } else {
             next_port(&taken, is_bound)
@@ -1799,6 +1808,37 @@ mod tests {
             last.contains("17672") && last.contains("17673"),
             "17671 is bound: {last}"
         );
+    }
+
+    #[test]
+    fn a_fresh_install_refuses_a_busy_main_port_set() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = false;
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.runtimes_ready = vec![Runtime::Docker];
+        for busy in [17670u16, 17680, 17690] {
+            let r = plan_gateways(
+                &f,
+                &with_gateways(&[GwKind::Docker]),
+                &FakeHost::default(),
+                &gw_paths(),
+                &crate::gwmodel::Registry::default(),
+                &[],
+                &|p| p == busy,
+            );
+            let e = r.unwrap_err();
+            assert!(e.contains(&busy.to_string()), "{e}");
+        }
+        assert!(plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &FakeHost::default(),
+            &gw_paths(),
+            &crate::gwmodel::Registry::default(),
+            &[],
+            &|_| false,
+        )
+        .is_ok());
     }
 
     #[test]
