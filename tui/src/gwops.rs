@@ -717,13 +717,7 @@ pub fn shares_runtime(reg: &Registry, name: &str) -> bool {
         .any(|g| g.name != name && g.kind != GwKind::Vm)
 }
 
-pub fn reset_steps_for(
-    f: &Facts,
-    p: &Paths,
-    spec: &GatewaySpec,
-    rt: Option<Runtime>,
-    shared: bool,
-) -> Vec<Step> {
+pub fn reset_steps_for(f: &Facts, p: &Paths, spec: &GatewaySpec, shared: bool) -> Vec<Step> {
     let state = p.state.to_string_lossy().into_owned();
     let config = p.config_home.to_string_lossy().into_owned();
     let packaged = spec.main && !(f.os == Os::MacOs && spec.kind != GwKind::Vm);
@@ -754,13 +748,16 @@ pub fn reset_steps_for(
     let sweep = if spec.kind == GwKind::Vm {
         script(gateway::SWEEP_VMS_SCRIPT, &[&state])
     } else {
-        let bin = rt
-            .filter(|r| r.bin() == spec.kind.driver())
-            .map_or(spec.kind.driver(), |r| r.bin());
+        // The gateway's own runtime, not whichever answers first.
+        let own = if spec.kind == GwKind::Podman {
+            Runtime::Podman
+        } else {
+            Runtime::Docker
+        };
         script(
             gateway::SWEEP_CONTAINERS_SCRIPT,
             &[
-                bin,
+                &f.runtime_bin(own),
                 &state,
                 &config,
                 if f.os == Os::MacOs { "darwin" } else { "linux" },
@@ -870,6 +867,7 @@ mod tests {
             has_clipboard: true,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
+            runtime_paths: vec![],
             podman_needs_socket: false,
             docker_permission_denied: false,
             kvm: Kvm::Usable,
@@ -1426,7 +1424,6 @@ mod tests {
             &facts(Os::Linux),
             &paths(),
             &spec(GwKind::Podman, 17671, false),
-            None,
             false,
         );
         let t = texts(&extra);
@@ -1437,7 +1434,6 @@ mod tests {
             &facts(Os::Linux),
             &paths(),
             &spec(GwKind::Docker, 17670, true),
-            None,
             false,
         ));
         assert!(main.contains("/h/.local/state/openshell/gateway/openshell.db"));
@@ -1446,7 +1442,6 @@ mod tests {
             &facts(Os::MacOs),
             &paths(),
             &spec(GwKind::Vm, 17670, true),
-            None,
             false,
         ));
         assert!(vm.contains("vm-driver/sandboxes") && vm.contains("brew services stop openshell"));
@@ -1465,13 +1460,34 @@ mod tests {
     }
 
     #[test]
+    fn reset_sweeps_with_the_runtime_wherever_it_is_installed() {
+        // Podman from its own macOS installer, outside Homebrew's folders (all gateway.env lists).
+        let mut h = FakeHost::with_bins(&["podman", "docker"]);
+        h.bin_paths
+            .insert("podman".into(), "/opt/podman/bin/podman".into());
+        h.bin_paths
+            .insert("docker".into(), "/Users/a/.nix-profile/bin/docker".into());
+        let f = crate::platform::gather_for(&h, Os::MacOs);
+        let t = |kind| {
+            texts(&reset_steps_for(
+                &f,
+                &paths(),
+                &spec(kind, 17671, false),
+                false,
+            ))
+        };
+        assert!(t(GwKind::Podman).contains(" /opt/podman/bin/podman /h/.local/state/openshell "));
+        assert!(t(GwKind::Docker)
+            .contains(" /Users/a/.nix-profile/bin/docker /h/.local/state/openshell "));
+    }
+
+    #[test]
     fn reset_marks_the_sweep_shared_when_told() {
         let t = |shared| {
             texts(&reset_steps_for(
                 &facts(Os::Linux),
                 &paths(),
                 &spec(GwKind::Podman, 17671, false),
-                None,
                 shared,
             ))
         };

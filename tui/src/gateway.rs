@@ -20,11 +20,14 @@ else
 fi"#;
 
 /// Removes leftover containers and volumes of a Docker or Podman driver.
-/// $1 = runtime binary, $2 = state dir, $3 = config dir, $4 = darwin flag, $5 = `shared` when
+/// $1 = runtime binary (its full path when osh found it: gateway.env's PATH lists only Homebrew's
+/// folders, and osh's own PATH is kept behind it for the same reason), $2 = state dir, $3 = config dir, $4 = darwin flag, $5 = `shared` when
 /// another gateway drives the same runtime. OpenShell's labels do not say which gateway owns a
 /// container, so a shared runtime only loses its stopped leftovers (`sandbox delete --all` has
 /// already removed this gateway's live ones) and its volumes stay.
-pub(crate) const SWEEP_CONTAINERS_SCRIPT: &str = r#"[ -f "$3/gateway.env" ] && { set -a; . "$3/gateway.env"; set +a; }
+pub(crate) const SWEEP_CONTAINERS_SCRIPT: &str = r#"osh_path="$PATH"
+[ -f "$3/gateway.env" ] && { set -a; . "$3/gateway.env"; set +a; }
+export PATH="${PATH:+$PATH:}$osh_path"
 [ "$4" = darwin ] && export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.colima/docker.sock}"
 if command -v "$1" >/dev/null 2>&1 && "$1" info >/dev/null 2>&1; then
   for f in label=openshell.ai/managed-by=openshell label=openshell.managed=true; do
@@ -381,7 +384,7 @@ pub fn reset_steps(
         Kind::Container => script(
             SWEEP_CONTAINERS_SCRIPT,
             &[
-                rt.unwrap_or(Runtime::Docker).bin(),
+                &f.runtime_bin(rt.unwrap_or(Runtime::Docker)),
                 &state,
                 &config,
                 if f.os == Os::MacOs { "darwin" } else { "linux" },
@@ -608,6 +611,7 @@ mod tests {
             has_clipboard: true,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
+            runtime_paths: vec![],
             podman_needs_socket: false,
             docker_permission_denied: false,
             kvm: Kvm::Absent,
@@ -945,6 +949,66 @@ mod tests {
         assert!(SWEEP_CONTAINERS_SCRIPT.contains(r#"[ "$5" = shared ]"#));
         assert!(SWEEP_CONTAINERS_SCRIPT.contains("status=exited"));
         assert!(SWEEP_CONTAINERS_SCRIPT.contains(r#"[ "$5" != shared ]"#));
+    }
+
+    #[test]
+    fn reset_sweep_names_the_located_runtime() {
+        let mut f = facts(Os::MacOs);
+        f.runtime_paths = vec![(Runtime::Docker, "/opt/docker/bin/docker".into())];
+        let s = reset_steps(&f, &paths(), DOCKER_GATEWAY, Some(Runtime::Docker), false).unwrap();
+        assert!(texts(&s).contains(" /opt/docker/bin/docker /h/.local/state/openshell "));
+    }
+
+    /// Runs the real sweep script: gateway.env replaces PATH with folders that lack the runtime,
+    /// as Homebrew's do for a Podman installed elsewhere. It must still find and use it.
+    #[test]
+    fn the_sweep_finds_a_runtime_outside_gateway_envs_path() {
+        let d = std::env::temp_dir().join(format!("osh-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (bin, config, state) = (d.join("bin"), d.join("config"), d.join("state"));
+        for dir in [&bin, &config, &state] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(
+            config.join("gateway.env"),
+            "PATH=\"/nonexistent/homebrew/bin\"\n",
+        )
+        .unwrap();
+        let log = d.join("log");
+        let podman = bin.join("podman");
+        std::fs::write(
+            &podman,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in ps) echo abc ;; volume) [ \"$2\" = ls ] && echo vol1 ;; esac\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&podman, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let run = |runtime: &str| {
+            let _ = std::fs::remove_file(&log);
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", SWEEP_CONTAINERS_SCRIPT, "sh", runtime])
+                .arg(&state)
+                .arg(&config)
+                .args(["linux", "own"])
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+                .output()
+                .unwrap();
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            (String::from_utf8_lossy(&out.stderr).into_owned(), calls)
+        };
+        // The full path osh located, and the bare name found on osh's own PATH kept behind.
+        for runtime in [podman.to_string_lossy().into_owned(), "podman".into()] {
+            let (err, calls) = run(&runtime);
+            assert!(!err.contains("unreachable"), "{runtime}: {err}");
+            assert!(calls.contains("rm -f abc"), "{runtime}: {calls}");
+            assert!(calls.contains("volume rm vol1"), "{runtime}: {calls}");
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

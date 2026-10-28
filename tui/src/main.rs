@@ -378,7 +378,7 @@ fn gateway_command(args: &[String]) -> i32 {
             let reg = gwmodel::Registry::load(&p.data);
             let shared = gwops::shares_runtime(&reg, name);
             if let Some(spec) = reg.get(name) {
-                Ok(gwops::reset_steps_for(&f, &p, spec, f.runtime(), shared))
+                Ok(gwops::reset_steps_for(&f, &p, spec, shared))
             } else {
                 // Sweep with the runtime the installed gateway drives, not whichever answers first.
                 let driver = h

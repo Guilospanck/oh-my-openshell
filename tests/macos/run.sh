@@ -137,12 +137,17 @@ printf 'reset\n' | osh_mac gateway-reset openshell-podman >"$HOME_T/out.log" 2>&
 [[ $rc -eq 0 ]] && pass "resetting the Podman extra exits 0" || { fail "resetting the Podman extra" "rc=$rc"; tail -20 "$HOME_T/out.log"; }
 before "the extra is booted out, then bootstrapped again" \
   "launchctl bootout gui/$uid/dev.guilospanck.openshell-podman" "launchctl bootstrap gui/$uid $podman_plist"
-# The sweep sources gateway.env, whose PATH is Homebrew's (/opt/homebrew/bin first), so on a Mac it
-# runs the real runtime CLI; the sandbox refuses that, which is all this test can show of it.
+# The sweep sources gateway.env, whose PATH lists only Homebrew's folders; the Podman stand-in sits
+# outside them (in the test HOME), as a Podman from its own installer would. osh passes the path it
+# found, so the sweep still reaches it.
 ran() { grep -n -m1 "^\[[0-9]*/[0-9]*\] $1" "$HOME_T/out.log" | cut -d: -f1; }
 a="$(ran 'Stop the gateway')"; b="$(ran 'Remove leftover sandbox runtimes')"; c="$(ran 'Start the gateway')"
 [[ -n "$a" && -n "$b" && -n "$c" && "$a" -lt "$b" && "$b" -lt "$c" ]] && pass "the sweep runs between stop and start" || fail "the sweep runs between stop and start"
-check "the sweep could not reach a real runtime from the sandbox" grep -q 'podman unreachable; containers not swept' "$HOME_T/out.log"
+check "the sweep reached the Podman outside Homebrew" bash -c "! grep -q 'podman unreachable' '$HOME_T/out.log'"
+check "the sweep removed the leftover containers" logged "podman rm -f def456"
+# The Docker extra drives a runtime too, so the sweep is the shared one: stopped leftovers only.
+check "the shared sweep only lists stopped containers" grep -q -- '^podman ps -aq .*--filter status=exited' "$STUB_LOG"
+check "the shared sweep keeps the volumes" bash -c "! grep -q '^podman volume rm' '$STUB_LOG'"
 check "the reset never touches the Homebrew service" bash -c "! grep -q '^brew services' '$STUB_LOG'"
 : > "$STUB_LOG"
 printf 'reset\n' | osh_mac gateway-reset openshell-vm >"$HOME_T/out.log" 2>&1; rc=$?

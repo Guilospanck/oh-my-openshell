@@ -368,6 +368,7 @@ mod tests {
             has_clipboard: true,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
+            runtime_paths: vec![],
             podman_needs_socket: false,
             docker_permission_denied: false,
             kvm: if os == Os::MacOs {

@@ -40,6 +40,9 @@ impl Runtime {
 /// The only door to the host, so planning and detection run against a fake in tests.
 pub trait Host {
     fn which(&self, bin: &str) -> bool;
+    /// Where `which` finds `bin`: the first match on this process's PATH. Scripts that set their
+    /// own PATH (gateway.env lists only Homebrew's folders) run this path, not the bare name.
+    fn locate(&self, bin: &str) -> Option<PathBuf>;
     fn exists(&self, path: &Path) -> bool;
     /// Runs `prog` directly (never through a shell); `Ok` is stdout, `Err` a failure message.
     fn run(&self, prog: &str, args: &[&str]) -> Result<String, String>;
@@ -136,12 +139,13 @@ impl RealHost {
 
 impl Host for RealHost {
     fn which(&self, bin: &str) -> bool {
-        std::env::var_os("PATH").is_some_and(|p| {
-            std::env::split_paths(&p).any(|d| {
-                let f = d.join(bin);
-                f.is_file() && is_executable(&f)
-            })
-        })
+        self.locate(bin).is_some()
+    }
+
+    fn locate(&self, bin: &str) -> Option<PathBuf> {
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|d| d.join(bin))
+            .find(|f| f.is_file() && is_executable(f))
     }
 
     fn run(&self, prog: &str, args: &[&str]) -> Result<String, String> {
@@ -285,6 +289,9 @@ pub struct Facts {
     pub runtimes_installed: Vec<Runtime>,
     /// `<bin> info` succeeded: usable right now. Docker first when both are.
     pub runtimes_ready: Vec<Runtime>,
+    /// Where each installed runtime's binary is, wherever it was installed (Homebrew, a vendor
+    /// installer, Nix, ~/.local/bin).
+    pub runtime_paths: Vec<(Runtime, PathBuf)>,
     /// Linux: `podman info` answers but the user's `podman.socket` (the API OpenShell talks to)
     /// is not active, so Podman is installed and usable but not ready for the gateway.
     pub podman_needs_socket: bool,
@@ -305,6 +312,17 @@ impl Facts {
     /// The runtime osh should use: a ready Docker, else a ready Podman.
     pub fn runtime(&self) -> Option<Runtime> {
         self.runtimes_ready.first().copied()
+    }
+
+    /// The command for `r` in a script: its full path when known, else the bare name.
+    pub fn runtime_bin(&self, r: Runtime) -> String {
+        self.runtime_paths
+            .iter()
+            .find(|(x, _)| *x == r)
+            .map_or_else(
+                || r.bin().to_string(),
+                |(_, p)| p.to_string_lossy().into_owned(),
+            )
     }
 }
 
@@ -377,6 +395,10 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
     let runtimes_installed: Vec<Runtime> = all
         .into_iter()
         .filter(|r| h.which(r.bin()) && !(*r == Runtime::Docker && docker_is_podman))
+        .collect();
+    let runtime_paths = runtimes_installed
+        .iter()
+        .filter_map(|r| Some((*r, h.locate(r.bin())?)))
         .collect();
     let mut docker_permission_denied = false;
     let mut podman_needs_socket = false;
@@ -453,6 +475,7 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
         },
         runtimes_installed,
         runtimes_ready,
+        runtime_paths,
         podman_needs_socket,
         docker_permission_denied,
         kvm,
@@ -473,6 +496,8 @@ pub mod testing {
     #[derive(Default)]
     pub struct FakeHost {
         pub bins: HashSet<String>,
+        /// Full paths `locate` reports, for binaries in `bins`.
+        pub bin_paths: HashMap<String, String>,
         pub files: HashMap<String, String>,
         /// Programs whose `run` fails; every other `run` succeeds with `outputs` or "".
         pub failing: HashSet<String>,
@@ -508,6 +533,7 @@ pub mod testing {
             has_clipboard: true,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
+            runtime_paths: vec![],
             podman_needs_socket: false,
             docker_permission_denied: false,
             kvm: if os == Os::MacOs {
@@ -534,6 +560,12 @@ pub mod testing {
     impl Host for FakeHost {
         fn which(&self, bin: &str) -> bool {
             self.bins.contains(bin)
+        }
+        fn locate(&self, bin: &str) -> Option<PathBuf> {
+            self.bins
+                .contains(bin)
+                .then(|| self.bin_paths.get(bin).map(PathBuf::from))
+                .flatten()
         }
         fn exists(&self, path: &Path) -> bool {
             path.to_str().is_some_and(|p| self.paths.contains(p))
@@ -642,6 +674,27 @@ mod tests {
         assert_eq!(f.runtimes_installed, vec![Runtime::Docker]);
         assert!(f.runtimes_ready.is_empty());
         assert_eq!(f.runtime(), None);
+    }
+
+    #[test]
+    fn facts_keep_where_each_runtime_is_installed() {
+        let mut h = FakeHost::with_bins(&["docker", "podman"]);
+        h.bin_paths
+            .insert("podman".into(), "/opt/podman/bin/podman".into());
+        let f = gather_for(&h, Os::MacOs);
+        assert_eq!(
+            f.runtime_paths,
+            vec![(Runtime::Podman, PathBuf::from("/opt/podman/bin/podman"))]
+        );
+        assert_eq!(f.runtime_bin(Runtime::Podman), "/opt/podman/bin/podman");
+        // Not located: the bare name, found on PATH when the script runs.
+        assert_eq!(f.runtime_bin(Runtime::Docker), "docker");
+    }
+
+    #[test]
+    fn real_locate_finds_the_first_executable_on_path() {
+        assert!(RealHost.locate("sh").is_some_and(|p| p.is_absolute()));
+        assert_eq!(RealHost.locate("osh-no-such-binary"), None);
     }
 
     #[test]

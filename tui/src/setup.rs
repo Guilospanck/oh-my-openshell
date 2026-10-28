@@ -1287,6 +1287,7 @@ mod tests {
             has_clipboard: false,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
+            runtime_paths: vec![],
             podman_needs_socket: false,
             docker_permission_denied: false,
             kvm: Kvm::Absent,
