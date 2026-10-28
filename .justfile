@@ -62,7 +62,7 @@ test-linux *args:
 test-linux-real runtime="podman":
 	@"{{justfile_directory()}}/tests/linux/real.sh" {{runtime}}
 
-# macOS, real KVM: test-linux-real vm on a separate, disposable Colima instance with nested virtualization (M3+); --keep keeps it, --preseed works around the known installer bug
+# macOS, real KVM: test-linux-real vm on a separate, disposable Colima instance with nested virtualization (M3+); --keep keeps it
 test-linux-kvm *args:
 	@"{{justfile_directory()}}/tests/linux/kvm.sh" {{args}}
 
@@ -74,7 +74,7 @@ test-macos:
 test-macos-runtimes *args:
 	@"{{justfile_directory()}}/tests/macos/runtimes.sh" {{args}}
 
-# macOS: real Homebrew, brew services and launchd in a disposable Tart macOS VM clone (needs tart; pulls a 26 GB image once); --keep, --preseed
+# macOS: real Homebrew, brew services and launchd in a disposable Tart macOS VM clone (needs tart; pulls a 26 GB image once); --keep keeps the clone
 test-macos-vm *args:
 	@"{{justfile_directory()}}/tests/macos/vm.sh" {{args}}
 

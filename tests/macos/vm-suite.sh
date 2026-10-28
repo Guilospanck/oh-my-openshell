@@ -58,13 +58,6 @@ out="$(osh setup --gateways vm,docker --dry-run </dev/null 2>&1)"; rc=$?
 grep -q 'colima start' <<<"$out" && fail "Docker answers, so Colima is not needed" "$out" || pass "Docker answers, so Colima is not needed"
 check "dry-run installed nothing" bash -c '! command -v openshell'
 
-if [ -n "${OSH_PRESEED:-}" ]; then
-  # KNOWN BUG workaround, opt-in: see tests/linux/real-suite.sh.
-  echo "== OSH_PRESEED: writing a vm gateway.toml before setup (known-bug workaround)"
-  mkdir -p "$HOME/.config/openshell"
-  printf '[openshell]\nversion = 2\n\n[openshell.gateway]\ncompute_driver = "vm"\n' > "$HOME/.config/openshell/gateway.toml"
-fi
-
 echo "== setup --gateways vm,docker --yes (real Homebrew, installer, brew services, launchd)"
 with_timeout 1800 osh setup --gateways vm,docker --yes </dev/null >"$log" 2>&1; rc=$?
 [ $rc -eq 0 ] && pass "setup exits 0" || {

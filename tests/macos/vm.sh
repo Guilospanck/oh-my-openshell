@@ -5,7 +5,7 @@
 # bootstrap`, `print`, `bootout` on osh's own LaunchAgent) through setup, reset, remove, add and
 # uninstall. The clone is deleted at the end, pass or fail, unless --keep.
 #
-#   tests/macos/vm.sh [--keep] [--preseed]        (or: just test-macos-vm [--keep] [--preseed])
+#   tests/macos/vm.sh [--keep]        (or: just test-macos-vm [--keep])
 #
 # A macOS guest has no hypervisor (kern.hv_support is 0: Apple's nested virtualization is for
 # Linux guests only), so nothing that boots a VM can run in it: no microVM sandbox, no Colima, no
@@ -13,10 +13,6 @@
 # a Docker engine on the host: a separate, disposable Colima instance (its own COLIMA_HOME, never
 # the user's), whose socket is forwarded over SSH into the guest at ~/.colima/default/docker.sock,
 # where Colima itself would put it, with the same `colima` Docker context Colima creates.
-#
-# --preseed sets OSH_PRESEED=1: the suite writes a vm gateway.toml before osh setup, to get past a
-# known bug (OpenShell's installer starts its Homebrew service before osh's VM config exists, and
-# OpenShell never auto-detects the vm driver) and test the rest.
 #
 # Needs: macOS on Apple silicon, tart (https://tart.run; $TART or on PATH), colima, limactl and
 # docker on PATH. The first run pulls the image ($OSH_MACOS_IMAGE, default
@@ -30,8 +26,7 @@ keep=0
 for a in "$@"; do
   case "$a" in
     --keep) keep=1 ;;
-    --preseed) export OSH_PRESEED=1 ;;
-    *) echo "usage: vm.sh [--keep] [--preseed]" >&2; exit 2 ;;
+    *) echo "usage: vm.sh [--keep]" >&2; exit 2 ;;
   esac
 done
 TART="${TART:-$(command -v tart || true)}"
@@ -104,4 +99,4 @@ ssh -i "$work/key" -o IdentitiesOnly=yes -o StrictHostKeyChecking=no -o UserKnow
 fwd_pid=$!
 
 echo "== running the suite in the guest"
-"$TART" exec "$vm" env OSH_PRESEED="${OSH_PRESEED:-}" bash "/Volumes/My Shared Files/repo/tests/macos/vm-suite.sh"
+"$TART" exec "$vm" bash "/Volumes/My Shared Files/repo/tests/macos/vm-suite.sh"

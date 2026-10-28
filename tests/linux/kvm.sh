@@ -4,11 +4,7 @@
 # the Docker host, so the systemd test machine gets a real /dev/kvm and OpenShell's VM driver
 # boots real microVMs in it.
 #
-#   tests/linux/kvm.sh [--keep] [--preseed]        (or: just test-linux-kvm [--keep] [--preseed])
-#
-# --preseed sets OSH_PRESEED=1: real-suite.sh writes a vm gateway.toml before osh setup, to get
-# past a known bug (OpenShell's installer cannot start its gateway before osh's VM config exists)
-# and test the rest, including booting a microVM. Without it the run shows that bug as a failure.
+#   tests/linux/kvm.sh [--keep]        (or: just test-linux-kvm [--keep])
 #
 # Nothing of an existing Colima is touched: the instance lives in its own COLIMA_HOME
 # ($OSH_KVM_HOME, default ~/.cache/osh-kvm, profile osh-kvm), is started without switching the
@@ -23,8 +19,7 @@ keep=0
 for a in "$@"; do
   case "$a" in
     --keep) keep=1 ;;
-    --preseed) export OSH_PRESEED=1 ;;
-    *) echo "usage: kvm.sh [--keep] [--preseed]" >&2; exit 2 ;;
+    *) echo "usage: kvm.sh [--keep]" >&2; exit 2 ;;
   esac
 done
 [[ "$(uname)" == Darwin ]] || { echo "kvm.sh runs on macOS; on Linux with KVM run: tests/linux/real.sh vm" >&2; exit 2; }

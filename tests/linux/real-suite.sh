@@ -69,7 +69,7 @@ if [[ ( "$runtime" == docker || "$runtime" == vm ) && "$phase" != after-login ]]
   for _ in $(seq 20); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 1; done
   # And a new login is a new process tree with the new groups: carry on in one.
   exec sudo -u tester -H env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" \
-    "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" "PATH=$PATH" "PREV_FAILS=$fails" "OSH_PRESEED=${OSH_PRESEED:-}" \
+    "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" "PATH=$PATH" "PREV_FAILS=$fails" \
     bash "$0" "$runtime" after-login
 fi
 
@@ -83,16 +83,6 @@ if [[ "$runtime" == podman ]]; then
   [[ $rc -eq 0 ]] && pass "the wizard installs podman end to end" || { fail "the wizard installs podman end to end" "rc=$rc"; tail -40 "$log"; }
   check "the wizard cleared its pending selection" test ! -e "$data/wizard.json"
 else
-if [[ "$runtime" == vm && -n "${OSH_PRESEED:-}" ]]; then
-  # KNOWN BUG workaround, opt-in (OSH_PRESEED=1): OpenShell's installer restarts its gateway
-  # before osh writes the VM config, and OpenShell never auto-detects the vm driver, so on a
-  # machine without Docker or Podman the installer fails ("no compute driver configured"). A
-  # config naming the driver, written first, gets past it so the rest can be tested; osh
-  # replaces it with its own. Drop this once osh writes the main's config before the installer.
-  echo "== OSH_PRESEED: writing a vm gateway.toml before setup (known-bug workaround)"
-  mkdir -p "$HOME/.config/openshell"
-  printf '[openshell]\nversion = 2\n\n[openshell.gateway]\ncompute_driver = "vm"\n' > "$HOME/.config/openshell/gateway.toml"
-fi
 echo "== setup --gateways $gateways --yes (real packages, installer, systemd)"
 osh setup --gateways "$gateways" --yes >"$log" 2>&1; rc=$?
 fi

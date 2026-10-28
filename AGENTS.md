@@ -87,9 +87,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   forwarded over SSH; `just test-macos-runtimes` runs osh's real `colima start` and `podman
   machine init/start` in a throwaway HOME and checks the user's Colima, containers and Lima
   instances are byte-identical afterwards. A macOS guest has no hypervisor, so microVMs, Colima
-  and Podman machines are checked to fail there. `--preseed` writes a vm `gateway.toml` before
-  setup, a workaround for a known bug (OpenShell never auto-detects the vm driver, and its
-  installer starts the gateway before osh writes the config). Docker Desktop stays untested: its
+  and Podman machines are checked to fail there. Docker Desktop stays untested: its
   engine needs a hypervisor (none in a macOS guest), on the host it would take over the user's
   Docker setup, and its licence needs a paid subscription for larger companies. `just test-release` runs the release
   workflow's Linux build and publish jobs with act (recording `gh`); the macOS entries need GitHub.

@@ -80,6 +80,6 @@ docker exec "$name" systemctl start "user@${uid}.service"
 for _ in $(seq 20); do docker exec "$name" test -S "/run/user/$uid/bus" && break; sleep 1; done
 
 echo "== running the suite as an ordinary user"
-docker exec -u tester -e XDG_RUNTIME_DIR="/run/user/$uid" -e OSH_PRESEED="${OSH_PRESEED:-}" \
+docker exec -u tester -e XDG_RUNTIME_DIR="/run/user/$uid" \
   -e DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
   "$name" bash /repo/tests/linux/real-suite.sh "$runtime"
