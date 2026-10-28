@@ -297,19 +297,18 @@ pub fn availability(f: &Facts, k: GwKind) -> Availability {
 }
 
 /// The lowest port from 17671 for an extra gateway whose port, health port (+10) and metrics port
-/// (+20) are all free: not in `taken` and not currently bound.
+/// (+20) are all free: none of the three is any taken gateway's port, health port or metrics port,
+/// and none is bound right now. Ports are compared as u32 so nothing near 65535 wraps; a candidate
+/// whose metrics port would not fit is never offered.
 pub fn next_port(taken: &[u16], is_bound: &dyn Fn(u16) -> bool) -> u16 {
-    let used = |p: u16| taken.contains(&p);
-    (17671..)
+    const OFFSETS: [u32; 3] = [0, 10, 20];
+    let ports = |p: u32| OFFSETS.map(|o| p + o);
+    let taken_ports: Vec<u32> = taken.iter().flat_map(|t| ports(u32::from(*t))).collect();
+    (17671..=u16::MAX - 20)
         .find(|p| {
-            !used(*p)
-                && !used(p + 10)
-                && !used(p + 20)
-                && !is_bound(*p)
-                && !is_bound(p + 10)
-                && !is_bound(p + 20)
-                // Nobody else's health or metrics port may be this one's gateway port.
-                && !taken.iter().any(|t| t + 10 == *p || t + 20 == *p)
+            ports(u32::from(*p))
+                .iter()
+                .all(|q| !taken_ports.contains(q) && u16::try_from(*q).is_ok_and(|q| !is_bound(q)))
         })
         .unwrap_or(17671)
 }
@@ -619,6 +618,29 @@ mod tests {
             next_port(&[], &|p| p == 17681 || p == 17682 || p == 17693),
             17674
         );
+    }
+
+    #[test]
+    fn next_port_compares_every_port_pair_and_never_overflows() {
+        // Every pair of the candidate's three ports against a taken gateway's three: 17671's
+        // health port is 17661's metrics port, 17672's is 17662's, and so on.
+        assert_eq!(next_port(&[17661, 17662, 17663], &|_| false), 17674);
+        assert_eq!(next_port(&[17651], &|_| false), 17672);
+        for p in 17671..17700u16 {
+            let got = next_port(&[p], &|_| false);
+            let (a, b) = (u32::from(p), u32::from(got));
+            assert!(
+                [0, 10, 20]
+                    .iter()
+                    .all(|x| [0, 10, 20].iter().all(|y| a + x != b + y)),
+                "{got} collides with {p}"
+            );
+        }
+        // Near the top: the highest candidate whose metrics port fits, and no wrap or panic.
+        // 65505 shares 65515 with the taken gateway; 65506 (65516, 65526) is the first free one.
+        assert_eq!(next_port(&[65515], &|p| p < 65505), 65506);
+        assert_eq!(next_port(&[], &|p| p < u16::MAX - 20), u16::MAX - 20);
+        assert_eq!(next_port(&[u16::MAX], &|_| true), 17671);
     }
 
     #[test]
