@@ -639,7 +639,12 @@ fn config_stale_with(reg: &crate::gwmodel::Registry, differs: bool) -> bool {
 }
 
 /// True when the installed `gateway.toml` is missing or differs from the one this host should run.
+/// Unit tests never look: the answer would come from the real HOME and a real `docker info`, and
+/// `Paths::detect` exits the test binary when HOME is unset.
 fn config_stale(reg: &crate::gwmodel::Registry) -> bool {
+    if cfg!(test) {
+        return false;
+    }
     let os = if cfg!(target_os = "macos") {
         crate::platform::Os::MacOs
     } else {
@@ -654,9 +659,13 @@ fn config_stale(reg: &crate::gwmodel::Registry) -> bool {
     config_stale_with(reg, differs)
 }
 
-/// The kind of gateway the installed `gateway.toml` runs, from its `compute_driver`.
+/// The kind of gateway the installed `gateway.toml` runs, from its `compute_driver`. `None` in
+/// unit tests, for the reason `config_stale` gives.
 fn installed_driver() -> Option<crate::gwmodel::GwKind> {
     use crate::platform::Host as _;
+    if cfg!(test) {
+        return None;
+    }
     let p = crate::gateway::Paths::detect();
     let text = crate::platform::RealHost.read(&p.config_home.join("gateway.toml"))?;
     let line = text
