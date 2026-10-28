@@ -243,6 +243,18 @@ pub enum Modal {
     },
 }
 
+/// Rows a scrolling modal can show: the terminal minus border and margin. Fixed under test so a unit test
+/// does not depend on the height of the terminal that runs `cargo test`.
+fn modal_rows() -> u16 {
+    if cfg!(test) {
+        return 20;
+    }
+    ratatui::crossterm::terminal::size()
+        .map(|(_, h)| h)
+        .unwrap_or(24)
+        .saturating_sub(4)
+}
+
 /// A command run with the terminal handed back to it (build, create, setup-token).
 pub struct Step {
     pub prog: String,
@@ -3284,10 +3296,7 @@ impl App {
                 perms,
                 mut scroll,
             } => {
-                let rows = ratatui::crossterm::terminal::size()
-                    .map(|(_, h)| h)
-                    .unwrap_or(24)
-                    .saturating_sub(4);
+                let rows = modal_rows();
                 let last = (crate::ui::perm_lines(&perms).len() as u16).saturating_sub(rows);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return,
@@ -3312,10 +3321,7 @@ impl App {
                 back,
             } => {
                 // The viewer fills the screen minus its border and margin; stop when the last line is at the bottom.
-                let rows = ratatui::crossterm::terminal::size()
-                    .map(|(_, h)| h)
-                    .unwrap_or(24)
-                    .saturating_sub(4);
+                let rows = modal_rows();
                 let last = (text.lines().count() as u16).saturating_sub(rows);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
