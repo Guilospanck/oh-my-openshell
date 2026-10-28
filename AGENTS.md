@@ -80,7 +80,9 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   through setup, add, reset, remove and uninstall. The real thing, each in disposable resources
   that are deleted at the end (pass or fail; `--keep` keeps them): `just test-linux-kvm` runs
   `test-linux-real vm` on its own Colima instance with nested virtualization (M3+, own
-  `COLIMA_HOME` in `~/.cache/osh-kvm`), so microVMs boot on real KVM; `just test-macos-vm`
+  `COLIMA_HOME` in `~/.cache/osh-kvm`), so microVMs boot on real KVM (its sandbox checks
+  report KNOWN-FAIL, not FAIL, only while the guest console shows OpenShell bug
+  NVIDIA/OpenShell#4014, `read /proc/self/status: Permission denied`); `just test-macos-vm`
   boots a Tart clone of a Cirrus Labs macOS image (`tests/macos/vm.sh`; 26 GB pulled once into
   `~/.tart`) and runs real Homebrew, OpenShell's installer, `brew services` and launchd through
   setup, KeepAlive, reset, remove, add and uninstall, with Docker from a separate host Colima

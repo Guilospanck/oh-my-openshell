@@ -280,7 +280,9 @@ for Homebrew, launchd, Colima and Podman without changing the Mac, and
 `just test-release` runs the release workflow's Linux jobs with act. On a Mac,
 with disposable VMs that are deleted afterwards: `just test-linux-kvm` runs the
 VM gateway scenario on real KVM (a separate Colima instance with nested
-virtualization, M3 or later), `just test-macos-vm` runs real Homebrew,
+virtualization, M3 or later; its sandbox checks show as KNOWN-FAIL while OpenShell
+bug [#4014](https://github.com/NVIDIA/OpenShell/issues/4014) stops every microVM
+sandbox at start), `just test-macos-vm` runs real Homebrew,
 `brew services` and launchd in a Tart macOS VM clone, and
 `just test-macos-runtimes` runs osh's real Colima and Podman machine steps in a
 throwaway HOME, leaving your own Colima untouched. Docker Desktop is not tested.
