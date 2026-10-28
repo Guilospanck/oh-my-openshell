@@ -135,9 +135,9 @@ release-setup-ci-key:
 	for id in $old_ids; do gh repo deploy-key delete "$id" -R "$tap" && echo "removed the earlier deploy key $id"; done
 	echo "deploy key added to homebrew-tap (write) and stored as HOMEBREW_TAP_DEPLOY_KEY"
 
-# Builds the archives into dist/ (this Mac plus Linux amd64 and arm64 in containers); uploads nothing. Usage: just release-build v0.2.0 (uses the Docker you already have; `just release` uses its own Colima on Apple Silicon)
+# Builds the archives into dist/ (this Mac plus Linux arm64 in a container; add --linux amd64 arm64 for x86_64, which crashes under QEMU on Apple Silicon); uploads nothing. Usage: just release-build v0.2.0 (uses the Docker you already have; `just release` uses its own Colima on Apple Silicon)
 release-build version:
-	@"{{justfile_directory()}}/scripts/release" {{version}} --linux amd64 arm64
+	@"{{justfile_directory()}}/scripts/release" {{version}} --linux arm64
 
 # Prints the Homebrew formula for the archives already in dist/. Usage: just release-formula v0.2.0
 release-formula version:
@@ -147,7 +147,7 @@ release-formula version:
 release-dry-run version *args:
 	@"{{justfile_directory()}}/scripts/publish" {{version}} --dry-run {{args}}
 
-# Full release: check, bump Cargo version (commit), archives, formula lint, tag, push, GitHub release, push formula to Guilospanck/homebrew-tap. Usage: just release v0.2.0 ["notes" [--linux arm64 | --no-linux]]
+# Full release: check, bump Cargo version (commit), archives, formula lint, tag, push, GitHub release, push formula to Guilospanck/homebrew-tap. Usage: just release v0.2.0 ["notes" [--linux amd64 arm64 | --no-linux]]
 release version $notes="" *args:
 	@"{{justfile_directory()}}/scripts/publish" {{version}} --notes "$notes" {{args}}
 

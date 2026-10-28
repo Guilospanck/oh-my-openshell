@@ -11,7 +11,7 @@
 #   5. lint        renders the formula and runs `brew style` on it
 #   6. publish     commits the bump, pushes it and the tag, `gh release create`, pushes the tap
 #
-# The Linux archives build in containers. On an Apple Silicon Mac that is a separate Colima instance
+# The Linux archives build in containers (arm64 by default, see --linux). On an Apple Silicon Mac that is a separate Colima instance
 # (scripts/release-colima), started for the run and deleted afterwards (--keep-vm keeps
 # it); --host-docker uses the Docker you already have instead. Elsewhere the current Docker or Podman.
 #
@@ -29,7 +29,9 @@ shift
 version="${tag#v}"
 dry=0
 notes=""
-linux=(amd64 arm64)
+# Native arm64 only by default: x86_64 under QEMU on Apple Silicon crashed the linker (cc: internal
+# compiler error: Segmentation fault), so --linux amd64 is opt-in. CI builds it on a native runner.
+linux=(arm64)
 own_vm=1
 keep_vm=0
 vm_up=0
