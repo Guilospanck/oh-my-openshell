@@ -82,7 +82,7 @@ fn without_header(t: &str) -> &str {
 
 /// The first backup path for `gateway.toml` that does not exist yet, so an earlier backup of the
 /// user's own file is never overwritten.
-fn free_backup_path(p: &Paths, h: &dyn Host) -> PathBuf {
+pub(crate) fn free_backup_path(p: &Paths, h: &dyn Host) -> PathBuf {
     let base = p.config_home.join("gateway.toml.osh-bak");
     if h.read(&base).is_none() {
         return base;

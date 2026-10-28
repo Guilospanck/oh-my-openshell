@@ -208,7 +208,7 @@ pub fn plan(f: &Facts, o: &Options, h: &dyn Host, p: &Paths, force: bool) -> Vec
                 "gateway-backup",
                 "Keep a copy of your gateway.toml before replacing it",
                 StepKind::Write {
-                    path: p.config_home.join("gateway.toml.osh-bak"),
+                    path: crate::gwops::free_backup_path(p, h),
                     content: old,
                 },
             ));
@@ -692,6 +692,28 @@ mod tests {
         assert!(
             matches!(&steps[1].kind, StepKind::Write { path, .. } if path.ends_with("gateway.toml"))
         );
+    }
+
+    #[test]
+    fn plan_never_overwrites_an_earlier_backup() {
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            "# second edit\n".into(),
+        );
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml.osh-bak".into(),
+            "# first edit\n".into(),
+        );
+        let steps = plan(&facts(Os::Linux), &Options::default(), &h, &paths(), false);
+        let StepKind::Write { path, content } = &steps[0].kind else {
+            panic!("{:?}", steps[0])
+        };
+        assert_eq!(
+            path,
+            Path::new("/h/.config/openshell/gateway.toml.osh-bak.1")
+        );
+        assert_eq!(content, "# second edit\n");
     }
 
     #[test]
