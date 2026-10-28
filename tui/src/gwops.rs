@@ -263,6 +263,39 @@ pub fn brew_service_config_step(
     )
 }
 
+/// Restarts a gateway whose service is up while its runtime was down (a stopped Podman machine or
+/// Colima): once the runtime is back, the gateway starts over against it.
+pub fn restart_gateway_steps(f: &Facts, spec: &GatewaySpec) -> Vec<Step> {
+    let packaged = spec.main && !(f.os == Os::MacOs && spec.kind != GwKind::Vm);
+    let restart = match (f.os, packaged) {
+        (Os::Linux, true) => st(
+            spec,
+            "restart",
+            "Restart the OpenShell gateway service",
+            cmd("systemctl", &["--user", "restart", "openshell-gateway"]),
+        ),
+        (Os::MacOs, true) => st(
+            spec,
+            "restart",
+            "Restart the OpenShell gateway service",
+            cmd("brew", &["services", "restart", "openshell"]),
+        ),
+        _ => restart_extra_steps(f, spec).remove(0),
+    };
+    chain(
+        vec![
+            restart,
+            st(
+                spec,
+                "wait",
+                "Wait for the gateway to answer",
+                script(WAIT_SCRIPT, &[&spec.name]),
+            ),
+        ],
+        None,
+    )
+}
+
 /// Config (written once), service, registration and wait for a gateway osh runs as its own service.
 fn own_service_steps(
     f: &Facts,
@@ -1640,6 +1673,28 @@ mod tests {
             x.contains("<key>EnvironmentVariables</key>") && x.contains("/opt/homebrew/bin"),
             "{x}"
         );
+    }
+
+    #[test]
+    fn a_gateway_whose_runtime_was_down_is_restarted_by_its_own_service() {
+        let mut steps =
+            restart_gateway_steps(&facts(Os::MacOs), &spec(GwKind::Podman, 17671, false));
+        assert!(steps[0].command_line().contains("launchctl kickstart -k"));
+        assert_eq!(steps[1].after, Some(steps[0].id));
+        steps = restart_gateway_steps(&facts(Os::MacOs), &spec(GwKind::Docker, 17670, true));
+        assert!(
+            steps[0].command_line().contains("launchctl kickstart -k"),
+            "osh's own agent"
+        );
+        steps = restart_gateway_steps(&facts(Os::Linux), &spec(GwKind::Docker, 17670, true));
+        assert_eq!(
+            steps[0].command_line(),
+            "systemctl --user restart openshell-gateway"
+        );
+        steps = restart_gateway_steps(&facts(Os::Linux), &spec(GwKind::Podman, 17671, false));
+        assert!(steps[0]
+            .command_line()
+            .contains("restart osh-gateway-openshell-podman.service"));
     }
 
     #[test]

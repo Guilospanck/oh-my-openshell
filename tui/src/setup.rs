@@ -839,6 +839,7 @@ pub fn plan_gateways(
             continue;
         };
         let known = existing.iter().any(|(n, _)| *n == spec.name);
+        let runtime_down = availability(f, *k).state == State::NeedsInstall;
         let mut g = if spec.main {
             crate::gwops::main_gateway_steps(f, p, h, reg, spec, !known)
         } else if !known || !crate::gwops::extra_running(f.os, h, spec) {
@@ -846,7 +847,12 @@ pub fn plan_gateways(
         } else {
             Vec::new()
         };
-        if !g.is_empty() && availability(f, *k).state == State::NeedsInstall {
+        // Its service is up but its runtime is not (a stopped Podman machine or Colima): bring
+        // the runtime back, then restart the gateway against it.
+        if g.is_empty() && runtime_down && *k != GwKind::Vm {
+            g = crate::gwops::restart_gateway_steps(f, spec);
+        }
+        if !g.is_empty() && runtime_down {
             let wait = revive.kind_prereqs(*k, None);
             if let Some(first) = g.first_mut() {
                 first.after = first.after.or(wait);
@@ -1919,6 +1925,8 @@ mod tests {
     fn kinds_already_registered_or_known_to_the_cli_are_skipped() {
         let mut f = facts(Os::Linux, PkgMgr::Apt);
         f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Podman];
+        f.runtimes_ready = vec![Runtime::Podman];
         let mut reg = crate::gwmodel::Registry::default();
         reg.add(crate::gwmodel::GatewaySpec {
             name: "openshell-podman".into(),
@@ -2210,6 +2218,70 @@ mod tests {
                 .all(|r| r.contains("17670") && !r.contains("17671")),
             "{regs:?}"
         );
+    }
+
+    #[test]
+    fn a_stopped_podman_machine_is_started_even_while_its_gateway_agent_is_loaded() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = true;
+        f.has_e2fsprogs = true;
+        f.colima = true;
+        f.runtimes_installed = vec![Runtime::Docker, Runtime::Podman];
+        f.runtimes_ready = vec![Runtime::Docker];
+        f.podman_machine = PodmanMachine::Stopped;
+        let reg = registered(&[
+            (GwKind::Docker, 17670, true),
+            (GwKind::Podman, 17671, false),
+        ]);
+        let p = gw_paths();
+        let mut h = FakeHost::default();
+        // Both agents are loaded (launchctl print succeeds) and current.
+        for spec in &reg.gateways {
+            let logs = crate::gwops::db_dir_for(&p, Os::MacOs, spec);
+            h.files.insert(
+                crate::gwops::agent_plist_path(&p, &spec.name)
+                    .to_string_lossy()
+                    .into_owned(),
+                crate::gwops::launchd_plist(spec, &p.exe, &logs),
+            );
+            h.files.insert(
+                crate::gwops::config_path(&p, &spec.name)
+                    .to_string_lossy()
+                    .into_owned(),
+                "x".into(),
+            );
+        }
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+            &h,
+            &p,
+            &reg,
+            &known_of(&reg),
+            &|_| false,
+        )
+        .unwrap();
+        let t = lines(&steps).join("\n");
+        assert!(t.contains("podman machine start"), "{t}");
+        assert!(!t.contains("podman machine init"), "{t}");
+        assert!(!t.contains("colima"), "Docker answers: {t}");
+        let restart = get(&steps, "gw-podman-restart");
+        assert!(restart.command_line().contains("kickstart -k"), "{t}");
+        assert_eq!(restart.after, Some("pm-start"));
+        // With the machine running again, nothing is left to do.
+        f.runtimes_ready.push(Runtime::Podman);
+        f.podman_machine = PodmanMachine::Running;
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker, GwKind::Podman]),
+            &h,
+            &p,
+            &reg,
+            &known_of(&reg),
+            &|_| false,
+        )
+        .unwrap();
+        assert!(steps.is_empty(), "{:?}", lines(&steps));
     }
 
     #[test]
