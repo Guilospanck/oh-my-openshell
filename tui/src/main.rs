@@ -248,7 +248,23 @@ fn first_run(data: &Path) -> bool {
 fn subcommand(args: &[String]) -> Option<i32> {
     match args.first().map(String::as_str)? {
         "doctor" => {
-            let (text, ok) = setup::doctor(&platform::gather(&platform::RealHost));
+            let f = platform::gather(&platform::RealHost);
+            // Without a usable HOME there is no registry to read: assume the strict default.
+            let needed = match gateway::Paths::from_env(
+                std::env::var_os("HOME"),
+                std::env::var_os("XDG_CONFIG_HOME"),
+                Some(assets::data_dir()),
+            ) {
+                Ok(p) => setup::runtime_needed(
+                    &f,
+                    &gwmodel::Registry::load(&p.data),
+                    std::fs::read_to_string(p.config_home.join("gateway.toml"))
+                        .ok()
+                        .as_deref(),
+                ),
+                Err(_) => setup::runtime_needed(&f, &gwmodel::Registry::default(), None),
+            };
+            let (text, ok) = setup::doctor(&f, needed);
             print!("{text}");
             Some(if ok { 0 } else { 1 })
         }

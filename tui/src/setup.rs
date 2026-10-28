@@ -1075,8 +1075,33 @@ pub fn execute_events(
     results
 }
 
+/// Whether this machine's gateways need a container runtime. Only on Linux, and not when every
+/// gateway osh set up is a VM gateway (or, with none registered, when the installed
+/// `gateway.toml` drives the vm driver).
+pub fn runtime_needed(
+    f: &Facts,
+    reg: &crate::gwmodel::Registry,
+    gateway_toml: Option<&str>,
+) -> bool {
+    if f.os != Os::Linux {
+        return false;
+    }
+    if !reg.gateways.is_empty() {
+        return reg.gateways.iter().any(|g| g.kind != GwKind::Vm);
+    }
+    let vm_config = gateway_toml.is_some_and(|t| {
+        t.lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("compute_driver"))
+            .and_then(|l| l.split('"').nth(1))
+            == Some("vm")
+    });
+    !vm_config
+}
+
 /// Read-only report: `(text, ok)`, `ok` false when a hard requirement is missing.
-pub fn doctor(f: &Facts) -> (String, bool) {
+/// `runtime_needed` (see `runtime_needed`) makes a missing container runtime one of those.
+pub fn doctor(f: &Facts, runtime_needed: bool) -> (String, bool) {
     let mut out = String::new();
     let mut ok = true;
     let mut line = |state: &str, name: &str, note: &str| {
@@ -1093,12 +1118,11 @@ pub fn doctor(f: &Facts) -> (String, bool) {
         ok = false;
         line("MISSING", "openshell", "osh setup installs it");
     }
-    let runtime_needed = f.os == Os::Linux;
     if let Some(rt) = f.runtime() {
         line("ok", &format!("container runtime ({})", rt.bin()), "");
     } else {
         let note = if f.runtimes_installed.is_empty() {
-            "osh setup --gateways docker|podman|vm sets one up".to_string()
+            "osh setup --gateways docker or --gateways podman sets one up".to_string()
         } else if f.docker_permission_denied {
             "docker is running but this user is not allowed to use docker yet; log out and back in"
                 .to_string()
@@ -1112,7 +1136,7 @@ pub fn doctor(f: &Facts) -> (String, bool) {
             line(
                 "optional",
                 "container runtime",
-                &format!("image builds and the Docker gateway; {note}"),
+                &format!("image builds and the Docker or Podman gateway; {note}"),
             );
         }
     }
@@ -2948,7 +2972,7 @@ mod tests {
     #[test]
     fn doctor_flags_missing_openshell_and_runtime() {
         let f = gather_for(&FakeHost::default(), Os::Linux);
-        let (text, ok) = doctor(&f);
+        let (text, ok) = doctor(&f, true);
         assert!(!ok);
         assert!(text.contains("MISSING  openshell"));
         assert!(text.contains("MISSING  container runtime"));
@@ -2960,14 +2984,14 @@ mod tests {
         let mut f = facts(Os::Linux, PkgMgr::Apt);
         f.runtimes_installed = vec![Runtime::Docker];
         f.docker_permission_denied = true;
-        let (text, ok) = doctor(&f);
+        let (text, ok) = doctor(&f, true);
         assert!(!ok);
         assert!(
             text.contains("not allowed to use docker") && text.contains("log out"),
             "{text}"
         );
         f.docker_permission_denied = false;
-        assert!(doctor(&f).0.contains("not answering"));
+        assert!(doctor(&f, true).0.contains("not answering"));
     }
 
     #[test]
@@ -3001,9 +3025,38 @@ mod tests {
     }
 
     #[test]
+    fn a_vm_only_linux_machine_does_not_need_a_container_runtime() {
+        let f = facts(Os::Linux, PkgMgr::Apt);
+        let vm = registered(&[(GwKind::Vm, 17670, true)]);
+        assert!(!runtime_needed(&f, &vm, None));
+        let both = registered(&[(GwKind::Vm, 17670, true), (GwKind::Podman, 17671, false)]);
+        assert!(runtime_needed(&f, &both, None));
+        let none = crate::gwmodel::Registry::default();
+        assert!(runtime_needed(&f, &none, None));
+        assert!(!runtime_needed(
+            &f,
+            &none,
+            Some("[openshell.gateway]\ncompute_driver = \"vm\"\n")
+        ));
+        assert!(!runtime_needed(
+            &facts(Os::MacOs, PkgMgr::Brew),
+            &none,
+            None
+        ));
+        let mut f = f;
+        f.has_openshell = true;
+        let (text, ok) = doctor(&f, runtime_needed(&f, &vm, None));
+        assert!(ok, "{text}");
+        assert!(
+            text.contains("optional container runtime") && !text.contains("|vm"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn doctor_is_ok_with_openshell_and_a_ready_runtime() {
         let h = FakeHost::with_bins(&["openshell", "podman"]);
-        let (text, ok) = doctor(&gather_for(&h, Os::Linux));
+        let (text, ok) = doctor(&gather_for(&h, Os::Linux), true);
         assert!(ok, "{text}");
         assert!(text.contains("ok       container runtime (podman)"));
     }
