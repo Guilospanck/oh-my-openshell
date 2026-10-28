@@ -12,7 +12,7 @@
 #   6. publish     commits the bump, pushes it and the tag, `gh release create`, pushes the tap
 #
 # The Linux archives build in containers. On an Apple Silicon Mac that is a separate Colima instance
-# with Rosetta (scripts/release-colima), started for the run and deleted afterwards (--keep-vm keeps
+# (scripts/release-colima), started for the run and deleted afterwards (--keep-vm keeps
 # it); --host-docker uses the Docker you already have instead. Elsewhere the current Docker or Podman.
 #
 # --dry-run stops after step 5 and puts the bump back. Nothing is pushed or installed: osh is
@@ -80,7 +80,7 @@ fi
 # build dies with "exec format error".
 if [[ ${#linux[@]} -gt 0 ]]; then
   if [[ $own_vm -eq 1 && "$(uname)" == Darwin && "$(uname -m)" == arm64 ]]; then
-    say "release Colima instance (Rosetta)"
+    say "release Colima instance"
     vm_up=1
     sock="$("$repo/scripts/release-colima" up)"
     unset DOCKER_CONTEXT

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # scripts/release-colima up|down
 #
-# A separate Colima instance for the Linux release archives on an Apple Silicon Mac. Its VM uses
-# Apple's Virtualization framework with Rosetta, so linux/amd64 containers run at near native
-# speed next to the native linux/arm64 ones (the GitHub workflow gets both from native runners).
+# A separate Colima instance for the Linux release archives on an Apple Silicon Mac. linux/arm64
+# containers run natively; linux/amd64 ones run under QEMU emulation inside the VM (slow, and the
+# GitHub workflow instead gets both from native runners). Nothing is installed on the Mac.
 #
 #   up     starts it if needed and prints the Docker socket path on stdout (everything else on stderr)
 #   down   deletes the instance and its disk
@@ -31,11 +31,9 @@ case "${1:-}" in
     if col status -p "$profile" >/dev/null 2>&1; then
       echo "release-colima: reusing the running instance $profile ($COLIMA_HOME)" >&2
     else
-      [[ -e /Library/Apple/usr/share/rosetta/rosetta ]] \
-        || { echo "release-colima: Rosetta is not installed (the amd64 containers need it). Run: softwareupdate --install-rosetta --agree-to-license" >&2; exit 1; }
-      echo "release-colima: starting the instance $profile with Rosetta ($COLIMA_HOME)" >&2
+      echo "release-colima: starting the instance $profile ($COLIMA_HOME)" >&2
       mkdir -p "$COLIMA_HOME"
-      col start -p "$profile" --vm-type vz --vz-rosetta --cpu 6 --memory 8 --disk 60 \
+      col start -p "$profile" --vm-type vz --cpu 6 --memory 8 --disk 60 \
         --activate=false --ssh-config=false >"$COLIMA_HOME/start.log" 2>&1 \
         || { tail -20 "$COLIMA_HOME/start.log" >&2; exit 1; }
     fi

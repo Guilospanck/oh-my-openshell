@@ -84,7 +84,7 @@ test-release:
 
 # Release, all from this machine (what .github/workflows/release.yml does in CI). Nothing here installs or runs osh.
 
-# One-time and read-only: checks gh login, push access to the Homebrew tap, Colima and Rosetta (Apple Silicon) or Docker for the Linux archives, brew, Zig
+# One-time and read-only: checks gh login, push access to the Homebrew tap, Colima (Apple Silicon) or Docker for the Linux archives, brew, Zig
 release-setup:
 	#!/usr/bin/env bash
 	set -u
@@ -106,9 +106,8 @@ release-setup:
 	source "{{justfile_directory()}}/dev-env"
 	osh_use_zig && ok "zig 0.15" || no "zig 0.15" "brew install zig@0.15"
 	if [[ "$(uname)" == Darwin && "$(uname -m)" == arm64 ]]; then
-	    # The Linux archives build in their own Colima instance with Rosetta (scripts/release-colima)
+	    # The Linux archives build in their own Colima instance (scripts/release-colima)
 	    command -v colima >/dev/null 2>&1 && command -v limactl >/dev/null 2>&1 && ok "colima, limactl" || no "colima and limactl" "brew install colima lima docker"
-	    [[ -e /Library/Apple/usr/share/rosetta/rosetta ]] && ok "Rosetta (amd64 Linux archive)" || no "Rosetta" "softwareupdate --install-rosetta --agree-to-license"
 	elif docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1; then ok "container runtime running (Linux archives)"; else no "running Docker or Podman" "start it; or release with --no-linux"; fi
 	exit $bad
 
