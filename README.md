@@ -24,7 +24,18 @@ osh gateway-reset NAME      # wipe a gateway's sandboxes and database (typed con
 osh sync-agents --dry-run   # preview what a sandbox would get from your agent setup
 ```
 
-Install from a release (Linux or macOS, x86_64 or aarch64): `curl -fsSL
+Install with Homebrew (macOS or Linux):
+
+```sh
+brew install Guilospanck/tap/oh-my-openshell   # taps Guilospanck/homebrew-tap on first use
+osh setup                                      # then install what osh needs (asks before each step)
+```
+
+Homebrew installs only the `osh` binary; it does not install OpenShell, a container runtime or a gateway until you
+run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. Releases currently ship Apple Silicon macOS and arm64
+Linux archives, so Intel Macs and x86_64 Linux need to build from source until those archives are added.
+
+Install from a release (Linux or macOS, aarch64; x86_64 once those archives are published): `curl -fsSL
 https://raw.githubusercontent.com/Guilospanck/oh-my-openshell/main/install.sh | sh` downloads
 `osh-VERSION-OS-ARCH.tar.gz`, checks its `.sha256`, puts `osh` in `~/.local/bin` and runs `osh setup`
 (asking before each step, on the terminal even when piped). Environment: `OSH_VERSION` (release tag; default the
@@ -327,3 +338,7 @@ them (`just install`, `upgrade`, `uninstall`, `gateway-docker`, `tui`) and
 whole staged snapshot with [Gitleaks](https://github.com/gitleaks/gitleaks)
 (`brew install gitleaks`) and refuses `.env` files. Rules live in
 `.gitleaks.toml`. A missing scanner or scan error blocks the commit.
+
+## License
+
+[MIT](LICENSE).
