@@ -263,6 +263,30 @@ pub fn brew_service_config_step(
     )
 }
 
+/// Colima's folder as Colima itself picks it (`config/files.go`): `$COLIMA_HOME` when that
+/// exists, else `~/.colima` when that exists, else `$XDG_CONFIG_HOME/colima` when that is set,
+/// else `~/.colima`. In `gateway.env` form: `${HOME}` stays a variable.
+pub fn colima_dir(h: &dyn Host, p: &Paths) -> String {
+    let set = |k: &str| h.env(k).filter(|v| !v.is_empty());
+    if let Some(dir) = set("COLIMA_HOME").filter(|d| h.exists(Path::new(d))) {
+        return dir;
+    }
+    if !h.exists(&p.home.join(".colima")) {
+        if let Some(xdg) = set("XDG_CONFIG_HOME").filter(|d| Path::new(d).is_absolute()) {
+            return format!("{}/colima", xdg.trim_end_matches('/'));
+        }
+    }
+    "${HOME}/.colima".into()
+}
+
+/// `gateway.env` for this machine: the embedded file, pointing at the Docker socket of Colima's
+/// default profile wherever Colima keeps it.
+pub fn gateway_env(h: &dyn Host, p: &Paths) -> String {
+    assets::embedded("gateway.env")
+        .unwrap_or_default()
+        .replace("${HOME}/.colima", &colima_dir(h, p))
+}
+
 /// Restarts a gateway whose service is up while its runtime was down (a stopped Podman machine or
 /// Colima): once the runtime is back, the gateway starts over against it.
 pub fn restart_gateway_steps(f: &Facts, spec: &GatewaySpec) -> Vec<Step> {
@@ -356,7 +380,7 @@ fn own_service_steps(
                     "Write gateway.env (Colima Docker socket)",
                     StepKind::Write {
                         path: p.config_home.join("gateway.env"),
-                        content: assets::embedded("gateway.env").unwrap_or_default().into(),
+                        content: gateway_env(h, p),
                     },
                 ));
             }
@@ -1673,6 +1697,58 @@ mod tests {
             x.contains("<key>EnvironmentVariables</key>") && x.contains("/opt/homebrew/bin"),
             "{x}"
         );
+    }
+
+    #[test]
+    fn gateway_env_points_where_colima_keeps_its_socket() {
+        let p = paths();
+        let sock = |h: &FakeHost| {
+            gateway_env(h, &p)
+                .lines()
+                .find(|l| l.starts_with("DOCKER_HOST="))
+                .unwrap()
+                .to_string()
+        };
+        let mut h = FakeHost::default();
+        assert_eq!(
+            sock(&h),
+            "DOCKER_HOST=\"unix://${HOME}/.colima/docker.sock\""
+        );
+        // XDG_CONFIG_HOME set and no ~/.colima: Colima lives under it.
+        h.env.insert("XDG_CONFIG_HOME".into(), "/x/cfg/".into());
+        assert_eq!(sock(&h), "DOCKER_HOST=\"unix:///x/cfg/colima/docker.sock\"");
+        // An existing ~/.colima wins over XDG_CONFIG_HOME, as in Colima.
+        h.paths.insert("/h/.colima".into());
+        assert_eq!(
+            sock(&h),
+            "DOCKER_HOST=\"unix://${HOME}/.colima/docker.sock\""
+        );
+        // COLIMA_HOME wins when that folder exists, and only then.
+        h.env.insert("COLIMA_HOME".into(), "/c/home".into());
+        assert_eq!(
+            sock(&h),
+            "DOCKER_HOST=\"unix://${HOME}/.colima/docker.sock\""
+        );
+        h.paths.insert("/c/home".into());
+        assert_eq!(sock(&h), "DOCKER_HOST=\"unix:///c/home/docker.sock\"");
+        // The written file is this one.
+        let steps = add_gateway_steps(
+            &facts(Os::MacOs),
+            &p,
+            &h,
+            &Registry::default(),
+            &spec(GwKind::Docker, 17671, false),
+        );
+        let env = steps
+            .iter()
+            .find_map(|s| match &s.kind {
+                StepKind::Write { path, content } if path.ends_with("gateway.env") => {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(env.contains("unix:///c/home/docker.sock"), "{env}");
     }
 
     #[test]
