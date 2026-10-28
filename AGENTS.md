@@ -66,10 +66,20 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   (OpenShell installer, systemd and the container runtime daemons stubbed); `just test-linux-real
   podman|docker` boots a systemd machine with nothing stubbed and runs the two-gateway
   scenarios (add, remove, reset, uninstall); the podman run also drives the wizard in a real
-  pseudo-terminal. `just test-linux` also parses the launchd plists with Python's `plistlib` and lints
-  the release workflow with actionlint. It
+  pseudo-terminal. `just test-linux-real vm` does the same for the VM gateway with `--device
+  /dev/kvm`; without KVM on the Docker host (Colima needs `--nested-virtualization`) it prints
+  SKIPPED and exits 77, which is not a pass. `just test-linux` also parses the launchd plists with
+  Python's `plistlib` and lints the release workflow with actionlint. It
   proves our commands are right for each distro, not that OpenShell's packages
   and systemd unit behave as assumed; a real Linux host is still untested.
+- macOS paths are picked by `cfg!(target_os)` at run time, so containers cannot run them.
+  `just test-macos` (on a Mac; `tests/macos/`) runs the macOS build in a throwaway HOME under
+  `sandbox-exec` (no writes outside it, the real launchctl, sudo, curl and Homebrew cannot start)
+  against recording stand-ins for brew, launchctl, colima, docker, podman and openshell, and checks
+  command order, launchd's rules (`plutil -lint`, label, no double bootstrap) and the registry
+  through setup, add, reset, remove and uninstall. Real launchd, Homebrew services, Colima,
+  Podman machines and Docker Desktop stay untested. `just test-release` runs the release
+  workflow's Linux build and publish jobs with act (recording `gh`); the macOS entries need GitHub.
 - Keep new code portable: no BSD-only or GNU-only flags without a branch on
   `uname` / `cfg!(target_os)`, no hard-coded `/opt/homebrew` outside the macOS
   code paths.

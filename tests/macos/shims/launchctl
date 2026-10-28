@@ -1,0 +1,42 @@
+#!/bin/bash
+# launchctl stand-in that keeps launchd's rules for the calls osh makes, so ordering mistakes fail
+# here as they would on a Mac:
+#   bootstrap gui/UID PLIST  the plist must pass `plutil -lint`, its Label must match the file name,
+#                            ProgramArguments[0] must be executable, and the label must not be
+#                            loaded already (real launchd: "Bootstrap failed: 5: Input/output error")
+#   bootout gui/UID/LABEL    fails with 3 when the label is not loaded (osh adds `|| true`)
+#   print gui/UID/LABEL      succeeds only for a loaded label
+#   kickstart -k gui/UID/LABEL
+# The domain must be the caller's own gui/UID. Loaded labels live in $HOME/.launchd.
+echo "launchctl $*" >> "${STUB_LOG:?}"
+loaded="$HOME/.launchd"
+mkdir -p "$loaded"
+domain="gui/$(id -u)"
+die() { echo "launchctl: $1" >&2; exit "${2:-5}"; }
+case "$1" in
+  bootstrap)
+    [ "$2" = "$domain" ] || die "bootstrap: wrong domain $2 (want $domain)" 125
+    plist="$3"
+    [ -f "$plist" ] || die "Bootstrap failed: 2: No such file or directory" 2
+    plutil -lint -s "$plist" || die "Bootstrap failed: $plist is not a valid property list"
+    label="$(plutil -extract Label raw -o - "$plist")" || die "Bootstrap failed: no Label"
+    [ "$(basename "$plist" .plist)" = "$label" ] || die "Bootstrap failed: Label $label does not match $plist"
+    prog="$(plutil -extract ProgramArguments.0 raw -o - "$plist")" || die "Bootstrap failed: no ProgramArguments"
+    [ -x "$prog" ] || die "Bootstrap failed: $prog is not executable"
+    [ -e "$loaded/$label" ] && die "Bootstrap failed: 5: Input/output error"
+    cp "$plist" "$loaded/$label" ;;
+  bootout)
+    case "$2" in "$domain"/*) ;; *) die "bootout: wrong domain $2" 125 ;; esac
+    label="${2##*/}"
+    [ -e "$loaded/$label" ] || die "Boot-out failed: 3: No such process" 3
+    rm -f "$loaded/$label" ;;
+  print)
+    case "$2" in "$domain"/*) ;; *) die "print: wrong domain $2" 125 ;; esac
+    [ -e "$loaded/${2##*/}" ] || die "Could not find service \"${2##*/}\" in domain for user gui: $(id -u)" 113 ;;
+  kickstart)
+    [ "$2" = -k ] || die "kickstart: osh always passes -k" 125
+    case "$3" in "$domain"/*) ;; *) die "kickstart: wrong domain $3" 125 ;; esac
+    [ -e "$loaded/${3##*/}" ] || die "Could not find service" 113 ;;
+  *) die "unexpected launchctl call: $*" 125 ;;
+esac
+exit 0

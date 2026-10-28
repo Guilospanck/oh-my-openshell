@@ -1,0 +1,19 @@
+#!/bin/bash
+# Homebrew stand-in. Records every call in $STUB_LOG. `install` puts each named tool on PATH
+# ($HOME/.installed: from ../installable when there is a stand-in for it, else a no-op), so a tool
+# is absent until brew installed it, as on a fresh Mac. `services` succeeds; `--prefix` says the
+# formula is not installed, so osh falls back to openshell-gateway on PATH.
+echo "brew $*" >> "${STUB_LOG:?}"
+src="$(cd "$(dirname "$0")/../installable" && pwd)"
+case "$1" in
+  install)
+    shift
+    mkdir -p "$HOME/.installed"
+    for t in "$@"; do
+      if [ -f "$src/$t" ]; then cp "$src/$t" "$HOME/.installed/$t"; else printf '#!/bin/sh\nexit 0\n' > "$HOME/.installed/$t"; fi
+      chmod +x "$HOME/.installed/$t"
+    done ;;
+  uninstall) shift; for t in "$@"; do rm -f "$HOME/.installed/$t"; done ;;
+  --prefix) exit 1 ;;
+esac
+exit 0

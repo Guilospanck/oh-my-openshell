@@ -272,8 +272,12 @@ and a bare `just` lists the recipes. Both build on macOS and Linux (Zig 0.15 on
 PATH, or `brew install zig@0.15` with Homebrew or Linuxbrew). The Linux
 install, uninstall and gateway-reset paths follow OpenShell's packaged systemd
 service. `just test-linux` checks them in Docker (Ubuntu, Fedora, Arch) with real
-package installs and stubbed OpenShell and systemd; they have not run on a real
-Linux host.
+package installs and stubbed OpenShell and systemd, and `just test-linux-real
+podman|docker|vm` in a systemd container with nothing stubbed (vm needs /dev/kvm
+on the Docker host and is skipped without it); they have not run on a real Linux
+host. `just test-macos` runs the macOS paths on a Mac against recording stand-ins
+for Homebrew, launchd, Colima and Podman without changing the Mac, and
+`just test-release` runs the release workflow's Linux jobs with act.
 
 ## Setup without the dashboard
 

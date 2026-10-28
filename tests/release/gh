@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stands in for the GitHub CLI in the act job container: prints what `gh release create` would
+# publish (the command and each file with its size) and changes nothing on GitHub.
+set -euo pipefail
+echo "gh-stub: gh $*"
+for a in "$@"; do
+  if [[ -f "$a" ]]; then echo "gh-stub: asset $a $(wc -c <"$a") bytes"; fi
+done

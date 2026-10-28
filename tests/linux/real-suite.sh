@@ -3,6 +3,8 @@
 #   podman machine: one gateway, openshell-podman (main), plus the VM type reported unavailable.
 #   docker machine: two gateways, openshell-docker (main) and openshell-podman (extra), then add,
 #                   remove and reset of the extra.
+#   vm machine:     one gateway, openshell-vm (main), on /dev/kvm passed in by real.sh: the user joins
+#                   the kvm group, logs in again, then the VM gateway answers, resets, uninstalls.
 set -uo pipefail
 
 runtime="${1:-podman}"
@@ -29,8 +31,16 @@ out="$(osh doctor 2>&1)"; rc=$?
 [[ $rc -eq 1 ]] && pass "doctor exits 1 on a bare machine" || fail "doctor exits 1 on a bare machine" "rc=$rc"
 grep -q 'MISSING  openshell' <<<"$out" && pass "doctor reports openshell missing" || fail "doctor reports openshell missing" "$out"
 
-if [[ "$runtime" == docker ]]; then gateways="docker,podman"; main=openshell-docker; extra=openshell-podman
-else gateways="podman"; main=openshell-podman; extra=""; fi
+case "$runtime" in
+  docker) gateways="docker,podman"; main=openshell-docker; extra=openshell-podman ;;
+  vm) gateways="vm"; main=openshell-vm; extra="" ;;
+  *) gateways="podman"; main=openshell-podman; extra="" ;;
+esac
+if [[ "$runtime" == vm && "$phase" != after-login ]]; then
+  # real.sh only starts a vm run when the host has KVM; make sure it really reached the machine.
+  check "/dev/kvm is in the machine" test -c /dev/kvm
+  check "the user cannot use it yet (not in the kvm group)" bash -c '! test -w /dev/kvm'
+fi
 
 echo "== setup --dry-run plans without changing anything"
 out="$(osh setup --gateways "$gateways" --dry-run </dev/null 2>&1)"; rc=$?
@@ -39,15 +49,17 @@ check "dry-run installed nothing" bash -c '! command -v openshell'
 without_yes="$(osh setup --gateways "$gateways" </dev/null 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && grep -q -- '--yes' <<<"$without_yes" && pass "without a terminal or --yes, nothing runs" || fail "setup refuses without a terminal" "rc=$rc"
 check "refusing installed nothing" bash -c '! command -v openshell'
+if [[ "$runtime" != vm ]]; then
 out="$(osh setup --gateways vm --yes </dev/null 2>&1)"; rc=$?
 [[ $rc -eq 2 ]] && grep -q '/dev/kvm' <<<"$out" && pass "the VM type is refused with the reason where there is no KVM" || fail "VM refused without KVM" "rc=$rc $out"
+fi
 out="$(osh setup --gateways lxc --yes </dev/null 2>&1)"; rc=$?
 [[ $rc -eq 2 ]] && pass "an unknown gateway type is refused" || fail "unknown type refused" "rc=$rc $out"
 
-if [[ "$runtime" == docker && "$phase" != after-login ]]; then
-  # Joining the docker group only reaches the user's systemd services after a new login, and the
-  # gateway is one of them, so osh must stop and say so instead of installing OpenShell too early.
-  echo "== docker: the first setup stops for a new login"
+if [[ ( "$runtime" == docker || "$runtime" == vm ) && "$phase" != after-login ]]; then
+  # Joining the docker (or kvm) group only reaches the user's systemd services after a new login,
+  # and the gateway is one of them, so osh must stop and say so instead of installing OpenShell too early.
+  echo "== $runtime: the first setup stops for a new login"
   osh setup --gateways "$gateways" --yes >"$log" 2>&1; rc=$?
   [[ $rc -ne 0 ]] && grep -q 'log out and back in' "$log" \
     && pass "the first setup asks for a new login" || { fail "the first setup asks for a new login" "rc=$rc"; tail -15 "$log"; }
@@ -58,7 +70,7 @@ if [[ "$runtime" == docker && "$phase" != after-login ]]; then
   # And a new login is a new process tree with the new groups: carry on in one.
   exec sudo -u tester -H env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" \
     "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" "PATH=$PATH" "PREV_FAILS=$fails" \
-    bash "$0" docker after-login
+    bash "$0" "$runtime" after-login
 fi
 
 if [[ "$runtime" == podman ]]; then
@@ -79,7 +91,12 @@ fi
   grep -E '^(\[[0-9]+/[0-9]+\]|failed:|skipped|do yourself|declined|openshell:|Failed|cp:|E:)' "$log" | head -70
 }
 check "openshell is installed" openshell --version
-check "the runtime is installed" command -v "$runtime"
+if [[ "$runtime" == vm ]]; then
+  check "the user can use /dev/kvm after the new login" test -w /dev/kvm
+  check "e2fsprogs is installed for the VM driver" command -v mke2fs
+else
+  check "the runtime is installed" command -v "$runtime"
+fi
 check "the gateway service is enabled" systemctl --user is-enabled openshell-gateway
 check "the gateway service is active" systemctl --user is-active openshell-gateway
 if [[ "$runtime" == podman ]]; then check "the podman socket is active" systemctl --user is-active podman.socket; fi
@@ -120,8 +137,10 @@ check "the service is active again" systemctl --user is-active openshell-gateway
 connected "$main" && pass "the main answers again" || fail "the main answers again"
 
 echo "== adding a type that cannot work, and one that already exists"
+if [[ "$runtime" != vm ]]; then
 out="$(osh gateway add vm --yes </dev/null 2>&1)"; rc=$?
 [[ $rc -eq 2 ]] && grep -q '/dev/kvm' <<<"$out" && pass "gateway add vm is refused with the reason" || fail "gateway add vm refused" "rc=$rc $out"
+fi
 out="$(osh gateway add "$runtime" --yes </dev/null 2>&1)"; rc=$?
 [[ $rc -eq 0 && "$out" == *"Nothing to do"* ]] && pass "adding an existing type is a no-op" || fail "adding an existing type is a no-op" "rc=$rc $out"
 

@@ -43,7 +43,7 @@ for d in "${distros[@]}"; do
   fi
 done
 
-# The release workflow cannot run without CI credits, but it can be linted.
+# The release workflow is linted here; `just test-release` runs its Linux jobs under act.
 echo "######## .github/workflows (actionlint)"
 docker run --rm -v "$repo:/repo:ro" -w /repo rhysd/actionlint:1.7.7 -color || failed+=("actionlint")
 

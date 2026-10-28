@@ -58,9 +58,17 @@ test-linux *args:
 # Developer wrappers: the logic lives in the osh binary (`osh setup`, `osh upgrade`, ...). They run the
 # checkout's launcher, which rebuilds osh when its sources changed.
 
-# Real, unstubbed Linux test: a systemd container, real packages, OpenShell and a real gateway (podman|docker)
+# Real, unstubbed Linux test: a systemd container, real packages, OpenShell and a real gateway (podman|docker|vm; vm needs /dev/kvm on the Docker host, else it is skipped with exit 77)
 test-linux-real runtime="podman":
 	@"{{justfile_directory()}}/tests/linux/real.sh" {{runtime}}
+
+# macOS only, changes nothing on the Mac: the macOS build against recording brew/launchctl/colima/podman stand-ins in a sandboxed throwaway HOME, plutil -lint on the agents
+test-macos:
+	@"{{justfile_directory()}}/tests/macos/run.sh"
+
+# Runs the release workflow's Linux build and publish jobs for real with act in Docker (gh is a recording stand-in; macOS entries need GitHub)
+test-release:
+	@"{{justfile_directory()}}/tests/release/run.sh"
 
 # Installs OpenShell, a container runtime and the gateway for this OS (asks before each step)
 install *args:

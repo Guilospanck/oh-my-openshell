@@ -1,0 +1,4 @@
+#!/bin/bash
+# Records the VM sweep after a reset instead of signalling real processes.
+echo "pkill $*" >> "${STUB_LOG:?}"
+exit 0
