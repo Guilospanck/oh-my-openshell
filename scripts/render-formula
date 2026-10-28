@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# scripts/render-formula VERSION DIST_DIR
+#
+# Prints the Homebrew formula for the archives that scripts/release left in DIST_DIR
+# (osh-VERSION-OS-ARCH.tar.gz with a .sha256 next to each). VERSION keeps its leading "v".
+# A platform without an archive gets no block, so a Mac-only or partial release never
+# ships a formula that points at a file that does not exist.
+#
+# Single source of truth for the formula: `just release-lint` renders it with placeholder
+# hashes, `just release` renders it with the real ones and pushes it to the tap.
+set -euo pipefail
+
+[[ $# -eq 2 ]] || { echo "usage: $0 vX.Y.Z DIST_DIR" >&2; exit 2; }
+tag="$1"
+dist="$2"
+[[ "$tag" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "version must look like v1.2.3 (got '$tag')" >&2; exit 2; }
+version="${tag#v}"
+repo="Guilospanck/oh-my-openshell"
+
+# Prints the sha256 of the archive for $1 (darwin|linux) and $2 (aarch64|x86_64); empty if absent.
+sha_of() {
+  local f="$dist/osh-$tag-$1-$2.tar.gz.sha256"
+  [[ -f "$f" ]] && awk '{print $1}' "$f" || true
+}
+
+# Prints one `on_arm` / `on_intel` block for the OS and CPU, or nothing.
+block() {
+  local os="$1" arch="$2" cpu="$3" sha
+  sha="$(sha_of "$os" "$arch")"
+  [[ -n "$sha" ]] || return 0
+  cat <<RUBY
+    $cpu do
+      url "https://github.com/$repo/releases/download/v#{version}/osh-v#{version}-$os-$arch.tar.gz"
+      sha256 "$sha"
+    end
+RUBY
+}
+
+section() {
+  local os="$1" brew_os="$2" body
+  body="$(block "$os" aarch64 on_arm; block "$os" x86_64 on_intel)"
+  [[ -n "$body" ]] || return 0
+  printf '\n  %s do\n%s\n  end\n' "$brew_os" "$body"
+}
+
+macos="$(section darwin on_macos)"
+linux="$(section linux on_linux)"
+[[ -n "$macos$linux" ]] || { echo "no osh-$tag-*.tar.gz.sha256 in $dist" >&2; exit 1; }
+
+cat <<RUBY
+class OhMyOpenshell < Formula
+  desc "Terminal dashboard and portable config for NVIDIA OpenShell sandboxes"
+  homepage "https://github.com/$repo"
+  version "$version"
+$macos$linux
+
+  def install
+    bin.install "osh"
+  end
+
+  def caveats
+    <<~EOS
+      Installing osh does not install OpenShell, a container runtime or a gateway.
+      Run \`osh setup\` when you want those (it asks before each step).
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/osh --version")
+  end
+end
+RUBY

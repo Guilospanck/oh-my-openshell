@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# scripts/publish vX.Y.Z [--dry-run] [--notes TEXT] [--linux ARCH...] [--no-linux]
+#
+# The local equivalent of the release workflow, end to end: checks, version bump, archives,
+# formula lint, tag, GitHub release, Homebrew tap. Run it through `just release`.
+#
+#   1. preflight   clean tree, on main and level with origin, tag and release free, tools, tap access
+#   2. just check  fmt, clippy, tests
+#   3. bump        tui/Cargo.toml and Cargo.lock to the version (committed only after the build works)
+#   4. build       scripts/release: this Mac, plus Linux amd64 and arm64 in containers
+#   5. lint        renders the formula and runs `brew style` on it
+#   6. publish     commits the bump, pushes it and the tag, `gh release create`, pushes the tap
+#
+# --dry-run stops after step 5 and puts the bump back. Nothing is pushed or installed: osh is
+# never run, `osh setup` is never called. Needs gh (logged in) with push access to the tap.
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+tap_repo="Guilospanck/homebrew-tap"
+formula="oh-my-openshell"
+
+tag="${1:-}"
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: scripts/publish vX.Y.Z [--dry-run] [--notes TEXT] [--linux ARCH...] [--no-linux]" >&2; exit 2; }
+shift
+version="${tag#v}"
+dry=0
+notes=""
+linux=(amd64 arm64)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run) dry=1 ;;
+    --notes) notes="${2:-}"; shift ;;
+    --no-linux) linux=() ;;
+    --linux) linux=(); shift; while [[ $# -gt 0 && "$1" != --* ]]; do linux+=("$1"); shift; done; continue ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+say() { printf '\n== %s\n' "$*"; }
+die() { echo "publish: $*" >&2; exit 1; }
+cd "$repo"
+
+say "preflight"
+for t in git gh just cargo brew; do command -v "$t" >/dev/null 2>&1 || die "$t is required"; done
+if [[ ${#linux[@]} -gt 0 ]]; then
+  docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1 || die "the Linux archives need a running Docker or Podman (start Colima, or pass --no-linux)"
+fi
+gh auth status >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
+[[ -z "$(git status --porcelain)" ]] || die "working tree not clean: commit or stash first"
+[[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || die "release from main"
+git fetch --quiet origin main --tags
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main is not level with origin/main: pull or push first"
+git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "tag $tag already exists"
+if [[ $dry -eq 0 ]]; then
+  gh release view "$tag" >/dev/null 2>&1 && die "GitHub release $tag already exists"
+  [[ "$(gh repo view "$tap_repo" --json viewerPermission --jq .viewerPermission)" =~ ^(ADMIN|MAINTAIN|WRITE)$ ]] \
+    || die "no push access to $tap_repo (run: just release-setup)"
+fi
+echo "ok"
+
+say "just check"
+just --justfile "$repo/.justfile" check
+
+# Everything from here changes tracked files; a dry run (or any failure) puts them back.
+restore() { git checkout -- tui/Cargo.toml tui/Cargo.lock 2>/dev/null || true; }
+trap 'restore' ERR
+trap 'restore; exit 130' INT
+
+say "bump to $version"
+perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' tui/Cargo.toml
+rm -rf "$repo/dist"
+"$repo/scripts/release" "$tag" --out "$repo/dist" ${linux[@]+--linux "${linux[@]}"}
+git diff --quiet -- tui/Cargo.toml && die "version bump changed nothing (Cargo.toml is already $version)"
+host_bin="$repo/tui/target/release/osh-tui"
+[[ "$("$host_bin" --version)" == "osh $version" ]] || die "built binary reports '$("$host_bin" --version)', expected 'osh $version'"
+
+say "lint the formula"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"; restore' EXIT
+mkdir -p "$tmp/Formula"
+"$repo/scripts/render-formula" "$tag" "$repo/dist" > "$tmp/Formula/$formula.rb"
+cat "$tmp/Formula/$formula.rb"
+"$repo/scripts/brew-style" "$tmp/Formula/$formula.rb"
+
+if [[ $dry -eq 1 ]]; then
+  restore
+  say "dry run done: archives in dist/, nothing pushed, bump reverted"
+  exit 0
+fi
+
+say "commit, tag, push"
+git add tui/Cargo.toml tui/Cargo.lock
+git commit -q -m "release $tag"
+trap - ERR
+if [[ -n "${notes//[[:space:]]/}" ]]; then git tag -a "$tag" --cleanup=verbatim -m "$notes"; else git tag "$tag"; fi
+git push origin HEAD
+git push origin "$tag"
+
+say "GitHub release"
+notes_args=()
+[[ -z "${notes//[[:space:]]/}" ]] || notes_args=(--notes "$notes")
+gh release create "$tag" "$repo"/dist/*.tar.gz "$repo"/dist/*.sha256 \
+  --title "$tag" ${notes_args[@]+"${notes_args[@]}"} --generate-notes
+
+say "Homebrew tap"
+git clone --quiet "git@github.com:$tap_repo.git" "$tmp/tap"
+mkdir -p "$tmp/tap/Formula"
+cp "$tmp/Formula/$formula.rb" "$tmp/tap/Formula/$formula.rb"
+(
+  cd "$tmp/tap"
+  git add "Formula/$formula.rb"
+  if git diff --cached --quiet; then
+    echo "formula already up to date; nothing to push"
+  else
+    git commit -q -m "$formula $version"
+    git push origin HEAD
+  fi
+)
+
+say "released $tag"
+echo "  brew install Guilospanck/tap/$formula"
+echo "  https://github.com/Guilospanck/oh-my-openshell/releases/tag/$tag"

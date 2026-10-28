@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# scripts/brew-style FILE
+#
+# `brew style FILE`, also when Homebrew lives in the read-only Nix store: its lint gems are
+# installed inside its own Library, so there the same code runs from a disposable writable copy.
+set -euo pipefail
+
+[[ $# -eq 1 ]] || { echo "usage: $0 FILE" >&2; exit 2; }
+file="$1"
+command -v brew >/dev/null 2>&1 || { echo "brew-style: install Homebrew: https://brew.sh" >&2; exit 1; }
+
+prefix="$(brew --prefix)"
+library="$prefix/Library/Homebrew"
+if [[ -d "$library" && "$(cd "$library" && pwd -P)" == /nix/store/* ]]; then
+  tmp="$(mktemp -d)"
+  trap 'rm -rf -- "$tmp"' EXIT
+  source_repo="$(cd -P "$library" && cd ../.. && pwd -P)"
+  mkdir -p "$tmp/brew"
+  cp -R "$source_repo/." "$tmp/brew/"
+  chmod -R u+w "$tmp/brew"
+  HOMEBREW_PREFIX="$prefix" \
+  HOMEBREW_REPOSITORY="$tmp/brew" \
+  HOMEBREW_LIBRARY="$tmp/brew/Library" \
+  HOMEBREW_BREW_FILE="$(command -v brew)" \
+  HOMEBREW_USER_CONFIG_HOME="$tmp/brew/config" \
+  HOMEBREW_DEVELOPER=1 HOMEBREW_NO_AUTO_UPDATE=1 \
+    /bin/bash "$tmp/brew/Library/Homebrew/brew.sh" style "$file"
+else
+  brew style "$file"
+fi

@@ -44,6 +44,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 | `install.sh` | Release installer (`curl ... | sh`): downloads and checksums `osh-VERSION-OS-ARCH.tar.gz`, installs `osh`, runs `osh setup`; `OSH_VERSION`, `OSH_BIN_DIR`, `OSH_RELEASE_BASE`, `OSH_NO_SETUP` |
 | `tests/linux`, `tests/macos`, `tests/release` | The container, VM and stand-in suites behind the `just test-*` recipes (see Platforms) |
 | `scripts/release` | Local release build (archives per platform); the GitHub workflow runs the same script |
+| `scripts/publish`, `scripts/render-formula`, `scripts/brew-style` | `just release`: check, bump, build, lint, tag, GitHub release, Homebrew tap push (`Guilospanck/homebrew-tap`, formula `oh-my-openshell`); `--dry-run` pushes nothing |
 | `providers/*.yaml` | OpenShell provider profiles (network policy per service). Imported with `openshell provider profile import` |
 | `images/Dockerfile-*` | Sandbox images built from the Images tab |
 | `gateway.toml` (macOS vm), `gateway-linux.toml`, `gateway-podman.toml`, `gateway-docker.toml`, `gateway.env` | Gateway configs, embedded in the binary |
@@ -114,7 +115,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   commit too. Do not bypass with `--no-verify`.
 - Ask first before running anything that changes the host or running
   OpenShell state: `osh setup|upgrade|uninstall|gateway-docker|gateway add|gateway remove` (and the `just`
-  wrappers), `osh gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
+  wrappers), `just release` (pushes a commit, a tag, a GitHub release and the Homebrew tap; `release-dry-run` is fine), `osh gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
   (it is interactive and talks to the live gateway), and any
   `openshell sandbox|provider|policy` write command. Read-only ones
   (`openshell status`, `... list`, `provider profile lint`) are fine.

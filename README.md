@@ -49,7 +49,16 @@ dashboard; image builds need a container runtime.
 
 Release archives: `scripts/release vX.Y.Z [--linux amd64 arm64]` builds them into `dist/` with a `.sha256` each
 and prints the `gh release create` command; it never uploads. Pushing a `v*` tag runs the same script in
-`.github/workflows/release.yml` (one runner per platform, then publish), which has not yet run on GitHub. From a
+`.github/workflows/release.yml` (one runner per platform, then publish), which has not yet run on GitHub.
+
+Releasing from this machine, the same steps as the workflow plus the Homebrew formula: `just release-setup`
+(read-only check of `gh` login, push access to the tap, Docker, Zig), then `just release-dry-run vX.Y.Z` (check,
+version bump, archives, formula lint; pushes nothing, reverts the bump), then `just release vX.Y.Z ["notes"]`
+(commits the `tui/Cargo.toml` bump, tags, pushes, `gh release create`, pushes `Formula/oh-my-openshell.rb` to
+`Guilospanck/homebrew-tap`). It needs a clean `main` level with `origin`, and never runs `osh` or `osh setup`.
+Users then run `brew install Guilospanck/tap/oh-my-openshell`; the formula installs only the binary. A Mac builds
+only its own architecture, so an Apple Silicon release has no Intel macOS archive and the formula omits that block.
+`just release-setup-ci-key` is the one-time deploy key (stored as the repo secret `HOMEBREW_TAP_DEPLOY_KEY`) the workflow uses to push the tap; once Actions run again, release by pushing the tag only, since `just release` also creates the GitHub release and would make the workflow fail. From a
 checkout, `./osh` is a launcher that builds the TUI with cargo when its sources
 change and sets `OSH_DIR` to the checkout, so edits to the repo's providers and
 Dockerfiles apply with no copy. Build needs `cargo` and Zig 0.15.
