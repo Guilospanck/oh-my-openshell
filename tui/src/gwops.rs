@@ -645,7 +645,21 @@ pub fn remove_gateway_steps(
 
 /// Wipes a gateway osh created and starts it again empty, with its own service, database and
 /// runtime.
-pub fn reset_steps_for(f: &Facts, p: &Paths, spec: &GatewaySpec, rt: Option<Runtime>) -> Vec<Step> {
+/// True when another registered gateway drives a container runtime, so a sweep must not assume
+/// every managed container belongs to `name`.
+pub fn shares_runtime(reg: &Registry, name: &str) -> bool {
+    reg.gateways
+        .iter()
+        .any(|g| g.name != name && g.kind != GwKind::Vm)
+}
+
+pub fn reset_steps_for(
+    f: &Facts,
+    p: &Paths,
+    spec: &GatewaySpec,
+    rt: Option<Runtime>,
+    shared: bool,
+) -> Vec<Step> {
     let state = p.state.to_string_lossy().into_owned();
     let config = p.config_home.to_string_lossy().into_owned();
     let packaged = spec.main && !(f.os == Os::MacOs && spec.kind != GwKind::Vm);
@@ -686,6 +700,7 @@ pub fn reset_steps_for(f: &Facts, p: &Paths, spec: &GatewaySpec, rt: Option<Runt
                 &state,
                 &config,
                 if f.os == Os::MacOs { "darwin" } else { "linux" },
+                if shared { "shared" } else { "own" },
             ],
         )
     };
@@ -1167,6 +1182,7 @@ mod tests {
             &paths(),
             &spec(GwKind::Podman, 17671, false),
             None,
+            false,
         );
         let t = texts(&extra);
         assert!(t.contains("/h/.local/state/openshell/gateway-podman/openshell.db"));
@@ -1177,6 +1193,7 @@ mod tests {
             &paths(),
             &spec(GwKind::Docker, 17670, true),
             None,
+            false,
         ));
         assert!(main.contains("/h/.local/state/openshell/gateway/openshell.db"));
         assert!(main.contains("systemctl --user stop openshell-gateway"));
@@ -1185,8 +1202,35 @@ mod tests {
             &paths(),
             &spec(GwKind::Vm, 17670, true),
             None,
+            false,
         ));
         assert!(vm.contains("vm-driver/sandboxes") && vm.contains("brew services stop openshell"));
+    }
+
+    #[test]
+    fn shares_runtime_ignores_vm_and_self() {
+        let mut r = Registry::default();
+        r.add(spec(GwKind::Docker, 17670, true));
+        assert!(!shares_runtime(&r, "openshell-docker"));
+        r.add(spec(GwKind::Vm, 17671, false));
+        assert!(!shares_runtime(&r, "openshell-docker"));
+        r.add(spec(GwKind::Podman, 17672, false));
+        assert!(shares_runtime(&r, "openshell-docker"));
+        assert!(shares_runtime(&r, "unregistered"));
+    }
+
+    #[test]
+    fn reset_marks_the_sweep_shared_when_told() {
+        let t = |shared| {
+            texts(&reset_steps_for(
+                &facts(Os::Linux),
+                &paths(),
+                &spec(GwKind::Podman, 17671, false),
+                None,
+                shared,
+            ))
+        };
+        assert!(t(true).contains(" linux shared") && t(false).contains(" linux own"));
     }
 
     /// With `OSH_DUMP_CONFIGS=<dir>` set, writes every generated config there so they can be

@@ -98,10 +98,22 @@ impl Registry {
             .unwrap_or_default()
             .iter()
             .filter_map(|g| {
+                let kind = GwKind::from_driver(g["kind"].as_str()?)?;
+                let name = g["name"].as_str()?;
+                // Names reach `rm -f` paths and service labels, so only the exact name osh
+                // gives each kind is trusted; the health and metrics ports sit above the
+                // gateway port and must fit.
+                if name != kind.name() {
+                    return None;
+                }
+                let port = u16::try_from(g["port"].as_u64()?).ok()?;
+                if port == 0 || port > u16::MAX - 20 {
+                    return None;
+                }
                 Some(GatewaySpec {
-                    name: g["name"].as_str()?.to_string(),
-                    kind: GwKind::from_driver(g["kind"].as_str()?)?,
-                    port: u16::try_from(g["port"].as_u64()?).ok()?,
+                    name: name.to_string(),
+                    kind,
+                    port,
                     main: g["main"].as_bool().unwrap_or(false),
                 })
             })
@@ -537,6 +549,27 @@ mod tests {
         assert_eq!(back.main().unwrap().name, "openshell-docker");
         assert!(back.has_kind(GwKind::Podman) && !back.has_kind(GwKind::Vm));
         assert_eq!(back.get("openshell-podman").unwrap().port, 17671);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn registry_drops_entries_whose_name_is_not_the_kinds_name() {
+        let d = tmp("badnames");
+        let entry = |name: &str, kind: &str, port: u64| {
+            format!(r#"{{"name":"{name}","kind":"{kind}","port":{port},"main":false}}"#)
+        };
+        let json = format!(
+            r#"{{"gateways":[{},{},{},{},{}]}}"#,
+            entry("openshell-docker", "docker", 17670),
+            entry("../../etc", "docker", 17671),
+            entry("openshell-vm", "docker", 17672),
+            entry("openshell-podman", "podman", 0),
+            entry("openshell-vm", "vm", 65530),
+        );
+        std::fs::write(d.join("gateways.json"), json).unwrap();
+        let r = Registry::load(&d);
+        let names: Vec<_> = r.gateways.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(names, vec!["openshell-docker"]);
         let _ = std::fs::remove_dir_all(&d);
     }
 

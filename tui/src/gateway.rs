@@ -20,16 +20,25 @@ else
 fi"#;
 
 /// Removes leftover containers and volumes of a Docker or Podman driver.
-/// $1 = runtime binary, $2 = state dir, $3 = config dir, $4 = darwin flag.
+/// $1 = runtime binary, $2 = state dir, $3 = config dir, $4 = darwin flag, $5 = `shared` when
+/// another gateway drives the same runtime. OpenShell's labels do not say which gateway owns a
+/// container, so a shared runtime only loses its stopped leftovers (`sandbox delete --all` has
+/// already removed this gateway's live ones) and its volumes stay.
 pub(crate) const SWEEP_CONTAINERS_SCRIPT: &str = r#"[ -f "$3/gateway.env" ] && { set -a; . "$3/gateway.env"; set +a; }
 [ "$4" = darwin ] && export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.colima/docker.sock}"
 if command -v "$1" >/dev/null 2>&1 && "$1" info >/dev/null 2>&1; then
   for f in label=openshell.ai/managed-by=openshell label=openshell.managed=true; do
-    ids="$("$1" ps -aq --filter "$f")"
+    if [ "$5" = shared ]; then
+      ids="$("$1" ps -aq --filter "$f" --filter status=exited --filter status=created --filter status=dead)"
+    else
+      ids="$("$1" ps -aq --filter "$f")"
+    fi
     [ -z "$ids" ] || "$1" rm -f $ids
   done
-  vols="$("$1" volume ls -q --filter label=openshell.ai/managed-by=openshell)"
-  [ -z "$vols" ] || "$1" volume rm $vols
+  if [ "$5" != shared ]; then
+    vols="$("$1" volume ls -q --filter label=openshell.ai/managed-by=openshell)"
+    [ -z "$vols" ] || "$1" volume rm $vols
+  fi
 else
   echo "$1 unreachable; containers not swept" >&2
 fi
@@ -325,6 +334,7 @@ pub fn reset_steps(
     p: &Paths,
     gateway: &str,
     rt: Option<Runtime>,
+    shared: bool,
 ) -> Result<Vec<Step>, String> {
     #[derive(PartialEq)]
     enum Kind {
@@ -375,6 +385,7 @@ pub fn reset_steps(
                 &state,
                 &config,
                 if f.os == Os::MacOs { "darwin" } else { "linux" },
+                if shared { "shared" } else { "own" },
             ],
         ),
     };
@@ -874,8 +885,8 @@ mod tests {
 
     #[test]
     fn reset_unknown_gateway_errors() {
-        assert!(reset_steps(&facts(Os::Linux), &paths(), "openshell-docker", None).is_err());
-        assert!(reset_steps(&facts(Os::MacOs), &paths(), "other", None).is_err());
+        assert!(reset_steps(&facts(Os::Linux), &paths(), "openshell-docker", None, false).is_err());
+        assert!(reset_steps(&facts(Os::MacOs), &paths(), "other", None, false).is_err());
     }
 
     #[test]
@@ -885,6 +896,7 @@ mod tests {
             &paths(),
             "openshell-docker",
             Some(Runtime::Docker),
+            false,
         )
         .unwrap();
         let t = texts(&s);
@@ -895,7 +907,7 @@ mod tests {
 
     #[test]
     fn reset_vm_gateway_kills_orphan_vms_not_containers() {
-        let s = reset_steps(&facts(Os::MacOs), &paths(), "openshell", None).unwrap();
+        let s = reset_steps(&facts(Os::MacOs), &paths(), "openshell", None, false).unwrap();
         let t = texts(&s);
         assert!(t.contains("vm-driver/sandboxes"));
         assert!(t.contains("brew services stop openshell"));
@@ -908,9 +920,31 @@ mod tests {
             &paths(),
             "openshell",
             Some(Runtime::Podman),
+            false,
         )
         .unwrap();
         assert!(texts(&s).contains(" podman /h/.local/state/openshell "));
+    }
+
+    #[test]
+    fn reset_sweep_on_a_shared_runtime_only_takes_stopped_containers() {
+        let sweep = |shared| {
+            let s = reset_steps(
+                &facts(Os::Linux),
+                &paths(),
+                "openshell",
+                Some(Runtime::Docker),
+                shared,
+            )
+            .unwrap();
+            texts(&s)
+        };
+        assert!(sweep(true).contains(" linux shared"));
+        assert!(sweep(false).contains(" linux own"));
+        // The script itself: live containers and volumes are untouched when shared.
+        assert!(SWEEP_CONTAINERS_SCRIPT.contains(r#"[ "$5" = shared ]"#));
+        assert!(SWEEP_CONTAINERS_SCRIPT.contains("status=exited"));
+        assert!(SWEEP_CONTAINERS_SCRIPT.contains(r#"[ "$5" != shared ]"#));
     }
 
     #[test]

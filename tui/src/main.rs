@@ -368,7 +368,7 @@ fn gateway_command(args: &[String]) -> i32 {
                 return 2;
             };
             // The dashboard asks its own question first and passes --confirmed.
-            if !args.iter().any(|a| a == "--confirmed") {
+            if !pre_confirmed(args) {
                 println!("This deletes every sandbox and provider on gateway {name}.");
                 if !confirmed("reset") {
                     eprintln!("aborted");
@@ -376,14 +376,15 @@ fn gateway_command(args: &[String]) -> i32 {
                 }
             }
             let reg = gwmodel::Registry::load(&p.data);
+            let shared = gwops::shares_runtime(&reg, name);
             if let Some(spec) = reg.get(name) {
-                Ok(gwops::reset_steps_for(&f, &p, spec, f.runtime()))
+                Ok(gwops::reset_steps_for(&f, &p, spec, f.runtime(), shared))
             } else {
                 // Sweep with the runtime the installed gateway drives, not whichever answers first.
                 let driver = h
                     .read(&p.config_home.join("gateway.toml"))
                     .and_then(|t| gateway::driver_runtime(&t));
-                gateway::reset_steps(&f, &p, name, driver.or(f.runtime()))
+                gateway::reset_steps(&f, &p, name, driver.or(f.runtime()), shared)
             }
         }
     };
@@ -450,7 +451,8 @@ fn gateway_add_remove(args: &[String]) -> i32 {
                     " (its data stays)"
                 }
             );
-            if !confirmed(word) {
+            // The dashboard asks its own question first and passes --confirmed.
+            if !pre_confirmed(args) && !confirmed(word) {
                 eprintln!("aborted");
                 return 1;
             }
@@ -465,6 +467,11 @@ fn gateway_add_remove(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+/// True when the caller (the dashboard) already asked the user and passed `--confirmed`.
+fn pre_confirmed(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--confirmed")
 }
 
 /// Asks the user to type `word`; `--yes` does not skip it, since these steps destroy data.
@@ -630,6 +637,17 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn confirmed_flag_skips_the_second_question() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(pre_confirmed(&a(&[
+            "remove",
+            "openshell-docker",
+            "--confirmed"
+        ])));
+        assert!(!pre_confirmed(&a(&["remove", "openshell-docker"])));
+    }
 
     #[test]
     fn sandbox_paths_follow_the_current_folder_inside_the_share() {
