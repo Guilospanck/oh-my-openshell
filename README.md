@@ -153,7 +153,10 @@ exactly as it is: it is listed, can be selected and wiped, but osh will not rena
 reconfigure or remove it.
 
 osh keeps each gateway's config in `~/.local/share/osh/gateways/NAME.toml` (edit it; your
-changes are kept) and remembers the ones it made in `gateways.json` there. Extras run as
+changes are kept). The main gateway on Linux, and the VM main on macOS, use OpenShell's own
+`gateway.toml` instead: osh rewrites it when it differs from what it would write and keeps the
+previous copy next to it as `gateway.toml.osh-bak` (then `.osh-bak.1`, `.2`, never overwriting
+an earlier one). osh remembers the ones it made in `gateways.json` there. Extras run as
 a systemd user unit `osh-gateway-NAME` (Linux) or a launchd agent (macOS); the main runs as
 OpenShell's own service (on macOS a Docker or Podman main runs as its own launchd agent
 instead of the Homebrew service). Logs on Linux:
