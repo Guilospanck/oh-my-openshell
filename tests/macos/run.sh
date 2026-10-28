@@ -13,7 +13,8 @@
 #
 # What it cannot show: that the real launchd starts the agent, that Homebrew's openshell service,
 # Colima and Podman machines really start, and Docker Desktop (osh looks for /Applications/Docker.app,
-# a fixed path the sandbox cannot fake).
+# a fixed path the sandbox cannot fake). tests/macos/vm.sh and runtimes.sh do all but Docker Desktop
+# for real, in disposable VMs.
 set -uo pipefail
 
 [[ "$(uname)" == Darwin ]] || { echo "tests/macos/run.sh runs on macOS only" >&2; exit 2; }

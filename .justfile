@@ -62,9 +62,21 @@ test-linux *args:
 test-linux-real runtime="podman":
 	@"{{justfile_directory()}}/tests/linux/real.sh" {{runtime}}
 
+# macOS, real KVM: test-linux-real vm on a separate, disposable Colima instance with nested virtualization (M3+); --keep keeps it, --preseed works around the known installer bug
+test-linux-kvm *args:
+	@"{{justfile_directory()}}/tests/linux/kvm.sh" {{args}}
+
 # macOS only, changes nothing on the Mac: the macOS build against recording brew/launchctl/colima/podman stand-ins in a sandboxed throwaway HOME, plutil -lint on the agents
 test-macos:
 	@"{{justfile_directory()}}/tests/macos/run.sh"
+
+# macOS: osh's real Colima and Podman machine steps in an isolated throwaway HOME (the user's Colima is checked untouched); --keep keeps the instances
+test-macos-runtimes *args:
+	@"{{justfile_directory()}}/tests/macos/runtimes.sh" {{args}}
+
+# macOS: real Homebrew, brew services and launchd in a disposable Tart macOS VM clone (needs tart; pulls a 26 GB image once); --keep, --preseed
+test-macos-vm *args:
+	@"{{justfile_directory()}}/tests/macos/vm.sh" {{args}}
 
 # Runs the release workflow's Linux build and publish jobs for real with act in Docker (gh is a recording stand-in; macOS entries need GitHub)
 test-release:

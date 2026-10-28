@@ -69,7 +69,7 @@ if [[ ( "$runtime" == docker || "$runtime" == vm ) && "$phase" != after-login ]]
   for _ in $(seq 20); do [[ -S "$XDG_RUNTIME_DIR/bus" ]] && break; sleep 1; done
   # And a new login is a new process tree with the new groups: carry on in one.
   exec sudo -u tester -H env "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" \
-    "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" "PATH=$PATH" "PREV_FAILS=$fails" \
+    "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" "PATH=$PATH" "PREV_FAILS=$fails" "OSH_PRESEED=${OSH_PRESEED:-}" \
     bash "$0" "$runtime" after-login
 fi
 
@@ -83,6 +83,16 @@ if [[ "$runtime" == podman ]]; then
   [[ $rc -eq 0 ]] && pass "the wizard installs podman end to end" || { fail "the wizard installs podman end to end" "rc=$rc"; tail -40 "$log"; }
   check "the wizard cleared its pending selection" test ! -e "$data/wizard.json"
 else
+if [[ "$runtime" == vm && -n "${OSH_PRESEED:-}" ]]; then
+  # KNOWN BUG workaround, opt-in (OSH_PRESEED=1): OpenShell's installer restarts its gateway
+  # before osh writes the VM config, and OpenShell never auto-detects the vm driver, so on a
+  # machine without Docker or Podman the installer fails ("no compute driver configured"). A
+  # config naming the driver, written first, gets past it so the rest can be tested; osh
+  # replaces it with its own. Drop this once osh writes the main's config before the installer.
+  echo "== OSH_PRESEED: writing a vm gateway.toml before setup (known-bug workaround)"
+  mkdir -p "$HOME/.config/openshell"
+  printf '[openshell]\nversion = 2\n\n[openshell.gateway]\ncompute_driver = "vm"\n' > "$HOME/.config/openshell/gateway.toml"
+fi
 echo "== setup --gateways $gateways --yes (real packages, installer, systemd)"
 osh setup --gateways "$gateways" --yes >"$log" 2>&1; rc=$?
 fi
@@ -113,6 +123,28 @@ real_validate="$(openshell-gateway config preflight --path "$HOME/.config/opensh
 check "the registry records the main on 17670" bash -c "grep -q '\"$main\"' '$data/gateways.json' && grep -q 17670 '$data/gateways.json'"
 out="$(osh doctor 2>&1)"; rc=$?
 [[ $rc -eq 0 ]] && pass "doctor is green after setup" || fail "doctor is green after setup" "$out"
+
+if [[ "$runtime" == vm ]]; then
+  # The gateway answering proves little about KVM: boot real sandboxes and run commands in them.
+  # A microVM has its own kernel, so its uname differs from this machine's.
+  echo "== a sandbox boots in a microVM on /dev/kvm"
+  out="$(timeout 1200 openshell -g "$main" sandbox create --name kvm-once --no-keep -- sh -c 'echo osh-microvm-ok; uname -r' 2>&1)"; rc=$?
+  if [[ $rc -eq 0 && "$out" == *osh-microvm-ok* ]]; then
+    pass "a one-shot sandbox runs a command in a microVM"
+    guest_kernel="$(grep -A1 -x 'osh-microvm-ok' <<<"$out" | tail -1 | tr -d '[:space:]')"
+    [[ -n "$guest_kernel" && "$guest_kernel" != "$(uname -r)" ]] \
+      && pass "it runs on its own kernel ($guest_kernel; machine $(uname -r))" || fail "it runs on its own kernel" "$out"
+  else
+    fail "a one-shot sandbox runs a command in a microVM" "rc=$rc $(tail -5 <<<"$out")"; show_gateway_log
+  fi
+  # osh's dashboard creates sandboxes detached and opens shells with `sandbox exec`.
+  timeout 1200 openshell -g "$main" sandbox create --name kvm-probe --detach >"$log" 2>&1; rc=$?
+  [[ $rc -eq 0 ]] && pass "a detached sandbox is created on the VM gateway" || { fail "a detached sandbox on the VM gateway" "rc=$rc"; tail -5 "$log"; }
+  out="$(timeout 300 openshell -g "$main" sandbox exec -n kvm-probe -- sh -c 'echo osh-microvm-ok' 2>&1)"; rc=$?
+  [[ $rc -eq 0 && "$out" == *osh-microvm-ok* ]] && pass "sandbox exec runs a command in it" || fail "sandbox exec runs a command in it" "rc=$rc $(tail -3 <<<"$out")"
+  pgrep -f vm-driver/sandboxes >/dev/null && pass "its microVM process is running" || fail "its microVM process is running"
+  timeout 300 openshell -g "$main" sandbox delete kvm-probe >"$log" 2>&1 && pass "the sandbox is deleted" || { fail "sandbox delete"; tail -5 "$log"; }
+fi
 
 if [[ -n "$extra" ]]; then
   echo "== the second gateway runs next to the main one"
