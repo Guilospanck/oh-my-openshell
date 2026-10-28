@@ -52,6 +52,9 @@ pub struct Env {
     pub lock: PathBuf,
     pub providers_dir: PathBuf,
     pub gitleaks_config: PathBuf,
+    /// The gitleaks binary for the secret scan; `None` skips it. Resolved once by `detect`, so
+    /// the scan does not depend on whatever PATH the caller happens to have.
+    pub gitleaks: Option<PathBuf>,
     /// The project whose Claude memory is offered for upload.
     pub memory_repo: PathBuf,
     /// graphify's version when already known; otherwise `graphify --version` is run.
@@ -74,6 +77,7 @@ impl Env {
             lock: home.join(".agents/.skill-lock.json"),
             providers_dir: data_dir.join("providers"),
             gitleaks_config: data_dir.join(".gitleaks.toml"),
+            gitleaks: which("gitleaks"),
             memory_repo,
             graphify_version: None,
             sandbox_home: sandbox_home.trim_end_matches('/').to_string(),
@@ -179,9 +183,10 @@ fn run_out(prog: &str, args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-fn which(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+fn which(bin: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join(bin))
+        .find(|f| f.is_file())
 }
 
 fn npx_skills(env: &Env) -> Vec<Item> {
@@ -488,11 +493,9 @@ fn stage_and_describe(env: &Env, own: &[PathBuf], stage: &Path) -> io::Result<Ve
 
 /// Secret-scan findings in the staged files; `None` when gitleaks is missing.
 fn scan(env: &Env, stage: &Path) -> Option<Vec<Value>> {
-    if !which("gitleaks") {
-        return None;
-    }
+    let gitleaks = env.gitleaks.as_ref()?;
     let report = stage.join(".gitleaks-report.json");
-    let mut c = Command::new("gitleaks");
+    let mut c = Command::new(gitleaks);
     c.arg("dir").arg(stage);
     if env.gitleaks_config.is_file() {
         c.arg("--config").arg(&env.gitleaks_config);
@@ -1225,6 +1228,7 @@ mod tests {
             lock: claude.join("../.agents/.skill-lock.json"),
             providers_dir: repo().join("providers"),
             gitleaks_config: repo().join(".gitleaks.toml"),
+            gitleaks: None,
             memory_repo: repo(),
             graphify_version: Some("1.2.3".into()),
             sandbox_home: "/workspace".into(),
@@ -1553,11 +1557,33 @@ mod tests {
     fn manifest_matches_the_recorded_python_output_on_the_fixture() {
         let root = tmp("golden");
         let claude = fixture(&root);
-        let got = normalized(&manifest(&env_with(&claude), "both").unwrap());
+        // The recording had a clean scan. A stand-in gitleaks reports that, so the result does
+        // not depend on whether (or which) gitleaks the machine running the tests has.
+        let gitleaks = root.join("gitleaks");
+        fs::write(
+            &gitleaks,
+            "#!/bin/sh\nwhile [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '[]' > \"$2\"; shift; done\n",
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&gitleaks, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let env = Env {
+            gitleaks: Some(gitleaks),
+            ..env_with(&claude)
+        };
+        let got = normalized(&manifest(&env, "both").unwrap());
+        let without = normalized(&manifest(&env_with(&claude), "both").unwrap());
         let want: Value =
             serde_json::from_str(include_str!("../fixtures/agents-golden.json")).unwrap();
         let _ = fs::remove_dir_all(&root);
         assert_eq!(got, want);
+        assert_eq!(
+            without["secret_findings"],
+            Value::Null,
+            "no gitleaks: scan skipped"
+        );
     }
 
     #[test]
