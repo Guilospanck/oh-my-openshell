@@ -229,6 +229,40 @@ fi
 openshell gateway select "$2"
 if openshell gateway list -o json | grep -q '"openshell"'; then openshell gateway remove openshell; fi"#;
 
+/// `gateway.toml` for OpenShell's Homebrew service on a Mac whose main is a Docker or Podman
+/// gateway osh runs itself. OpenShell's installer starts that service and waits for it to answer,
+/// and OpenShell never picks the vm driver on its own: without a config naming one the service
+/// exits unless Docker answers at one of its default sockets (not Colima's). osh stops the
+/// service once the installer is done.
+pub const BREW_SERVICE_TOML: &str =
+    "# Written by osh: lets OpenShell's Homebrew service start while \
+OpenShell installs or upgrades. osh runs your main gateway itself and stops this service.\n\
+[openshell]\nversion = 2\n\n[openshell.gateway]\ncompute_driver = \"vm\"\n";
+
+/// The step that gives OpenShell's Homebrew service a config it can start with, before the
+/// installer runs (see `BREW_SERVICE_TOML`). None when it is not needed or a config is there.
+pub fn brew_service_config_step(
+    f: &Facts,
+    p: &Paths,
+    h: &dyn Host,
+    spec: &GatewaySpec,
+) -> Option<Step> {
+    let target = p.config_home.join("gateway.toml");
+    (f.os == Os::MacOs && spec.main && spec.kind != GwKind::Vm && h.read(&target).is_none()).then(
+        || {
+            st(
+                spec,
+                "brew-config",
+                "Give OpenShell's Homebrew service a config it can start with",
+                StepKind::Write {
+                    path: target,
+                    content: BREW_SERVICE_TOML.into(),
+                },
+            )
+        },
+    )
+}
+
 /// Config (written once), service, registration and wait for a gateway osh runs as its own service.
 fn own_service_steps(
     f: &Facts,

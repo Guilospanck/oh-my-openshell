@@ -872,6 +872,7 @@ pub fn plan_gateways(
         .collect();
     let mut reg_now = reg.clone();
     let mut prev_last: Option<&'static str> = None;
+    let mut install_first: Vec<&'static str> = Vec::new();
     for (i, kind) in wanted.iter().enumerate() {
         let is_main = i == 0 && no_main;
         let port = if is_main {
@@ -914,12 +915,58 @@ pub fn plan_gateways(
         if let Some(first) = g.first_mut() {
             first.after = first.after.or(dep);
         }
+        if is_main && !f.has_openshell {
+            // OpenShell's installer starts its gateway and waits for it, so the main's leading
+            // writes (registry entry, config) go before it: the gateway starts with the right
+            // driver, and a re-run after a failed install resumes this main instead of taking
+            // the installer's `openshell` for someone else's gateway.
+            install_first.extend(
+                g.iter()
+                    .take_while(|s| matches!(s.kind, StepKind::Write { .. }))
+                    .map(|s| s.id),
+            );
+            if let Some(s) = crate::gwops::brew_service_config_step(f, p, h, &spec) {
+                install_first.push(s.id);
+                steps.push(s);
+            }
+        }
         prev_last = g.last().map(|s| s.id);
         reg_now.add(spec);
         steps.extend(g);
     }
+    hoist_before_installer(&mut steps, &install_first);
     resume.extend(steps);
     Ok(resume)
+}
+
+/// Moves the steps named `ids` (in plan order) to just before OpenShell's installer, which then
+/// waits for them. Steps that waited for one of them wait for what the first of `ids` in the plan
+/// waited for. Nothing changes when the plan has no installer.
+fn hoist_before_installer(steps: &mut Vec<Step>, ids: &[&'static str]) {
+    if ids.is_empty() || !steps.iter().any(|s| s.id == "openshell") {
+        return;
+    }
+    let (mut first, mut rest): (Vec<Step>, Vec<Step>) = std::mem::take(steps)
+        .into_iter()
+        .partition(|s| ids.contains(&s.id));
+    let dep = ids
+        .iter()
+        .find_map(|id| first.iter().find(|s| s.id == *id))
+        .and_then(|s| s.after);
+    for s in &mut rest {
+        if s.after.is_some_and(|a| ids.contains(&a)) {
+            s.after = dep;
+        }
+    }
+    let at = rest.iter().position(|s| s.id == "openshell").unwrap_or(0);
+    let mut prev = rest[at].after;
+    for s in &mut first {
+        s.after = prev;
+        prev = Some(s.id);
+    }
+    rest[at].after = prev;
+    rest.splice(at..at, first);
+    *steps = rest;
 }
 
 /// Plans and runs the wanted gateway types on this machine (the `--gateways` and `gateway add`
@@ -1187,6 +1234,8 @@ pub fn run(o: &Options, required_only: bool) -> bool {
     let paths = crate::gateway::Paths::detect();
     if legacy_gateway_steps_allowed(&crate::gwmodel::Registry::load(&paths.data)) {
         steps.extend(crate::gateway::plan(&f, &o, &h, &paths, false));
+        // The installer starts the gateway: its config must be there first.
+        hoist_before_installer(&mut steps, &["gateway-backup", "gateway-config"]);
     }
     run_steps(&h, steps, &o, interactive)
 }
@@ -1972,18 +2021,191 @@ mod tests {
             &[],
         )
         .unwrap();
-        let reg = steps.iter().find(|s| s.id == "gw-docker-registry").unwrap();
+        // The registry entry is written before the installer; the first step that needs Docker
+        // (stopping the Homebrew service, then the agent) waits for Colima.
+        let stop = steps
+            .iter()
+            .find(|s| s.id == "gw-docker-stop-brew")
+            .unwrap();
         assert_eq!(
-            reg.after,
+            stop.after,
             Some("colima-start"),
             "{:?}",
             steps.iter().map(|s| s.id).collect::<Vec<_>>()
         );
         let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
         let pos = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+        assert!(pos("gw-docker-registry") < pos("openshell"));
         assert!(
-            pos("openshell") < pos("colima") && pos("colima-start") < pos("gw-docker-registry")
+            pos("openshell") < pos("colima") && pos("colima-start") < pos("gw-docker-stop-brew")
         );
+    }
+
+    fn pos_of(steps: &[Step], id: &str) -> usize {
+        steps.iter().position(|s| s.id == id).unwrap_or_else(|| {
+            panic!(
+                "no {id} in {:?}",
+                steps.iter().map(|s| s.id).collect::<Vec<_>>()
+            )
+        })
+    }
+
+    fn get<'a>(steps: &'a [Step], id: &str) -> &'a Step {
+        &steps[pos_of(steps, id)]
+    }
+
+    #[test]
+    fn a_fresh_vm_main_has_its_config_and_registry_before_the_installer_starts_the_gateway() {
+        for os in [Os::Linux, Os::MacOs] {
+            let mut f = facts(
+                os,
+                if os == Os::Linux {
+                    PkgMgr::Apt
+                } else {
+                    PkgMgr::Brew
+                },
+            );
+            f.has_openshell = false;
+            f.kvm = Kvm::Usable;
+            f.has_e2fsprogs = true;
+            let steps =
+                gw_plan(&f, &[GwKind::Vm], &crate::gwmodel::Registry::default(), &[]).unwrap();
+            let install = pos_of(&steps, "openshell");
+            let cfg = get(&steps, "gw-vm-config");
+            assert!(pos_of(&steps, "gw-vm-config") < install, "{os:?}");
+            assert!(pos_of(&steps, "gw-vm-registry") < install, "{os:?}");
+            match &cfg.kind {
+                StepKind::Write { path, content } => {
+                    assert!(path.ends_with(".config/openshell/gateway.toml"));
+                    assert!(content.contains("compute_driver = \"vm\""), "{content}");
+                }
+                k => panic!("{k:?}"),
+            }
+            assert_eq!(
+                get(&steps, "openshell").after,
+                Some("gw-vm-config"),
+                "{os:?}"
+            );
+            // What runs after the installer still waits for it, not just for the config.
+            let restart = pos_of(&steps, "gw-vm-restart");
+            assert!(restart > install);
+            let first_after = steps[install + 1..]
+                .iter()
+                .find(|s| s.id.starts_with("gw-vm-"))
+                .unwrap();
+            assert_eq!(first_after.after, Some("openshell"), "{os:?}");
+        }
+    }
+
+    #[test]
+    fn when_the_installer_fails_the_gateway_is_not_restarted() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = false;
+        f.kvm = Kvm::Usable;
+        f.has_e2fsprogs = true;
+        let steps = gw_plan(&f, &[GwKind::Vm], &crate::gwmodel::Registry::default(), &[]).unwrap();
+        let mut h = FakeHost::default();
+        h.failing.insert("sh".into());
+        let r = execute(&steps, &h, &Options::default(), &mut yes);
+        let out = |id: &str| r.iter().find(|x| x.id == id).unwrap().outcome.clone();
+        assert_eq!(out("gw-vm-config"), Outcome::Done);
+        assert!(matches!(out("openshell"), Outcome::Failed(_)));
+        assert_eq!(out("gw-vm-reload"), Outcome::Blocked);
+    }
+
+    #[test]
+    fn a_fresh_macos_docker_main_gives_the_homebrew_service_a_vm_config_first() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = false;
+        f.has_e2fsprogs = true;
+        let steps = gw_plan(
+            &f,
+            &[GwKind::Docker],
+            &crate::gwmodel::Registry::default(),
+            &[],
+        )
+        .unwrap();
+        let install = pos_of(&steps, "openshell");
+        assert!(pos_of(&steps, "gw-docker-brew-config") < install);
+        match &get(&steps, "gw-docker-brew-config").kind {
+            StepKind::Write { path, content } => {
+                assert!(path.ends_with(".config/openshell/gateway.toml"));
+                assert!(content.contains("compute_driver = \"vm\""), "{content}");
+            }
+            k => panic!("{k:?}"),
+        }
+        // A config of the user's own is left alone.
+        let mut h = FakeHost::default();
+        h.files
+            .insert("/h/.config/openshell/gateway.toml".into(), "mine".into());
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &h,
+            &gw_paths(),
+            &crate::gwmodel::Registry::default(),
+            &[],
+            &|_| false,
+        )
+        .unwrap();
+        assert!(!steps.iter().any(|s| s.id == "gw-docker-brew-config"));
+    }
+
+    #[test]
+    fn a_rerun_after_a_failed_install_resumes_the_main_instead_of_adding_an_extra() {
+        // The first run wrote the registry and the config, then the installer failed after
+        // installing OpenShell and registering its own `openshell` gateway.
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = true;
+        f.has_e2fsprogs = true;
+        let reg = registered(&[(GwKind::Vm, 17670, true)]);
+        let mut h = FakeHost::default();
+        h.files.insert(
+            "/h/.config/openshell/gateway.toml".into(),
+            crate::gwops::gateway_toml(reg.get("openshell-vm").unwrap(), Os::MacOs),
+        );
+        h.failing.insert("openshell".into()); // the Homebrew service is in error
+        let known = [("openshell".to_string(), 17670u16)];
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Vm]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &known,
+            &|_| false,
+        )
+        .unwrap();
+        let t = lines(&steps).join("\n");
+        assert!(t.contains("brew services restart openshell"), "{t}");
+        assert!(steps.iter().any(|s| s.id == "gw-vm-register"), "{t}");
+        assert!(!t.contains("17671"), "{t}");
+        let regs = written_json(&steps);
+        assert!(
+            regs.iter()
+                .all(|r| r.contains("17670") && !r.contains("17671")),
+            "{regs:?}"
+        );
+    }
+
+    #[test]
+    fn the_older_setup_writes_the_gateway_config_before_the_installer() {
+        let f = facts(Os::MacOs, PkgMgr::Brew);
+        let mut f = f;
+        f.has_openshell = false;
+        let h = FakeHost::default();
+        let mut steps = plan(&f, &Options::default());
+        steps.extend(crate::gateway::plan(
+            &f,
+            &Options::default(),
+            &h,
+            &gw_paths(),
+            false,
+        ));
+        hoist_before_installer(&mut steps, &["gateway-backup", "gateway-config"]);
+        assert!(pos_of(&steps, "gateway-config") < pos_of(&steps, "openshell"));
+        assert_eq!(get(&steps, "openshell").after, Some("gateway-config"));
+        assert_eq!(get(&steps, "gateway-restart").after, Some("openshell"));
     }
 
     #[test]
@@ -2337,8 +2559,9 @@ mod tests {
         )
         .unwrap();
         let ids: Vec<_> = steps.iter().map(|s| s.id).collect();
-        let first_gw = steps.iter().find(|s| s.id == "gw-podman-registry").unwrap();
-        assert_eq!(first_gw.after, Some("openshell"));
+        // The registry entry and config go before the installer; the rest waits for it.
+        assert!(pos_of(&steps, "gw-podman-config") < pos_of(&steps, "openshell"));
+        assert_eq!(get(&steps, "gw-podman-reload").after, Some("openshell"));
         for s in &steps {
             if let Some(a) = s.after {
                 assert!(ids.contains(&a), "{} waits for missing {a}", s.id);
