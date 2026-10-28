@@ -639,11 +639,13 @@ pub fn remove_gateway_steps(
                 "Remove its systemd unit",
                 cmd("rm", &["-f", &unit_path(p, &spec.name).to_string_lossy()]),
             ));
+            // The unit is already gone; a failing reload (no user manager) must not leave the
+            // registry entry behind with no way to finish a retry.
             steps.push(st(
                 &spec,
                 "reload",
                 "Reload systemd user units",
-                cmd("systemctl", &["--user", "daemon-reload"]),
+                script("systemctl --user daemon-reload 2>/dev/null || true", &[]),
             ));
         }
         (Os::MacOs, true) => steps.push(st(
@@ -1296,6 +1298,64 @@ mod tests {
         };
         down.failing.insert("launchctl".into());
         assert!(!main_gateway_steps(&f, &p, &down, &Registry::default(), &s, false).is_empty());
+    }
+
+    fn run_removal(h: &FakeHost) -> Vec<String> {
+        let mut r = Registry::default();
+        r.add(spec(GwKind::Docker, 17670, true));
+        r.add(spec(GwKind::Podman, 17671, false));
+        let steps =
+            remove_gateway_steps(&facts(Os::Linux), &paths(), &r, "openshell-podman", false)
+                .unwrap();
+        let res = crate::setup::execute(
+            &steps,
+            h,
+            &crate::setup::Options {
+                yes: true,
+                ..Default::default()
+            },
+            &mut |_| crate::setup::Answer::Yes,
+        );
+        res.iter()
+            .map(|r| format!("{}:{:?}", r.id, r.outcome))
+            .collect()
+    }
+
+    fn registry_writes(h: &FakeHost) -> Vec<String> {
+        h.written
+            .borrow()
+            .iter()
+            .filter(|(p, _)| p.ends_with("gateways.json"))
+            .map(|(_, c)| c.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_failed_removal_step_keeps_the_registry_entry_and_a_retry_finishes() {
+        let mut h = FakeHost::default();
+        h.failing.insert("rm".into());
+        let out = run_removal(&h);
+        assert!(out.iter().any(|l| l.contains("Failed")), "{out:?}");
+        assert!(registry_writes(&h).is_empty(), "entry stays until success");
+        // The retry (the fault is gone) removes the entry.
+        let ok = FakeHost::default();
+        let out = run_removal(&ok);
+        assert!(out.iter().all(|l| !l.contains("Failed")), "{out:?}");
+        let w = registry_writes(&ok);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("openshell-docker") && !w[0].contains("openshell-podman"));
+    }
+
+    #[test]
+    fn the_reload_in_a_removal_cannot_fail_the_retry() {
+        let mut r = Registry::default();
+        r.add(spec(GwKind::Podman, 17671, false));
+        let steps =
+            remove_gateway_steps(&facts(Os::Linux), &paths(), &r, "openshell-podman", false)
+                .unwrap();
+        let reload = steps.iter().find(|s| s.id.ends_with("reload")).unwrap();
+        assert!(reload.command_line().contains("daemon-reload"));
+        assert!(reload.command_line().contains("|| true"));
     }
 
     #[test]
