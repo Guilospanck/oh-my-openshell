@@ -157,31 +157,188 @@ pub fn systemd_unit(spec: &GatewaySpec, exe: &Path) -> String {
 
 /// The macOS launchd agent for a gateway osh runs itself.
 pub fn launchd_plist(spec: &GatewaySpec, exe: &Path, logs: &Path) -> String {
-    let esc = |p: &Path| {
-        p.display()
-            .to_string()
-            .replace('&', "&amp;")
+    agent_plist(
+        &agent_label(&spec.name),
+        exe,
+        &["gateway-service", &spec.name],
+        &[],
+        logs,
+    )
+}
+
+/// A launchd agent that runs `exe ARGS...` with Homebrew's folders on PATH plus `env`, and keeps
+/// it alive while it fails.
+fn agent_plist(
+    label: &str,
+    exe: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+    logs: &Path,
+) -> String {
+    let esc = |t: &str| {
+        t.replace('&', "&amp;")
             .replace('<', "&lt;")
             .replace('>', "&gt;")
     };
+    let path = |p: &Path| esc(&p.display().to_string());
+    let args: String = args
+        .iter()
+        .map(|a| format!("<string>{}</string>", esc(a)))
+        .collect();
+    let env: String = env
+        .iter()
+        .map(|(k, v)| format!("<key>{}</key><string>{}</string>", esc(k), esc(v)))
+        .collect();
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
   <key>Label</key><string>{label}</string>
-  <key>ProgramArguments</key><array><string>{exe}</string><string>gateway-service</string><string>{name}</string></array>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <key>ProgramArguments</key><array><string>{exe}</string>{args}</array>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>{env}</dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>{logs}/gateway.out.log</string>
   <key>StandardErrorPath</key><string>{logs}/gateway.err.log</string>
 </dict></plist>
 "#,
-        label = agent_label(&spec.name),
-        name = spec.name,
-        exe = esc(exe),
-        logs = esc(logs)
+        label = esc(label),
+        exe = path(exe),
+        logs = path(logs)
     )
+}
+
+/// The `openshell-docker` agent for a Mac whose Docker gateway the older `just gateway-docker` set
+/// up (it is not in the registry): `osh gateway-service docker`, which runs it from the data dir's
+/// `gateway-docker.toml` with the same database, logs and TLS material as before. `OSH_DIR` pins
+/// that data dir, so a development checkout's agent reads the checkout's config.
+pub fn legacy_docker_plist(p: &Paths) -> String {
+    agent_plist(
+        gateway::DOCKER_LABEL,
+        &p.exe,
+        &["gateway-service", "docker"],
+        &[("OSH_DIR", &p.data.to_string_lossy())],
+        &p.state.join("gateway-docker"),
+    )
+}
+
+/// The first `ProgramArguments` string of a launchd plist: the program the agent runs.
+fn agent_program(plist: &str) -> Option<String> {
+    let rest = &plist[plist.find("<key>ProgramArguments</key>")?..];
+    let start = rest.find("<string>")? + "<string>".len();
+    let end = start + rest[start..].find("</string>")?;
+    Some(
+        rest[start..end]
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Rewrites, then restarts, every osh launchd agent whose program is gone: the
+/// `gateway-docker-service` script that older versions' `just gateway-docker` pointed the
+/// `openshell-docker` agent at (deleted from the repo; launchd would retry it forever while the
+/// gateway stays down), or an osh binary that has since moved. Agents of registered gateways get
+/// what osh writes for them now; the unregistered `openshell-docker` gets `legacy_docker_plist`.
+/// An agent whose program exists is left alone. macOS only.
+pub fn stale_agent_steps(f: &Facts, p: &Paths, h: &dyn Host, reg: &Registry) -> Vec<Vec<Step>> {
+    if f.os != Os::MacOs {
+        return Vec::new();
+    }
+    let mut agents: Vec<(String, PathBuf, String, PathBuf)> = reg
+        .gateways
+        .iter()
+        .filter(|g| !packaged(g, f.os))
+        .map(|g| {
+            let logs = db_dir_for(p, f.os, g);
+            (
+                agent_label(&g.name),
+                agent_plist_path(p, &g.name),
+                launchd_plist(g, &p.exe, &logs),
+                logs,
+            )
+        })
+        .collect();
+    if reg.get(gateway::DOCKER_GATEWAY).is_none() {
+        agents.push((
+            gateway::DOCKER_LABEL.to_string(),
+            agent_plist_path(p, gateway::DOCKER_GATEWAY),
+            legacy_docker_plist(p),
+            p.state.join("gateway-docker"),
+        ));
+    }
+    let fid = |label: &str, role: &str| -> &'static str {
+        Box::leak(format!("agent-fix-{label}-{role}").into_boxed_str())
+    };
+    agents
+        .into_iter()
+        .filter_map(|(label, plist, wanted, logs)| {
+            let text = h.read(&plist)?;
+            let program = agent_program(&text)?;
+            let gone = text.contains("gateway-docker-service")
+                || (Path::new(&program) != p.exe.as_path() && !h.exists(Path::new(&program)));
+            if !gone || text == wanted {
+                return None;
+            }
+            Some(chain(
+                vec![
+                    step(
+                        fid(&label, "write"),
+                        &format!("Point the launchd agent {label} at osh (it runs {program}, which is gone)"),
+                        StepKind::Write {
+                            path: plist.clone(),
+                            content: wanted,
+                        },
+                    ),
+                    step(
+                        fid(&label, "logs"),
+                        "Create the log directory",
+                        cmd("mkdir", &["-p", &logs.to_string_lossy()]),
+                    ),
+                    step(
+                        fid(&label, "bootout"),
+                        "Stop the old agent",
+                        script(
+                            r#"launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true"#,
+                            &[&label],
+                        ),
+                    ),
+                    step(
+                        fid(&label, "bootstrap"),
+                        "Start the agent again",
+                        script(
+                            r#"launchctl bootstrap "gui/$(id -u)" "$1""#,
+                            &[&plist.to_string_lossy()],
+                        ),
+                    ),
+                ],
+                None,
+            ))
+        })
+        .collect()
+}
+
+/// `steps` with the `stale_agent_steps` repairs in front, leaving out an agent `steps` already
+/// rewrites. The repairs depend on nothing in `steps`.
+pub fn with_agent_repairs(
+    f: &Facts,
+    p: &Paths,
+    h: &dyn Host,
+    reg: &Registry,
+    steps: Vec<Step>,
+) -> Vec<Step> {
+    let writes = |path: &Path| {
+        steps
+            .iter()
+            .any(|s| matches!(&s.kind, StepKind::Write { path: w, .. } if w == path))
+    };
+    let mut out: Vec<Step> = stale_agent_steps(f, p, h, reg)
+        .into_iter()
+        .filter(|g| !matches!(&g[0].kind, StepKind::Write { path, .. } if writes(path)))
+        .flatten()
+        .collect();
+    out.extend(steps);
+    out
 }
 
 /// Writes `gateways.json`. `id` is per gateway (`sid(spec, "registry")`): a shared id would let a
@@ -1548,6 +1705,136 @@ mod tests {
             false,
         ));
         assert!(vm.contains("vm-driver/sandboxes") && vm.contains("brew services stop openshell"));
+    }
+
+    /// The plist the older `just gateway-docker` wrote: its program is the deleted script.
+    const OLD_DOCKER_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+  <key>Label</key><string>dev.guilospanck.openshell-docker</string>
+  <key>ProgramArguments</key><array><string>/src/oh-my-openshell/gateway-docker-service</string></array>
+  <key>RunAtLoad</key><true/>
+</dict></plist>
+"#;
+    const OLD_PLIST_PATH: &str = "/h/Library/LaunchAgents/dev.guilospanck.openshell-docker.plist";
+
+    #[test]
+    fn an_agent_left_on_the_deleted_gateway_docker_service_is_pointed_at_osh() {
+        let mut h = FakeHost::default();
+        h.files
+            .insert(OLD_PLIST_PATH.into(), OLD_DOCKER_PLIST.into());
+        let groups = stale_agent_steps(&facts(Os::MacOs), &paths(), &h, &Registry::default());
+        assert_eq!(groups.len(), 1);
+        let g = &groups[0];
+        let StepKind::Write { path, content } = &g[0].kind else {
+            panic!("{:?}", g[0])
+        };
+        assert_eq!(path, Path::new(OLD_PLIST_PATH));
+        assert_eq!(content, &legacy_docker_plist(&paths()));
+        assert!(content.contains(
+            "<string>/usr/local/bin/osh</string><string>gateway-service</string><string>docker</string>"
+        ));
+        assert!(content.contains("<key>OSH_DIR</key><string>/h/.local/share/osh</string>"));
+        assert!(content.contains("/h/.local/state/openshell/gateway-docker/gateway.err.log"));
+        let t = texts(g);
+        assert!(
+            t.contains("mkdir -p /h/.local/state/openshell/gateway-docker"),
+            "{t}"
+        );
+        assert!(t.contains("launchctl bootout") && t.contains("dev.guilospanck.openshell-docker"));
+        assert!(t.contains(&format!(
+            "launchctl bootstrap \"gui/$(id -u)\" \"$1\" sh {OLD_PLIST_PATH}"
+        )));
+        assert_eq!(g[0].after, None);
+        for w in g.windows(2) {
+            assert_eq!(w[1].after, Some(w[0].id));
+        }
+        // Run through the executor: the plist is rewritten on the host.
+        let r = crate::setup::execute(
+            &g.clone(),
+            &h,
+            &crate::setup::Options::default(),
+            &mut |_| crate::setup::Answer::Yes,
+        );
+        assert!(r.iter().all(|r| r.outcome == crate::setup::Outcome::Done));
+        assert_eq!(h.written.borrow()[0].0, PathBuf::from(OLD_PLIST_PATH));
+        // Nothing to do on Linux, without a plist, or once it is repaired.
+        assert!(
+            stale_agent_steps(&facts(Os::Linux), &paths(), &h, &Registry::default()).is_empty()
+        );
+        let mut done = FakeHost::default();
+        done.files
+            .insert(OLD_PLIST_PATH.into(), legacy_docker_plist(&paths()));
+        assert!(
+            stale_agent_steps(&facts(Os::MacOs), &paths(), &done, &Registry::default()).is_empty()
+        );
+        assert!(stale_agent_steps(
+            &facts(Os::MacOs),
+            &paths(),
+            &FakeHost::default(),
+            &Registry::default()
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn an_agent_whose_program_exists_is_left_alone_and_a_moved_osh_is_repaired() {
+        let own = |exe: &str| {
+            OLD_DOCKER_PLIST.replace("/src/oh-my-openshell/gateway-docker-service", exe)
+        };
+        let mut h = FakeHost::default();
+        h.files
+            .insert(OLD_PLIST_PATH.into(), own("/opt/osh/bin/osh"));
+        h.paths.insert("/opt/osh/bin/osh".into());
+        assert!(
+            stale_agent_steps(&facts(Os::MacOs), &paths(), &h, &Registry::default()).is_empty()
+        );
+        // A registered gateway's agent on an osh binary that is gone gets osh's own agent now.
+        let s = spec(GwKind::Podman, 17671, false);
+        let mut reg = Registry::default();
+        reg.add(spec(GwKind::Vm, 17670, true));
+        reg.add(s.clone());
+        let plist = agent_plist_path(&paths(), &s.name);
+        let mut h = FakeHost::default();
+        h.files.insert(
+            plist.to_string_lossy().into_owned(),
+            launchd_plist(&s, Path::new("/old/place/osh"), Path::new("/l")),
+        );
+        let groups = stale_agent_steps(&facts(Os::MacOs), &paths(), &h, &reg);
+        assert_eq!(groups.len(), 1);
+        let StepKind::Write { path, content } = &groups[0][0].kind else {
+            panic!()
+        };
+        assert_eq!(path, &plist);
+        assert_eq!(
+            content,
+            &launchd_plist(&s, &paths().exe, &db_dir_for(&paths(), Os::MacOs, &s))
+        );
+        // A plan that already rewrites that agent does not get a second repair.
+        let planned = vec![step(
+            "x",
+            "",
+            StepKind::Write {
+                path: plist.clone(),
+                content: String::new(),
+            },
+        )];
+        let out = with_agent_repairs(&facts(Os::MacOs), &paths(), &h, &reg, planned);
+        assert_eq!(out.len(), 1);
+        let out = with_agent_repairs(&facts(Os::MacOs), &paths(), &h, &reg, Vec::new());
+        assert_eq!(out.len(), 4);
+    }
+
+    #[test]
+    fn launchd_plist_is_unchanged_by_the_shared_agent_writer() {
+        let s = spec(GwKind::Docker, 17671, false);
+        assert_eq!(
+            launchd_plist(&s, Path::new("/a&b/osh"), Path::new("/l")),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>dev.guilospanck.openshell-docker</string>\n  <key>ProgramArguments</key><array><string>/a&amp;b/osh</string><string>gateway-service</string><string>openshell-docker</string></array>\n  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>StandardOutPath</key><string>/l/gateway.out.log</string>\n  <key>StandardErrorPath</key><string>/l/gateway.err.log</string>\n</dict></plist>\n"
+        );
+        assert_eq!(
+            agent_program(&launchd_plist(&s, Path::new("/a&b/osh"), Path::new("/l"))),
+            Some("/a&b/osh".into())
+        );
     }
 
     #[test]

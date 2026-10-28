@@ -150,7 +150,10 @@ showing only the types you do not have), `x` removes one osh created, `d` wipes 
 The main gateway cannot be removed while others exist. A gateway you had before osh
 managed it (for example `openshell` or `openshell-docker` from an older setup) is left
 exactly as it is: it is listed, can be selected and wiped, but osh will not rename,
-reconfigure or remove it.
+reconfigure or remove it. One repair is the exception: the `openshell-docker` launchd agent an
+older `just gateway-docker` set up runs a script osh no longer ships, so `osh setup`, `osh upgrade`
+and `osh gateway-docker` point it at `osh gateway-service docker` (same config, database and
+logs) and start it again; any osh launchd agent whose program is gone is repaired the same way.
 
 osh keeps each gateway's config in `~/.local/share/osh/gateways/NAME.toml` (edit it; your
 changes are kept). The main gateway on Linux, and the VM main on macOS, use OpenShell's own

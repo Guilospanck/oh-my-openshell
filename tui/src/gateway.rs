@@ -265,10 +265,23 @@ pub fn upgrade_steps(f: &Facts, o: &Options, h: &dyn Host, p: &Paths) -> Vec<Ste
     upgrade_steps_for(f, o, h, p, &crate::gwmodel::Registry::load(&p.data))
 }
 
+/// `upgrade_steps_for`, after repairing launchd agents whose program is gone (see
+/// `gwops::stale_agent_steps`): their restarts would otherwise kick a gateway that cannot start.
+pub fn upgrade_steps_for(
+    f: &Facts,
+    o: &Options,
+    h: &dyn Host,
+    p: &Paths,
+    reg: &crate::gwmodel::Registry,
+) -> Vec<Step> {
+    let steps = upgrade_plan(f, o, h, p, reg);
+    crate::gwops::with_agent_repairs(f, p, h, reg, steps)
+}
+
 /// `upgrade_steps` for a given registry. With a main osh created, the upgrade keeps that main's
 /// own config and restarts it and its extras; the older single-gateway behaviour (the built-in
 /// config for this OS) is only for machines osh's wizard never set up.
-pub fn upgrade_steps_for(
+fn upgrade_plan(
     f: &Facts,
     o: &Options,
     h: &dyn Host,
@@ -811,6 +824,43 @@ mod tests {
             t.contains("brew services restart openshell") && t.contains("launchctl kickstart"),
             "{t}"
         );
+    }
+
+    #[test]
+    fn upgrade_first_repairs_an_agent_left_on_the_deleted_gateway_docker_service() {
+        let plist = "/h/Library/LaunchAgents/dev.guilospanck.openshell-docker.plist";
+        let mut h = FakeHost::default();
+        h.files.insert(
+            plist.into(),
+            "<plist><dict><key>ProgramArguments</key><array><string>/src/gateway-docker-service</string></array></dict></plist>".into(),
+        );
+        let steps = upgrade_steps(&facts(Os::MacOs), &Options::default(), &h, &paths());
+        let write = steps
+            .iter()
+            .position(|s| s.command_line() == format!("write {plist}"))
+            .expect("the agent is rewritten");
+        let kick = steps
+            .iter()
+            .position(|s| s.id == "upgrade-docker-gateway")
+            .unwrap();
+        assert!(write < kick);
+        assert_eq!(steps[write].after, None, "the repair waits for nothing");
+        // With a registry main too, and never on Linux.
+        let t = texts(&upgrade_steps_for(
+            &facts(Os::MacOs),
+            &Options::default(),
+            &h,
+            &paths(),
+            &reg_with(crate::gwmodel::GwKind::Vm, None),
+        ));
+        assert!(t.contains(&format!("write {plist}")), "{t}");
+        let linux = texts(&upgrade_steps(
+            &facts(Os::Linux),
+            &Options::default(),
+            &h,
+            &paths(),
+        ));
+        assert!(!linux.contains(plist));
     }
 
     #[test]

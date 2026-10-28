@@ -60,7 +60,9 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 - New host-touching code goes through `Host` and returns `Step`s, so it is
   unit-tested with `FakeHost`. Gateways are named after their type
   (`openshell-vm|docker|podman`); the first one set up is the main (17670), the rest are
-  extras. Never rename, restart or reconfigure a gateway that is not in the registry. Branch on `Os` / `PkgMgr` / `cfg!(target_os)`.
+  extras. Never rename, restart or reconfigure a gateway that is not in the registry,
+  except repairing a launchd agent whose program is gone (`gwops::stale_agent_steps`: the older
+  `just gateway-docker` agent pointed at the deleted `gateway-docker-service`). Branch on `Os` / `PkgMgr` / `cfg!(target_os)`.
 - `just test-linux` (Docker; `tests/linux/`) runs the real build, clippy and
   tests on Ubuntu, Fedora and Arch, and `osh setup` with real package installs
   (OpenShell installer, systemd and the container runtime daemons stubbed); `just test-linux-real

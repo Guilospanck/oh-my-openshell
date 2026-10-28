@@ -871,7 +871,7 @@ pub fn plan_gateways(
     revived.extend(resume);
     let mut resume = revived;
     if wanted.is_empty() {
-        return Ok(resume);
+        return Ok(crate::gwops::with_agent_repairs(f, p, h, reg, resume));
     }
     let mut o2 = o.clone();
     o2.gateways = wanted.clone();
@@ -949,7 +949,7 @@ pub fn plan_gateways(
     }
     hoist_before_installer(&mut steps, &install_first);
     resume.extend(steps);
-    Ok(resume)
+    Ok(crate::gwops::with_agent_repairs(f, p, h, reg, resume))
 }
 
 /// Moves the steps named `ids` (in plan order) to just before OpenShell's installer, which then
@@ -1269,11 +1269,13 @@ pub fn run(o: &Options, required_only: bool) -> bool {
         steps.retain(|s| !s.optional);
     }
     let paths = crate::gateway::Paths::detect();
-    if legacy_gateway_steps_allowed(&crate::gwmodel::Registry::load(&paths.data)) {
+    let reg = crate::gwmodel::Registry::load(&paths.data);
+    if legacy_gateway_steps_allowed(&reg) {
         steps.extend(crate::gateway::plan(&f, &o, &h, &paths, false));
         // The installer starts the gateway: its config must be there first.
         hoist_before_installer(&mut steps, &["gateway-backup", "gateway-config"]);
     }
+    let steps = crate::gwops::with_agent_repairs(&f, &paths, &h, &reg, steps);
     run_steps(&h, steps, &o, interactive)
 }
 
@@ -2332,6 +2334,62 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("openshell-docker") && e.contains("id -u"), "{e}");
+    }
+
+    /// `osh gateway-docker` on a Mac whose Docker gateway the older `just gateway-docker` set up:
+    /// the CLI knows `openshell-docker`, so there is no gateway to add, but its agent still runs
+    /// the deleted `gateway-docker-service`.
+    #[test]
+    fn gateway_docker_repairs_an_agent_left_on_the_deleted_script() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.runtimes_ready = vec![Runtime::Docker];
+        f.colima = true;
+        let plist = "/h/Library/LaunchAgents/dev.guilospanck.openshell-docker.plist";
+        let mut h = FakeHost::default();
+        h.files.insert(
+            plist.into(),
+            "<plist><dict><key>ProgramArguments</key><array><string>/src/gateway-docker-service</string></array></dict></plist>".into(),
+        );
+        let known = vec![
+            ("openshell".to_string(), 17670),
+            ("openshell-docker".to_string(), 17671),
+        ];
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &h,
+            &gw_paths(),
+            &crate::gwmodel::Registry::default(),
+            &known,
+            &|_| false,
+        )
+        .unwrap();
+        assert!(
+            has(&steps, &format!("write {plist}")),
+            "{:?}",
+            lines(&steps)
+        );
+        assert!(has(&steps, "launchctl bootstrap"), "{:?}", lines(&steps));
+        let StepKind::Write { content, .. } = &steps[0].kind else {
+            panic!("{:?}", steps[0])
+        };
+        assert!(content.contains("<string>gateway-service</string><string>docker</string>"));
+        // Repaired, it is "nothing to do" again.
+        h.files
+            .insert(plist.into(), crate::gwops::legacy_docker_plist(&gw_paths()));
+        let steps = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &h,
+            &gw_paths(),
+            &crate::gwmodel::Registry::default(),
+            &known,
+            &|_| false,
+        )
+        .unwrap();
+        assert!(steps.is_empty(), "{:?}", lines(&steps));
     }
 
     #[test]
