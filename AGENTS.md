@@ -30,7 +30,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 
 | Path | What |
 | --- | --- |
-| `tui/src/` | Rust TUI (crate `osh-tui`). `main.rs` event loop and subcommands (`doctor`, `setup`, `upgrade`, `uninstall`, `gateway-docker`, `gateway-reset`, `sync-agents`), `app.rs` state and tabs, `ui.rs` drawing, `cli.rs` wrappers around the `openshell` and container runtime CLIs, `term.rs` embedded shells (libghostty-vt + portable-pty), `watch.rs` log watcher, `logview.rs`, `clip.rs` clipboard |
+| `tui/src/` | Rust TUI (crate `osh-tui`). `main.rs` event loop and subcommands (`doctor`, `setup`, `upgrade`, `uninstall`, `gateway add|remove`, `gateway-docker`, `gateway-reset`, `gateway-service`, `sync-agents`), `app.rs` state and tabs, `ui.rs` drawing, `cli.rs` wrappers around the `openshell` and container runtime CLIs, `term.rs` embedded shells (libghostty-vt + portable-pty), `watch.rs` log watcher, `logview.rs`, `clip.rs` clipboard |
 | `tui/src/platform.rs` | `Os`, `PkgMgr`, `Runtime` (Docker/Podman), the `Host` trait (the only door to the host; `FakeHost` in tests) and `Facts` |
 | `tui/src/setup.rs` | Pure planner (`plan`: Facts in, `Step`s out), `execute` with consent, `doctor`, `hint` |
 | `tui/src/gateway.rs` | Gateway config install, service restart, macOS Docker gateway (launchd), reset, upgrade, uninstall: all as `Step`s |
@@ -41,6 +41,8 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 | `tui/src/agents.rs` | The `sync-agents` logic (manifest, policy preflight, generated profile); golden fixture in `tui/fixtures/` |
 | `osh`, `dev-env` | Developer launcher: rebuilds `tui/` when sources are newer than the binary, sets `OSH_DIR` to the checkout, execs the binary. `dev-env` is the shared Zig 0.15 lookup |
 | `.justfile` | Developer entry points: checks and build, thin wrappers over `osh setup|upgrade|uninstall|gateway-docker`, hooks |
+| `install.sh` | Release installer (`curl ... | sh`): downloads and checksums `osh-VERSION-OS-ARCH.tar.gz`, installs `osh`, runs `osh setup`; `OSH_VERSION`, `OSH_BIN_DIR`, `OSH_RELEASE_BASE`, `OSH_NO_SETUP` |
+| `tests/linux`, `tests/macos`, `tests/release` | The container, VM and stand-in suites behind the `just test-*` recipes (see Platforms) |
 | `scripts/release` | Local release build (archives per platform); the GitHub workflow runs the same script |
 | `providers/*.yaml` | OpenShell provider profiles (network policy per service). Imported with `openshell provider profile import` |
 | `images/Dockerfile-*` | Sandbox images built from the Images tab |
@@ -52,9 +54,10 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 - macOS: vm gateway (Homebrew service, `gateway.toml`) plus an optional
   Docker gateway (launchd agent that runs `osh gateway-service docker`, Colima,
   `gateway-docker.toml`).
-- Linux: one gateway, the packaged `openshell-gateway` systemd user service,
-  on the Docker driver (`gateway-linux.toml`) or the Podman driver
-  (`gateway-podman.toml`, untested on a real host). `osh setup` installs a
+- Linux: the main gateway is the packaged `openshell-gateway` systemd user
+  service, on the Docker driver (`gateway-linux.toml`), the Podman driver
+  (`gateway-podman.toml`, untested on a real host) or the vm driver (needs
+  `/dev/kvm`); extras run as `osh-gateway-NAME` units. Docker Desktop is untested. `osh setup` installs a
   runtime only when neither Docker nor Podman exists. Linux needs Zig 0.15
   (PATH or Linuxbrew) to build and `wl-paste` or `xclip` for image paste.
 - New host-touching code goes through `Host` and returns `Step`s, so it is
@@ -66,7 +69,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 - `just test-linux` (Docker; `tests/linux/`) runs the real build, clippy and
   tests on Ubuntu, Fedora and Arch, and `osh setup` with real package installs
   (OpenShell installer, systemd and the container runtime daemons stubbed); `just test-linux-real
-  podman|docker` boots a systemd machine with nothing stubbed and runs the two-gateway
+  podman|docker|vm` boots a systemd machine with nothing stubbed and runs the two-gateway
   scenarios (add, remove, reset, uninstall); the podman run also drives the wizard in a real
   pseudo-terminal. `just test-linux-real vm` does the same for the VM gateway with `--device
   /dev/kvm`; without KVM on the Docker host (Colima needs `--nested-virtualization`) it prints
@@ -110,7 +113,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   tokens: the pre-commit hook blocks them, and a missing `gitleaks` blocks the
   commit too. Do not bypass with `--no-verify`.
 - Ask first before running anything that changes the host or running
-  OpenShell state: `osh setup|upgrade|uninstall|gateway-docker` (and the `just`
+  OpenShell state: `osh setup|upgrade|uninstall|gateway-docker|gateway add|gateway remove` (and the `just`
   wrappers), `osh gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
   (it is interactive and talks to the live gateway), and any
   `openshell sandbox|provider|policy` write command. Read-only ones

@@ -14,14 +14,22 @@ here, not in the dotfiles checkout.
 osh            # the dashboard; the first time, a guided screen sets up your gateways
 osh doctor     # read-only: what is installed, what is missing
 osh setup      # the guided screen again (needs a terminal); or, without one:
-osh setup --gateways docker,podman --yes   # the first listed is the main gateway
-osh gateway add vm|docker|podman           # one more gateway
+osh setup --gateways docker,podman --yes   # the first listed is the main gateway; --dry-run only prints the steps
+osh gateway add vm|docker|podman [--yes] [--dry-run]   # one more gateway
 osh gateway remove NAME [--delete-data]    # remove a gateway osh created (typed confirmation)
-osh upgrade    # reinstall OpenShell, refresh the gateway config, restart the service
+osh upgrade    # reinstall OpenShell, refresh the gateway config, restart the main gateway and its extras
+osh gateway-docker          # same as: osh gateway add docker
 osh uninstall  # remove OpenShell, its services and folders (asks first; sandboxes are lost)
 osh gateway-reset NAME      # wipe a gateway's sandboxes and database (typed confirmation)
 osh sync-agents --dry-run   # preview what a sandbox would get from your agent setup
 ```
+
+Install from a release (Linux or macOS, x86_64 or aarch64): `curl -fsSL
+https://raw.githubusercontent.com/Guilospanck/oh-my-openshell/main/install.sh | sh` downloads
+`osh-VERSION-OS-ARCH.tar.gz`, checks its `.sha256`, puts `osh` in `~/.local/bin` and runs `osh setup`
+(asking before each step, on the terminal even when piped). Environment: `OSH_VERSION` (release tag; default the
+latest), `OSH_BIN_DIR`, `OSH_RELEASE_BASE` (a directory or URL holding the archives; needs `OSH_VERSION`)
+and `OSH_NO_SETUP=1` (binary only). Linux archives are built on Ubuntu 24.04 and need glibc 2.39 or newer.
 
 `osh` is a single binary. The provider profiles, sandbox Dockerfiles and gateway
 configs are embedded in it and written to `~/.local/share/osh` on first run
@@ -39,7 +47,9 @@ it cannot do for you (no sudo, unknown distro, a stopped Docker daemon) is
 printed as the command to run yourself. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the
 dashboard; image builds need a container runtime.
 
-Release binaries: `scripts/release` builds them locally (see Development). From a
+Release archives: `scripts/release vX.Y.Z [--linux amd64 arm64]` builds them into `dist/` with a `.sha256` each
+and prints the `gh release create` command; it never uploads. Pushing a `v*` tag runs the same script in
+`.github/workflows/release.yml` (one runner per platform, then publish), which has not yet run on GitHub. From a
 checkout, `./osh` is a launcher that builds the TUI with cargo when its sources
 change and sets `OSH_DIR` to the checkout, so edits to the repo's providers and
 Dockerfiles apply with no copy. Build needs `cargo` and Zig 0.15.
@@ -51,7 +61,7 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a GitHub repo token (`t`) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a GitHub repo token (`t`), install skills and plugins (`K`, below) |
 | Providers | create from a `providers/*.yaml` profile or a read/write GitHub repo token (`n`), update credentials (`u`; renews a repo token), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated |
@@ -137,12 +147,12 @@ sandbox closes. The host needs `pngpaste` (macOS; `osh setup` installs it),
 A gateway is where sandboxes run, and each is named after its type: `openshell-vm`,
 `openshell-docker`, `openshell-podman`. You can have several side by side, on
 macOS and on Linux. The first one you create is the **main** gateway (port 17670, the
-one the CLI uses by default); the others get the next free ports (17671 and up).
+one the CLI uses by default); the others get the next free ports (17671 and up). Each gateway also uses the port +10 (health) and +20 (metrics).
 
 | Type | What it is | Needs |
 | --- | --- | --- |
 | VM | each sandbox in its own microVM; strongest isolation, fixed size per VM | macOS: `e2fsprogs`. Linux: `/dev/kvm` usable by your user (osh adds you to the `kvm` group and asks for a new login) and `e2fsprogs`; unavailable, with the reason, where there is no KVM |
-| Docker | sandboxes as containers; honours per-sandbox CPU/memory | Linux: Docker Engine, the `docker` service, your user in the `docker` group (new login). macOS: Colima (installed and started) or Docker Desktop (you start it) |
+| Docker | sandboxes as containers; honours per-sandbox CPU/memory | Linux: Docker Engine, the `docker` service, your user in the `docker` group (new login). macOS: Colima (installed and started) or Docker Desktop (you start it; untested) |
 | Podman | like Docker, daemonless and rootless | Linux: `podman` and its user `podman.socket`. macOS: `podman` and a Podman machine (created and started) |
 
 The Gateways tab lists them with their type and port. `a` adds one (the same screen,
@@ -293,7 +303,7 @@ throwaway HOME, leaving your own Colima untouched. Docker Desktop is not tested.
 ## Setup without the dashboard
 
 Everything above runs from the shell (`osh setup`, `upgrade`, `uninstall`,
-`gateway-docker`, `gateway-reset`). The justfile keeps thin developer wrappers for
+`gateway add|remove`, `gateway-docker`, `gateway-reset`). The justfile keeps thin developer wrappers for
 them (`just install`, `upgrade`, `uninstall`, `gateway-docker`, `tui`) and
 `just install-hooks` (below). Run recipes with `just --justfile .justfile <recipe>`.
 
