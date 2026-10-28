@@ -185,6 +185,8 @@ pub enum ConfKind {
     /// Stop and start these sandboxes so they pick up a renewed token.
     Restart(Vec<String>),
     DeleteSandbox(String),
+    /// Open GitHub's token list; the carried names are the tokens to delete there.
+    OpenTokenPage(Vec<String>),
     DeleteProvider(String),
     ResetGateway(String),
     /// Remove a gateway osh created (typed confirmation was the modal).
@@ -358,6 +360,8 @@ pub enum GhStage {
         token: String,
         problem: Option<String>,
     },
+    /// A sandbox was deleted with its token providers; the tokens still live on GitHub.
+    Leftover(Vec<String>),
 }
 
 /// Result of a background step of the "add skills to a sandbox" flow.
@@ -1347,6 +1351,19 @@ impl App {
                         kind: ConfKind::Restart(sandboxes),
                     });
                 }
+                return;
+            }
+            Some(GhStage::Leftover(names)) => {
+                self.modal = Some(Modal::Confirm {
+                    text: format!(
+                        "The GitHub token{} only this sandbox used {} still valid on github.com: {}.\n\nGitHub has no way to delete a token from here. Open your token list now so you can delete {}?",
+                        if names.len() == 1 { "" } else { "s" },
+                        if names.len() == 1 { "is" } else { "are" },
+                        names.join(", "),
+                        if names.len() == 1 { "it" } else { "them" },
+                    ),
+                    kind: ConfKind::OpenTokenPage(names),
+                });
                 return;
             }
             None => {}
@@ -2789,15 +2806,30 @@ impl App {
                 let title = format!("Token for {} (hidden)", flow.repo.full());
                 self.input(&title, true, InKind::RepoToken(flow));
             }
+            ConfKind::OpenTokenPage(names) => {
+                self.status = if cli::open_url(ghrepo::TOKENS_PAGE) {
+                    format!("Delete {} on GitHub", names.join(", "))
+                } else {
+                    format!("Could not open a browser; go to {}", ghrepo::TOKENS_PAGE)
+                };
+            }
             ConfKind::DeleteSandbox(name) => {
                 let providers = self.snap.providers.clone();
-                self.bg_msg(move || {
+                self.bg(move || {
                     cli::os(&["sandbox", "delete", &name])?;
                     let gone = cli::drop_repo_providers(&name, &providers);
-                    Ok(if gone.is_empty() {
+                    let msg = if gone.is_empty() {
                         format!("Deleted sandbox {name}")
                     } else {
-                        format!("Deleted sandbox {name} and {}", gone.join(", "))
+                        let names: Vec<&str> = gone.iter().map(|(p, _)| p.as_str()).collect();
+                        format!("Deleted sandbox {name} and {}", names.join(", "))
+                    };
+                    Ok(Done {
+                        msg,
+                        next: None,
+                        sync: None,
+                        gh: (!gone.is_empty())
+                            .then(|| GhStage::Leftover(gone.into_iter().map(|(_, t)| t).collect())),
                     })
                 })
             }
@@ -3823,6 +3855,27 @@ mod tests {
             }),
         });
         assert!(a.modal.is_none());
+    }
+
+    #[test]
+    fn deleting_a_sandbox_with_its_own_token_offers_to_open_the_github_token_list() {
+        let mut a = app();
+        a.on_done(Done {
+            msg: "Deleted sandbox dev and github-dev-app".into(),
+            next: None,
+            sync: None,
+            gh: Some(GhStage::Leftover(vec!["osh-dev-app".into()])),
+        });
+        match &a.modal {
+            Some(Modal::Confirm {
+                text,
+                kind: ConfKind::OpenTokenPage(names),
+            }) => {
+                assert_eq!(names, &["osh-dev-app".to_string()]);
+                assert!(text.contains("osh-dev-app") && text.contains("delete it"));
+            }
+            _ => panic!("no token offer"),
+        }
     }
 
     #[test]

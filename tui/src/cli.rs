@@ -604,8 +604,9 @@ pub fn restart_sandbox(sandbox: &str) -> Result<(), String> {
 }
 
 /// Remove the per-sandbox repo providers of a deleted sandbox, and their profiles once no
-/// other provider uses them. Returns the providers removed.
-pub fn drop_repo_providers(sandbox: &str, providers: &[Provider]) -> Vec<String> {
+/// other provider uses them. Returns each provider removed with the name of the GitHub token
+/// behind it, which stays valid on github.com until the user deletes it there.
+pub fn drop_repo_providers(sandbox: &str, providers: &[Provider]) -> Vec<(String, String)> {
     let file = ghrepo::tracked_path();
     let gw = gateway();
     let mine: Vec<Tracked> = ghrepo::load_tracked(file.as_deref())
@@ -616,11 +617,15 @@ pub fn drop_repo_providers(sandbox: &str, providers: &[Provider]) -> Vec<String>
                     .is_some_and(|r| ghrepo::provider_name(sandbox, &r) == t.provider)
         })
         .collect();
-    let mut removed = Vec::new();
+    let mut removed: Vec<(String, String)> = Vec::new();
     for t in &mine {
         if os(&["provider", "delete", &t.provider]).is_ok() {
             ghrepo::untrack(file.as_deref(), &gw, &t.provider);
-            removed.push(t.provider.clone());
+            let repo = t.repo.rsplit('/').next().unwrap_or(&t.repo);
+            removed.push((
+                t.provider.clone(),
+                ghrepo::token_name(&format!("{sandbox}-{repo}")),
+            ));
         }
     }
     for t in &mine {
@@ -633,7 +638,7 @@ pub fn drop_repo_providers(sandbox: &str, providers: &[Provider]) -> Vec<String>
         };
         let used = providers
             .iter()
-            .any(|p| &p.ty == ty && !removed.contains(&p.name));
+            .any(|p| &p.ty == ty && !removed.iter().any(|(r, _)| r == &p.name));
         if !used {
             let _ = os(&["profile", "delete", ty]);
         }

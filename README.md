@@ -257,7 +257,8 @@ that repo only. The token lives in a provider created from it: `github-<sandbox>
 for one sandbox, or `github-<repo>` when you pick "shared by sandboxes" (also
 `n` on the Providers tab, "GitHub repo, read/write"; attach it to other
 sandboxes with `a` or pick it in the wizard). A sandbox's own provider is deleted
-with the sandbox; a shared one stays until you delete it.
+with the sandbox, and osh then offers to open GitHub's token list and names the token to delete there
+(GitHub has no API for that); a shared one stays until you delete it.
 
 Tokens expire after 30 days. The Providers tab shows the repo and time left
 (yellow in the last 7 days), and a yellow banner under the tabs names the

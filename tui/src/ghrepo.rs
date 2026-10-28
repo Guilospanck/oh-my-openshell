@@ -87,15 +87,23 @@ fn encode(s: &str) -> String {
 /// GitHub's template URL for a fine-grained token. The repository cannot be preselected, so
 /// `steps` tells the user to pick it.
 pub fn token_url(r: &GhRepo, label: &str) -> String {
-    let name: String = format!("osh-{}", slug(label)).chars().take(40).collect();
-    let name = name.trim_end_matches('-');
+    let name = token_name(label);
     format!(
         "https://github.com/settings/personal-access-tokens/new?name={}&description={}&target_name={}&expires_in={TOKEN_DAYS}&contents=write&pull_requests=write&workflows=write",
-        encode(name),
+        encode(&name),
         encode(&format!("osh sandbox access to {}", r.full())),
         encode(&r.owner),
     )
 }
+
+/// The name the prefilled GitHub token page gives a token labelled `label`.
+pub fn token_name(label: &str) -> String {
+    let name: String = format!("osh-{}", slug(label)).chars().take(40).collect();
+    name.trim_end_matches('-').to_string()
+}
+
+/// Where GitHub lists fine-grained tokens; it has no API to delete one.
+pub const TOKENS_PAGE: &str = "https://github.com/settings/personal-access-tokens";
 
 /// What to tell the user before they paste the token.
 pub fn steps(r: &GhRepo, url: &str) -> String {
@@ -322,6 +330,14 @@ GIT_CONFIG_VALUE_2='!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn token_name_matches_the_prefilled_page_and_stays_short() {
+        let r = parse_remote("https://github.com/acme/app").unwrap();
+        assert_eq!(token_name("box-app"), "osh-box-app");
+        assert!(token_url(&r, "box-app").contains("name=osh-box-app&"));
+        assert!(token_name(&"x".repeat(80)).len() <= 40);
+    }
+
     use super::*;
 
     fn repo(o: &str, r: &str) -> GhRepo {
