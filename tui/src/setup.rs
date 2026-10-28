@@ -840,9 +840,16 @@ pub fn plan_gateways(
         };
         let known = existing.iter().any(|(n, _)| *n == spec.name);
         let runtime_down = availability(f, *k).state == State::NeedsInstall;
+        // Whether osh's own service for it is up. Not knowing must not read as "stopped": that
+        // would restart a healthy gateway and drop its sandboxes' connections.
+        let running = if crate::gwops::packaged(spec, f.os) || (!spec.main && !known) {
+            false
+        } else {
+            crate::gwops::extra_running(f.os, h, spec)?
+        };
         let mut g = if spec.main {
             crate::gwops::main_gateway_steps(f, p, h, reg, spec, !known)
-        } else if !known || !crate::gwops::extra_running(f.os, h, spec) {
+        } else if !known || !running {
             crate::gwops::add_gateway_steps(f, p, h, reg, spec)
         } else {
             Vec::new()
@@ -2235,6 +2242,7 @@ mod tests {
         ]);
         let p = gw_paths();
         let mut h = FakeHost::default();
+        h.outputs.insert("id -u".into(), "501\n".into());
         // Both agents are loaded (launchctl print succeeds) and current.
         for spec in &reg.gateways {
             let logs = crate::gwops::db_dir_for(&p, Os::MacOs, spec);
@@ -2305,12 +2313,35 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_agent_whose_state_cannot_be_told_stops_the_plan() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.runtimes_ready = vec![Runtime::Docker];
+        let reg = registered(&[(GwKind::Vm, 17670, true), (GwKind::Docker, 17671, false)]);
+        let mut h = FakeHost::default();
+        h.failing.insert("id".into());
+        let e = plan_gateways(
+            &f,
+            &with_gateways(&[GwKind::Docker]),
+            &h,
+            &gw_paths(),
+            &reg,
+            &known_of(&reg),
+            &|_| false,
+        )
+        .unwrap_err();
+        assert!(e.contains("openshell-docker") && e.contains("id -u"), "{e}");
+    }
+
+    #[test]
     fn a_resumed_macos_docker_main_gets_its_runtime_started_first() {
         let mut f = facts(Os::MacOs, PkgMgr::Brew);
         f.has_openshell = true;
         f.colima = true; // installed, not running: docker does not answer
         let reg = registered(&[(GwKind::Docker, 17670, true)]);
         let mut h = FakeHost::default();
+        h.outputs.insert("id -u".into(), "501\n".into());
         h.failing.insert("launchctl".into());
         let steps = plan_gateways(
             &f,

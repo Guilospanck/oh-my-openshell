@@ -435,24 +435,34 @@ fn own_service_steps(
     chain(steps, None)
 }
 
-/// Whether an osh-run extra's service is active right now.
-pub fn extra_running(os: Os, h: &dyn Host, spec: &GatewaySpec) -> bool {
+/// Whether an osh-run gateway's own service is active right now. `Err` when that cannot be told
+/// (macOS: `id -u` failed, so there is no launchd domain to ask): not knowing is not "stopped".
+pub fn extra_running(os: Os, h: &dyn Host, spec: &GatewaySpec) -> Result<bool, String> {
     match os {
-        Os::Linux => h
+        Os::Linux => Ok(h
             .run(
                 "systemctl",
                 &["--user", "is-active", "--quiet", &unit_name(&spec.name)],
             )
-            .is_ok(),
+            .is_ok()),
         Os::MacOs => {
-            let target = format!("gui/{}/{}", "$(id -u)", agent_label(&spec.name));
             // `launchctl print` needs the real uid; ask `id` rather than a shell.
             let uid = h
                 .run("id", &["-u"])
                 .map(|o| o.trim().to_string())
-                .unwrap_or_default();
-            let target = target.replace("$(id -u)", &uid);
-            h.run("launchctl", &["print", &target]).is_ok()
+                .ok()
+                .filter(|u| !u.is_empty() && u.bytes().all(|b| b.is_ascii_digit()))
+                .ok_or_else(|| {
+                    format!(
+                        "cannot tell whether {} is running: `id -u` did not give a user id",
+                        spec.name
+                    )
+                })?;
+            let label = agent_label(&spec.name);
+            Ok(
+                h.run("launchctl", &["print", &format!("gui/{uid}/{label}")])
+                    .is_ok(),
+            )
         }
     }
 }
@@ -570,7 +580,9 @@ fn main_steps(
             && !installing
             && agent_current
             && h.read(&config_path(p, &spec.name)).is_some()
-            && extra_running(f.os, h, spec)
+            // `plan_gateways` refuses to plan when this cannot be told; anywhere else, an unknown
+            // state gets the steps that bring the gateway up.
+            && extra_running(f.os, h, spec) == Ok(true)
         {
             return Vec::new();
         }
@@ -1570,6 +1582,24 @@ mod tests {
         r.add(spec(GwKind::Podman, 17672, false));
         assert!(shares_runtime(&r, "openshell-docker"));
         assert!(shares_runtime(&r, "unregistered"));
+    }
+
+    #[test]
+    fn extra_running_reports_an_unknown_uid_as_an_error_not_as_stopped() {
+        let s = spec(GwKind::Docker, 17671, false);
+        let mut h = FakeHost::default();
+        h.outputs.insert("id -u".into(), "501\n".into());
+        assert_eq!(extra_running(Os::MacOs, &h, &s), Ok(true));
+        assert!(h
+            .calls
+            .borrow()
+            .contains(&"launchctl print gui/501/dev.guilospanck.openshell-docker".to_string()));
+        h.failing.insert("launchctl".into());
+        assert_eq!(extra_running(Os::MacOs, &h, &s), Ok(false));
+        let mut h = FakeHost::default();
+        h.failing.insert("id".into());
+        assert!(extra_running(Os::MacOs, &h, &s).is_err());
+        assert!(!h.calls.borrow().iter().any(|c| c.starts_with("launchctl")));
     }
 
     #[test]
