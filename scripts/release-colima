@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# scripts/release-colima up|down
+#
+# A separate Colima instance for the Linux release archives on an Apple Silicon Mac. Its VM uses
+# Apple's Virtualization framework with Rosetta, so linux/amd64 containers run at near native
+# speed next to the native linux/arm64 ones (the GitHub workflow gets both from native runners).
+#
+#   up     starts it if needed and prints the Docker socket path on stdout (everything else on stderr)
+#   down   deletes the instance and its disk
+#
+# Nothing of an existing Colima is touched, as in tests/linux/kvm.sh: its own COLIMA_HOME
+# ($OSH_RELEASE_HOME, default ~/.cache/osh-release), profile osh-release, no Docker context switch
+# (--activate=false and a throwaway DOCKER_CONFIG for colima itself), no ~/.ssh/config edit. The
+# caller points Docker at the socket for its own run only.
+set -euo pipefail
+
+[[ "$(uname)" == Darwin && "$(uname -m)" == arm64 ]] || { echo "release-colima: Apple Silicon macOS only" >&2; exit 2; }
+for t in colima limactl docker; do
+  command -v "$t" >/dev/null 2>&1 || { echo "release-colima: $t is required (brew install colima docker)" >&2; exit 2; }
+done
+
+profile=osh-release
+export COLIMA_HOME="${OSH_RELEASE_HOME:-$HOME/.cache/osh-release}"
+cfg="$(mktemp -d "${TMPDIR:-/tmp}/osh-release-docker.XXXXXX")"
+trap 'rm -rf "$cfg"' EXIT
+col() { DOCKER_CONFIG="$cfg" colima "$@"; }
+sock="$COLIMA_HOME/$profile/docker.sock"
+
+case "${1:-}" in
+  up)
+    if col status -p "$profile" >/dev/null 2>&1; then
+      echo "release-colima: reusing the running instance $profile ($COLIMA_HOME)" >&2
+    else
+      [[ -e /Library/Apple/usr/share/rosetta/rosetta ]] \
+        || { echo "release-colima: Rosetta is not installed (the amd64 containers need it). Run: softwareupdate --install-rosetta --agree-to-license" >&2; exit 1; }
+      echo "release-colima: starting the instance $profile with Rosetta ($COLIMA_HOME)" >&2
+      mkdir -p "$COLIMA_HOME"
+      col start -p "$profile" --vm-type vz --vz-rosetta --cpu 6 --memory 8 --disk 60 \
+        --activate=false --ssh-config=false >"$COLIMA_HOME/start.log" 2>&1 \
+        || { tail -20 "$COLIMA_HOME/start.log" >&2; exit 1; }
+    fi
+    [[ -S "$sock" ]] || { echo "release-colima: no Docker socket at $sock" >&2; exit 1; }
+    echo "$sock"
+    ;;
+  down)
+    if [[ -d "$COLIMA_HOME/$profile" ]]; then
+      echo "release-colima: deleting the instance $profile" >&2
+      col delete -p "$profile" --data --force >/dev/null 2>&1 || true
+    fi
+    rm -rf "$COLIMA_HOME"
+    ;;
+  *) echo "usage: release-colima up|down" >&2; exit 2 ;;
+esac

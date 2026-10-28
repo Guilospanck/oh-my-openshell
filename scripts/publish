@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/publish vX.Y.Z [--dry-run] [--notes TEXT] [--linux ARCH...] [--no-linux]
+# scripts/publish vX.Y.Z [--dry-run] [--notes TEXT] [--linux ARCH...] [--no-linux] [--host-docker] [--keep-vm]
 #
 # The local equivalent of the release workflow, end to end: checks, version bump, archives,
 # formula lint, tag, GitHub release, Homebrew tap. Run it through `just release`.
@@ -11,6 +11,10 @@
 #   5. lint        renders the formula and runs `brew style` on it
 #   6. publish     commits the bump, pushes it and the tag, `gh release create`, pushes the tap
 #
+# The Linux archives build in containers. On an Apple Silicon Mac that is a separate Colima instance
+# with Rosetta (scripts/release-colima), started for the run and deleted afterwards (--keep-vm keeps
+# it); --host-docker uses the Docker you already have instead. Elsewhere the current Docker or Podman.
+#
 # --dry-run stops after step 5 and puts the bump back. Nothing is pushed or installed: osh is
 # never run, `osh setup` is never called. Needs gh (logged in) with push access to the tap.
 set -euo pipefail
@@ -20,17 +24,22 @@ tap_repo="Guilospanck/homebrew-tap"
 formula="oh-my-openshell"
 
 tag="${1:-}"
-[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: scripts/publish vX.Y.Z [--dry-run] [--notes TEXT] [--linux ARCH...] [--no-linux]" >&2; exit 2; }
+[[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "usage: scripts/publish vX.Y.Z [--dry-run] [--notes TEXT] [--linux ARCH...] [--no-linux] [--host-docker] [--keep-vm]" >&2; exit 2; }
 shift
 version="${tag#v}"
 dry=0
 notes=""
 linux=(amd64 arm64)
+own_vm=1
+keep_vm=0
+vm_up=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) dry=1 ;;
     --notes) notes="${2:-}"; shift ;;
     --no-linux) linux=() ;;
+    --host-docker) own_vm=0 ;;
+    --keep-vm) keep_vm=1 ;;
     --linux) linux=(); shift; while [[ $# -gt 0 && "$1" != --* ]]; do linux+=("$1"); shift; done; continue ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
@@ -41,17 +50,20 @@ say() { printf '\n== %s\n' "$*"; }
 die() { echo "publish: $*" >&2; exit 1; }
 cd "$repo"
 
+# Everything this run changes is put back on exit, pass or fail: the version bump (until it is
+# committed), the temp dir, and the release Colima instance.
+tmp=""
+restore() { git checkout -- tui/Cargo.toml tui/Cargo.lock 2>/dev/null || true; }
+cleanup() {
+  restore
+  [[ -z "$tmp" ]] || rm -rf "$tmp"
+  if [[ $vm_up -eq 1 && $keep_vm -eq 0 ]]; then "$repo/scripts/release-colima" down; fi
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
 say "preflight"
 for t in git gh just cargo brew; do command -v "$t" >/dev/null 2>&1 || die "$t is required"; done
-if [[ ${#linux[@]} -gt 0 ]]; then
-  rt=docker; docker info >/dev/null 2>&1 || rt=podman
-  "$rt" info >/dev/null 2>&1 || die "the Linux archives need a running Docker or Podman (start Colima, or pass --no-linux)"
-  # A foreign architecture needs an emulator in the container VM; without it the build dies with "exec format error".
-  for a in "${linux[@]}"; do
-    "$rt" run --rm --platform "linux/$a" busybox true >/dev/null 2>&1 \
-      || die "cannot run linux/$a containers here (no emulator). Register one: $rt run --privileged --rm tonistiigi/binfmt --install $a; or build only what runs: --linux arm64"
-  done
-fi
 gh auth status >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
 [[ -z "$(git status --porcelain)" ]] || die "working tree not clean: commit or stash first"
 [[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || die "release from main"
@@ -63,15 +75,28 @@ if [[ $dry -eq 0 ]]; then
   [[ "$(gh repo view "$tap_repo" --json viewerPermission --jq .viewerPermission)" =~ ^(ADMIN|MAINTAIN|WRITE)$ ]] \
     || die "no push access to $tap_repo (run: just release-setup)"
 fi
+
+# Containers for the Linux archives. Foreign architectures need an emulator in the VM, or the
+# build dies with "exec format error".
+if [[ ${#linux[@]} -gt 0 ]]; then
+  if [[ $own_vm -eq 1 && "$(uname)" == Darwin && "$(uname -m)" == arm64 ]]; then
+    say "release Colima instance (Rosetta)"
+    vm_up=1
+    sock="$("$repo/scripts/release-colima" up)"
+    unset DOCKER_CONTEXT
+    export DOCKER_HOST="unix://$sock"
+  fi
+  rt=docker; docker info >/dev/null 2>&1 || rt=podman
+  "$rt" info >/dev/null 2>&1 || die "the Linux archives need a running Docker or Podman (start Colima, or pass --no-linux)"
+  for a in "${linux[@]}"; do
+    "$rt" run --rm --platform "linux/$a" busybox true >/dev/null 2>&1 \
+      || die "cannot run linux/$a containers here (no emulator). Use the default release Colima (drop --host-docker), register one: $rt run --privileged --rm tonistiigi/binfmt --install $a; or build only what runs: --linux arm64"
+  done
+fi
 echo "ok"
 
 say "just check"
 just --justfile "$repo/.justfile" check
-
-# Everything from here changes tracked files; a dry run (or any failure) puts them back.
-restore() { git checkout -- tui/Cargo.toml tui/Cargo.lock 2>/dev/null || true; }
-trap 'restore' ERR
-trap 'restore; exit 130' INT
 
 say "bump to $version"
 perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' tui/Cargo.toml
@@ -83,7 +108,6 @@ host_bin="$repo/tui/target/release/osh-tui"
 
 say "lint the formula"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"; restore' EXIT
 mkdir -p "$tmp/Formula"
 "$repo/scripts/render-formula" "$tag" "$repo/dist" > "$tmp/Formula/$formula.rb"
 cat "$tmp/Formula/$formula.rb"
@@ -98,7 +122,6 @@ fi
 say "commit, tag, push"
 git add tui/Cargo.toml tui/Cargo.lock
 git commit -q -m "release $tag"
-trap - ERR
 if [[ -n "${notes//[[:space:]]/}" ]]; then git tag -a "$tag" --cleanup=verbatim -m "$notes"; else git tag "$tag"; fi
 git push origin HEAD
 git push origin "$tag"

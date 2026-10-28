@@ -56,6 +56,9 @@ Releasing from this machine, the same steps as the workflow plus the Homebrew fo
 version bump, archives, formula lint; pushes nothing, reverts the bump), then `just release vX.Y.Z ["notes"]`
 (commits the `tui/Cargo.toml` bump, tags, pushes, `gh release create`, pushes `Formula/oh-my-openshell.rb` to
 `Guilospanck/homebrew-tap`). It needs a clean `main` level with `origin`, and never runs `osh` or `osh setup`.
+On Apple Silicon the Linux archives build in a separate Colima instance with Rosetta (`scripts/release-colima`; it
+needs `colima`, `lima` and Rosetta: `softwareupdate --install-rosetta`), created for the run and deleted after it
+(`--keep-vm` keeps it, `--host-docker` uses your own Docker instead); your own Colima is not touched.
 Users then run `brew install Guilospanck/tap/oh-my-openshell`; the formula installs only the binary. A Mac builds
 only its own architecture, so an Apple Silicon release has no Intel macOS archive and the formula omits that block.
 `just release-setup-ci-key` is the one-time deploy key (stored as the repo secret `HOMEBREW_TAP_DEPLOY_KEY`) the workflow uses to push the tap; once Actions run again, release by pushing the tag only, since `just release` also creates the GitHub release and would make the workflow fail. From a

@@ -84,7 +84,7 @@ test-release:
 
 # Release, all from this machine (what .github/workflows/release.yml does in CI). Nothing here installs or runs osh.
 
-# One-time and read-only: checks gh login, push access to the Homebrew tap, Docker for the Linux archives, brew, Zig
+# One-time and read-only: checks gh login, push access to the Homebrew tap, Colima and Rosetta (Apple Silicon) or Docker for the Linux archives, brew, Zig
 release-setup:
 	#!/usr/bin/env bash
 	set -u
@@ -105,7 +105,11 @@ release-setup:
 	command -v just >/dev/null 2>&1 && ok just || no just "brew install just"
 	source "{{justfile_directory()}}/dev-env"
 	osh_use_zig && ok "zig 0.15" || no "zig 0.15" "brew install zig@0.15"
-	if docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1; then ok "container runtime running (Linux archives)"; else no "running Docker or Podman" "colima start; or release with --no-linux"; fi
+	if [[ "$(uname)" == Darwin && "$(uname -m)" == arm64 ]]; then
+	    # The Linux archives build in their own Colima instance with Rosetta (scripts/release-colima)
+	    command -v colima >/dev/null 2>&1 && command -v limactl >/dev/null 2>&1 && ok "colima, limactl" || no "colima and limactl" "brew install colima lima docker"
+	    [[ -e /Library/Apple/usr/share/rosetta/rosetta ]] && ok "Rosetta (amd64 Linux archive)" || no "Rosetta" "softwareupdate --install-rosetta --agree-to-license"
+	elif docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1; then ok "container runtime running (Linux archives)"; else no "running Docker or Podman" "start it; or release with --no-linux"; fi
 	exit $bad
 
 # Only for later CI use, safe to rerun: new deploy key on the tap replaces the earlier one; private half stored as the HOMEBREW_TAP_DEPLOY_KEY secret of this repo (the local release does not need it)
@@ -132,7 +136,7 @@ release-setup-ci-key:
 	for id in $old_ids; do gh repo deploy-key delete "$id" -R "$tap" && echo "removed the earlier deploy key $id"; done
 	echo "deploy key added to homebrew-tap (write) and stored as HOMEBREW_TAP_DEPLOY_KEY"
 
-# Builds the archives into dist/ (this Mac plus Linux amd64 and arm64 in containers); uploads nothing. Usage: just release-build v0.2.0
+# Builds the archives into dist/ (this Mac plus Linux amd64 and arm64 in containers); uploads nothing. Usage: just release-build v0.2.0 (uses the Docker you already have; `just release` uses its own Colima on Apple Silicon)
 release-build version:
 	@"{{justfile_directory()}}/scripts/release" {{version}} --linux amd64 arm64
 
