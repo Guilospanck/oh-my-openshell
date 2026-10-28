@@ -44,7 +44,13 @@ cd "$repo"
 say "preflight"
 for t in git gh just cargo brew; do command -v "$t" >/dev/null 2>&1 || die "$t is required"; done
 if [[ ${#linux[@]} -gt 0 ]]; then
-  docker info >/dev/null 2>&1 || podman info >/dev/null 2>&1 || die "the Linux archives need a running Docker or Podman (start Colima, or pass --no-linux)"
+  rt=docker; docker info >/dev/null 2>&1 || rt=podman
+  "$rt" info >/dev/null 2>&1 || die "the Linux archives need a running Docker or Podman (start Colima, or pass --no-linux)"
+  # A foreign architecture needs an emulator in the container VM; without it the build dies with "exec format error".
+  for a in "${linux[@]}"; do
+    "$rt" run --rm --platform "linux/$a" busybox true >/dev/null 2>&1 \
+      || die "cannot run linux/$a containers here (no emulator). Register one: $rt run --privileged --rm tonistiigi/binfmt --install $a; or build only what runs: --linux arm64"
+  done
 fi
 gh auth status >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
 [[ -z "$(git status --porcelain)" ]] || die "working tree not clean: commit or stash first"

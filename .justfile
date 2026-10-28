@@ -144,9 +144,9 @@ release-formula version:
 release-dry-run version *args:
 	@"{{justfile_directory()}}/scripts/publish" {{version}} --dry-run {{args}}
 
-# Full release: check, bump Cargo version (commit), archives, formula lint, tag, push, GitHub release, push formula to Guilospanck/homebrew-tap. Usage: just release v0.2.0 ["notes"]
-release version $notes="":
-	@"{{justfile_directory()}}/scripts/publish" {{version}} --notes "$notes"
+# Full release: check, bump Cargo version (commit), archives, formula lint, tag, push, GitHub release, push formula to Guilospanck/homebrew-tap. Usage: just release v0.2.0 ["notes" [--linux arm64 | --no-linux]]
+release version $notes="" *args:
+	@"{{justfile_directory()}}/scripts/publish" {{version}} --notes "$notes" {{args}}
 
 # Installs OpenShell, a container runtime and the gateway for this OS (asks before each step)
 install *args:
