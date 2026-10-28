@@ -1,5 +1,7 @@
-//! Thin wrappers around the `openshell`, `docker` and `just` CLIs.
+//! Thin wrappers around the `openshell` and container runtime (`docker` or `podman`) CLIs.
+use crate::agents;
 use crate::ghrepo::{self, GhRepo, Tracked};
+use crate::platform::{self, Runtime};
 use serde_json::Value;
 use std::{
     fs,
@@ -7,7 +9,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         mpsc::{Receiver, Sender},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     thread,
     time::Duration,
@@ -139,14 +141,26 @@ pub enum Freshness {
 /// Image label holding the hash of the Dockerfile the image was built from.
 pub const HASH_LABEL: &str = "osh.dockerfile-hash";
 
-/// FNV-1a 64-bit of the Dockerfile contents; stable across Rust versions.
+/// Hash of the Dockerfile contents, recorded on the image to tell when it is stale.
 pub fn dockerfile_hash(file: &Path) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in fs::read(file).unwrap_or_default() {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    format!("{h:016x}")
+    crate::assets::hash(&fs::read(file).unwrap_or_default())
+}
+
+static RUNTIME: OnceLock<Option<Runtime>> = OnceLock::new();
+
+/// The container runtime to drive, found once: a ready Docker, else a ready Podman.
+pub fn runtime() -> Option<Runtime> {
+    *RUNTIME.get_or_init(|| platform::gather(&platform::RealHost).runtime())
+}
+
+/// Program for image builds and container inspection. Falls back to `docker` when no runtime
+/// answers, so the failure reads like the familiar "command not found".
+pub fn runtime_bin() -> &'static str {
+    bin_for(runtime())
+}
+
+fn bin_for(rt: Option<Runtime>) -> &'static str {
+    rt.map_or("docker", Runtime::bin)
 }
 
 /// `docker build` arguments that record the Dockerfile hash on the image.
@@ -164,7 +178,7 @@ pub fn build_args(dir: &Path, file: &Path, tag: &str) -> Vec<String> {
 }
 
 fn image_freshness(tag: &str, file: &Path) -> Freshness {
-    let label = Command::new("docker")
+    let label = Command::new(runtime_bin())
         .args([
             "image",
             "inspect",
@@ -692,7 +706,7 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
     snap.gateway = gateway();
     for file in dockerfiles(dir) {
         let tag = dockerfile_tag(&file);
-        let built = Command::new("docker")
+        let built = Command::new(runtime_bin())
             .args(["image", "inspect", &tag])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -784,7 +798,7 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
 /// config, or, for the vm driver, from the gateway-wide size on its process line.
 fn limits(driver: &str, sandbox: &str) -> String {
     match driver {
-        "docker" => {
+        "docker" | "podman" => {
             docker_limits(sandbox).unwrap_or_else(|| "unknown (container not found)".into())
         }
         "vm" => vm_limits().unwrap_or_else(|| "unknown".into()),
@@ -794,7 +808,7 @@ fn limits(driver: &str, sandbox: &str) -> String {
 
 fn docker_limits(sandbox: &str) -> Option<String> {
     let names = run(
-        "docker",
+        runtime_bin(),
         &[
             "ps".into(),
             "-a".into(),
@@ -809,7 +823,7 @@ fn docker_limits(sandbox: &str) -> Option<String> {
         n.starts_with("openshell-") && n.contains(&needle) && !n.ends_with("-supervisor")
     })?;
     let out = run(
-        "docker",
+        runtime_bin(),
         &[
             "inspect".into(),
             container.into(),
@@ -1108,22 +1122,6 @@ fn text_of(v: &Value) -> String {
     text(v)
 }
 
-/// Directory holding `sync-agents`: the config directory, or else the checkout this binary
-/// was built in (`<repo>/tui/target/release/osh-tui`), for when `OSH_DIR` is not set.
-fn script_dir(dir: &Path) -> PathBuf {
-    if dir.join("sync-agents").is_file() {
-        return dir.to_path_buf();
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|e| {
-            e.ancestors()
-                .find(|a| a.join("sync-agents").is_file())
-                .map(Path::to_path_buf)
-        })
-        .unwrap_or_else(|| dir.to_path_buf())
-}
-
 /// The sandbox user's HOME, which differs by driver (`/workspace` on docker, `/sandbox` on vm)
 /// and is the only place the default policy lets uploads land.
 fn sandbox_home(sandbox: &str) -> String {
@@ -1157,28 +1155,8 @@ pub fn sync_gen_profile(
     ids: &[String],
     name: &str,
 ) -> Result<String, String> {
-    let mut args: Vec<String> = [
-        "--gen-profile",
-        sandbox,
-        "--name",
-        name,
-        "--agent",
-        agent,
-        "--only",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect();
-    args.push(ids.join(","));
-    let gw = gateway();
-    if !gw.is_empty() {
-        args.extend(["--gateway".into(), gw]);
-    }
-    run(
-        &script_dir(dir).join("sync-agents").to_string_lossy(),
-        &args,
-        &[],
-    )
+    let env = agents::Env::detect(dir, &sandbox_home(sandbox));
+    agents::gen_profile(&env, agent, sandbox, &gateway(), Some(ids), name)
 }
 
 /// What the gateway says when it will not merge a provider into the sandbox's policy,
@@ -1366,50 +1344,35 @@ pub fn drop_generated(sandbox: &str, name: &str) -> Result<String, String> {
 
 /// `agent` is `claude-code`, `pi` or `both`.
 pub fn sync_manifest(dir: &Path, sandbox: &str, agent: &str) -> Result<SyncManifest, String> {
-    let script = script_dir(dir).join("sync-agents");
-    let args = [
-        "--json".to_string(),
-        "--agent".into(),
-        agent.into(),
-        "--home".into(),
-        sandbox_home(sandbox),
-    ];
-    run(&script.to_string_lossy(), &args, &[]).and_then(|t| parse_manifest(&t))
+    let env = agents::Env::detect(dir, &sandbox_home(sandbox));
+    agents::manifest(&env, agent).and_then(|t| parse_manifest(&t))
 }
 
 /// Check the selected items against the sandbox's effective network policy.
-/// The script exits 3 when something is blocked but still prints the report.
 pub fn sync_check(
     dir: &Path,
     sandbox: &str,
     agent: &str,
     ids: &[String],
 ) -> Result<SyncCheck, String> {
-    let mut args: Vec<String> = vec![
-        "--preflight".into(),
-        sandbox.into(),
-        "--json".into(),
-        "--agent".into(),
-        agent.into(),
-        "--only".into(),
-        ids.join(","),
-    ];
-    let gw = gateway();
-    if !gw.is_empty() {
-        args.extend(["--gateway".into(), gw]);
-    }
-    let out = Command::new(script_dir(dir).join("sync-agents"))
-        .args(&args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("sync-agents: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    parse_check(&stdout).map_err(|_| String::from_utf8_lossy(&out.stderr).trim().to_string())
+    let env = agents::Env::detect(dir, "/workspace");
+    agents::check(&env, agent, sandbox, &gateway(), Some(ids)).and_then(|t| parse_check(&t))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn container_programs_follow_the_selected_runtime() {
+        assert_eq!(bin_for(Some(Runtime::Podman)), "podman");
+        assert_eq!(bin_for(Some(Runtime::Docker)), "docker");
+    }
+
+    #[test]
+    fn without_a_runtime_the_familiar_docker_error_shows() {
+        assert_eq!(bin_for(None), "docker");
+    }
 
     #[test]
     fn profile_json_becomes_permissions() {

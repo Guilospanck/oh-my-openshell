@@ -128,23 +128,13 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         (format!("  {} unreachable", app.snap.gateway), Color::Red)
     };
     spans.push(Span::styled(txt, Style::default().fg(color)));
-    let (link, link_color) = if app.linked {
-        ("linked in PATH ", Color::Green)
-    } else {
-        ("not linked (just link) ", Color::Yellow)
-    };
     if app.config_stale {
         spans.push(Span::styled(
-            "  gateway.toml out of date (just install)",
+            "  gateway.toml out of date (osh setup)",
             Style::default().fg(Color::Yellow),
         ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
-    f.render_widget(
-        Paragraph::new(Line::styled(link, Style::default().fg(link_color)))
-            .alignment(Alignment::Right),
-        area,
-    );
 }
 
 fn table_state(i: usize) -> TableState {
@@ -380,9 +370,16 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
         .iter()
         .map(|g| {
             let cur = g.name == app.snap.gateway;
+            let info = app.gateway_info(&g.name, &g.endpoint);
+            let name = if info.main {
+                format!("{}  main", g.name)
+            } else {
+                g.name.clone()
+            };
             let row = Row::new(vec![
-                g.name.clone(),
-                g.endpoint.clone(),
+                name,
+                info.kind,
+                info.port,
                 if cur {
                     "selected".to_string()
                 } else {
@@ -399,32 +396,38 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(20),
-            Constraint::Min(30),
+            Constraint::Min(28),
+            Constraint::Length(8),
+            Constraint::Length(7),
             Constraint::Length(10),
         ],
     )
     .header(
-        Row::new(vec!["GATEWAY", "ENDPOINT", "STATE"])
+        Row::new(vec!["GATEWAY", "TYPE", "PORT", "STATE"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
     .row_highlight_style(highlight())
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Gateways (d: wipe) "),
+            .title(" Gateways (a: add  x: remove  d: wipe) "),
     );
     f.render_stateful_widget(table, area, &mut table_state(app.cursor[4]));
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let help = match app.tab {
+/// The per-tab key hints in the footer.
+pub fn footer_help(tab: Tab) -> &'static str {
+    match tab {
         Tab::Sandboxes => "Enter shell (● running)  l logs  p blocked  n new  d delete  s stop  S start  a/x attach/detach provider  K skills  t renew GitHub token",
         Tab::Providers => "n create  u update credentials (renews GitHub repo tokens)  d delete",
         Tab::Profiles => "u / Enter import or update from providers/",
         Tab::Images => "b / Enter build",
-        Tab::Gateways => "Enter select  d wipe (delete all data)",
-    };
+        Tab::Gateways => "Enter select  a add  d wipe (delete all data)  x remove",
+    }
+}
+
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let help = footer_help(app.tab);
     let lines = vec![
         Line::from(status_spans(
             app,

@@ -1,0 +1,31 @@
+#!/bin/bash
+# OpenShell CLI stand-in (put on PATH by the curl shim's "installer"). Keeps the CLI's gateway list
+# in $HOME/.openshell-gateways ("name endpoint" lines), so registration and removal can be checked;
+# every gateway reports itself connected.
+echo "openshell $*" >> "${STUB_LOG:?}"
+db="$HOME/.openshell-gateways"
+touch "$db"
+[ "$1" = -g ] && shift 2
+case "$1 ${2:-}" in
+  "--version "*) echo "openshell 0.0.0-stub" ;;
+  "status "*) echo "Status: Connected" ;;
+  "gateway list")
+    printf '['
+    sep=""
+    while read -r name endpoint; do
+      printf '%s{"name": "%s", "endpoint": "%s"}' "$sep" "$name" "$endpoint"; sep=", "
+    done < "$db"
+    printf ']\n' ;;
+  "gateway add")
+    endpoint="$3"; name=""
+    shift 3
+    while [ $# -gt 0 ]; do [ "$1" = --name ] && name="$2"; shift; done
+    [ -n "$name" ] || { echo "gateway add: --name is required" >&2; exit 2; }
+    grep -q "^$name " "$db" && { echo "gateway $name already exists" >&2; exit 1; }
+    echo "$name $endpoint" >> "$db" ;;
+  "gateway remove")
+    grep -q "^$3 " "$db" || { echo "no gateway $3" >&2; exit 1; }
+    grep -v "^$3 " "$db" > "$db.new"; mv "$db.new" "$db" ;;
+  "gateway select") grep -q "^$3 " "$db" || { echo "no gateway $3" >&2; exit 1; } ;;
+esac
+exit 0

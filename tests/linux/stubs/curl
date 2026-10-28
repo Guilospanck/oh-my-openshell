@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# Stands in for the OpenShell installer download: with `-o FILE` it writes the "installer" there,
+# otherwise to stdout. The installer records that it ran and puts the openshell stub on PATH
+# ($HOME/.installed), so openshell is absent until the installer has run, as on a fresh machine.
+# It also leaves the client certificate directory the real installer creates.
 . "$(dirname "$0")/_log"
 log "$@"
-echo "echo installer-ran >> \"$STUB_LOG\""
+src="$(cd "$(dirname "$0")/../stubs-openshell" && pwd)/openshell"
+script="echo installer-ran >> \"$STUB_LOG\"; mkdir -p \"$HOME/.installed\" \"$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls\"; cp \"$src\" \"$HOME/.installed/openshell\""
+out=""
+while [[ $# -gt 0 ]]; do [[ "$1" == -o ]] && out="$2"; shift; done
+if [[ -n "$out" ]]; then echo "$script" > "$out"; else echo "$script"; fi

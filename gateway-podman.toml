@@ -1,0 +1,17 @@
+# Gateway config for Linux hosts that use Podman: `osh setup` copies it to
+# ~/.config/openshell/gateway.toml, which the openshell-gateway service reads. Needs a running
+# Podman API socket (systemctl --user enable --now podman.socket).
+[openshell]
+version = 2
+
+[openshell.gateway]
+compute_driver = "podman"
+
+# Lets sandboxes bind-mount host folders via --driver-config-json mounts.
+# Raw host bind mounts have no label resolver, so admission is off for this driver.
+[openshell.drivers.podman]
+allow_driver_config = true
+enable_bind_mounts = true
+
+[openshell.drivers.podman.resource_admission]
+enabled = false

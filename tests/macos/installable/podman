@@ -1,0 +1,15 @@
+#!/bin/bash
+# Podman stand-in (installed by the brew shim) with a Podman machine: `machine start` needs a
+# machine from `machine init`, `info` answers only while it runs.
+echo "podman $*" >> "${STUB_LOG:?}"
+created="$HOME/.podman-machine"; running="$HOME/.podman-running"
+case "$1 ${2:-}" in
+  "--version "*) echo "podman version 5.0.0" ;;
+  "machine init") [ -e "$created" ] && { echo "Error: machine already exists" >&2; exit 125; }; touch "$created" ;;
+  "machine start") [ -e "$created" ] || { echo "Error: no machine" >&2; exit 125; }; touch "$running" ;;
+  "machine list") if [ -e "$running" ]; then echo true; elif [ -e "$created" ]; then echo false; fi ;;
+  "info "*) [ -e "$running" ] || { echo "Cannot connect to Podman" >&2; exit 125; } ;;
+  "ps "*) echo def456 ;;
+  "volume ls") echo vol2 ;;
+esac
+exit 0

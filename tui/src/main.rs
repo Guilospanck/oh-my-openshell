@@ -1,13 +1,21 @@
 //! osh: ratatui front end for OpenShell. Dashboard of sandboxes with live
 //! status, embedded sandbox shells, plus creating, providers, profiles and images.
+mod agents;
 mod app;
+mod assets;
 mod cli;
 mod clip;
+mod gateway;
 mod ghrepo;
+mod gwmodel;
+mod gwops;
 mod logview;
+mod platform;
+mod setup;
 mod term;
 mod ui;
 mod watch;
+mod wizard;
 
 use app::{App, Done, Failed, Step};
 use ratatui::crossterm::{
@@ -20,25 +28,12 @@ use ratatui::crossterm::{
     terminal::supports_keyboard_enhancement,
 };
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{mpsc, Arc, Mutex},
     time::Duration,
 };
-
-fn config_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("OSH_DIR") {
-        return PathBuf::from(d);
-    }
-    // Fall back to the symlinked config directory.
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config")
-        });
-    base.join("openshell")
-}
 
 fn pause() {
     print!("\nPress Enter to return to osh...");
@@ -196,35 +191,350 @@ fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
     failed
 }
 
-/// Offer to install OpenShell before the dashboard opens. Returns false to quit.
-fn ensure_installed(dir: &Path) -> bool {
-    while !cli::have("openshell") {
-        print!("openshell is not installed. Install it now? [Y/n] ");
-        let _ = io::stdout().flush();
-        let mut a = String::new();
-        let _ = io::stdin().read_line(&mut a);
-        if matches!(a.trim().to_lowercase().as_str(), "n" | "no") {
+/// Opens the set-up wizard before the dashboard when this looks like a first run (or a stopped
+/// install to resume). Returns false when osh should exit instead of opening the dashboard.
+fn first_run(data: &Path) -> bool {
+    let reg = gwmodel::Registry::load(data);
+    let have = cli::have("openshell");
+    let facts = platform::gather(&platform::RealHost);
+    // If the CLI cannot say which gateways exist, do not guess: the user's own gateway could be
+    // among them. Open the dashboard as it is.
+    let known = match setup::known_gateways(&facts, &platform::RealHost) {
+        Ok(k) => k,
+        Err(e) => {
+            if have {
+                eprintln!("osh: {e}");
+            }
+            return have;
+        }
+    };
+    // A remembered selection whose gateways all exist now has nothing to resume.
+    if let Some(p) = gwmodel::Pending::load(data) {
+        if setup::pending_is_stale(&p, &reg, &known) {
+            gwmodel::Pending::clear(data);
+        }
+    }
+    let pending = gwmodel::Pending::load(data).is_some();
+    if !wizard::needs_wizard(have, known.len(), reg.gateways.is_empty(), pending) {
+        return true;
+    }
+    if !io::stdin().is_terminal() {
+        if !have {
+            eprintln!("osh: OpenShell is not installed. Run `osh setup --gateways docker` (or podman, vm) to set it up.");
+        }
+        return have;
+    }
+    match wizard::run_modal(wizard::Mode::First, data) {
+        Ok(wizard::Outcome::Installed) => {}
+        Ok(wizard::Outcome::Cancelled) => return have,
+        Ok(wizard::Outcome::NeedsAction(text)) => {
+            println!("osh: {text}");
+            // Something is left to do, but if OpenShell and a gateway work, the dashboard still helps.
+            return have && !known.is_empty();
+        }
+        Err(e) => {
+            eprintln!("osh: the set-up screen failed: {e}");
             return false;
         }
-        if !cli::have("just") {
-            println!("`just` is required to run the installer (macOS: brew install just; Linux: your package manager or https://just.systems).");
-            return false;
-        }
-        let st = Command::new("just")
-            .arg("--justfile")
-            .arg(dir.join(".justfile"))
-            .arg("install")
-            .status();
-        if !st.map(|s| s.success()).unwrap_or(false) {
-            println!("Install failed; see the output above.");
-        }
+    }
+    if !cli::have("openshell") {
+        println!("OpenShell is installed but not on PATH yet: open a new terminal (or add its folder to PATH) and run osh again.");
+        return false;
     }
     true
 }
 
+/// `osh doctor` and `osh setup [--yes] [--dry-run] [--runtime docker|podman]`; None for the dashboard.
+fn subcommand(args: &[String]) -> Option<i32> {
+    match args.first().map(String::as_str)? {
+        "doctor" => {
+            let f = platform::gather(&platform::RealHost);
+            // Without a usable HOME there is no registry to read: assume the strict default.
+            let needed = match gateway::Paths::from_env(
+                std::env::var_os("HOME"),
+                std::env::var_os("XDG_CONFIG_HOME"),
+                Some(assets::data_dir()),
+            ) {
+                Ok(p) => setup::runtime_needed(
+                    &f,
+                    &gwmodel::Registry::load(&p.data),
+                    std::fs::read_to_string(p.config_home.join("gateway.toml"))
+                        .ok()
+                        .as_deref(),
+                ),
+                Err(_) => setup::runtime_needed(&f, &gwmodel::Registry::default(), None),
+            };
+            let (text, ok) = setup::doctor(&f, needed);
+            print!("{text}");
+            Some(if ok { 0 } else { 1 })
+        }
+        "setup" => {
+            materialize_data();
+            let mut o = setup::Options::default();
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--yes" | "-y" => o.yes = true,
+                    "--dry-run" => o.dry_run = true,
+                    "--gateways" => match it.next().map(|l| setup::parse_gateways(l)) {
+                        Some(Ok(k)) => o.gateways = k,
+                        Some(Err(e)) => {
+                            eprintln!("osh setup: {e}");
+                            return Some(2);
+                        }
+                        None => {
+                            eprintln!("--gateways takes a list such as docker,podman");
+                            return Some(2);
+                        }
+                    },
+                    // The older flag: one runtime means one gateway of that type.
+                    "--runtime" => match it.next().and_then(|r| gwmodel::GwKind::parse(r)) {
+                        Some(k) if k != gwmodel::GwKind::Vm => o.gateways = vec![k],
+                        _ => {
+                            eprintln!("--runtime takes docker or podman");
+                            return Some(2);
+                        }
+                    },
+                    other => {
+                        eprintln!("osh setup: unknown option {other}");
+                        return Some(2);
+                    }
+                }
+            }
+            if !o.gateways.is_empty() {
+                return Some(setup::run_gateways(&o));
+            }
+            // Without flags and with a terminal, `osh setup` is the guided wizard.
+            if !o.yes && !o.dry_run && io::stdin().is_terminal() {
+                let data = assets::data_dir();
+                return Some(match wizard::run_modal(wizard::Mode::First, &data) {
+                    Ok(wizard::Outcome::Installed | wizard::Outcome::Cancelled) => 0,
+                    Ok(wizard::Outcome::NeedsAction(t)) => {
+                        println!("osh: {t}");
+                        1
+                    }
+                    Err(e) => {
+                        eprintln!("osh: the set-up screen failed: {e}");
+                        1
+                    }
+                });
+            }
+            Some(if setup::run(&o, false) { 0 } else { 1 })
+        }
+        "gateway-docker" => {
+            materialize_data();
+            let o = setup::Options {
+                gateways: vec![gwmodel::GwKind::Docker],
+                ..Default::default()
+            };
+            Some(setup::run_gateways(&o))
+        }
+        "gateway" => Some(gateway_add_remove(&args[1..])),
+        "sync-agents" => Some(agents::cli_main(&args[1..], &assets::data_dir())),
+        "upgrade" | "uninstall" | "gateway-reset" | "gateway-service" => {
+            Some(gateway_command(args))
+        }
+        _ => None,
+    }
+}
+
+/// Host-changing gateway commands. Each shows its steps and asks before running them.
+fn gateway_command(args: &[String]) -> i32 {
+    use platform::Host as _;
+    let h = platform::RealHost;
+    let f = platform::gather(&h);
+    let p = gateway::Paths::detect();
+    let o = setup::Options::default();
+    let interactive = io::stdin().is_terminal();
+    let steps = match args[0].as_str() {
+        "upgrade" => Ok(gateway::upgrade_steps(&f, &o, &h, &p)),
+        "gateway-service" if args.get(1).map(String::as_str) == Some("docker") => {
+            let e = gateway::exec_docker_service(&p, &assets::data_dir());
+            eprintln!("osh: cannot start the gateway: {e}");
+            return 1;
+        }
+        "gateway-service" => match args.get(1) {
+            Some(name) => {
+                let e = gwops::service_exec(name, &p);
+                eprintln!("osh: cannot start the gateway {name}: {e}");
+                return 1;
+            }
+            None => Err("usage: osh gateway-service <name>".to_string()),
+        },
+        "uninstall" => {
+            let steps = gateway::uninstall_steps(&f, &p);
+            println!(
+                "This will remove OpenShell, its services and these folders (sandboxes are lost):"
+            );
+            println!(
+                "  {}\n  {}\n  {}",
+                p.config_home.display(),
+                p.state.display(),
+                p.share.display()
+            );
+            if !confirmed("uninstall") {
+                eprintln!("aborted");
+                return 1;
+            }
+            Ok(steps)
+        }
+        _ => {
+            let Some(name) = args.get(1) else {
+                eprintln!("usage: osh gateway-reset <gateway>");
+                return 2;
+            };
+            // The dashboard asks its own question first and passes --confirmed.
+            if !pre_confirmed(args) {
+                println!("This deletes every sandbox and provider on gateway {name}.");
+                if !confirmed("reset") {
+                    eprintln!("aborted");
+                    return 1;
+                }
+            }
+            let reg = gwmodel::Registry::load(&p.data);
+            let spec = match reg.get(name) {
+                Some(spec) => Ok(spec.clone()),
+                None => {
+                    // Sweep with the runtime the installed gateway drives, not whichever answers
+                    // first.
+                    let driver = h
+                        .read(&p.config_home.join("gateway.toml"))
+                        .and_then(|t| gateway::driver_runtime(&t));
+                    gateway::legacy_spec(f.os, name, driver.or(f.runtime()))
+                }
+            };
+            spec.map(|spec| {
+                gwops::reset_steps_for(&f, &p, &spec, gwops::shares_runtime(&reg, &spec))
+            })
+        }
+    };
+    match steps {
+        Ok(steps) => {
+            // Uninstall and reset were confirmed by typing; upgrade and gateway-docker ask per step.
+            let typed = matches!(args[0].as_str(), "uninstall" | "gateway-reset");
+            let o = setup::Options { yes: typed, ..o };
+            i32::from(!setup::run_steps(&h, steps, &o, interactive))
+        }
+        Err(e) => {
+            eprintln!("osh: {e}");
+            2
+        }
+    }
+}
+
+/// `osh gateway add <vm|docker|podman> [--yes] [--dry-run]` and
+/// `osh gateway remove <name> [--delete-data]`.
+fn gateway_add_remove(args: &[String]) -> i32 {
+    let usage = "usage: osh gateway add <vm|docker|podman> [--yes] [--dry-run] | osh gateway remove <name> [--delete-data]";
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let Some(kind) = args.get(1).and_then(|k| gwmodel::GwKind::parse(k)) else {
+                eprintln!("{usage}");
+                return 2;
+            };
+            materialize_data();
+            let o = setup::Options {
+                gateways: vec![kind],
+                yes: args.iter().any(|a| a == "--yes" || a == "-y"),
+                dry_run: args.iter().any(|a| a == "--dry-run"),
+                ..Default::default()
+            };
+            setup::run_gateways(&o)
+        }
+        Some("remove") => {
+            let Some(name) = args.get(1).filter(|n| !n.starts_with("--")) else {
+                eprintln!("{usage}");
+                return 2;
+            };
+            let delete = args.iter().any(|a| a == "--delete-data");
+            let h = platform::RealHost;
+            let f = platform::gather(&h);
+            let p = gateway::Paths::detect();
+            let reg = gwmodel::Registry::load(&p.data);
+            let steps = match gwops::remove_gateway_steps(&f, &p, &reg, name, delete) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("osh: {e}");
+                    return 2;
+                }
+            };
+            let word = if delete {
+                "remove and delete data"
+            } else {
+                "remove"
+            };
+            println!(
+                "This removes the gateway {name}{}.",
+                if delete {
+                    " and its data"
+                } else {
+                    " (its data stays)"
+                }
+            );
+            // The dashboard asks its own question first and passes --confirmed.
+            if !pre_confirmed(args) && !confirmed(word) {
+                eprintln!("aborted");
+                return 1;
+            }
+            let o = setup::Options {
+                yes: true,
+                ..Default::default()
+            };
+            i32::from(!setup::run_steps(&h, steps, &o, io::stdin().is_terminal()))
+        }
+        _ => {
+            eprintln!("{usage}");
+            2
+        }
+    }
+}
+
+/// True when the caller (the dashboard) already asked the user and passed `--confirmed`.
+fn pre_confirmed(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--confirmed")
+}
+
+/// Asks the user to type `word`; `--yes` does not skip it, since these steps destroy data.
+fn confirmed(word: &str) -> bool {
+    print!("Type '{word}' to continue: ");
+    let _ = io::stdout().flush();
+    let mut a = String::new();
+    let _ = io::stdin().read_line(&mut a);
+    if word == "reset" {
+        gateway::confirm_reset(&a)
+    } else {
+        a.trim() == word
+    }
+}
+
+/// Writes the embedded providers, Dockerfiles and configs to the data dir, and returns it.
+fn materialize_data() -> PathBuf {
+    let dir = assets::data_dir();
+    // OSH_DIR is a checkout in development: its files are the source, not a copy to refresh.
+    if std::env::var_os("OSH_DIR").is_none() {
+        match assets::materialize(&dir) {
+            Ok(r) => {
+                for p in r.kept_user_edits {
+                    eprintln!("osh: keeping your edited {}", p.display());
+                }
+            }
+            Err(e) => eprintln!("osh: cannot write {}: {e}", dir.display()),
+        }
+    }
+    dir
+}
+
 fn main() -> io::Result<()> {
-    let dir = config_dir();
-    if !ensure_installed(&dir) {
+    if platform::valid_home(std::env::var_os("HOME")).is_none() {
+        eprintln!("osh: HOME is not set to an absolute path; refusing to run");
+        std::process::exit(1);
+    }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(code) = subcommand(&args) {
+        std::process::exit(code);
+    }
+    let dir = materialize_data();
+    if !first_run(&dir) {
         return Ok(());
     }
     let (snap_tx, snap_rx) = mpsc::channel();
@@ -291,7 +601,7 @@ fn main() -> io::Result<()> {
                         "Ready".into()
                     } else {
                         if cfg!(target_os = "macos") {
-                            "Gateway unreachable: brew services start openshell (vm) or just gateway-docker".into()
+                            "Gateway unreachable: brew services start openshell (vm) or osh gateway-docker".into()
                         } else {
                             "Gateway unreachable: systemctl --user start openshell-gateway".into()
                         }
@@ -314,6 +624,24 @@ fn main() -> io::Result<()> {
                 terminal = ratatui::init();
                 terminal.clear()?;
                 app.finish_job(failed);
+                app.reload_gateways();
+                app.refresh();
+            }
+            if let Some(mode) = app.wizard_request.take() {
+                if captured {
+                    host_modes(false, keys);
+                    captured = false;
+                }
+                let data = app.dir.clone();
+                match wizard::run(&mut terminal, wizard::open(mode, &data), &data) {
+                    Ok(wizard::Outcome::NeedsAction(t)) => {
+                        app.status = format!("Gateway setup stopped: {t}")
+                    }
+                    Ok(wizard::Outcome::Installed) => app.status = "Gateways set up".into(),
+                    _ => {}
+                }
+                terminal.clear()?;
+                app.reload_gateways();
                 app.refresh();
             }
         }
@@ -329,6 +657,18 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn confirmed_flag_skips_the_second_question() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(pre_confirmed(&a(&[
+            "remove",
+            "openshell-docker",
+            "--confirmed"
+        ])));
+        assert!(!pre_confirmed(&a(&["remove", "openshell-docker"])));
+    }
+
     #[test]
     fn sandbox_paths_follow_the_current_folder_inside_the_share() {
         assert_eq!(

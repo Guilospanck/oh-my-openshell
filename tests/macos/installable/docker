@@ -1,0 +1,11 @@
+#!/bin/bash
+# Docker CLI stand-in (installed by the brew shim): `info` answers only while Colima runs; the
+# sweep after a reset finds one labelled container and volume.
+echo "docker $*" >> "${STUB_LOG:?}"
+case "$1" in
+  --version) echo "Docker version 27.0.0, build stub" ;;
+  info) [ -e "$HOME/.colima-running" ] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; } ;;
+  ps) echo abc123 ;;
+  volume) [ "$2" = ls ] && echo vol1 ;;
+esac
+exit 0

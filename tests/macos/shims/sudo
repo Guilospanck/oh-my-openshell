@@ -1,0 +1,5 @@
+#!/bin/bash
+# osh never needs root on macOS: a sudo call is recorded and refused, so the suite notices it.
+echo "sudo $*" >> "${STUB_LOG:?}"
+echo "sudo: refused by the macOS test" >&2
+exit 1

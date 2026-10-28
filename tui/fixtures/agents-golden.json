@@ -1,0 +1,196 @@
+{
+  "agents": [
+    "claude-code",
+    "pi"
+  ],
+  "items": [
+    {
+      "agents": {
+        "claude-code": [
+          "npx --yes skills@1.7.4 add acme/skills -g -a claude-code -s locked-skill -y --copy"
+        ],
+        "pi": [
+          "npx --yes skills@1.7.4 add acme/skills -g -a pi -s locked-skill -y --copy"
+        ]
+      },
+      "default": true,
+      "detail": "acme/skills @ abcdef1",
+      "group": "npx-skills",
+      "id": "npx-skills:locked-skill",
+      "kind": "run",
+      "name": "locked-skill",
+      "needs": [
+        [
+          "github.com",
+          "/usr/bin/git"
+        ],
+        [
+          "registry.npmjs.org",
+          "/usr/local/bin/node"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "agents": {
+        "claude-code": [
+          "claude plugin install gopls-lsp@official"
+        ]
+      },
+      "default": false,
+      "detail": "gopls-lsp@official v1",
+      "group": "plugins",
+      "id": "plugins:gopls-lsp",
+      "kind": "host-only",
+      "name": "gopls-lsp",
+      "needs": [],
+      "note": "needs the language-server binary in the image; no official pi equivalent"
+    },
+    {
+      "agents": {
+        "claude-code": [
+          "claude plugin install other@market"
+        ]
+      },
+      "default": true,
+      "detail": "other@market v?",
+      "group": "plugins",
+      "id": "plugins:other",
+      "kind": "run",
+      "name": "other",
+      "needs": [
+        [
+          "github.com",
+          "/usr/local/bin/claude"
+        ]
+      ],
+      "note": "no pi equivalent known"
+    },
+    {
+      "agents": {
+        "claude-code": [
+          "claude plugin marketplace add acme/plugins",
+          "claude plugin install superpowers@official"
+        ],
+        "pi": [
+          "pi install git:github.com/obra/superpowers@0123456789abcdef0123456789abcdef01234567"
+        ]
+      },
+      "default": true,
+      "detail": "superpowers@official v1.2",
+      "group": "plugins",
+      "id": "plugins:superpowers",
+      "kind": "run",
+      "name": "superpowers",
+      "needs": [
+        [
+          "github.com",
+          "/usr/bin/git"
+        ],
+        [
+          "github.com",
+          "/usr/local/bin/claude"
+        ],
+        [
+          "registry.npmjs.org",
+          "/usr/local/bin/node"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "agents": {
+        "claude-code": [
+          "uv tool install graphifyy==1.2.3",
+          "graphify install"
+        ],
+        "pi": [
+          "uv tool install graphifyy==1.2.3",
+          "graphify install --platform pi"
+        ]
+      },
+      "default": true,
+      "detail": "graphifyy 1.2.3 (PyPI; needs python 3.10+ and uv in the image)",
+      "group": "packages",
+      "id": "packages:graphify",
+      "kind": "run",
+      "name": "graphify",
+      "needs": [
+        [
+          "files.pythonhosted.org",
+          "/usr/local/bin/uv"
+        ],
+        [
+          "pypi.org",
+          "/usr/local/bin/uv"
+        ]
+      ],
+      "note": ""
+    },
+    {
+      "agents": {
+        "claude-code": {
+          "dest": "/workspace/.claude/skills",
+          "result": "/workspace/.claude/skills/own-one",
+          "src": "<STAGE>/skills/own-one"
+        },
+        "pi": {
+          "dest": "/workspace/.agents/skills",
+          "result": "/workspace/.agents/skills/own-one",
+          "src": "<STAGE>/skills/own-one"
+        }
+      },
+      "default": true,
+      "detail": "directory",
+      "group": "own-skills",
+      "id": "own-skills:own-one",
+      "kind": "upload",
+      "name": "own-one",
+      "needs": [],
+      "note": ""
+    },
+    {
+      "agents": {
+        "claude-code": {
+          "dest": "/workspace/.claude/CLAUDE.md",
+          "result": "/workspace/.claude/CLAUDE.md",
+          "src": "<STAGE>/CLAUDE.md"
+        },
+        "pi": {
+          "dest": "/workspace/.pi/agent/AGENTS.md",
+          "result": "/workspace/.pi/agent/AGENTS.md",
+          "src": "<STAGE>/CLAUDE.md"
+        }
+      },
+      "default": true,
+      "detail": "global instructions",
+      "group": "context",
+      "id": "context:CLAUDE.md",
+      "kind": "upload",
+      "name": "CLAUDE.md",
+      "needs": [],
+      "note": ""
+    },
+    {
+      "agents": {
+        "claude-code": {
+          "dest": "/workspace/.claude/projects/-workspace",
+          "result": "/workspace/.claude/projects/-workspace/memory",
+          "src": "<STAGE>/memory"
+        }
+      },
+      "default": true,
+      "detail": "this repo's Claude memory",
+      "group": "context",
+      "id": "context:memory",
+      "kind": "upload",
+      "name": "memory",
+      "needs": [],
+      "note": ""
+    }
+  ],
+  "secret_findings": [],
+  "unclassified": [
+    "noskill"
+  ]
+}

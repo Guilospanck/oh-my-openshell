@@ -8,7 +8,7 @@ use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::{
     io::Write,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Command, Stdio},
     sync::{atomic::Ordering, mpsc::Sender, Arc, Mutex},
     thread,
@@ -187,6 +187,8 @@ pub enum ConfKind {
     DeleteSandbox(String),
     DeleteProvider(String),
     ResetGateway(String),
+    /// Remove a gateway osh created (typed confirmation was the modal).
+    RemoveGateway(String),
     Sync(SyncPlan),
     /// Set up a provider that needs a secret, then attach it and check again.
     SyncSecret {
@@ -239,6 +241,18 @@ pub enum Modal {
         scroll: u16,
         back: Box<Modal>,
     },
+}
+
+/// Rows a scrolling modal can show: the terminal minus border and margin. Fixed under test so a unit test
+/// does not depend on the height of the terminal that runs `cargo test`.
+fn modal_rows() -> u16 {
+    if cfg!(test) {
+        return 20;
+    }
+    ratatui::crossterm::terminal::size()
+        .map(|(_, h)| h)
+        .unwrap_or(24)
+        .saturating_sub(4)
 }
 
 /// A command run with the terminal handed back to it (build, create, setup-token).
@@ -396,9 +410,7 @@ pub struct SyncPlan {
 
 pub struct App {
     pub dir: PathBuf,
-    /// Whether an `osh` on PATH resolves to this checkout's launcher.
-    pub linked: bool,
-    /// Installed gateway.toml differs from the repo copy (`just install` copies it).
+    /// Installed gateway.toml differs from the one osh ships (`osh setup` installs it).
     pub config_stale: bool,
     pub tab: Tab,
     pub snap: Snapshot,
@@ -413,6 +425,12 @@ pub struct App {
     born: Instant,
     pub quit: bool,
     pub job: Option<Vec<Step>>,
+    /// Set by `a` on the Gateways tab; the main loop opens the wizard and clears it.
+    pub wizard_request: Option<crate::wizard::Mode>,
+    /// The gateways osh created (`gateways.json`); reloaded on refresh.
+    pub registry: crate::gwmodel::Registry,
+    /// What the legacy `openshell` gateway's installed `gateway.toml` drives.
+    pub legacy_kind: Option<crate::gwmodel::GwKind>,
     /// Record the job's output, so a failed step can be explained (only sync jobs:
     /// `claude setup-token` prints a secret).
     pub capture: bool,
@@ -622,47 +640,109 @@ fn review_label(s: &watch::Seen) -> String {
     l
 }
 
-/// True when an `osh` found on PATH is this checkout's launcher.
 fn hit_label((gw, name): &(String, String)) -> String {
     format!("{name} on {gw}")
 }
 
-fn on_path(dir: &Path) -> bool {
-    let Ok(ours) = dir.join("osh").canonicalize() else {
-        return false;
-    };
-    std::env::var_os("PATH").is_some_and(|p| {
-        std::env::split_paths(&p).any(|d| d.join("osh").canonicalize().is_ok_and(|c| c == ours))
-    })
+/// The banner rule: the built-in gateway config only counts as "out of date" when osh did not
+/// make the main gateway (a wizard-made main has its own generated config).
+fn config_stale_with(reg: &crate::gwmodel::Registry, differs: bool) -> bool {
+    differs && reg.main().is_none()
 }
 
-/// True when `gateway.toml` in the user config dir exists and differs from the repo's.
-fn config_stale(dir: &Path) -> bool {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
-        });
-    match (
-        std::fs::read(dir.join("gateway.toml")),
-        std::fs::read(base.join("openshell/gateway.toml")),
-    ) {
-        (Ok(repo), Ok(installed)) => repo != installed,
-        (Ok(_), Err(_)) => true,
-        _ => false,
+/// True when the installed `gateway.toml` is missing or differs from the one this host should run.
+/// Unit tests never look: the answer would come from the real HOME and a real `docker info`, and
+/// `Paths::detect` exits the test binary when HOME is unset.
+fn config_stale(reg: &crate::gwmodel::Registry) -> bool {
+    if cfg!(test) {
+        return false;
     }
+    let os = if cfg!(target_os = "macos") {
+        crate::platform::Os::MacOs
+    } else {
+        crate::platform::Os::Linux
+    };
+    let name = crate::gateway::config_name_for(os, cli::runtime());
+    let differs = crate::gateway::stale(
+        name,
+        &crate::platform::RealHost,
+        &crate::gateway::Paths::detect(),
+    );
+    config_stale_with(reg, differs)
+}
+
+/// The kind of gateway the installed `gateway.toml` runs, from its `compute_driver`. `None` in
+/// unit tests, for the reason `config_stale` gives.
+fn installed_driver() -> Option<crate::gwmodel::GwKind> {
+    use crate::platform::Host as _;
+    if cfg!(test) {
+        return None;
+    }
+    let p = crate::gateway::Paths::detect();
+    let text = crate::platform::RealHost.read(&p.config_home.join("gateway.toml"))?;
+    let line = text
+        .lines()
+        .find(|l| l.trim_start().starts_with("compute_driver"))?;
+    crate::gwmodel::GwKind::from_driver(line.split('"').nth(1)?)
+}
+
+/// What the Gateways table shows about one gateway.
+pub struct GwInfo {
+    pub kind: String,
+    pub port: String,
+    pub main: bool,
+    /// osh created it, so osh may remove it.
+    pub managed: bool,
 }
 
 impl App {
+    /// Kind, port and whether it is the main gateway, from the registry, the legacy names, or `?`.
+    pub fn gateway_info(&self, name: &str, endpoint: &str) -> GwInfo {
+        use crate::gwmodel::GwKind;
+        let port = endpoint
+            .rsplit(':')
+            .next()
+            .map(|p| p.trim_end_matches('/'))
+            .filter(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+            .unwrap_or("")
+            .to_string();
+        if let Some(g) = self.registry.get(name) {
+            return GwInfo {
+                kind: g.kind.label().into(),
+                port,
+                main: g.main,
+                managed: true,
+            };
+        }
+        let legacy_main = name == "openshell" && self.registry.main().is_none();
+        let kind = if name == "openshell" {
+            self.legacy_kind
+        } else {
+            GwKind::parse(name)
+        };
+        GwInfo {
+            kind: kind.map_or("?", GwKind::label).into(),
+            port,
+            main: legacy_main,
+            managed: false,
+        }
+    }
+
+    /// Reload what the tab shows after the wizard or a removal changed things.
+    pub fn reload_gateways(&mut self) {
+        self.registry = crate::gwmodel::Registry::load(&self.dir);
+        self.legacy_kind = installed_driver();
+    }
+
     pub fn new(
         dir: PathBuf,
         selected: Arc<Mutex<Option<String>>>,
         wake: Sender<()>,
         done_tx: Sender<Done>,
     ) -> Self {
+        let registry = crate::gwmodel::Registry::load(&dir);
         App {
-            linked: on_path(&dir),
-            config_stale: config_stale(&dir),
+            config_stale: config_stale(&registry),
             dir,
             tab: Tab::Sandboxes,
             snap: Snapshot::default(),
@@ -684,6 +764,9 @@ impl App {
             token_flow: None,
             sync_stage: None,
             sync_secret: None,
+            wizard_request: None,
+            registry,
+            legacy_kind: installed_driver(),
             tracked: ghrepo::load_tracked(ghrepo::tracked_path().as_deref()),
             temp_access: None,
             selected,
@@ -782,7 +865,7 @@ impl App {
                 self.open_session(name);
             }
         }
-        self.config_stale = config_stale(&self.dir);
+        self.config_stale = config_stale(&self.registry);
         for i in 0..4 {
             let len = [
                 self.snap.sandboxes.len(),
@@ -1557,7 +1640,7 @@ impl App {
             let n = sync.manifest.findings.unwrap_or(0);
             self.cleanup_sync_stage();
             self.modal = Some(Modal::Info(format!(
-                "The secret scan found {n} finding(s) in the files that would be uploaded. Run `sync-agents --json` and review the staged files, or deselect the uploads (own-skills, context)."
+                "The secret scan found {n} finding(s) in the files that would be uploaded. Run `osh sync-agents --json` and review the staged files, or deselect the uploads (own-skills, context)."
             )));
             return;
         }
@@ -1740,7 +1823,7 @@ impl App {
             .find(|i| i.tag == plan.image && !i.built)
         {
             steps.push(Step {
-                prog: "docker".into(),
+                prog: cli::runtime_bin().into(),
                 args: cli::build_args(&self.dir, &img.file, &img.tag),
             });
         }
@@ -2581,9 +2664,9 @@ impl App {
         !self.snap.driver.is_empty() && self.snap.driver != "vm"
     }
 
-    /// Only the vm and docker gateways in this repo allow host mounts.
+    /// Only the vm, docker and podman gateways in this repo allow host mounts.
     fn shares_supported(&self) -> bool {
-        matches!(self.snap.driver.as_str(), "vm" | "docker")
+        matches!(self.snap.driver.as_str(), "vm" | "docker" | "podman")
     }
 
     fn ask_share(&mut self, plan: Plan) {
@@ -2754,9 +2837,22 @@ impl App {
                 }
             }
             ConfKind::ResetGateway(name) => {
+                let exe = std::env::current_exe().unwrap_or_else(|_| "osh".into());
                 self.job = Some(vec![Step {
-                    prog: self.dir.join("gateway-reset").to_string_lossy().into(),
-                    args: vec![name],
+                    prog: exe.to_string_lossy().into(),
+                    args: vec!["gateway-reset".into(), name, "--confirmed".into()],
+                }]);
+            }
+            ConfKind::RemoveGateway(name) => {
+                let exe = std::env::current_exe().unwrap_or_else(|_| "osh".into());
+                self.job = Some(vec![Step {
+                    prog: exe.to_string_lossy().into(),
+                    args: vec![
+                        "gateway".into(),
+                        "remove".into(),
+                        name,
+                        "--confirmed".into(),
+                    ],
                 }]);
             }
             ConfKind::DeleteProvider(name) => self.bg_msg(move || {
@@ -2857,6 +2953,9 @@ impl App {
             return false;
         }
         let Some(png) = clip::host_image() else {
+            if let Some(hint) = clip::missing_tool_hint() {
+                self.status = hint;
+            }
             return false;
         };
         let Some(s) = self.session() else {
@@ -2895,9 +2994,13 @@ impl App {
             Tab::Gateways => self.gateway_key(code),
             Tab::Images => {
                 if code == KeyCode::Char('b') || code == KeyCode::Enter {
+                    if cli::runtime().is_none() {
+                        self.status = "No running container runtime: start Docker or Podman, or run `osh setup --runtime docker|podman`".into();
+                        return;
+                    }
                     if let Some(img) = self.snap.images.get(self.current()) {
                         self.job = Some(vec![Step {
-                            prog: "docker".into(),
+                            prog: cli::runtime_bin().into(),
                             args: cli::build_args(&self.dir, &img.file, &img.tag),
                         }]);
                     }
@@ -3005,22 +3108,29 @@ impl App {
     }
 
     fn gateway_key(&mut self, code: KeyCode) {
-        let Some(g) = self.snap.gateways.get(self.current()) else {
+        if code == KeyCode::Char('a') {
+            self.wizard_request = Some(crate::wizard::Mode::Add);
+            return;
+        }
+        let Some(g) = self.snap.gateways.get(self.current()).cloned() else {
             return;
         };
+        let info = self.gateway_info(&g.name, &g.endpoint);
         match code {
             KeyCode::Char('d') => {
-                if !matches!(g.name.as_str(), "openshell" | "openshell-docker") {
+                let wipeable =
+                    info.managed || matches!(g.name.as_str(), "openshell" | "openshell-docker");
+                if !wipeable {
                     self.modal = Some(Modal::Info(format!(
-                        "{} is not managed by this repo; only openshell and openshell-docker can be wiped.",
+                        "{} is not managed by osh; only gateways osh set up can be wiped.",
                         g.name
                     )));
                     return;
                 }
-                let what = if g.name == "openshell" {
+                let what = if info.kind == "VM" {
                     "microVMs"
                 } else {
-                    "Docker containers and volumes"
+                    "containers and volumes"
                 };
                 self.modal = Some(Modal::Confirm {
                     text: format!(
@@ -3033,6 +3143,40 @@ impl App {
                         name = g.name
                     ),
                     kind: ConfKind::ResetGateway(g.name.clone()),
+                });
+            }
+            KeyCode::Char('x') => {
+                if !info.managed {
+                    self.modal = Some(Modal::Info(format!(
+                        "{} was not created by osh, so osh will not remove it.",
+                        g.name
+                    )));
+                    return;
+                }
+                let extras: Vec<String> = self
+                    .registry
+                    .gateways
+                    .iter()
+                    .filter(|x| !x.main)
+                    .map(|x| x.name.clone())
+                    .collect();
+                if info.main && !extras.is_empty() {
+                    self.modal = Some(Modal::Info(format!(
+                        "{} is the main gateway. Remove {} first.",
+                        g.name,
+                        extras.join(", ")
+                    )));
+                    return;
+                }
+                self.modal = Some(Modal::Confirm {
+                    text: format!(
+                        "Remove gateway {name}?\n\nIts service is stopped and disabled and it is\n\
+                         forgotten by osh and the OpenShell CLI.\n\
+                         Its sandboxes' data stays on disk (osh keeps the database).\n\
+                         To delete the data too, run: osh gateway remove {name} --delete-data",
+                        name = g.name
+                    ),
+                    kind: ConfKind::RemoveGateway(g.name.clone()),
                 });
             }
             KeyCode::Enter => {
@@ -3152,10 +3296,7 @@ impl App {
                 perms,
                 mut scroll,
             } => {
-                let rows = ratatui::crossterm::terminal::size()
-                    .map(|(_, h)| h)
-                    .unwrap_or(24)
-                    .saturating_sub(4);
+                let rows = modal_rows();
                 let last = (crate::ui::perm_lines(&perms).len() as u16).saturating_sub(rows);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return,
@@ -3180,10 +3321,7 @@ impl App {
                 back,
             } => {
                 // The viewer fills the screen minus its border and margin; stop when the last line is at the bottom.
-                let rows = ratatui::crossterm::terminal::size()
-                    .map(|(_, h)| h)
-                    .unwrap_or(24)
-                    .saturating_sub(4);
+                let rows = modal_rows();
                 let last = (text.lines().count() as u16).saturating_sub(rows);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
@@ -3298,6 +3436,177 @@ impl App {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    use crate::gwmodel::{GatewaySpec, GwKind};
+
+    fn gw(name: &str, port: u16) -> cli::Gateway {
+        cli::Gateway {
+            name: name.into(),
+            endpoint: format!("https://localhost:{port}"),
+        }
+    }
+
+    fn on_gateways(app: &mut App, gws: Vec<cli::Gateway>) {
+        app.tab = Tab::Gateways;
+        app.snap.gateways = gws;
+        app.cursor[4] = 0;
+    }
+
+    fn spec(kind: GwKind, port: u16, main: bool) -> GatewaySpec {
+        GatewaySpec {
+            name: kind.name().into(),
+            kind,
+            port,
+            main,
+        }
+    }
+
+    #[test]
+    fn the_out_of_date_banner_is_not_shown_when_osh_made_the_main() {
+        let mut reg = crate::gwmodel::Registry::default();
+        assert!(
+            config_stale_with(&reg, true),
+            "nothing registered: the older rule applies"
+        );
+        assert!(!config_stale_with(&reg, false));
+        reg.add(spec(GwKind::Podman, 17670, true));
+        assert!(
+            !config_stale_with(&reg, true),
+            "the main's config is osh's own, not the built-in one"
+        );
+    }
+
+    #[test]
+    fn wizard_request_is_set_by_a_on_the_gateways_tab() {
+        let mut app = app();
+        on_gateways(&mut app, vec![gw("openshell", 17670)]);
+        app.gateway_key(KeyCode::Char('a'));
+        assert_eq!(app.wizard_request, Some(crate::wizard::Mode::Add));
+        // Even with no gateway at all, adding must work.
+        let mut app = self::app();
+        on_gateways(&mut app, vec![]);
+        app.gateway_key(KeyCode::Char('a'));
+        assert_eq!(app.wizard_request, Some(crate::wizard::Mode::Add));
+    }
+
+    #[test]
+    fn x_on_a_legacy_gateway_explains_it_is_not_managed() {
+        let mut app = app();
+        on_gateways(&mut app, vec![gw("openshell", 17670)]);
+        app.gateway_key(KeyCode::Char('x'));
+        match &app.modal {
+            Some(Modal::Info(t)) => assert!(t.contains("not created by osh"), "{t}"),
+            _ => panic!("expected an explanation"),
+        }
+    }
+
+    #[test]
+    fn x_on_an_extra_asks_for_confirmation_before_removing() {
+        let mut app = app();
+        app.registry.add(spec(GwKind::Docker, 17670, true));
+        app.registry.add(spec(GwKind::Podman, 17671, false));
+        on_gateways(
+            &mut app,
+            vec![gw("openshell-docker", 17670), gw("openshell-podman", 17671)],
+        );
+        app.cursor[4] = 1;
+        app.gateway_key(KeyCode::Char('x'));
+        match &app.modal {
+            Some(Modal::Confirm {
+                text,
+                kind: ConfKind::RemoveGateway(n),
+            }) => {
+                assert_eq!(n, "openshell-podman");
+                assert!(
+                    text.contains("data stays") || text.contains("keeps"),
+                    "{text}"
+                );
+            }
+            _ => panic!("expected a confirmation"),
+        }
+    }
+
+    #[test]
+    fn x_on_the_main_gateway_with_extras_says_to_remove_them_first() {
+        let mut app = app();
+        app.registry.add(spec(GwKind::Docker, 17670, true));
+        app.registry.add(spec(GwKind::Podman, 17671, false));
+        on_gateways(
+            &mut app,
+            vec![gw("openshell-docker", 17670), gw("openshell-podman", 17671)],
+        );
+        app.gateway_key(KeyCode::Char('x'));
+        match &app.modal {
+            Some(Modal::Info(t)) => {
+                assert!(t.contains("openshell-podman") && t.contains("first"), "{t}")
+            }
+            _ => panic!("expected an explanation"),
+        }
+    }
+
+    #[test]
+    fn reset_is_offered_for_registry_and_legacy_gateways_only() {
+        for name in ["openshell", "openshell-docker", "openshell-podman"] {
+            let mut app = app();
+            app.registry.add(spec(GwKind::Podman, 17671, false));
+            on_gateways(&mut app, vec![gw(name, 17670)]);
+            app.gateway_key(KeyCode::Char('d'));
+            assert!(
+                matches!(&app.modal, Some(Modal::Confirm { kind: ConfKind::ResetGateway(n), .. }) if n == name),
+                "{name}"
+            );
+        }
+        let mut app = app();
+        on_gateways(&mut app, vec![gw("somebody-elses", 9000)]);
+        app.gateway_key(KeyCode::Char('d'));
+        assert!(matches!(&app.modal, Some(Modal::Info(t)) if t.contains("not managed")));
+    }
+
+    #[test]
+    fn gateway_rows_show_kind_port_and_main() {
+        let mut app = app();
+        app.registry.add(spec(GwKind::Docker, 17670, true));
+        app.registry.add(spec(GwKind::Podman, 17671, false));
+        let docker = app.gateway_info("openshell-docker", "https://localhost:17670");
+        assert_eq!(
+            (docker.kind.as_str(), docker.port.as_str(), docker.main),
+            ("Docker", "17670", true)
+        );
+        let podman = app.gateway_info("openshell-podman", "https://localhost:17671");
+        assert_eq!(
+            (podman.kind.as_str(), podman.port.as_str(), podman.main),
+            ("Podman", "17671", false)
+        );
+        let mut legacy = self::app();
+        legacy.legacy_kind = Some(GwKind::Vm);
+        let vm = legacy.gateway_info("openshell", "https://127.0.0.1:17670");
+        assert_eq!(
+            (vm.kind.as_str(), vm.port.as_str(), vm.main),
+            ("VM", "17670", true)
+        );
+        let other = legacy.gateway_info("custom", "https://example.com");
+        assert_eq!(other.kind, "?");
+    }
+
+    #[test]
+    fn footer_keys_match_the_readme_table() {
+        let footer = crate::ui::footer_help(Tab::Gateways);
+        let readme = include_str!("../../README.md");
+        let row = readme
+            .lines()
+            .find(|l| l.starts_with("| Gateways"))
+            .expect("README Gateways row");
+        for key in ["a", "x", "d"] {
+            assert!(
+                footer.contains(&format!("{key} ")),
+                "footer lacks {key}: {footer}"
+            );
+            assert!(
+                row.contains(&format!("(`{key}`)")),
+                "README Gateways row lacks ({key}): {row}"
+            );
+        }
+    }
 
     fn app() -> App {
         let (wake, _w) = mpsc::channel();

@@ -1,0 +1,8 @@
+#!/bin/bash
+# Colima stand-in (installed by the brew shim): `start` makes the Docker stand-in answer.
+echo "colima $*" >> "${STUB_LOG:?}"
+case "$1" in
+  start) touch "$HOME/.colima-running" ;;
+  stop) rm -f "$HOME/.colima-running" ;;
+  status) [ -e "$HOME/.colima-running" ] ;;
+esac

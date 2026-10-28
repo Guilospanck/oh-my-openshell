@@ -11,31 +11,61 @@ here, not in the dotfiles checkout.
 ## osh
 
 ```sh
-just --justfile .justfile link   # once: symlinks osh into ~/.local/bin
-osh                              # then run it from anywhere
+osh            # the dashboard; the first time, a guided screen sets up your gateways
+osh doctor     # read-only: what is installed, what is missing
+osh setup      # the guided screen again (needs a terminal); or, without one:
+osh setup --gateways docker,podman --yes   # the first listed is the main gateway; --dry-run only prints the steps
+osh gateway add vm|docker|podman [--yes] [--dry-run]   # one more gateway
+osh gateway remove NAME [--delete-data]    # remove a gateway osh created (typed confirmation)
+osh upgrade    # reinstall OpenShell, refresh the gateway config, restart the main gateway and its extras
+osh gateway-docker          # same as: osh gateway add docker
+osh uninstall  # remove OpenShell, its services and folders (asks first; sandboxes are lost)
+osh gateway-reset NAME      # wipe a gateway's sandboxes and database (typed confirmation)
+osh sync-agents --dry-run   # preview what a sandbox would get from your agent setup
 ```
 
-`just install` also links it. Without linking, run `./osh` from the checkout
-(or `~/.config/openshell/osh` when linked by dotfiles). The link points at the
-checkout, so edits and rebuilds apply with no re-link. Remove it with
-`just unlink`.
+Install from a release (Linux or macOS, x86_64 or aarch64): `curl -fsSL
+https://raw.githubusercontent.com/Guilospanck/oh-my-openshell/main/install.sh | sh` downloads
+`osh-VERSION-OS-ARCH.tar.gz`, checks its `.sha256`, puts `osh` in `~/.local/bin` and runs `osh setup`
+(asking before each step, on the terminal even when piped). Environment: `OSH_VERSION` (release tag; default the
+latest), `OSH_BIN_DIR`, `OSH_RELEASE_BASE` (a directory or URL holding the archives; needs `OSH_VERSION`)
+and `OSH_NO_SETUP=1` (binary only). Linux archives are built on Ubuntu 24.04 and need glibc 2.39 or newer.
 
-Builds the ratatui TUI (`tui/`) with cargo on first run and whenever its
-sources change. Offers to install OpenShell if missing. Needs `cargo`; Docker
-for image builds.
+`osh` is a single binary. The provider profiles, sandbox Dockerfiles and gateway
+configs are embedded in it and written to `~/.local/share/osh` on first run
+(your edits to those files are kept on upgrade, and a file you delete stays deleted; remove `.osh-manifest.json` there to restore the defaults; add your own `images/Dockerfile-*`
+and `providers/*.yaml` there). The first time you run `osh` (and with `osh setup`) a guided screen walks you
+through it: **Machine** (what was found), **Gateways** (tick the types you want;
+each says what it needs and what osh will install for it), **Review** (every
+step, with `sudo` marked), **Install** (live progress; `Esc` stops after the step that is running, and the rest are left for the next `osh setup`) and **Done**. Setup
+detects the OS and package manager (Homebrew, apt, dnf, pacman, zypper) and
+installs OpenShell, the gateway configs and services, whatever each ticked type
+needs (Docker Engine, Podman, Colima, a Podman machine, `e2fsprogs`, KVM access),
+and the optional tools: `tmux`, `gh` and a clipboard tool. `--runtime docker|podman`
+is an alias for `--gateways docker|podman`. It never installs silently: each step is shown first, and what
+it cannot do for you (no sudo, unknown distro, a stopped Docker daemon) is
+printed as the command to run yourself. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the
+dashboard; image builds need a container runtime.
+
+Release archives: `scripts/release vX.Y.Z [--linux amd64 arm64]` builds them into `dist/` with a `.sha256` each
+and prints the `gh release create` command; it never uploads. Pushing a `v*` tag runs the same script in
+`.github/workflows/release.yml` (one runner per platform, then publish), which has not yet run on GitHub. From a
+checkout, `./osh` is a launcher that builds the TUI with cargo when its sources
+change and sets `OSH_DIR` to the checkout, so edits to the repo's providers and
+Dockerfiles apply with no copy. Build needs `cargo` and Zig 0.15.
 
 The embedded sandbox shell uses libghostty-vt (Ghostty's terminal engine),
-which builds only with Zig 0.15 (`brew install zig@0.15`). `osh` puts
+which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 `zig@0.15` on PATH for the build; building by hand needs
 `PATH="$(brew --prefix zig@0.15)/bin:$PATH" LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast cargo build --release`.
 
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a GitHub repo token (`t`) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a GitHub repo token (`t`), install skills and plugins (`K`, below) |
 | Providers | create from a `providers/*.yaml` profile or a read/write GitHub repo token (`n`), update credentials (`u`; renews a repo token), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated |
-| Gateways | switch (`g` / `Enter`), wipe and restart empty (`d`) |
+| Gateways | switch (`g` / `Enter`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
 
 Credentials are read from the environment when exported, else prompted hidden;
 they never go through argv. The footer shows the keys for the current tab.
@@ -109,23 +139,44 @@ paths attach as an image. With no image on the clipboard, `Ctrl-V` goes to the
 shell as usual. The clipboard is read only when you press it, images over
 20 MiB are refused, the host copy lives in a private temp directory only for
 the upload, and the sandbox copies are deleted when the last shell for that
-sandbox closes. The host needs `pngpaste` (macOS; `just install` installs it),
+sandbox closes. The host needs `pngpaste` (macOS; `osh setup` installs it),
 `wl-paste` (Wayland) or `xclip` (X11).
 
 ## Gateways
 
-- **Linux**: one gateway, `openshell`, the packaged `openshell-gateway`
-  systemd user service on the Docker driver (honours CPU/memory limits).
-  `just install` runs the official installer (deb/rpm; needs Docker Engine and
-  `sudo`) and copies `gateway-linux.toml` to `~/.config/openshell/gateway.toml`.
-  Logs: `journalctl --user -u openshell-gateway`. The two gateways below are
-  macOS only.
-- **vm** (default on macOS, Homebrew service, libkrun): fixed size per VM.
-- **docker** (`openshell-docker`, Colima): honours per-sandbox CPU/memory
-  limits, weaker isolation. Needs the Homebrew gateway run once for shared TLS.
+A gateway is where sandboxes run, and each is named after its type: `openshell-vm`,
+`openshell-docker`, `openshell-podman`. You can have several side by side, on
+macOS and on Linux. The first one you create is the **main** gateway (port 17670, the
+one the CLI uses by default); the others get the next free ports (17671 and up). Each gateway also uses the port +10 (health) and +20 (metrics).
 
-Config: `gateway.toml`, `gateway-docker.toml`. Providers and profiles are
-per gateway.
+| Type | What it is | Needs |
+| --- | --- | --- |
+| VM | each sandbox in its own microVM; strongest isolation, fixed size per VM | macOS: `e2fsprogs`. Linux: `/dev/kvm` usable by your user (osh adds you to the `kvm` group and asks for a new login) and `e2fsprogs`; unavailable, with the reason, where there is no KVM |
+| Docker | sandboxes as containers; honours per-sandbox CPU/memory | Linux: Docker Engine, the `docker` service, your user in the `docker` group (new login). macOS: Colima (installed and started) or Docker Desktop (you start it; untested) |
+| Podman | like Docker, daemonless and rootless | Linux: `podman` and its user `podman.socket`. macOS: `podman` and a Podman machine (created and started) |
+
+The Gateways tab lists them with their type and port. `a` adds one (the same screen,
+showing only the types you do not have), `x` removes one osh created, `d` wipes one.
+The main gateway cannot be removed while others exist. A gateway you had before osh
+managed it (for example `openshell` or `openshell-docker` from an older setup) is left
+exactly as it is: it is listed, can be selected and wiped, but osh will not rename,
+reconfigure or remove it. One repair is the exception: the `openshell-docker` launchd agent an
+older `just gateway-docker` set up runs a script osh no longer ships, so `osh setup`, `osh upgrade`
+and `osh gateway-docker` point it at `osh gateway-service docker` (same config, database and
+logs) and start it again; any osh launchd agent whose program is gone is repaired the same way.
+
+osh keeps each gateway's config in `~/.local/share/osh/gateways/NAME.toml` (edit it; your
+changes are kept). The main gateway on Linux, and the VM main on macOS, use OpenShell's own
+`gateway.toml` instead: osh rewrites it when it differs from what it would write and keeps the
+previous copy next to it as `gateway.toml.osh-bak` (then `.osh-bak.1`, `.2`, never overwriting
+an earlier one). osh remembers the ones it made in `gateways.json` there. Extras run as
+a systemd user unit `osh-gateway-NAME` (Linux) or a launchd agent (macOS); the main runs as
+OpenShell's own service (on macOS a Docker or Podman main runs as its own launchd agent
+instead of the Homebrew service). Logs on Linux:
+`journalctl --user -u openshell-gateway` or `-u osh-gateway-NAME`. Providers and
+profiles are per gateway. The Podman and VM gateways have only been tested up to a
+connected gateway on Linux, never booting a real microVM, and nothing here has run
+on a real Linux desktop.
 
 ## Claude Code provider
 
@@ -146,17 +197,16 @@ reinstalled from their sources (`npx skills`, `claude plugin install`,
 `pi install`, graphify from PyPI); only your own skills and `CLAUDE.md` are
 uploaded, after a secret scan (findings block the upload). The OpenShell skills
 and the language-server plugins are left out. Versions are pinned: the `skills`
-CLI to `SKILLS_CLI` in `sync-agents`, graphify to the host's version, and
+CLI to `SKILLS_CLI` in `tui/src/agents.rs`, graphify to the host's version, and
 superpowers for pi to the commit installed on the host.
 
 If the sandbox's policy blocks an install, `K` offers to create (if needed) and attach the anonymous profiles that grant the access, then checks again. The profiles are: `npm`, `pypi`
 (graphify) and `claude-marketplace` (read-only github.com for plugins, `npx
-skills` and `pi install`). You can also create them by hand with `just provider-npm`,
-`just provider-pypi` and `just provider-claude-marketplace`. Preview the list
-with `just sync-agents --dry-run`.
+skills` and `pi install`). You can also create them from the Providers tab. Preview the list
+with `osh sync-agents --dry-run`.
 
 When access is missing, `K` offers either the built-in profiles above or a
-generated one: `sync-agents --gen-profile` writes a profile that grants only
+generated one: `osh sync-agents --gen-profile` writes a profile that grants only
 the hosts and programs still missing (no credential), shows you a summary,
 asks for a name (default `install-<sandbox>`), then imports it, creates the
 provider and attaches it. After the installs it offers to detach and delete
@@ -234,18 +284,28 @@ test and change the repo. For humans: `just doctor` checks the prerequisites,
 and a bare `just` lists the recipes. Both build on macOS and Linux (Zig 0.15 on
 PATH, or `brew install zig@0.15` with Homebrew or Linuxbrew). The Linux
 install, uninstall and gateway-reset paths follow OpenShell's packaged systemd
-service. `just test-linux` checks them in Docker against stubbed system tools
-(and runs the real build and tests on Ubuntu); they have not run on a real
-Linux host.
+service. `just test-linux` checks them in Docker (Ubuntu, Fedora, Arch) with real
+package installs and stubbed OpenShell and systemd, and `just test-linux-real
+podman|docker|vm` in a systemd container with nothing stubbed (vm needs /dev/kvm
+on the Docker host and is skipped without it); they have not run on a real Linux
+host. `just test-macos` runs the macOS paths on a Mac against recording stand-ins
+for Homebrew, launchd, Colima and Podman without changing the Mac, and
+`just test-release` runs the release workflow's Linux jobs with act. On a Mac,
+with disposable VMs that are deleted afterwards: `just test-linux-kvm` runs the
+VM gateway scenario on real KVM (a separate Colima instance with nested
+virtualization, M3 or later; its sandbox checks show as KNOWN-FAIL while OpenShell
+bug [#4014](https://github.com/NVIDIA/OpenShell/issues/4014) stops every microVM
+sandbox at start), `just test-macos-vm` runs real Homebrew,
+`brew services` and launchd in a Tart macOS VM clone, and
+`just test-macos-runtimes` runs osh's real Colima and Podman machine steps in a
+throwaway HOME, leaving your own Colima untouched. Docker Desktop is not tested.
 
-## Setup without osh
+## Setup without the dashboard
 
-`just install` (OpenShell, and links `osh` into `~/.local/bin` so it runs from
-anywhere), `just link` / `just unlink` (only the `osh` link),
-`just gateway-docker` (second gateway), `just install-hooks` (below),
-`just uninstall` (removes OpenShell, both gateway services,
-`~/.config/openshell`, state and runtime dirs, and the `osh` link; asks for
-confirmation first). Run recipes with `just --justfile .justfile <recipe>`.
+Everything above runs from the shell (`osh setup`, `upgrade`, `uninstall`,
+`gateway add|remove`, `gateway-docker`, `gateway-reset`). The justfile keeps thin developer wrappers for
+them (`just install`, `upgrade`, `uninstall`, `gateway-docker`, `tui`) and
+`just install-hooks` (below). Run recipes with `just --justfile .justfile <recipe>`.
 
 ## Secret and PII hook
 

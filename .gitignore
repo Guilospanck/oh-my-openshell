@@ -1,1 +1,7 @@
 /tui/target/
+.real-dist.*
+dist/
+/gateways/
+/gateways.json
+/wizard.json
+.act-run.*

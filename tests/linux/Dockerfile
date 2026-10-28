@@ -1,12 +1,21 @@
-# Linux test environment: Ubuntu with the build prerequisites that `just doctor` checks.
-# Built and run by tests/linux/run.sh; not a sandbox image.
-FROM ubuntu:24.04
+# Linux test environment with the build prerequisites that `just doctor` checks.
+# Built and run by tests/linux/run.sh for each distro (BASE = ubuntu:24.04, fedora:41, an Arch image);
+# not a sandbox image.
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends \
-        bash build-essential ca-certificates curl git jq xz-utils \
-    && rm -rf /var/lib/apt/lists/*
+RUN if [ -f /etc/os-release ]; then . /etc/os-release; else . /usr/lib/os-release; fi \
+    && case "$ID" in \
+        ubuntu|debian) apt-get update \
+            && apt-get install --yes --no-install-recommends bash build-essential ca-certificates curl git jq python3 xz-utils \
+            && rm -rf /var/lib/apt/lists/* ;; \
+        fedora) dnf install -y bash gcc gcc-c++ make ca-certificates curl git jq python3 xz tar gzip findutils which \
+            && dnf clean all ;; \
+        arch|archarm) sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf \
+            && pacman -Syu --noconfirm --needed base-devel bash ca-certificates curl git jq python3 xz ;; \
+        *) echo "unsupported distro $ID" >&2; exit 1 ;; \
+    esac
 
 # just, Zig 0.15 (libghostty-vt builds only with it) and gitleaks (the pre-commit hook), from releases.
 RUN curl -fsSL https://just.systems/install.sh | bash -s -- --to /usr/local/bin

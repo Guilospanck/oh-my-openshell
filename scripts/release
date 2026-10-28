@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# scripts/release VERSION [--out DIR] [--no-host] [--linux ARCH...]
+#
+# Builds the osh release archive for this machine, and with --linux also for Linux in containers
+# (ARCH: amd64, arm64; needs Docker or Podman). The GitHub workflow runs this same script on one
+# runner per platform, so a local release and a CI release are built the same way.
+#
+#   scripts/release v0.2.0                       this machine only, into dist/
+#   scripts/release v0.2.0 --linux amd64 arm64   plus both Linux architectures, via containers
+#
+# Writes dist/osh-VERSION-OS-ARCH.tar.gz and a .sha256 next to each (OS: darwin|linux, ARCH:
+# x86_64|aarch64). Never uploads: it prints the `gh release create` command to run yourself.
+# --no-host skips this machine's own archive (used to build only the Linux ones).
+# Linux archives are built on Ubuntu 24.04, so they need glibc 2.39 or newer.
+set -euo pipefail
+
+repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+version="${1:-}"
+[[ "$version" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "usage: scripts/release vX.Y.Z [--out DIR] [--linux amd64|arm64...]" >&2; exit 2; }
+shift
+out="$repo/dist"
+linux=()
+host=1
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --no-host) host=0 ;;
+    --out) out="$(mkdir -p "$2" && cd "$2" && pwd)"; shift ;;
+    --linux) shift; while [[ $# -gt 0 && "$1" != --* ]]; do
+        case "$1" in amd64|arm64) linux+=("$1") ;; *) echo "unknown architecture $1" >&2; exit 2 ;; esac; shift
+      done; continue ;;
+    *) echo "unknown option $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+mkdir -p "$out"
+
+sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
+
+# Archives $1 (a built osh-tui binary) as osh-VERSION-$2-$3.tar.gz in $out.
+package() {
+  local bin="$1" os="$2" arch="$3" stage name
+  name="osh-$version-$os-$arch.tar.gz"
+  stage="$(mktemp -d)"
+  install -m 755 "$bin" "$stage/osh"
+  tar -C "$stage" -czf "$out/$name" osh
+  (cd "$out" && sha256 "$name" > "$name.sha256")
+  rm -rf "$stage"
+  echo "built $out/$name"
+}
+
+host_arch() { case "$(uname -m)" in arm64|aarch64) echo aarch64 ;; *) echo x86_64 ;; esac; }
+
+# This machine.
+if [[ $host -eq 1 ]]; then
+  # shellcheck source=../dev-env
+  source "$repo/dev-env"
+  osh_use_zig || { echo "scripts/release: Zig 0.15 is required (run: just doctor)" >&2; exit 1; }
+  cargo build --release --manifest-path "$repo/tui/Cargo.toml"
+  package "$repo/tui/target/release/osh-tui" "$(uname | tr '[:upper:]' '[:lower:]')" "$(host_arch)"
+fi
+
+# Linux, in containers.
+if [[ ${#linux[@]} -gt 0 ]]; then
+  runtime="$(command -v docker || command -v podman || true)"
+  [[ -n "$runtime" ]] || { echo "scripts/release: --linux needs docker or podman" >&2; exit 1; }
+  for a in "${linux[@]}"; do
+    case "$a" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac
+    image="osh-release-$a"
+    "$runtime" build --platform "linux/$a" -t "$image" "$repo/tests/linux"
+    # Under $out, not /tmp: a container VM (Colima, Docker Desktop) shares the home folder, not /var.
+    work="$(mktemp -d "$out/.build.XXXXXX")"
+    # The container compiles a copy of the tree (tracked and untracked files), not the host's target dir.
+    (cd "$repo" && COPYFILE_DISABLE=1 git ls-files -z --cached --others --exclude-standard |
+      COPYFILE_DISABLE=1 tar --null -T - -cf -) |
+      "$runtime" run --rm -i --platform "linux/$a" -v "$work:/out" "$image" bash -c \
+        'tar --warning=no-unknown-keyword -x -C /work && cd /work && source dev-env && osh_use_zig && cargo build --release --manifest-path tui/Cargo.toml && cp tui/target/release/osh-tui /out/osh-tui'
+    package "$work/osh-tui" linux "$arch"
+    rm -rf "$work"
+  done
+fi
+
+echo
+echo "Upload by hand when ready:"
+echo "  gh release create $version $out/osh-$version-*.tar.gz $out/osh-$version-*.sha256 --title $version --generate-notes"

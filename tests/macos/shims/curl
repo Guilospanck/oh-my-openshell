@@ -1,0 +1,13 @@
+#!/bin/bash
+# Stands in for the OpenShell installer download. The "installer" it hands out records that it
+# ran, puts the openshell stand-in on PATH ($HOME/.installed) and leaves what the real installer
+# leaves: the CLI's client certificates and its own `openshell` gateway registration.
+echo "curl $*" >> "${STUB_LOG:?}"
+src="$(cd "$(dirname "$0")/../installable" && pwd)/openshell"
+script="echo installer-ran >> \"\$STUB_LOG\"
+mkdir -p \"\$HOME/.installed\" \"\$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls\"
+cp '$src' \"\$HOME/.installed/openshell\"
+echo 'openshell https://127.0.0.1:17670' >> \"\$HOME/.openshell-gateways\""
+out=""
+while [ $# -gt 0 ]; do [ "$1" = -o ] && out="$2"; shift; done
+if [ -n "$out" ]; then echo "$script" > "$out"; else echo "$script"; fi
