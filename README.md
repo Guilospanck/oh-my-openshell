@@ -29,7 +29,7 @@ configs are embedded in it and written to `~/.local/share/osh` on first run
 and `providers/*.yaml` there). The first time you run `osh` (and with `osh setup`) a guided screen walks you
 through it: **Machine** (what was found), **Gateways** (tick the types you want;
 each says what it needs and what osh will install for it), **Review** (every
-step, with `sudo` marked), **Install** (live progress) and **Done**. Setup
+step, with `sudo` marked), **Install** (live progress; `Esc` stops after the step that is running, and the rest are left for the next `osh setup`) and **Done**. Setup
 detects the OS and package manager (Homebrew, apt, dnf, pacman, zypper) and
 installs OpenShell, the gateway configs and services, whatever each ticked type
 needs (Docker Engine, Podman, Colima, a Podman machine, `e2fsprogs`, KVM access),

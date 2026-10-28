@@ -38,6 +38,8 @@ pub enum Action {
     /// Run these steps to create these gateway types.
     Install(Vec<Step>, Vec<GwKind>),
     Finish,
+    /// Stop the install after the step that is running.
+    Cancel,
 }
 
 /// Turns the ticked types into the plan; `Err` carries a reason to show.
@@ -157,7 +159,12 @@ impl Wizard {
                 KeyCode::Char('q') => return Action::Quit,
                 _ => {}
             },
-            Screen::Install => {}
+            // The install is running (the screen becomes Done when it ends).
+            Screen::Install => {
+                if matches!(k, KeyCode::Esc | KeyCode::Char('c')) {
+                    return Action::Cancel;
+                }
+            }
             Screen::Done => {
                 if matches!(k, KeyCode::Enter | KeyCode::Esc | KeyCode::Char('q')) {
                     return Action::Finish;
@@ -369,7 +376,7 @@ fn hints(w: &Wizard, p: &Progress) -> &'static str {
         Screen::Gateways => "↑↓ move   space tick   enter continue   esc back   q quit",
         Screen::Review => "Commands are shown as they run.   enter  Install   b  back   q  quit",
         Screen::Install if p.finished => "enter  continue",
-        Screen::Install => "working… the command being run is shown below",
+        Screen::Install => "working… esc  stop after this step",
         Screen::Done => "enter  open the dashboard",
     }
 }
@@ -825,6 +832,7 @@ use ratatui::{
 use std::{
     io,
     path::Path,
+    process::Stdio,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc, Arc,
@@ -909,8 +917,11 @@ pub fn apply_event(p: &mut Progress, steps: &[Step], e: &SetupEvent, elapsed: Du
                 StepOutcome::Manual => {
                     RowState::Manual(steps.get(*i).map(Step::command_line).unwrap_or_default())
                 }
-                StepOutcome::Blocked | StepOutcome::Declined => {
+                StepOutcome::Blocked => {
                     RowState::Failed("waiting on an earlier step that did not finish".into())
+                }
+                StepOutcome::Declined => {
+                    RowState::Failed("not run: you stopped the install".into())
                 }
             };
             if let Some(r) = p.rows.get_mut(*i) {
@@ -923,6 +934,45 @@ pub fn apply_event(p: &mut Progress, steps: &[Step], e: &SetupEvent, elapsed: Du
 enum Msg {
     Event(SetupEvent),
     Finished(Vec<StepResult>),
+    /// The install thread panicked; the text is the panic message.
+    Crashed(String),
+}
+
+/// Runs the install on the calling thread and turns a panic into `Msg::Crashed`, so the screen
+/// never waits forever for a `Finished` that a dead thread cannot send.
+fn guarded(run: impl FnOnce() -> Vec<StepResult>) -> Msg {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(results) => Msg::Finished(results),
+        Err(e) => Msg::Crashed(
+            e.downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| e.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown error".into()),
+        ),
+    }
+}
+
+/// Marks the step that was running (or the first unfinished one) as failed by the crash.
+fn mark_crashed(p: &mut Progress, why: &str) {
+    let at = p
+        .rows
+        .iter()
+        .position(|r| *r == RowState::Running)
+        .or_else(|| p.rows.iter().position(|r| *r == RowState::Pending));
+    if let Some(i) = at {
+        p.rows[i] = RowState::Failed(format!("the installer crashed: {why}"));
+    }
+}
+
+/// Answers each step "yes", until `cancel` is set: then every step still to run is declined.
+fn consent(cancel: &AtomicBool) -> impl FnMut(&Step) -> crate::setup::Answer + '_ {
+    move |_| {
+        if cancel.load(Ordering::Relaxed) {
+            crate::setup::Answer::No
+        } else {
+            crate::setup::Answer::Yes
+        }
+    }
 }
 
 /// The wizard for this machine: its facts, the gateways that already exist, and a planner that
@@ -986,6 +1036,7 @@ pub fn run(terminal: &mut DefaultTerminal, wizard: Wizard, data: &Path) -> io::R
     let mut started = Instant::now();
     let mut outcome = Outcome::Cancelled;
     let keepalive = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(AtomicBool::new(false));
     loop {
         terminal.draw(|f| draw(f, &w, &prog))?;
         while let Ok(m) = rx.try_recv() {
@@ -995,6 +1046,15 @@ pub fn run(terminal: &mut DefaultTerminal, wizard: Wizard, data: &Path) -> io::R
                         started = Instant::now();
                     }
                     apply_event(&mut prog, &steps_running, &e, started.elapsed());
+                }
+                Msg::Crashed(why) => {
+                    keepalive.store(false, Ordering::Relaxed);
+                    mark_crashed(&mut prog, &why);
+                    outcome = Outcome::NeedsAction(format!("the installer crashed: {why}"));
+                    settle_pending(data, &outcome);
+                    prog.finished = true;
+                    prog.ok = false;
+                    w.show_done();
                 }
                 Msg::Finished(results) => {
                     keepalive.store(false, Ordering::Relaxed);
@@ -1023,6 +1083,7 @@ pub fn run(terminal: &mut DefaultTerminal, wizard: Wizard, data: &Path) -> io::R
                 return Ok(Outcome::Cancelled);
             }
             Action::Finish => return Ok(outcome),
+            Action::Cancel => cancel.store(true, Ordering::Relaxed),
             Action::Install(steps, kinds) => {
                 if steps.iter().any(privileged) && !warm_sudo(terminal) {
                     w.note = "sudo did not accept the password; nothing was run.".into();
@@ -1037,6 +1098,8 @@ pub fn run(terminal: &mut DefaultTerminal, wizard: Wizard, data: &Path) -> io::R
                     ..Default::default()
                 };
                 steps_running = steps.clone();
+                cancel.store(false, Ordering::Relaxed);
+                let cancel = cancel.clone();
                 keepalive.store(true, Ordering::Relaxed);
                 spawn_keepalive(keepalive.clone());
                 let tx = tx.clone();
@@ -1048,16 +1111,18 @@ pub fn run(terminal: &mut DefaultTerminal, wizard: Wizard, data: &Path) -> io::R
                         ..Default::default()
                     };
                     let tx2 = tx.clone();
-                    let results = crate::setup::execute_events(
-                        &steps,
-                        &RealHost,
-                        &o,
-                        &mut |_| crate::setup::Answer::Yes,
-                        &mut |e| {
-                            let _ = tx2.send(Msg::Event(e));
-                        },
-                    );
-                    let _ = tx.send(Msg::Finished(results));
+                    let msg = guarded(|| {
+                        crate::setup::execute_events(
+                            &steps,
+                            &RealHost,
+                            &o,
+                            &mut consent(&cancel),
+                            &mut |e| {
+                                let _ = tx2.send(Msg::Event(e));
+                            },
+                        )
+                    });
+                    let _ = tx.send(msg);
                 });
             }
         }
@@ -1067,11 +1132,7 @@ pub fn run(terminal: &mut DefaultTerminal, wizard: Wizard, data: &Path) -> io::R
 /// Leaves the full-screen view for one `sudo -v` password prompt on the real terminal, so the
 /// install can then run `sudo -n`. False when sudo refused.
 fn warm_sudo(terminal: &mut DefaultTerminal) -> bool {
-    if std::process::Command::new("sudo")
-        .args(["-n", "-v"])
-        .status()
-        .is_ok_and(|s| s.success())
-    {
+    if silent_ok("sudo", &["-n", "-v"]) {
         return true;
     }
     ratatui::restore();
@@ -1084,6 +1145,18 @@ fn warm_sudo(terminal: &mut DefaultTerminal) -> bool {
     ok
 }
 
+/// Runs a command with no stdio at all, so a refusal ("a password is required") cannot be
+/// drawn over the full-screen view. True when it succeeded.
+fn silent_ok(prog: &str, args: &[&str]) -> bool {
+    std::process::Command::new(prog)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
 /// Refreshes the sudo ticket every 50 seconds while the install runs.
 fn spawn_keepalive(on: Arc<AtomicBool>) {
     std::thread::spawn(move || {
@@ -1093,9 +1166,7 @@ fn spawn_keepalive(on: Arc<AtomicBool>) {
             waited += 1;
             if waited >= 50 {
                 waited = 0;
-                let _ = std::process::Command::new("sudo")
-                    .args(["-n", "-v"])
-                    .status();
+                let _ = silent_ok("sudo", &["-n", "-v"]);
             }
         }
     });
@@ -1697,6 +1768,104 @@ mod tests {
 
     fn result(id: &'static str, outcome: StepOutcome) -> StepResult {
         StepResult { id, outcome }
+    }
+
+    #[test]
+    fn a_panic_in_the_install_thread_becomes_a_crash_message() {
+        match guarded(|| panic!("boom")) {
+            Msg::Crashed(t) => assert_eq!(t, "boom"),
+            _ => panic!("expected a crash"),
+        }
+        match guarded(|| panic!("{}", String::from("formatted"))) {
+            Msg::Crashed(t) => assert_eq!(t, "formatted"),
+            _ => panic!("expected a crash"),
+        }
+        assert!(matches!(guarded(Vec::new), Msg::Finished(_)));
+    }
+
+    #[test]
+    fn a_crash_marks_the_running_step_failed_and_the_done_screen_shows_it() {
+        let mut p = Progress {
+            rows: vec![
+                RowState::Done(Duration::ZERO),
+                RowState::Running,
+                RowState::Pending,
+            ],
+            ..Default::default()
+        };
+        mark_crashed(&mut p, "boom");
+        assert_eq!(
+            p.rows[1],
+            RowState::Failed("the installer crashed: boom".into())
+        );
+        assert_eq!(p.rows[2], RowState::Pending);
+        p.finished = true;
+        let mut w = wizard_with(Screen::Done);
+        w.steps = vec![named_step("a"), named_step("b"), named_step("c")];
+        assert!(render(&w, &p, 100, 30)
+            .0
+            .join("\n")
+            .contains("the installer crashed: boom"));
+    }
+
+    #[test]
+    fn esc_or_c_while_installing_asks_to_stop_and_the_hint_says_so() {
+        let mut w = wizard_with(Screen::Install);
+        assert!(matches!(w.on_key(KeyCode::Esc), Action::Cancel));
+        assert!(matches!(w.on_key(KeyCode::Char('c')), Action::Cancel));
+        assert!(matches!(w.on_key(KeyCode::Char('x')), Action::None));
+        assert!(hints(&w, &Progress::default()).contains("esc"));
+    }
+
+    #[test]
+    fn cancelling_declines_every_step_not_yet_started() {
+        use crate::platform::testing::FakeHost;
+        let steps: Vec<Step> = (0..3)
+            .map(|i| Step {
+                id: ["a", "b", "c"][i],
+                title: format!("s{i}"),
+                kind: StepKind::Cmd {
+                    prog: "true".into(),
+                    args: vec![],
+                },
+                optional: false,
+                after: None,
+            })
+            .collect();
+        let cancel = AtomicBool::new(false);
+        let h = FakeHost::default();
+        let mut ask = consent(&cancel);
+        let results =
+            crate::setup::execute_events(&steps, &h, &Options::default(), &mut ask, &mut |e| {
+                if matches!(e, SetupEvent::Done(0, _)) {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            });
+        assert_eq!(results[0].outcome, StepOutcome::Done);
+        assert_eq!(results[1].outcome, StepOutcome::Declined);
+        assert_eq!(results[2].outcome, StepOutcome::Declined);
+        assert!(matches!(finish(&steps, &results), Outcome::NeedsAction(_)));
+        let mut p = Progress {
+            rows: vec![RowState::Pending; 3],
+            ..Default::default()
+        };
+        apply_event(
+            &mut p,
+            &steps,
+            &SetupEvent::Done(1, StepOutcome::Declined),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            p.rows[1],
+            RowState::Failed("not run: you stopped the install".into())
+        );
+    }
+
+    #[test]
+    fn silent_ok_reports_success_and_failure_without_output() {
+        assert!(silent_ok("sh", &["-c", "echo noise >&2; exit 0"]));
+        assert!(!silent_ok("sh", &["-c", "echo noise >&2; exit 3"]));
+        assert!(!silent_ok("/nonexistent-program", &[]));
     }
 
     #[test]
