@@ -247,6 +247,11 @@ fn first_run(data: &Path) -> bool {
 /// `osh doctor` and `osh setup [--yes] [--dry-run] [--runtime docker|podman]`; None for the dashboard.
 fn subcommand(args: &[String]) -> Option<i32> {
     match args.first().map(String::as_str)? {
+        // The Homebrew formula's test block and `scripts/release` rely on this.
+        "--version" | "-V" | "version" => {
+            println!("osh {}", env!("CARGO_PKG_VERSION"));
+            Some(0)
+        }
         "doctor" => {
             let f = platform::gather(&platform::RealHost);
             // Without a usable HOME there is no registry to read: assume the strict default.
@@ -657,6 +662,14 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn version_flag_is_a_subcommand_that_exits_zero() {
+        let a = |v: &str| vec![v.to_string()];
+        for flag in ["--version", "-V", "version"] {
+            assert_eq!(subcommand(&a(flag)), Some(0), "{flag}");
+        }
+    }
 
     #[test]
     fn confirmed_flag_skips_the_second_question() {
