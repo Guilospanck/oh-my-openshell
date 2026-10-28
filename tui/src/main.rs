@@ -392,16 +392,20 @@ fn gateway_command(args: &[String]) -> i32 {
                 }
             }
             let reg = gwmodel::Registry::load(&p.data);
-            let shared = gwops::shares_runtime(&reg, name);
-            if let Some(spec) = reg.get(name) {
-                Ok(gwops::reset_steps_for(&f, &p, spec, shared))
-            } else {
-                // Sweep with the runtime the installed gateway drives, not whichever answers first.
-                let driver = h
-                    .read(&p.config_home.join("gateway.toml"))
-                    .and_then(|t| gateway::driver_runtime(&t));
-                gateway::reset_steps(&f, &p, name, driver.or(f.runtime()), shared)
-            }
+            let spec = match reg.get(name) {
+                Some(spec) => Ok(spec.clone()),
+                None => {
+                    // Sweep with the runtime the installed gateway drives, not whichever answers
+                    // first.
+                    let driver = h
+                        .read(&p.config_home.join("gateway.toml"))
+                        .and_then(|t| gateway::driver_runtime(&t));
+                    gateway::legacy_spec(f.os, name, driver.or(f.runtime()))
+                }
+            };
+            spec.map(|spec| {
+                gwops::reset_steps_for(&f, &p, &spec, gwops::shares_runtime(&reg, &spec))
+            })
         }
     };
     match steps {

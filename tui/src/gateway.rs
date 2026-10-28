@@ -23,9 +23,14 @@ fi"#;
 /// Removes leftover containers and volumes of a Docker or Podman driver.
 /// $1 = runtime binary (its full path when osh found it: gateway.env's PATH lists only Homebrew's
 /// folders, and osh's own PATH is kept behind it for the same reason), $2 = state dir, $3 = config dir, $4 = darwin flag, $5 = `shared` when
-/// another gateway drives the same runtime. OpenShell's labels do not say which gateway owns a
-/// container, so a shared runtime only loses its stopped leftovers (`sandbox delete --all` has
-/// already removed this gateway's live ones) and its volumes stay.
+/// another gateway drives the same runtime, $6 = the gateway's driver. OpenShell's labels do not
+/// say which gateway owns a container, so a shared runtime only loses its stopped leftovers
+/// (`sandbox delete --all` has already removed this gateway's live ones) and its volumes stay.
+/// Sandbox tokens: only OpenShell's Docker driver writes them, to
+/// `docker-sandbox-tokens/<sandbox_label>/<sandbox id>/` (`openshell-driver-docker`), and osh's
+/// configs leave `sandbox_label` at its default, so every Docker gateway's tokens share one folder
+/// and only the sandbox id (in the database this reset deletes) tells them apart. They go only
+/// when this is a Docker gateway that has the runtime to itself.
 pub(crate) const SWEEP_CONTAINERS_SCRIPT: &str = r#"osh_path="$PATH"
 [ -f "$3/gateway.env" ] && { set -a; . "$3/gateway.env"; set +a; }
 export PATH="${PATH:+$PATH:}$osh_path"
@@ -46,7 +51,9 @@ if command -v "$1" >/dev/null 2>&1 && "$1" info >/dev/null 2>&1; then
 else
   echo "$1 unreachable; containers not swept" >&2
 fi
-rm -rf "$2"/docker-sandbox-tokens/*"#;
+if [ "$6" = docker ] && [ "$5" != shared ]; then
+  rm -rf "$2"/docker-sandbox-tokens/*
+fi"#;
 
 /// vm driver microVMs are child processes; kill orphans, drop their state. $1 = state dir.
 pub(crate) const SWEEP_VMS_SCRIPT: &str = r#"pkill -f "$1/vm-driver/sandboxes" 2>/dev/null || true
@@ -331,96 +338,32 @@ pub fn confirm_reset(typed: &str) -> bool {
     typed.trim() == "reset"
 }
 
-/// Wipes a local gateway: its sandboxes, then its database, then starts it empty.
-/// Mac knows `openshell` (vm) and `openshell-docker`; Linux only `openshell`.
-pub fn reset_steps(
-    f: &Facts,
-    p: &Paths,
+/// The registry-shaped description of a gateway osh did not create but `osh gateway-reset` still
+/// wipes: the installer's `openshell` (the VM gateway on macOS; on Linux the packaged service on
+/// `driver`, Docker when unknown) and, on macOS, the `openshell-docker` agent of older osh versions.
+pub fn legacy_spec(
+    os: Os,
     gateway: &str,
-    rt: Option<Runtime>,
-    shared: bool,
-) -> Result<Vec<Step>, String> {
-    #[derive(PartialEq)]
-    enum Kind {
-        Vm,
-        Container,
-    }
-    let (kind, db_dir) = match (f.os, gateway) {
-        (Os::MacOs, "openshell") => (Kind::Vm, p.state.join("gateway")),
-        (Os::MacOs, DOCKER_GATEWAY) => (Kind::Container, p.state.join("gateway-docker")),
-        (Os::Linux, "openshell") => (Kind::Container, p.state.join("gateway")),
+    driver: Option<Runtime>,
+) -> Result<crate::gwmodel::GatewaySpec, String> {
+    use crate::gwmodel::GwKind;
+    let kind = match (os, gateway) {
+        (Os::MacOs, "openshell") => GwKind::Vm,
+        (Os::MacOs, DOCKER_GATEWAY) => GwKind::Docker,
+        (Os::Linux, "openshell") if driver == Some(Runtime::Podman) => GwKind::Podman,
+        (Os::Linux, "openshell") => GwKind::Docker,
         (Os::MacOs, _) => return Err("usage: openshell or openshell-docker".into()),
         (Os::Linux, _) => {
             return Err("only the gateway openshell exists on Linux (no openshell-docker)".into())
         }
     };
-    let state = p.state.to_string_lossy().into_owned();
-    let config = p.config_home.to_string_lossy().into_owned();
-    let uid_target = |label: &str| format!("gui/$(id -u)/{label}");
-    let (stop, start) = match (f.os, gateway) {
-        (Os::Linux, _) => (
-            cmd("systemctl", &["--user", "stop", "openshell-gateway"]),
-            cmd("systemctl", &["--user", "start", "openshell-gateway"]),
-        ),
-        (Os::MacOs, "openshell") => (
-            cmd("brew", &["services", "stop", "openshell"]),
-            cmd("brew", &["services", "start", "openshell"]),
-        ),
-        _ => (
-            script(
-                &format!(
-                    r#"launchctl bootout "{}" 2>/dev/null || true"#,
-                    uid_target(DOCKER_LABEL)
-                ),
-                &[],
-            ),
-            script(
-                r#"launchctl bootstrap "gui/$(id -u)" "$1""#,
-                &[&p.plist().to_string_lossy()],
-            ),
-        ),
-    };
-    let sweep = match kind {
-        Kind::Vm => script(SWEEP_VMS_SCRIPT, &[&state]),
-        Kind::Container => script(
-            SWEEP_CONTAINERS_SCRIPT,
-            &[
-                &f.runtime_bin(rt.unwrap_or(Runtime::Docker)),
-                &state,
-                &config,
-                if f.os == Os::MacOs { "darwin" } else { "linux" },
-                if shared { "shared" } else { "own" },
-            ],
-        ),
-    };
-    let db = |ext: &str| {
-        db_dir
-            .join(format!("openshell.db{ext}"))
-            .to_string_lossy()
-            .into_owned()
-    };
-    let steps = vec![
-        step(
-            "reset-sandboxes",
-            "Delete the sandboxes through the gateway",
-            script(DELETE_SANDBOXES_SCRIPT, &[gateway]),
-        ),
-        step("reset-stop", "Stop the gateway", stop),
-        step("reset-settle", "Let it settle", cmd("sleep", &["2"])),
-        step("reset-sweep", "Remove leftover sandbox runtimes", sweep),
-        step(
-            "reset-db",
-            "Delete the database",
-            cmd("rm", &["-f", &db(""), &db("-shm"), &db("-wal")]),
-        ),
-        step("reset-start", "Start the gateway", start),
-        step(
-            "reset-wait",
-            "Wait for the gateway to answer",
-            script(WAIT_SCRIPT, &[gateway]),
-        ),
-    ];
-    Ok(chain(steps, None))
+    let main = gateway == "openshell";
+    Ok(crate::gwmodel::GatewaySpec {
+        name: gateway.into(),
+        kind,
+        port: if main { 17670 } else { 17671 },
+        main,
+    })
 }
 
 /// Removes OpenShell's files and services. The osh data directory stays.
@@ -887,6 +830,149 @@ mod tests {
         assert_eq!(p.data, PathBuf::from("/d/osh"));
     }
 
+    /// What `osh gateway-reset NAME` plans for a gateway osh did not create.
+    fn reset_steps(
+        f: &Facts,
+        p: &Paths,
+        gateway: &str,
+        rt: Option<Runtime>,
+        shared: bool,
+    ) -> Result<Vec<Step>, String> {
+        let spec = legacy_spec(f.os, gateway, rt)?;
+        Ok(crate::gwops::reset_steps_for(f, p, &spec, shared))
+    }
+
+    /// The steps the older, separate legacy reset planned (removed in favour of `reset_steps_for`),
+    /// as (title, command line): the same scripts with the same inputs, in the same order.
+    fn older_reset(
+        f: &Facts,
+        p: &Paths,
+        gateway: &str,
+        rt: Option<Runtime>,
+        shared: bool,
+    ) -> Vec<(String, String)> {
+        let (vm, db_dir) = match (f.os, gateway) {
+            (Os::MacOs, "openshell") => (true, p.state.join("gateway")),
+            (Os::MacOs, _) => (false, p.state.join("gateway-docker")),
+            (Os::Linux, _) => (false, p.state.join("gateway")),
+        };
+        let state = p.state.to_string_lossy().into_owned();
+        let config = p.config_home.to_string_lossy().into_owned();
+        let (stop, start) = match (f.os, gateway) {
+            (Os::Linux, _) => (
+                cmd("systemctl", &["--user", "stop", "openshell-gateway"]),
+                cmd("systemctl", &["--user", "start", "openshell-gateway"]),
+            ),
+            (Os::MacOs, "openshell") => (
+                cmd("brew", &["services", "stop", "openshell"]),
+                cmd("brew", &["services", "start", "openshell"]),
+            ),
+            _ => (
+                script(
+                    &format!(
+                        r#"launchctl bootout "gui/$(id -u)/{DOCKER_LABEL}" 2>/dev/null || true"#
+                    ),
+                    &[],
+                ),
+                script(
+                    r#"launchctl bootstrap "gui/$(id -u)" "$1""#,
+                    &[&p.plist().to_string_lossy()],
+                ),
+            ),
+        };
+        let sweep = if vm {
+            script(SWEEP_VMS_SCRIPT, &[&state])
+        } else {
+            let rt = rt.unwrap_or(Runtime::Docker);
+            script(
+                SWEEP_CONTAINERS_SCRIPT,
+                &[
+                    &f.runtime_bin(rt),
+                    &state,
+                    &config,
+                    if f.os == Os::MacOs { "darwin" } else { "linux" },
+                    if shared { "shared" } else { "own" },
+                    // The driver argument this change added: the older script had none.
+                    if rt == Runtime::Podman {
+                        "podman"
+                    } else {
+                        "docker"
+                    },
+                ],
+            )
+        };
+        let db = |ext: &str| {
+            db_dir
+                .join(format!("openshell.db{ext}"))
+                .to_string_lossy()
+                .into_owned()
+        };
+        [
+            (
+                "Delete the sandboxes through the gateway",
+                script(DELETE_SANDBOXES_SCRIPT, &[gateway]),
+            ),
+            ("Stop the gateway", stop),
+            ("Let it settle", cmd("sleep", &["2"])),
+            ("Remove leftover sandbox runtimes", sweep),
+            (
+                "Delete the database",
+                cmd("rm", &["-f", &db(""), &db("-shm"), &db("-wal")]),
+            ),
+            ("Start the gateway", start),
+            (
+                "Wait for the gateway to answer",
+                script(WAIT_SCRIPT, &[gateway]),
+            ),
+        ]
+        .into_iter()
+        .map(|(t, k)| (t.to_string(), step("x", "", k).command_line()))
+        .collect()
+    }
+
+    #[test]
+    fn legacy_reset_plans_what_the_older_separate_reset_did() {
+        let cases = [
+            (Os::Linux, "openshell", Some(Runtime::Docker)),
+            (Os::Linux, "openshell", Some(Runtime::Podman)),
+            (Os::Linux, "openshell", None),
+            (Os::MacOs, "openshell", None),
+            (Os::MacOs, DOCKER_GATEWAY, Some(Runtime::Docker)),
+            (Os::MacOs, DOCKER_GATEWAY, None),
+        ];
+        for (os, name, rt) in cases {
+            for shared in [false, true] {
+                let mut f = facts(os);
+                f.runtime_paths = vec![(Runtime::Podman, "/opt/podman/bin/podman".into())];
+                let new = reset_steps(&f, &paths(), name, rt, shared).unwrap();
+                let got: Vec<(String, String)> = new
+                    .iter()
+                    .map(|s| {
+                        // The agent's bootout passes the label as $1 instead of splicing it into
+                        // the script: the same command once the shell expands it.
+                        let line = s.command_line().replace(
+                            r#"launchctl bootout "gui/$(id -u)/$1" 2>/dev/null || true sh dev.guilospanck.openshell-docker"#,
+                            &format!(
+                                r#"launchctl bootout "gui/$(id -u)/{DOCKER_LABEL}" 2>/dev/null || true sh"#
+                            ),
+                        );
+                        (s.title.clone(), line)
+                    })
+                    .collect();
+                assert_eq!(
+                    got,
+                    older_reset(&f, &paths(), name, rt, shared),
+                    "{os:?} {name} {rt:?} shared={shared}"
+                );
+                // Still one chain, each step after the one before it.
+                assert_eq!(new[0].after, None);
+                for w in new.windows(2) {
+                    assert_eq!(w[1].after, Some(w[0].id));
+                }
+            }
+        }
+    }
+
     #[test]
     fn reset_requires_typed_confirmation() {
         assert!(confirm_reset("reset\n"));
@@ -1001,7 +1087,7 @@ mod tests {
                 .args(["-c", SWEEP_CONTAINERS_SCRIPT, "sh", runtime])
                 .arg(&state)
                 .arg(&config)
-                .args(["linux", "own"])
+                .args(["linux", "own", "podman"])
                 .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
                 .output()
                 .unwrap();
@@ -1015,6 +1101,48 @@ mod tests {
             assert!(calls.contains("rm -f abc"), "{runtime}: {calls}");
             assert!(calls.contains("volume rm vol1"), "{runtime}: {calls}");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Runs the real sweep script: only a Docker gateway with the runtime to itself clears the
+    /// sandbox tokens, which every Docker gateway keeps in one shared folder.
+    #[test]
+    fn the_sweep_keeps_other_gateways_sandbox_tokens() {
+        let d = std::env::temp_dir().join(format!("osh-tokens-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (bin, config, state) = (d.join("bin"), d.join("config"), d.join("state"));
+        for dir in [&bin, &config, &state] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let docker = bin.join("docker");
+        std::fs::write(&docker, "#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let token = state.join("docker-sandbox-tokens/default/sb1/sandbox.jwt");
+        let run = |mode: &str, driver: &str| {
+            std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+            std::fs::write(&token, "t\n").unwrap();
+            let out = std::process::Command::new("/bin/sh")
+                .args(["-c", SWEEP_CONTAINERS_SCRIPT, "sh"])
+                .arg(&docker)
+                .arg(&state)
+                .arg(&config)
+                .args(["linux", mode, driver])
+                .env("PATH", "/usr/bin:/bin")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            token.exists()
+        };
+        assert!(run("shared", "docker"), "a shared runtime keeps the tokens");
+        assert!(
+            run("own", "podman"),
+            "a Podman gateway keeps the Docker gateway's tokens"
+        );
+        assert!(!run("own", "docker"), "a Docker gateway alone clears them");
+        assert!(state.join("docker-sandbox-tokens").is_dir());
         let _ = std::fs::remove_dir_all(&d);
     }
 

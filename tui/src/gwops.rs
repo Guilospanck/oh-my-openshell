@@ -808,16 +808,18 @@ pub fn remove_gateway_steps(
     Ok(chain(steps, None))
 }
 
-/// Wipes a gateway osh created and starts it again empty, with its own service, database and
-/// runtime.
-/// True when another registered gateway drives a container runtime, so a sweep must not assume
-/// every managed container belongs to `name`.
-pub fn shares_runtime(reg: &Registry, name: &str) -> bool {
-    reg.gateways
-        .iter()
-        .any(|g| g.name != name && g.kind != GwKind::Vm)
+/// True when another registered gateway drives the same container runtime as `spec` (Docker and
+/// Podman are separate runtimes), so a sweep must not assume every managed container there
+/// belongs to `spec`.
+pub fn shares_runtime(reg: &Registry, spec: &GatewaySpec) -> bool {
+    spec.kind != GwKind::Vm
+        && reg
+            .gateways
+            .iter()
+            .any(|g| g.name != spec.name && g.kind == spec.kind)
 }
 
+/// Wipes a gateway and starts it again empty, with its own service, database and runtime.
 pub fn reset_steps_for(f: &Facts, p: &Paths, spec: &GatewaySpec, shared: bool) -> Vec<Step> {
     let state = p.state.to_string_lossy().into_owned();
     let config = p.config_home.to_string_lossy().into_owned();
@@ -862,6 +864,7 @@ pub fn reset_steps_for(f: &Facts, p: &Paths, spec: &GatewaySpec, shared: bool) -
                 &config,
                 if f.os == Os::MacOs { "darwin" } else { "linux" },
                 if shared { "shared" } else { "own" },
+                spec.kind.driver(),
             ],
         )
     };
@@ -1573,15 +1576,29 @@ mod tests {
     }
 
     #[test]
-    fn shares_runtime_ignores_vm_and_self() {
+    fn shares_runtime_only_counts_other_gateways_on_the_same_runtime() {
         let mut r = Registry::default();
-        r.add(spec(GwKind::Docker, 17670, true));
-        assert!(!shares_runtime(&r, "openshell-docker"));
+        let docker = spec(GwKind::Docker, 17670, true);
+        let podman = spec(GwKind::Podman, 17672, false);
+        r.add(docker.clone());
+        assert!(!shares_runtime(&r, &docker));
         r.add(spec(GwKind::Vm, 17671, false));
-        assert!(!shares_runtime(&r, "openshell-docker"));
-        r.add(spec(GwKind::Podman, 17672, false));
-        assert!(shares_runtime(&r, "openshell-docker"));
-        assert!(shares_runtime(&r, "unregistered"));
+        assert!(!shares_runtime(&r, &docker));
+        // Docker and Podman are separate runtimes: neither sweep may hold back for the other.
+        r.add(podman.clone());
+        assert!(!shares_runtime(&r, &docker));
+        assert!(!shares_runtime(&r, &podman));
+        // A gateway osh did not create (the installer's `openshell` on Linux) on Docker shares it
+        // with the registered Docker gateway; a VM gateway never shares a container runtime.
+        let legacy = |kind| GatewaySpec {
+            name: "openshell".into(),
+            kind,
+            port: 17670,
+            main: true,
+        };
+        assert!(shares_runtime(&r, &legacy(GwKind::Docker)));
+        assert!(shares_runtime(&r, &legacy(GwKind::Podman)));
+        assert!(!shares_runtime(&r, &legacy(GwKind::Vm)));
     }
 
     #[test]
