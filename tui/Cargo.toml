@@ -3,6 +3,7 @@ name = "osh-tui"
 version = "0.2.0"
 edition = "2021"
 description = "ratatui front end for the OpenShell CLI"
+license = "MIT"
 
 [dependencies]
 libghostty-vt = "=0.2.2"

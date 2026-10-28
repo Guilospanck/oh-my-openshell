@@ -52,6 +52,7 @@ class OhMyOpenshell < Formula
   desc "Terminal dashboard and portable config for NVIDIA OpenShell sandboxes"
   homepage "https://github.com/$repo"
   version "$version"
+  license "MIT"
 $macos$linux
 
   def install
