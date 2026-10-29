@@ -707,6 +707,12 @@ fn draw_session(f: &mut Frame, app: &App, s: &Session) {
         base.add_modifier(Modifier::BOLD),
     )];
     let title = s.vt.title();
+    if let Some(branch) = crate::term::branch_of(&title) {
+        spans.push(Span::styled(
+            format!(" {branch} "),
+            base.fg(Color::Blue).add_modifier(Modifier::BOLD),
+        ));
+    }
     let title = crate::term::shown_title(&title);
     if !title.is_empty() {
         spans.push(Span::styled(format!(" {title} "), base));
