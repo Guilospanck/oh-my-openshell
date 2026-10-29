@@ -52,6 +52,8 @@ pub struct Plan {
     pub gh: Option<GhGrant>,
     /// Where the wizard continues once a provider the plan needs exists.
     pub resume: Resume,
+    /// Build the image again before creating, because its Dockerfile changed since the last build.
+    pub rebuild: bool,
 }
 
 /// A repo token pasted for a new sandbox; kept in memory only until the provider is created.
@@ -93,6 +95,8 @@ pub enum SelKind {
     Preset,
     Image,
     Providers(Plan),
+    /// Whether to rebuild an outdated image before the sandbox is created from it.
+    Rebuild(Plan),
     /// Which of several sandboxes (gateway, name) sharing the project folder to open.
     OpenShared(Vec<(String, String)>),
     /// No folder, the folder `osh` was started in, or one typed in.
@@ -1887,13 +1891,56 @@ impl App {
         }
     }
 
+    /// A sandbox keeps the image it was created from, so offer the fresh build before creating
+    /// from an image whose Dockerfile changed since it was built.
+    fn ask_rebuild(&mut self, plan: Plan) {
+        let outdated = self
+            .snap
+            .images
+            .iter()
+            .any(|i| i.tag == plan.image && i.built && i.freshness == cli::Freshness::Outdated);
+        if !outdated {
+            return self.confirm_create(plan);
+        }
+        let title = format!(
+            "{} is outdated (its Dockerfile changed since it was built). A sandbox keeps the image it is created from",
+            plan.image
+        );
+        let items = vec![
+            "Rebuild the image first".to_string(),
+            "Use the current image".to_string(),
+        ];
+        self.select(&title, items, false, SelKind::Rebuild(plan));
+    }
+
+    fn confirm_create(&mut self, plan: Plan) {
+        let steps = self.sandbox_steps(&plan);
+        let summary = steps
+            .iter()
+            .map(|s| format!("{} {}", s.prog, s.args.join(" ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let extra = plan.gh.as_ref().map_or(String::new(), |g| {
+            format!(
+                "First creates provider {} for {} from the pasted token (expires in {} days).\n\n",
+                ghrepo::provider_name(&plan.name, &g.repo),
+                g.repo.full(),
+                ghrepo::TOKEN_DAYS
+            )
+        });
+        self.modal = Some(Modal::Confirm {
+            text: format!("{extra}Run:\n{summary}\n\nContinue?"),
+            kind: ConfKind::CreateSandbox(plan),
+        });
+    }
+
     fn sandbox_steps(&self, plan: &Plan) -> Vec<Step> {
         let mut steps = Vec::new();
         if let Some(img) = self
             .snap
             .images
             .iter()
-            .find(|i| i.tag == plan.image && !i.built)
+            .find(|i| i.tag == plan.image && (!i.built || plan.rebuild))
         {
             steps.push(Step {
                 prog: cli::runtime_bin().into(),
@@ -2088,6 +2135,10 @@ impl App {
             SelKind::Gateway => {
                 let name = first.split_whitespace().next().unwrap_or_default();
                 self.change_gateway(name);
+            }
+            SelKind::Rebuild(mut plan) => {
+                plan.rebuild = first.starts_with("Rebuild");
+                self.confirm_create(plan);
             }
             SelKind::ClaudeToken(flow) => {
                 if first.starts_with("Paste") {
@@ -2633,24 +2684,7 @@ impl App {
             }
             InKind::Command(mut plan) => {
                 plan.command = text.trim().into();
-                let steps = self.sandbox_steps(&plan);
-                let summary = steps
-                    .iter()
-                    .map(|s| format!("{} {}", s.prog, s.args.join(" ")))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                let extra = plan.gh.as_ref().map_or(String::new(), |g| {
-                    format!(
-                        "First creates provider {} for {} from the pasted token (expires in {} days).\n\n",
-                        ghrepo::provider_name(&plan.name, &g.repo),
-                        g.repo.full(),
-                        ghrepo::TOKEN_DAYS
-                    )
-                });
-                self.modal = Some(Modal::Confirm {
-                    text: format!("{extra}Run:\n{summary}\n\nContinue?"),
-                    kind: ConfKind::CreateSandbox(plan),
-                });
+                self.ask_rebuild(plan);
             }
             InKind::RepoName => {
                 let text = text.trim();
@@ -3678,6 +3712,60 @@ mod tests {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
         App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done)
+    }
+
+    #[test]
+    fn an_outdated_image_is_offered_a_rebuild_before_the_sandbox_is_created() {
+        let mut a = app();
+        a.snap.images = vec![cli::Image {
+            tag: "osh-pi".into(),
+            built: true,
+            freshness: cli::Freshness::Outdated,
+            ..cli::Image::default()
+        }];
+        let plan = Plan {
+            image: "osh-pi".into(),
+            ..Plan::default()
+        };
+        a.ask_rebuild(plan);
+        let Some(Modal::Select {
+            kind: SelKind::Rebuild(plan),
+            items,
+            ..
+        }) = a.modal.take()
+        else {
+            panic!("no rebuild question");
+        };
+        assert!(items[0].starts_with("Rebuild"));
+        a.on_select(SelKind::Rebuild(plan.clone()), vec![items[0].clone()]);
+        let Some(Modal::Confirm { text, .. }) = a.modal.take() else {
+            panic!("no confirmation");
+        };
+        assert!(
+            text.contains(" build ") && text.contains("sandbox create"),
+            "{text}"
+        );
+
+        a.on_select(SelKind::Rebuild(plan), vec![items[1].clone()]);
+        let Some(Modal::Confirm { text, .. }) = a.modal.take() else {
+            panic!("no confirmation");
+        };
+        assert!(!text.contains(" build "), "{text}");
+    }
+
+    #[test]
+    fn an_up_to_date_image_goes_straight_to_the_confirmation() {
+        let mut a = app();
+        a.snap.images = vec![cli::Image {
+            tag: "osh-pi".into(),
+            built: true,
+            ..cli::Image::default()
+        }];
+        a.ask_rebuild(Plan {
+            image: "osh-pi".into(),
+            ..Plan::default()
+        });
+        assert!(matches!(a.modal, Some(Modal::Confirm { .. })));
     }
 
     #[test]

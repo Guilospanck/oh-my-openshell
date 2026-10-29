@@ -90,7 +90,7 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 | Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a GitHub repo token (`t`), install skills and plugins (`K`, below) |
 | Providers | create from a `providers/*.yaml` profile or a read/write GitHub repo token (`n`), update credentials (`u`; renews a repo token), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
-| Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated |
+| Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from) |
 | Gateways | switch (`g` / `Enter`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
 
 Credentials are read from the environment when exported, else prompted hidden;
