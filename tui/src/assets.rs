@@ -93,6 +93,37 @@ fn resolve(
     base.join("osh")
 }
 
+const SEEN: &str = ".osh-seen";
+
+/// Identifies this binary: its resolved path and modification time. A reinstall or upgrade
+/// changes the time, so the id differs from the one the previous install recorded.
+pub fn exe_id() -> String {
+    let exe = std::env::current_exe()
+        .and_then(|p| p.canonicalize())
+        .unwrap_or_default();
+    let secs = fs::metadata(&exe)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    format!("{}\n{secs}", exe.display())
+}
+
+/// True once per binary when `dir` already holds data osh wrote for an earlier install, e.g.
+/// after a bare `brew uninstall`, which leaves the data folder behind. Call before `materialize`.
+/// The id is recorded either way, so later runs of the same binary stay quiet.
+pub fn leftover_from_earlier_install(dir: &Path, id: &str) -> bool {
+    let had_data = dir.join(MANIFEST).is_file();
+    let seen = fs::read_to_string(dir.join(SEEN)).ok();
+    if seen.as_deref() == Some(id) {
+        return false;
+    }
+    let _ = fs::create_dir_all(dir);
+    let _ = fs::write(dir.join(SEEN), id);
+    // No marker but data present: written by an osh that predates the marker, still leftover.
+    had_data
+}
+
 /// FNV-1a 64-bit; stable across Rust versions, unlike `DefaultHasher`.
 pub fn hash(bytes: &[u8]) -> String {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -150,6 +181,20 @@ mod tests {
         let d = std::env::temp_dir().join(format!("osh-assets-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    #[test]
+    fn leftover_is_reported_once_per_binary() {
+        let d = tmp("leftover");
+        assert!(!leftover_from_earlier_install(&d, "a\n1"), "fresh dir");
+        materialize(&d).unwrap();
+        assert!(!leftover_from_earlier_install(&d, "a\n1"), "same binary");
+        assert!(
+            leftover_from_earlier_install(&d, "a\n2"),
+            "reinstalled binary"
+        );
+        assert!(!leftover_from_earlier_install(&d, "a\n2"), "only once");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

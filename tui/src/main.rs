@@ -518,6 +518,18 @@ fn materialize_data() -> PathBuf {
     let dir = assets::data_dir();
     // OSH_DIR is a checkout in development: its files are the source, not a copy to refresh.
     if std::env::var_os("OSH_DIR").is_none() {
+        if assets::leftover_from_earlier_install(&dir, &assets::exe_id()) {
+            let n = gwmodel::Registry::load(&dir).gateways.len();
+            eprintln!(
+                "osh: found data from an earlier install in {} ({n} gateway(s) of osh's). \
+                 Using it. For a clean start, run `osh uninstall` (sandboxes are lost).",
+                dir.display()
+            );
+            if io::stdin().is_terminal() {
+                eprint!("Press Enter to continue.");
+                let _ = io::stdin().read_line(&mut String::new());
+            }
+        }
         match assets::materialize(&dir) {
             Ok(r) => {
                 for p in r.kept_user_edits {

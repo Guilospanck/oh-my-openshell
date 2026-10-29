@@ -34,7 +34,7 @@ osh setup                                      # then install what osh needs (as
 ```
 
 Homebrew installs only the `osh` binary; it does not install OpenShell, a container runtime or a gateway until you
-run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. To remove everything, run `osh uninstall` (it also runs `brew uninstall` for you); a bare `brew uninstall` removes only the binary and leaves OpenShell, its gateways and osh's data behind. Releases currently ship Apple Silicon macOS and arm64
+run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. To remove everything, run `osh uninstall` (it also runs `brew uninstall` for you); a bare `brew uninstall` removes only the binary and leaves OpenShell, its gateways and osh's data behind. After such a reinstall, `osh` prints a one-time notice that it found that data and is using it. Releases currently ship Apple Silicon macOS and arm64
 Linux archives, so Intel Macs and x86_64 Linux need to build from source until those archives are added.
 
 Install from a release (Linux or macOS, aarch64; x86_64 once those archives are published): `curl -fsSL
