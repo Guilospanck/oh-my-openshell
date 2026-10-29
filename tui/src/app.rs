@@ -1600,6 +1600,11 @@ impl App {
         self.token_flow = Some(flow);
     }
 
+    /// Whether the job about to run prints a secret on the terminal (`claude setup-token`).
+    pub fn job_prints_secret(&self) -> bool {
+        self.token_flow.is_some()
+    }
+
     /// Called after a terminal hand-over: resume a token flow with the paste prompt.
     /// Remove the staging directory of the "add skills" flow, if one exists.
     pub fn cleanup_sync_stage(&mut self) {
@@ -3673,6 +3678,22 @@ mod tests {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
         App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done)
+    }
+
+    #[test]
+    fn only_a_setup_token_job_is_marked_as_printing_a_secret() {
+        let mut a = app();
+        assert!(!a.job_prints_secret());
+        a.generate_token(InKind::Cred {
+            provider: "claude".into(),
+            keys: vec!["CLAUDE_CODE_OAUTH_TOKEN".into()],
+            values: vec![],
+            update: false,
+            next: None,
+        });
+        assert!(a.job_prints_secret());
+        a.finish_job(None);
+        assert!(!a.job_prints_secret());
     }
 
     fn snap(gateway: &str, ok: bool) -> Snapshot {

@@ -151,8 +151,9 @@ fn recorded(s: &Step, log: &Path) -> Command {
 }
 
 /// Hand the terminal to child processes, then take it back. Returns the step that failed;
-/// with `capture`, the end of its output too.
-fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
+/// with `capture`, the end of its output too. With `wipe`, the screen and scrollback are cleared
+/// before osh returns, for steps that print a secret.
+fn run_steps(steps: Vec<Step>, capture: bool, wipe: bool) -> Option<Failed> {
     ratatui::restore();
     let log = std::env::temp_dir().join(format!("osh-step-{}.log", std::process::id()));
     let capture = capture && cli::have("script");
@@ -188,8 +189,20 @@ fn run_steps(steps: Vec<Step>, capture: bool) -> Option<Failed> {
     }
     let _ = std::fs::remove_file(&log);
     pause();
+    if wipe {
+        wipe_screen();
+    }
     failed
 }
+
+/// Clears the screen and its scrollback (`ESC [ 3 J`), so a secret a step printed is not
+/// left behind to scroll back to once osh has taken the terminal over again.
+fn wipe_screen() {
+    print!("{WIPE}");
+    let _ = io::stdout().flush();
+}
+
+const WIPE: &str = "\x1b[2J\x1b[3J\x1b[H";
 
 /// Opens the set-up wizard before the dashboard when this looks like a first run (or a stopped
 /// install to resume). Returns false when osh should exit instead of opening the dashboard.
@@ -629,7 +642,7 @@ fn main() -> io::Result<()> {
                     host_modes(false, keys);
                     captured = false;
                 }
-                let failed = run_steps(steps, app.capture);
+                let failed = run_steps(steps, app.capture, app.job_prints_secret());
                 terminal = ratatui::init();
                 terminal.clear()?;
                 app.finish_job(failed);
@@ -666,6 +679,10 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_wipe_clears_the_screen_and_its_scrollback() {
+        assert!(super::WIPE.contains("\x1b[2J") && super::WIPE.contains("\x1b[3J"));
+    }
 
     #[test]
     fn version_flag_is_a_subcommand_that_exits_zero() {
