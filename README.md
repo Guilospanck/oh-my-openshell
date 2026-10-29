@@ -1,4 +1,6 @@
-# oh-my-openshell
+<p align="center"><img src="assets/icon.png" alt="oh-my-openshell icon" width="128" height="128"></p>
+
+<h1 align="center">oh-my-openshell</h1>
 
 Portable [OpenShell](https://github.com/NVIDIA/OpenShell) config plus `osh`, a
 terminal dashboard for managing gateways, sandboxes, providers, profiles and
