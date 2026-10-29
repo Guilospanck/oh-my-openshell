@@ -602,19 +602,10 @@ fn main() -> io::Result<()> {
                 }
             }
             while let Ok(s) = snap_rx.try_recv() {
-                if app.status == "Loading..." || app.status == "Refreshing..." {
-                    app.status = if s.gateway_ok {
-                        "Ready".into()
-                    } else {
-                        if cfg!(target_os = "macos") {
-                            "Gateway unreachable: brew services start openshell (vm) or osh gateway-docker".into()
-                        } else {
-                            "Gateway unreachable: systemctl --user start openshell-gateway".into()
-                        }
-                    };
-                }
-                if let Some(e) = &s.error {
-                    app.status = e.clone();
+                // Collected for the gateway shown before a switch: it would put the old
+                // gateway's data and health under the new one's name.
+                if !s.gateway.is_empty() && s.gateway != cli::gateway() {
+                    continue;
                 }
                 app.on_snapshot(s);
             }

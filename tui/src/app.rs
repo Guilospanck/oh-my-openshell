@@ -423,6 +423,12 @@ pub struct App {
     /// Full-screen live log viewer; takes over the keyboard while open.
     pub logview: Option<LogView>,
     pub status: String,
+    /// The status the latest snapshot produced. While `status` still equals it, the poller owns
+    /// the line and keeps it true; any other message is an action's result and stays.
+    snap_status: String,
+    /// No snapshot of the current gateway has arrived yet (first start, or just switched), so
+    /// whether it is reachable is not known.
+    pub awaiting_snapshot: bool,
     /// When `status` last changed; a shell's status bar shows it for a few seconds.
     status_at: Option<(String, Instant)>,
     /// Start of the run, the clock the spinner frames are read from.
@@ -754,6 +760,8 @@ impl App {
             modal: None,
             logview: None,
             status: "Loading...".into(),
+            snap_status: String::new(),
+            awaiting_snapshot: true,
             status_at: None,
             born: Instant::now(),
             quit: false,
@@ -798,16 +806,29 @@ impl App {
         }
     }
 
+    /// Aims every `openshell` call at `name` and shows it as loading until its first snapshot.
+    /// The gateway list and its cursor stay, so the Gateways tab does not empty or jump.
+    fn change_gateway(&mut self, name: &str) {
+        cli::set_gateway(name);
+        let gateways = std::mem::take(&mut self.snap.gateways);
+        self.snap = Snapshot {
+            gateway: name.to_string(),
+            gateways,
+            ..Default::default()
+        };
+        let on_gateways = self.cursor[4];
+        self.cursor = [0; 5];
+        self.cursor[4] = on_gateways;
+        self.awaiting_snapshot = true;
+        self.status = format!("Switching to {name}...");
+        self.sync_selection();
+        self.refresh();
+    }
+
     /// Switch to the sandbox's gateway if needed; the session opens once that gateway has loaded.
     fn go_to(&mut self, (gw, name): (String, String)) {
         if gw != cli::gateway() {
-            cli::set_gateway(&gw);
-            self.snap = Snapshot::default();
-            self.snap.gateway = gw.clone();
-            self.cursor = [0; 5];
-            self.status = format!("Switching to {gw}...");
-            self.sync_selection();
-            self.refresh();
+            self.change_gateway(&gw);
         }
         self.pending_open = Some((gw, name));
     }
@@ -856,8 +877,34 @@ impl App {
         self.snap.sandboxes.get(self.cursor[0])
     }
 
+    /// What a snapshot says about its gateway, as a status line.
+    fn snapshot_status(s: &Snapshot) -> String {
+        if let Some(e) = &s.error {
+            e.clone()
+        } else if s.gateway_ok {
+            "Ready".into()
+        } else if cfg!(target_os = "macos") {
+            "Gateway unreachable: brew services start openshell (vm) or osh gateway-docker".into()
+        } else {
+            "Gateway unreachable: systemctl --user start openshell-gateway".into()
+        }
+    }
+
+    /// Whether the status is still the poller's to keep current: a load in progress (first
+    /// start, `r`, a gateway switch) or what an earlier snapshot said.
+    fn status_is_snapshot_owned(&self) -> bool {
+        matches!(self.status.as_str(), "Loading..." | "Refreshing...")
+            || (self.status.starts_with("Switching to ") && self.status.ends_with("..."))
+            || (!self.snap_status.is_empty() && self.status == self.snap_status)
+    }
+
     pub fn on_snapshot(&mut self, snap: Snapshot) {
+        if self.status_is_snapshot_owned() {
+            self.snap_status = Self::snapshot_status(&snap);
+            self.status = self.snap_status.clone();
+        }
         self.snap = snap;
+        self.awaiting_snapshot = false;
         if self.snap.gateway_ok
             && self.snap.error.is_none()
             && self
@@ -870,12 +917,13 @@ impl App {
             }
         }
         self.config_stale = config_stale(&self.registry);
-        for i in 0..4 {
+        for i in 0..5 {
             let len = [
                 self.snap.sandboxes.len(),
                 self.snap.providers.len(),
                 self.profile_rows().len(),
                 self.snap.images.len(),
+                self.snap.gateways.len(),
             ][i];
             self.cursor[i] = self.cursor[i].min(len.saturating_sub(1));
         }
@@ -1244,7 +1292,10 @@ impl App {
     {
         let tx = self.done_tx.clone();
         thread::spawn(move || {
-            let d = f().unwrap_or_else(|e| Done {
+            // A panic must still end the spinner the status shows while this runs.
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+                .unwrap_or_else(|_| Err("the background task failed unexpectedly".into()));
+            let d = r.unwrap_or_else(|e| Done {
                 msg: format!("Error: {e}"),
                 next: None,
                 sync: None,
@@ -2031,13 +2082,7 @@ impl App {
             }
             SelKind::Gateway => {
                 let name = first.split_whitespace().next().unwrap_or_default();
-                cli::set_gateway(name);
-                self.snap = Snapshot::default();
-                self.snap.gateway = name.to_string();
-                self.cursor = [0; 5];
-                self.status = format!("Switching to {name}...");
-                self.sync_selection();
-                self.refresh();
+                self.change_gateway(name);
             }
             SelKind::ClaudeToken(flow) => {
                 if first.starts_with("Paste") {
@@ -2069,9 +2114,8 @@ impl App {
                 };
                 self.status = format!("Detaching {other} from {}...", sync.sandbox);
                 let sandbox = sync.sandbox.clone();
-                let tx = self.done_tx.clone();
-                thread::spawn(move || {
-                    let r = cli::os(&[
+                self.bg(move || {
+                    cli::os(&[
                         "sandbox",
                         "provider",
                         "detach",
@@ -2080,26 +2124,17 @@ impl App {
                         "--wait",
                         "--timeout",
                         "30",
-                    ]);
-                    let d = match r {
-                        Ok(_) => Done {
-                            msg: format!("Detached {other}"),
-                            next: None,
-                            sync: Some(SyncStage::Retry {
-                                sync,
-                                profile,
-                                round,
-                            }),
-                            gh: None,
-                        },
-                        Err(e) => Done {
-                            msg: format!("Error: {e}"),
-                            next: None,
-                            sync: None,
-                            gh: None,
-                        },
-                    };
-                    let _ = tx.send(d);
+                    ])?;
+                    Ok(Done {
+                        msg: format!("Detached {other}"),
+                        next: None,
+                        sync: Some(SyncStage::Retry {
+                            sync,
+                            profile,
+                            round,
+                        }),
+                        gh: None,
+                    })
                 });
             }
             SelKind::SyncAccess { sync, check } => {
@@ -3213,13 +3248,7 @@ impl App {
             }
             KeyCode::Enter => {
                 let name = g.name.clone();
-                cli::set_gateway(&name);
-                self.snap = Snapshot::default();
-                self.snap.gateway = name.clone();
-                self.cursor = [0; 5];
-                self.status = format!("Switching to {name}...");
-                self.sync_selection();
-                self.refresh();
+                self.change_gateway(&name);
             }
             _ => {}
         }
@@ -3644,6 +3673,92 @@ mod tests {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
         App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done)
+    }
+
+    fn snap(gateway: &str, ok: bool) -> Snapshot {
+        Snapshot {
+            gateway: gateway.into(),
+            gateway_ok: ok,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_switch_is_loading_until_the_new_gateways_first_snapshot_then_ready() {
+        let mut a = app();
+        a.on_snapshot(snap("openshell-docker", true));
+        assert_eq!(a.status, "Ready");
+        a.snap.gateways = vec![
+            cli::Gateway {
+                name: "openshell-docker".into(),
+                endpoint: "e1".into(),
+            },
+            cli::Gateway {
+                name: "openshell-vm".into(),
+                endpoint: "e2".into(),
+            },
+        ];
+        a.cursor[4] = 1;
+        a.change_gateway("openshell-vm");
+        assert_eq!(a.status, "Switching to openshell-vm...");
+        assert!(a.busy() && a.awaiting_snapshot);
+        assert_eq!(a.snap.gateways.len(), 2, "the Gateways tab keeps its rows");
+        assert_eq!(a.cursor[4], 1, "and its cursor");
+        a.on_snapshot(snap("openshell-vm", true));
+        assert_eq!(a.status, "Ready");
+        assert!(!a.busy() && !a.awaiting_snapshot);
+        cli::set_gateway("");
+    }
+
+    #[test]
+    fn the_status_follows_the_gateway_but_keeps_an_actions_result() {
+        let mut a = app();
+        a.on_snapshot(snap("g", true));
+        assert_eq!(a.status, "Ready");
+        // The gateway goes down and comes back: "Ready" must not outlive either.
+        a.on_snapshot(snap("g", false));
+        assert!(a.status.starts_with("Gateway unreachable"), "{}", a.status);
+        a.on_snapshot(snap("g", true));
+        assert_eq!(a.status, "Ready");
+        let mut bad = snap("g", true);
+        bad.error = Some("Error: sandbox list failed".into());
+        a.on_snapshot(bad);
+        assert_eq!(a.status, "Error: sandbox list failed");
+        a.on_snapshot(snap("g", true));
+        assert_eq!(
+            a.status, "Ready",
+            "an error clears when the gateway recovers"
+        );
+        // What an action reported, or is still doing, is not overwritten by the poller.
+        a.status = "Creating provider x...".into();
+        a.on_snapshot(snap("g", false));
+        assert_eq!(a.status, "Creating provider x...");
+        a.status = "Detached y".into();
+        a.on_snapshot(snap("g", true));
+        assert_eq!(a.status, "Detached y");
+    }
+
+    #[test]
+    fn a_panicking_background_task_still_ends_the_status() {
+        let (wake, _w) = mpsc::channel();
+        let (done, rx) = mpsc::channel();
+        let a = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        a.bg(|| -> Result<Done, String> { panic!("boom") });
+        let d = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(d.msg.starts_with("Error"), "{}", d.msg);
+    }
+
+    #[test]
+    fn the_gateways_cursor_stays_inside_the_list() {
+        let mut a = app();
+        a.cursor[4] = 3;
+        let mut s = snap("g", true);
+        s.gateways = vec![cli::Gateway {
+            name: "g".into(),
+            endpoint: "e".into(),
+        }];
+        a.on_snapshot(s);
+        assert_eq!(a.cursor[4], 0);
     }
 
     fn repo() -> GhRepo {

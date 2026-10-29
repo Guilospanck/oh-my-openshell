@@ -883,7 +883,13 @@ pub fn spawn_poller(
 ) {
     thread::spawn(move || loop {
         let sel = selected.lock().ok().and_then(|g| g.clone());
-        if tx.send(collect(&dir, sel)).is_err() {
+        let gw = gateway();
+        let snap = collect(&dir, sel);
+        // The user switched gateways while this ran: its calls mixed two gateways. Start over.
+        if !gw.is_empty() && gateway() != gw {
+            continue;
+        }
+        if tx.send(snap).is_err() {
             break;
         }
         let _ = wake.recv_timeout(Duration::from_secs(2));

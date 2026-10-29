@@ -111,7 +111,14 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         };
         spans.push(Span::styled(format!(" {} {name} ", i + 1), style));
     }
-    let (txt, color) = if app.snap.gateway_ok {
+    let (txt, color) = if app.awaiting_snapshot {
+        let gw = if app.snap.gateway.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", app.snap.gateway)
+        };
+        (format!("  connecting{gw}..."), Color::Yellow)
+    } else if app.snap.gateway_ok {
         let driver = if app.snap.driver.is_empty() {
             String::new()
         } else {
