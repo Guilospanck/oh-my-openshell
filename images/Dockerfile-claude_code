@@ -21,6 +21,7 @@ RUN apt-get update \
         less \
         python3 \
         ripgrep \
+        tmux \
         vim-tiny \
     && rm -rf /var/lib/apt/lists/*
 
@@ -36,6 +37,46 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
     && apt-get install --yes --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/* \
     && gh --version
+
+# workmux drives tmux windows; /etc/tmux.conf lets copies and Shift-Enter reach osh's embedded
+# terminal (set-clipboard forwards OSC 52, extended-keys keeps modified Enter distinct). The window title
+# carries workmux's status icon as `osh-status:<icon>`, which osh mirrors onto its host tmux window.
+# Pinned: rebuild with --build-arg WORKMUX_VERSION=<tag> to change. The archive is checked
+# against the checksum file published with the release.
+ARG WORKMUX_VERSION=v0.1.277
+RUN arch="$(dpkg --print-architecture)" \
+    && base="https://github.com/raine/workmux/releases/download/${WORKMUX_VERSION}" \
+    && cd /tmp \
+    && curl -fsSLO "${base}/workmux-linux-${arch}.tar.gz" \
+    && curl -fsSL "${base}/workmux-linux-${arch}.sha256" | sha256sum --check - \
+    && tar -xzf "workmux-linux-${arch}.tar.gz" -C /usr/local/bin workmux \
+    && rm "workmux-linux-${arch}.tar.gz" \
+    && workmux --version \
+    && printf '%s\n' \
+        'set -g set-clipboard on' \
+        "set -as terminal-features ',*:clipboard'" \
+        'set -g extended-keys on' \
+        'set -g set-titles on' \
+        'set -g set-titles-string "osh-status:#{@workmux_status}"' \
+        > /etc/tmux.conf
+
+# just (https://github.com/casey/just) runs project recipes. Pinned: rebuild with
+# --build-arg JUST_VERSION=<version> to change. The archive is checked against the release's
+# SHA256SUMS.
+ARG JUST_VERSION=1.59.0
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) triple=x86_64-unknown-linux-musl ;; \
+        arm64) triple=aarch64-unknown-linux-musl ;; \
+        *) echo "unsupported architecture" >&2; exit 1 ;; \
+    esac \
+    && base="https://github.com/casey/just/releases/download/${JUST_VERSION}" \
+    && archive="just-${JUST_VERSION}-${triple}.tar.gz" \
+    && cd /tmp \
+    && curl -fsSLO "${base}/${archive}" \
+    && curl -fsSL "${base}/SHA256SUMS" | grep -F " ${archive}" | sha256sum --check - \
+    && tar -xzf "${archive}" -C /usr/local/bin just \
+    && rm "${archive}" \
+    && just --version
 
 COPY --from=claude-install /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe /usr/local/bin/claude \

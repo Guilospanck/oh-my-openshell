@@ -668,7 +668,12 @@ fn start_script(dirs: &[String]) -> String {
             d.replace('\'', "'\\''")
         ));
     }
-    script.push_str("true; exec bash");
+    // tmux when the image has it, so tools that need a tmux session (workmux, /orchestrate)
+    // work; `-A` reattaches to the same session when the shell is opened again.
+    script.push_str(
+        "true; if command -v tmux >/dev/null 2>&1 && [ -z \"$TMUX\" ]; \
+         then exec tmux new-session -A -s osh bash; else exec bash; fi",
+    );
     script
 }
 
@@ -693,6 +698,46 @@ fn git_identity_exports(name: Option<&str>, email: Option<&str>) -> String {
         }
     }
     out
+}
+
+/// Prefix the images' `/etc/tmux.conf` puts on the window title (`set-titles-string`), followed by
+/// the icon workmux's hooks set on the sandbox tmux window.
+const STATUS_PREFIX: &str = "osh-status:";
+
+/// What the agent in a shell is doing, ordered by how much the user needs to look.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum AgentStatus {
+    Done,
+    Working,
+    Waiting,
+}
+
+impl AgentStatus {
+    /// The argument of `workmux set-window-status`.
+    pub fn word(s: Option<Self>) -> &'static str {
+        match s {
+            None => "clear",
+            Some(Self::Done) => "done",
+            Some(Self::Working) => "working",
+            Some(Self::Waiting) => "waiting",
+        }
+    }
+}
+
+/// The status in a shell's window title. Icons are workmux's defaults, which hold in the sandbox
+/// because it has no workmux config; an unknown icon or a title without the prefix is none.
+pub fn agent_status(title: &str) -> Option<AgentStatus> {
+    match title.strip_prefix(STATUS_PREFIX)?.trim() {
+        "🤖" => Some(AgentStatus::Working),
+        "💬" => Some(AgentStatus::Waiting),
+        "✅" => Some(AgentStatus::Done),
+        _ => None,
+    }
+}
+
+/// The title as shown in the shell's bar: the status prefix is plumbing.
+pub fn shown_title(title: &str) -> &str {
+    title.strip_prefix(STATUS_PREFIX).unwrap_or(title)
 }
 
 impl Session {
@@ -945,10 +990,27 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn titles_carry_the_agent_status() {
+        assert_eq!(agent_status("osh-status:🤖"), Some(AgentStatus::Working));
+        assert_eq!(agent_status("osh-status:💬"), Some(AgentStatus::Waiting));
+        assert_eq!(agent_status("osh-status:✅"), Some(AgentStatus::Done));
+        assert_eq!(agent_status("osh-status:"), None);
+        assert_eq!(agent_status("osh-status:?"), None);
+        assert_eq!(agent_status("✅"), None);
+        assert!(AgentStatus::Waiting > AgentStatus::Working);
+        assert!(AgentStatus::Working > AgentStatus::Done);
+        assert_eq!(shown_title("osh-status:🤖"), "🤖");
+        assert_eq!(shown_title("vim"), "vim");
+        assert_eq!(AgentStatus::word(None), "clear");
+        assert_eq!(AgentStatus::word(Some(AgentStatus::Waiting)), "waiting");
+    }
+
+    #[test]
     fn start_script_tries_each_dir_and_quotes_them() {
         assert_eq!(
             start_script(&[]),
-            "export PATH=\"$HOME/.local/bin:$PATH\"; true; exec bash"
+            "export PATH=\"$HOME/.local/bin:$PATH\"; true; if command -v tmux >/dev/null 2>&1 \
+             && [ -z \"$TMUX\" ]; then exec tmux new-session -A -s osh bash; else exec bash; fi"
         );
         let s = start_script(&["/sandbox/it's/src".into(), "/sandbox/it's".into()]);
         assert!(s.contains(

@@ -452,6 +452,8 @@ pub struct App {
     running_sync: Option<SyncPlan>,
     /// Embedded sandbox shells; they keep running while the dashboard is shown.
     pub sessions: Vec<Session>,
+    /// Last status sent to the host tmux window (`workmux set-window-status`).
+    host_status: Option<crate::term::AgentStatus>,
     /// Session that has the screen and the keyboard.
     pub active: Option<usize>,
     /// Policy denials seen in sandboxes with a shell open, and the prompts still to show.
@@ -773,6 +775,7 @@ impl App {
             capture: false,
             running_sync: None,
             sessions: Vec::new(),
+            host_status: None,
             active: None,
             watch: Watch::with_never_file(watch::never_path()),
             follows: Vec::new(),
@@ -1058,6 +1061,40 @@ impl App {
         s
     }
 
+    /// Argument for `workmux set-window-status` when the most urgent agent status over all
+    /// shells differs from the last one sent; the host window is one, so the shells share it.
+    fn host_status_change(&mut self) -> Option<&'static str> {
+        let now = self
+            .sessions
+            .iter()
+            .filter_map(|s| crate::term::agent_status(&s.vt.title()))
+            .max();
+        if now == self.host_status {
+            return None;
+        }
+        self.host_status = now;
+        Some(crate::term::AgentStatus::word(now))
+    }
+
+    /// Show what the agents in the shells are doing on osh's own tmux window, the way workmux
+    /// does for agents running on the host. Does nothing outside tmux or without workmux.
+    fn mirror_host_status(&mut self) {
+        let Some(word) = self.host_status_change() else {
+            return;
+        };
+        if std::env::var_os("TMUX_PANE").is_none() {
+            return;
+        }
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("workmux")
+                .args(["set-window-status", word])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        });
+    }
+
     /// Feed every shell's output to its terminal, focused or not, and drop ended ones.
     pub fn pump_sessions(&mut self) {
         let mut copy = None;
@@ -1082,6 +1119,7 @@ impl App {
                 format!("Shell in {} ended: {last}", s.sandbox)
             };
         }
+        self.mirror_host_status();
     }
 
     /// Size every shell, focused or not, to the pane it gets on a `w`x`h` screen.
@@ -3712,6 +3750,26 @@ mod tests {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
         App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done)
+    }
+
+    #[test]
+    fn host_status_follows_the_most_urgent_shell_and_is_sent_once() {
+        use crate::term::Session;
+        let mut a = app();
+        let mut s1 = Session::spawn("a".into(), String::new(), "cat", &[], 20, 5).unwrap();
+        let mut s2 = Session::spawn("b".into(), String::new(), "cat", &[], 20, 5).unwrap();
+        assert_eq!(a.host_status_change(), None);
+        s1.vt.feed("\x1b]0;osh-status:🤖\x07".as_bytes());
+        a.sessions.push(s1);
+        assert_eq!(a.host_status_change(), Some("working"));
+        assert_eq!(a.host_status_change(), None);
+        s2.vt.feed("\x1b]0;osh-status:💬\x07".as_bytes());
+        a.sessions.push(s2);
+        assert_eq!(a.host_status_change(), Some("waiting"));
+        a.sessions.remove(1);
+        assert_eq!(a.host_status_change(), Some("working"));
+        a.sessions.clear();
+        assert_eq!(a.host_status_change(), Some("clear"));
     }
 
     #[test]
