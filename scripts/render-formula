@@ -63,6 +63,9 @@ $macos$linux
     <<~EOS
       Installing osh does not install OpenShell, a container runtime or a gateway.
       Run \`osh setup\` when you want those (it asks before each step).
+
+      To remove everything, run \`osh uninstall\` before \`brew uninstall\`: Homebrew
+      cannot clean up OpenShell, its gateways or osh's data folder.
     EOS
   end
 

@@ -21,7 +21,7 @@ osh gateway add vm|docker|podman [--yes] [--dry-run]   # one more gateway
 osh gateway remove NAME [--delete-data]    # remove a gateway osh created (typed confirmation)
 osh upgrade    # reinstall OpenShell, refresh the gateway config, restart the main gateway and its extras
 osh gateway-docker          # same as: osh gateway add docker
-osh uninstall  # remove OpenShell, its services and folders (asks first; sandboxes are lost)
+osh uninstall  # remove OpenShell, its services and folders, osh's own data and the osh program (asks first; sandboxes are lost)
 osh gateway-reset NAME      # wipe a gateway's sandboxes and database (typed confirmation)
 osh sync-agents --dry-run   # preview what a sandbox would get from your agent setup
 ```
@@ -34,7 +34,7 @@ osh setup                                      # then install what osh needs (as
 ```
 
 Homebrew installs only the `osh` binary; it does not install OpenShell, a container runtime or a gateway until you
-run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. Releases currently ship Apple Silicon macOS and arm64
+run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. To remove everything, run `osh uninstall` (it also runs `brew uninstall` for you); a bare `brew uninstall` removes only the binary and leaves OpenShell, its gateways and osh's data behind. Releases currently ship Apple Silicon macOS and arm64
 Linux archives, so Intel Macs and x86_64 Linux need to build from source until those archives are added.
 
 Install from a release (Linux or macOS, aarch64; x86_64 once those archives are published): `curl -fsSL

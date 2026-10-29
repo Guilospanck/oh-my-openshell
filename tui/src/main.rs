@@ -369,13 +369,14 @@ fn gateway_command(args: &[String]) -> i32 {
         "uninstall" => {
             let steps = gateway::uninstall_steps(&f, &p);
             println!(
-                "This will remove OpenShell, its services and these folders (sandboxes are lost):"
+                "This will remove OpenShell, its services, osh's own data and the osh program, with these folders (sandboxes are lost):"
             );
             println!(
-                "  {}\n  {}\n  {}",
+                "  {}\n  {}\n  {}\n  {}",
                 p.config_home.display(),
                 p.state.display(),
-                p.share.display()
+                p.share.display(),
+                p.data.display()
             );
             if !confirmed("uninstall") {
                 eprintln!("aborted");

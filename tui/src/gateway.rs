@@ -379,7 +379,15 @@ pub fn legacy_spec(
     })
 }
 
-/// Removes OpenShell's files and services. The osh data directory stays.
+/// Removes `$1`, osh's data dir, but only when osh itself filled it (its manifest is there) and it
+/// is not a development checkout, whose tracked files are the source of the embedded assets.
+const REMOVE_DATA_SCRIPT: &str = r#"if [ -f "$1/.osh-manifest.json" ] && [ ! -e "$1/.git" ] && [ ! -f "$1/tui/Cargo.toml" ]; then rm -rf "$1"; else echo "$1 is not an osh-only folder: left in place"; fi"#;
+
+/// Removes the osh binary `$1` the way it was installed: `brew uninstall` for Homebrew's, a plain
+/// delete for the release installer's, nothing for a development build under `target/`.
+const REMOVE_BINARY_SCRIPT: &str = r#"real=$(readlink "$1" 2>/dev/null || echo "$1"); case "$real" in */Cellar/*) brew uninstall Guilospanck/tap/oh-my-openshell || true ;; */target/*) echo "$1 is a development build: left in place" ;; *) rm -f "$1" ;; esac"#;
+
+/// Removes OpenShell's files and services, then osh's own data and binary.
 pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
     let mut steps = Vec::new();
     match f.os {
@@ -449,6 +457,11 @@ pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
             ],
         ),
     ));
+    steps.push(step(
+        "uninstall-data",
+        "Remove osh's data folder",
+        script(REMOVE_DATA_SCRIPT, &[&p.data.to_string_lossy()]),
+    ));
     // rm -rf does not follow symlinks, so linked config entries only lose the link.
     steps.push(step(
         "uninstall-files",
@@ -476,6 +489,12 @@ pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
         s.optional = true;
         steps.push(s);
     }
+    // Last: the running binary goes away only after everything that needed it.
+    steps.push(step(
+        "uninstall-binary",
+        "Remove the osh program",
+        script(REMOVE_BINARY_SCRIPT, &[&p.exe.to_string_lossy()]),
+    ));
     chain(steps, None)
 }
 
@@ -1252,11 +1271,66 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_plan_macos_removes_agent_and_formula_but_not_osh_data() {
-        let t = texts(&uninstall_steps(&facts(Os::MacOs), &paths()));
+    fn uninstall_plan_macos_removes_agent_formula_osh_data_and_binary() {
+        let steps = uninstall_steps(&facts(Os::MacOs), &paths());
+        let t = texts(&steps);
         assert!(t.contains("brew uninstall openshell"));
         assert!(t.contains("launchctl bootout"));
-        assert!(!t.contains("share/osh "));
+        assert!(t.contains(REMOVE_DATA_SCRIPT) && t.contains("/h/.local/share/osh"));
+        assert_eq!(steps.last().unwrap().id, "uninstall-binary");
+    }
+
+    /// Runs `script` with `$1` = `arg` in a real shell.
+    fn sh(script: &str, arg: &std::path::Path) -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", script, "sh"])
+            .arg(arg)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    }
+
+    fn tmpdir(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("osh-un-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn the_data_folder_goes_unless_it_is_a_checkout_or_not_osh_s() {
+        let own = tmpdir("own");
+        std::fs::write(own.join(".osh-manifest.json"), "{}").unwrap();
+        assert!(sh(REMOVE_DATA_SCRIPT, &own));
+        assert!(!own.exists());
+        let checkout = tmpdir("checkout");
+        std::fs::write(checkout.join(".osh-manifest.json"), "{}").unwrap();
+        std::fs::create_dir_all(checkout.join("tui")).unwrap();
+        std::fs::write(checkout.join("tui/Cargo.toml"), "").unwrap();
+        assert!(sh(REMOVE_DATA_SCRIPT, &checkout));
+        assert!(checkout.join(".osh-manifest.json").exists());
+        let foreign = tmpdir("foreign");
+        assert!(sh(REMOVE_DATA_SCRIPT, &foreign));
+        assert!(foreign.exists());
+        for d in [checkout, foreign] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+    }
+
+    #[test]
+    fn the_binary_is_deleted_unless_it_is_a_development_build() {
+        let d = tmpdir("bin");
+        let installed = d.join("osh");
+        std::fs::write(&installed, "").unwrap();
+        assert!(sh(REMOVE_BINARY_SCRIPT, &installed));
+        assert!(!installed.exists());
+        std::fs::create_dir_all(d.join("target/release")).unwrap();
+        let dev = d.join("target/release/osh-tui");
+        std::fs::write(&dev, "").unwrap();
+        assert!(sh(REMOVE_BINARY_SCRIPT, &dev));
+        assert!(dev.exists());
+        let _ = std::fs::remove_dir_all(d);
     }
 
     #[test]
