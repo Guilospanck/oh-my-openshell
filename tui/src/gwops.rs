@@ -474,6 +474,28 @@ pub fn gateway_env(h: &dyn Host, p: &Paths) -> String {
         .replace("${HOME}/.colima", &colima_dir(h, p))
 }
 
+/// Writes `gateway.env` (Colima's Docker socket) on macOS when it is missing, before the gateway
+/// starts: the gateway reads it only at startup, and without it the VM driver finds no local
+/// container engine and pulls `--from` images from a registry. Linux needs none: its engines
+/// listen where the gateway looks, and the file's `PATH` is Homebrew's.
+fn colima_env_step(f: &Facts, p: &Paths, h: &dyn Host, spec: &GatewaySpec) -> Option<Step> {
+    let wanted = f.os == Os::MacOs
+        && !f.docker_desktop
+        && matches!(spec.kind, GwKind::Docker | GwKind::Vm)
+        && h.read(&p.config_home.join("gateway.env")).is_none();
+    wanted.then(|| {
+        st(
+            spec,
+            "env",
+            "Write gateway.env (Colima Docker socket)",
+            StepKind::Write {
+                path: p.config_home.join("gateway.env"),
+                content: gateway_env(h, p),
+            },
+        )
+    })
+}
+
 /// Restarts a gateway whose service is up while its runtime was down (a stopped Podman machine or
 /// Colima): once the runtime is back, the gateway starts over against it.
 pub fn restart_gateway_steps(f: &Facts, spec: &GatewaySpec) -> Vec<Step> {
@@ -556,20 +578,7 @@ fn own_service_steps(
         }
         Os::MacOs => {
             let logs = db_dir_for(p, f.os, spec);
-            if spec.kind == GwKind::Docker
-                && !f.docker_desktop
-                && h.read(&p.config_home.join("gateway.env")).is_none()
-            {
-                steps.push(st(
-                    spec,
-                    "env",
-                    "Write gateway.env (Colima Docker socket)",
-                    StepKind::Write {
-                        path: p.config_home.join("gateway.env"),
-                        content: gateway_env(h, p),
-                    },
-                ));
-            }
+            steps.extend(colima_env_step(f, p, h, spec));
             let plist = agent_plist_path(p, &spec.name);
             steps.push(st(
                 spec,
@@ -789,7 +798,7 @@ fn main_steps(
         if !force && !installing && current && gateway::service_running(f.os, h) {
             return Vec::new();
         }
-        let mut steps = Vec::new();
+        let mut steps: Vec<Step> = colima_env_step(f, p, h, spec).into_iter().collect();
         if !current {
             if let Some(old) = installed.filter(|t| !t.is_empty()) {
                 steps.push(st(
@@ -2235,6 +2244,59 @@ mod tests {
             &spec(GwKind::Docker, 17671, false),
         );
         assert!(texts(&steps).contains("write /h/.config/openshell/gateway.env"));
+    }
+
+    #[test]
+    fn a_vm_main_gets_the_colima_socket_file_before_its_service_restarts() {
+        let h = FakeHost::default();
+        let vm = spec(GwKind::Vm, 17670, true);
+        let steps = main_gateway_steps(
+            &facts(Os::MacOs),
+            &paths(),
+            &h,
+            &Registry::default(),
+            &vm,
+            true,
+        );
+        let line = |s: &Step| s.command_line();
+        let env = steps
+            .iter()
+            .position(|s| line(s).contains("write /h/.config/openshell/gateway.env"))
+            .expect("gateway.env is written");
+        let restart = steps
+            .iter()
+            .position(|s| line(s).contains("brew services restart openshell"))
+            .expect("the service restarts");
+        assert!(
+            env < restart,
+            "the gateway reads gateway.env only at startup"
+        );
+        // Never overwritten once there, skipped for Docker Desktop, and Linux has no Colima.
+        let mut kept = FakeHost::default();
+        kept.files
+            .insert("/h/.config/openshell/gateway.env".into(), "x".into());
+        let steps = main_gateway_steps(
+            &facts(Os::MacOs),
+            &paths(),
+            &kept,
+            &Registry::default(),
+            &vm,
+            true,
+        );
+        assert!(!texts(&steps).contains("gateway.env"));
+        let mut f = facts(Os::MacOs);
+        f.docker_desktop = true;
+        let steps = main_gateway_steps(&f, &paths(), &h, &Registry::default(), &vm, true);
+        assert!(!texts(&steps).contains("gateway.env"));
+        let steps = main_gateway_steps(
+            &facts(Os::Linux),
+            &paths(),
+            &h,
+            &Registry::default(),
+            &vm,
+            true,
+        );
+        assert!(!texts(&steps).contains("gateway.env"));
     }
 
     #[test]
