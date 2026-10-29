@@ -2252,7 +2252,7 @@ mod tests {
                 crate::gwops::agent_plist_path(&p, &spec.name)
                     .to_string_lossy()
                     .into_owned(),
-                crate::gwops::launchd_plist(spec, &p.exe, &logs),
+                crate::gwops::launchd_plist(spec, &p, &logs),
             );
             h.files.insert(
                 crate::gwops::config_path(&p, &spec.name)

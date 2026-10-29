@@ -135,12 +135,41 @@ pub fn gateway_toml(spec: &GatewaySpec, os: Os) -> String {
     t
 }
 
+/// The folders `osh gateway-service` must resolve exactly as the process that wrote the service
+/// did: a launchd agent or systemd unit starts with none of the caller's environment, so a
+/// registry kept in a checkout (`OSH_DIR`) or a custom `XDG_CONFIG_HOME` would not be found.
+fn service_env(p: &Paths) -> Vec<(&'static str, String)> {
+    vec![
+        ("OSH_DIR", p.data.to_string_lossy().into_owned()),
+        (
+            "XDG_CONFIG_HOME",
+            p.config_home
+                .parent()
+                .unwrap_or(&p.home)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]
+}
+
 /// The Linux user unit for an extra gateway, shaped like the packaged `openshell-gateway.service`.
-pub fn systemd_unit(spec: &GatewaySpec, exe: &Path) -> String {
+pub fn systemd_unit(spec: &GatewaySpec, p: &Paths) -> String {
+    let exe = &p.exe;
+    let env: String = service_env(p)
+        .iter()
+        .map(|(k, v)| {
+            let v = v
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%");
+            format!("Environment=\"{k}={v}\"\n")
+        })
+        .collect();
     format!(
         "[Unit]\nDescription=OpenShell Gateway ({name})\nAfter=default.target\n\n\
          [Service]\nType=simple\n\
          Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls\n\
+         {env}\
          EnvironmentFile=-%E/openshell/gateway.env\n\
          ExecStart=\"{exe}\" gateway-service {name}\n\
          Restart=on-failure\nRestartSec=5s\nUMask=0077\n\n\
@@ -156,12 +185,14 @@ pub fn systemd_unit(spec: &GatewaySpec, exe: &Path) -> String {
 }
 
 /// The macOS launchd agent for a gateway osh runs itself.
-pub fn launchd_plist(spec: &GatewaySpec, exe: &Path, logs: &Path) -> String {
+pub fn launchd_plist(spec: &GatewaySpec, p: &Paths, logs: &Path) -> String {
+    let env = service_env(p);
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
     agent_plist(
         &agent_label(&spec.name),
-        exe,
+        &p.exe,
         &["gateway-service", &spec.name],
-        &[],
+        &env,
         logs,
     )
 }
@@ -254,7 +285,7 @@ pub fn stale_agent_steps(f: &Facts, p: &Paths, h: &dyn Host, reg: &Registry) -> 
             (
                 agent_label(&g.name),
                 agent_plist_path(p, &g.name),
-                launchd_plist(g, &p.exe, &logs),
+                launchd_plist(g, p, &logs),
                 logs,
             )
         })
@@ -504,7 +535,7 @@ fn own_service_steps(
                 "Write the gateway's systemd user unit",
                 StepKind::Write {
                     path: unit_path(p, &spec.name),
-                    content: systemd_unit(spec, &p.exe),
+                    content: systemd_unit(spec, p),
                 },
             ));
             steps.push(st(
@@ -546,7 +577,7 @@ fn own_service_steps(
                 "Write the launchd agent",
                 StepKind::Write {
                     path: plist.clone(),
-                    content: launchd_plist(spec, &p.exe, &logs),
+                    content: launchd_plist(spec, p, &logs),
                 },
             ));
             steps.push(st(
@@ -732,7 +763,7 @@ fn main_steps(
         // Re-running would bootout and bootstrap it, dropping the sandboxes' connections.
         let logs = db_dir_for(p, f.os, spec);
         let agent_current = h.read(&agent_plist_path(p, &spec.name)).as_deref()
-            == Some(launchd_plist(spec, &p.exe, &logs).as_str());
+            == Some(launchd_plist(spec, p, &logs).as_str());
         if !force
             && !installing
             && agent_current
@@ -1138,6 +1169,13 @@ mod tests {
         }
     }
 
+    fn with_exe(exe: &str) -> Paths {
+        Paths {
+            exe: exe.into(),
+            ..paths()
+        }
+    }
+
     fn paths() -> Paths {
         Paths {
             home: "/h".into(),
@@ -1205,7 +1243,7 @@ mod tests {
     fn systemd_unit_runs_gateway_service_with_the_shared_tls_dir() {
         let u = systemd_unit(
             &spec(GwKind::Podman, 17671, false),
-            Path::new("/usr/local/bin/osh"),
+            &with_exe("/usr/local/bin/osh"),
         );
         assert!(u.contains(r#"ExecStart="/usr/local/bin/osh" gateway-service openshell-podman"#));
         assert!(u.contains("OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls"));
@@ -1214,17 +1252,63 @@ mod tests {
     }
 
     #[test]
+    fn services_carry_the_data_and_config_dirs_of_the_process_that_wrote_them() {
+        // A registry in a checkout (`OSH_DIR`) and a custom `XDG_CONFIG_HOME`: launchd and
+        // systemd start the service with neither, so it must be told.
+        let p = Paths {
+            data: "/work/oh my/osh".into(),
+            config_home: "/c/x/openshell".into(),
+            ..paths()
+        };
+        let s = spec(GwKind::Docker, 17670, true);
+        let x = launchd_plist(&s, &p, Path::new("/l"));
+        assert!(
+            x.contains("<key>OSH_DIR</key><string>/work/oh my/osh</string>"),
+            "{x}"
+        );
+        assert!(
+            x.contains("<key>XDG_CONFIG_HOME</key><string>/c/x</string>"),
+            "{x}"
+        );
+        let u = systemd_unit(&s, &p);
+        assert!(
+            u.contains("Environment=\"OSH_DIR=/work/oh my/osh\"\n"),
+            "{u}"
+        );
+        assert!(u.contains("Environment=\"XDG_CONFIG_HOME=/c/x\"\n"), "{u}");
+    }
+
+    #[test]
+    fn an_agent_written_without_the_data_dir_is_rewritten() {
+        let f = facts(Os::MacOs);
+        let p = paths();
+        let s = spec(GwKind::Docker, 17670, true);
+        let mut h = FakeHost::default();
+        let old = launchd_plist(&s, &p, &db_dir_for(&p, f.os, &s))
+            .replace("<key>OSH_DIR</key><string>/h/.local/share/osh</string>", "");
+        h.files.insert(
+            agent_plist_path(&p, &s.name).to_string_lossy().into_owned(),
+            old,
+        );
+        h.files.insert(
+            config_path(&p, &s.name).to_string_lossy().into_owned(),
+            "x".into(),
+        );
+        assert!(!main_gateway_steps(&f, &p, &h, &Registry::default(), &s, false).is_empty());
+    }
+
+    #[test]
     fn plist_label_is_per_gateway() {
         let x = launchd_plist(
             &spec(GwKind::Podman, 17671, false),
-            Path::new("/osh"),
+            &with_exe("/osh"),
             Path::new("/logs"),
         );
         assert!(x.contains("<string>dev.guilospanck.openshell-podman</string>"));
         assert!(x.contains("<string>gateway-service</string><string>openshell-podman</string>"));
         let esc = launchd_plist(
             &spec(GwKind::Vm, 17671, false),
-            Path::new("/a&b"),
+            &with_exe("/a&b"),
             Path::new("/l"),
         );
         assert!(esc.contains("/a&amp;b"));
@@ -1240,7 +1324,7 @@ mod tests {
         for kind in [GwKind::Vm, GwKind::Docker, GwKind::Podman] {
             let x = launchd_plist(
                 &spec(kind, 17671, false),
-                Path::new("/Users/me/My Apps/a&b/osh"),
+                &with_exe("/Users/me/My Apps/a&b/osh"),
                 Path::new("/Users/me/Library/Logs"),
             );
             std::fs::write(Path::new(&dir).join(format!("{}.plist", kind.name())), x).unwrap();
@@ -1439,7 +1523,7 @@ mod tests {
     fn systemd_exec_start_is_quoted_for_paths_with_spaces_and_specifiers() {
         let u = systemd_unit(
             &spec(GwKind::Podman, 17671, false),
-            Path::new("/Users/a b/100%/osh"),
+            &with_exe("/Users/a b/100%/osh"),
         );
         assert!(
             u.contains(r#"ExecStart="/Users/a b/100%%/osh" gateway-service openshell-podman"#),
@@ -1545,7 +1629,7 @@ mod tests {
         );
         h.files.insert(
             agent_plist_path(&p, &s.name).to_string_lossy().into_owned(),
-            launchd_plist(&s, &p.exe, &db_dir_for(&p, f.os, &s)),
+            launchd_plist(&s, &p, &db_dir_for(&p, f.os, &s)),
         );
         assert!(main_gateway_steps(&f, &p, &h, &Registry::default(), &s, false).is_empty());
         // Forced (after an upgrade) and not-running both still restart it.
@@ -1797,7 +1881,7 @@ mod tests {
         let mut h = FakeHost::default();
         h.files.insert(
             plist.to_string_lossy().into_owned(),
-            launchd_plist(&s, Path::new("/old/place/osh"), Path::new("/l")),
+            launchd_plist(&s, &with_exe("/old/place/osh"), Path::new("/l")),
         );
         let groups = stale_agent_steps(&facts(Os::MacOs), &paths(), &h, &reg);
         assert_eq!(groups.len(), 1);
@@ -1807,7 +1891,7 @@ mod tests {
         assert_eq!(path, &plist);
         assert_eq!(
             content,
-            &launchd_plist(&s, &paths().exe, &db_dir_for(&paths(), Os::MacOs, &s))
+            &launchd_plist(&s, &paths(), &db_dir_for(&paths(), Os::MacOs, &s))
         );
         // A plan that already rewrites that agent does not get a second repair.
         let planned = vec![step(
@@ -1828,11 +1912,11 @@ mod tests {
     fn launchd_plist_is_unchanged_by_the_shared_agent_writer() {
         let s = spec(GwKind::Docker, 17671, false);
         assert_eq!(
-            launchd_plist(&s, Path::new("/a&b/osh"), Path::new("/l")),
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>dev.guilospanck.openshell-docker</string>\n  <key>ProgramArguments</key><array><string>/a&amp;b/osh</string><string>gateway-service</string><string>openshell-docker</string></array>\n  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>StandardOutPath</key><string>/l/gateway.out.log</string>\n  <key>StandardErrorPath</key><string>/l/gateway.err.log</string>\n</dict></plist>\n"
+            launchd_plist(&s, &with_exe("/a&b/osh"), Path::new("/l")),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n  <key>Label</key><string>dev.guilospanck.openshell-docker</string>\n  <key>ProgramArguments</key><array><string>/a&amp;b/osh</string><string>gateway-service</string><string>openshell-docker</string></array>\n  <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string><key>OSH_DIR</key><string>/h/.local/share/osh</string><key>XDG_CONFIG_HOME</key><string>/h/.config</string></dict>\n  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n  <key>StandardOutPath</key><string>/l/gateway.out.log</string>\n  <key>StandardErrorPath</key><string>/l/gateway.err.log</string>\n</dict></plist>\n"
         );
         assert_eq!(
-            agent_program(&launchd_plist(&s, Path::new("/a&b/osh"), Path::new("/l"))),
+            agent_program(&launchd_plist(&s, &with_exe("/a&b/osh"), Path::new("/l"))),
             Some("/a&b/osh".into())
         );
     }
@@ -2046,7 +2130,7 @@ mod tests {
     fn launchd_agents_get_a_path_that_finds_homebrew() {
         let x = launchd_plist(
             &spec(GwKind::Podman, 17671, false),
-            Path::new("/osh"),
+            &with_exe("/osh"),
             Path::new("/logs"),
         );
         assert!(
