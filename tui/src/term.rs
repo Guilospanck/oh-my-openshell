@@ -701,7 +701,8 @@ fn git_identity_exports(name: Option<&str>, email: Option<&str>) -> String {
 }
 
 /// Prefix the images' `/etc/tmux.conf` puts on the window title (`set-titles-string`), followed by
-/// the icon workmux's hooks set on the sandbox tmux window.
+/// the icon workmux's hooks set on the sandbox tmux window, `|`, and the git branch of the
+/// shell's directory (empty outside a repo).
 const STATUS_PREFIX: &str = "osh-status:";
 
 /// What the agent in a shell is doing, ordered by how much the user needs to look.
@@ -727,7 +728,7 @@ impl AgentStatus {
 /// The status in a shell's window title. Icons are workmux's defaults, which hold in the sandbox
 /// because it has no workmux config; an unknown icon or a title without the prefix is none.
 pub fn agent_status(title: &str) -> Option<AgentStatus> {
-    match title.strip_prefix(STATUS_PREFIX)?.trim() {
+    match split_status(title)?.0 {
         "🤖" => Some(AgentStatus::Working),
         "💬" => Some(AgentStatus::Waiting),
         "✅" => Some(AgentStatus::Done),
@@ -735,9 +736,23 @@ pub fn agent_status(title: &str) -> Option<AgentStatus> {
     }
 }
 
-/// The title as shown in the shell's bar: the status prefix is plumbing.
+/// The icon and the branch of a title that carries the status prefix.
+fn split_status(title: &str) -> Option<(&str, &str)> {
+    let rest = title.strip_prefix(STATUS_PREFIX)?;
+    let (icon, branch) = rest.split_once('|').unwrap_or((rest, ""));
+    Some((icon.trim(), branch.trim()))
+}
+
+/// The git branch the shell's directory is on, when the sandbox reports one.
+pub fn branch_of(title: &str) -> Option<&str> {
+    split_status(title)
+        .map(|(_, b)| b)
+        .filter(|b| !b.is_empty())
+}
+
+/// The title as shown in the shell's bar: the status prefix and the branch are plumbing here.
 pub fn shown_title(title: &str) -> &str {
-    title.strip_prefix(STATUS_PREFIX).unwrap_or(title)
+    split_status(title).map_or(title, |(icon, _)| icon)
 }
 
 impl Session {
@@ -999,6 +1014,16 @@ mod tests {
         assert_eq!(agent_status("✅"), None);
         assert!(AgentStatus::Waiting > AgentStatus::Working);
         assert!(AgentStatus::Working > AgentStatus::Done);
+        assert_eq!(
+            agent_status("osh-status:💬|main"),
+            Some(AgentStatus::Waiting)
+        );
+        assert_eq!(agent_status("osh-status:|main"), None);
+        assert_eq!(branch_of("osh-status:🤖|feat/a|b"), Some("feat/a|b"));
+        assert_eq!(branch_of("osh-status:🤖|"), None);
+        assert_eq!(branch_of("osh-status:🤖"), None);
+        assert_eq!(branch_of("vim"), None);
+        assert_eq!(shown_title("osh-status:🤖|main"), "🤖");
         assert_eq!(shown_title("osh-status:🤖"), "🤖");
         assert_eq!(shown_title("vim"), "vim");
         assert_eq!(AgentStatus::word(None), "clear");

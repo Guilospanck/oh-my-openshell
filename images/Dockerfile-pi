@@ -31,7 +31,8 @@ RUN mkdir -p -m 755 /etc/apt/keyrings \
 
 # workmux drives tmux windows; /etc/tmux.conf lets copies and Shift-Enter reach osh's embedded
 # terminal (set-clipboard forwards OSC 52, extended-keys keeps modified Enter distinct). The window title
-# carries workmux's status icon as `osh-status:<icon>`, which osh mirrors onto its host tmux window.
+# carries workmux's status icon and the git branch as `osh-status:<icon>|<branch>`: osh shows the
+# branch in the shell's bar and mirrors the status onto its host tmux window.
 # Pinned: rebuild with --build-arg WORKMUX_VERSION=<tag> to change. The archive is checked
 # against the checksum file published with the release.
 ARG WORKMUX_VERSION=v0.1.277
@@ -48,7 +49,8 @@ RUN arch="$(dpkg --print-architecture)" \
         "set -as terminal-features ',*:clipboard'" \
         'set -g extended-keys on' \
         'set -g set-titles on' \
-        'set -g set-titles-string "osh-status:#{@workmux_status}"' \
+        'set -g status-interval 5' \
+        'set -g set-titles-string "osh-status:#{@workmux_status}|#(git -C \"#{pane_current_path}\" branch --show-current 2>/dev/null)"' \
         > /etc/tmux.conf
 
 # just (https://github.com/casey/just) runs project recipes. Pinned: rebuild with

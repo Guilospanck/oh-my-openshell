@@ -103,7 +103,8 @@ they never go through argv. The footer shows the keys for the current tab.
 shell again reattaches to it; this is what `workmux` and `/orchestrate` need.
 When `workmux` hooks run in the sandbox (`workmux set-window-status` in the sandbox's Claude
 settings), osh mirrors the most urgent state of its shells (waiting, working, done) onto its own
-tmux window with the host's `workmux set-window-status`; it needs osh itself to run in tmux with
+tmux window with the host's `workmux set-window-status`. The shell's bar also shows the git branch of the
+shell's current directory (read by the sandbox's tmux, so it follows `cd` and `git switch`, refreshed every 5 s); it needs osh itself to run in tmux with
 `workmux` on the host. Every key goes to the
 shell; `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
 each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), dashboard (the shell keeps
