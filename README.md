@@ -98,7 +98,13 @@ they never go through argv. The footer shows the keys for the current tab.
 
 ### Embedded shells
 
-`Enter` on a sandbox opens `bash` in it, inside osh. Every key goes to the
+`Enter` on a sandbox opens `bash` in it, inside osh. When the image has `tmux`
+(the Claude Code image does) the shell runs in a tmux session named `osh`, and opening the
+shell again reattaches to it; this is what `workmux` and `/orchestrate` need.
+When `workmux` hooks run in the sandbox (`workmux set-window-status` in the sandbox's Claude
+settings), osh mirrors the most urgent state of its shells (waiting, working, done) onto its own
+tmux window with the host's `workmux set-window-status`; it needs osh itself to run in tmux with
+`workmux` on the host. Every key goes to the
 shell; `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
 each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), dashboard (the shell keeps
 running, marked `●`; `Enter` on it returns), or close it. Shells keep their

@@ -707,6 +707,7 @@ fn draw_session(f: &mut Frame, app: &App, s: &Session) {
         base.add_modifier(Modifier::BOLD),
     )];
     let title = s.vt.title();
+    let title = crate::term::shown_title(&title);
     if !title.is_empty() {
         spans.push(Span::styled(format!(" {title} "), base));
     }
