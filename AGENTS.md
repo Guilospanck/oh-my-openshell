@@ -42,6 +42,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 | `osh`, `dev-env` | Developer launcher: rebuilds `tui/` when sources are newer than the binary, sets `OSH_DIR` to the checkout, execs the binary. `dev-env` is the shared Zig 0.15 lookup |
 | `.justfile` | Developer entry points: checks and build, thin wrappers over `osh setup|upgrade|uninstall|gateway-docker`, hooks |
 | `install.sh` | Release installer (`curl ... | sh`): downloads and checksums `osh-VERSION-OS-ARCH.tar.gz`, installs `osh`, runs `osh setup`; `OSH_VERSION`, `OSH_BIN_DIR`, `OSH_RELEASE_BASE`, `OSH_NO_SETUP` |
+| `sandbox-policy.yaml`, `tests/sandbox/checks.sh` | Filesystem policy every osh-created sandbox gets (`--policy`; embedded, written to the data dir); `just test-sandbox` proves PTY, tmux and writes in a real sandbox inside the disposable test container |
 | `tests/linux`, `tests/macos`, `tests/release` | The container, VM and stand-in suites behind the `just test-*` recipes (see Platforms) |
 | `scripts/release` | Local release build (archives per platform); the GitHub workflow runs the same script |
 | `scripts/publish`, `scripts/render-formula`, `scripts/brew-style`, `scripts/release-colima` | `just release`: check, bump, build, lint, tag, GitHub release, Homebrew tap push (`Guilospanck/homebrew-tap`, formula `oh-my-openshell`); `--dry-run` pushes nothing |
@@ -109,13 +110,19 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   behavior you change; keep `just check` green; keep README tables and key
   lists in step with code changes (the footer keys and the README tab table
   must agree).
+- Anything that runs a new program, device or path inside a sandbox (a shell wrapper, an image
+  tool, a policy change) needs a check in a real sandbox, not only a unit test: unit tests passed
+  while tmux could not start anywhere, because OpenShell's default policy denies opening a
+  terminal. Add the check to `tests/sandbox/checks.sh` (`just test-sandbox`) and run it (ask first:
+  it boots the disposable test container and creates a sandbox only inside it, never on the host) before calling the feature done. A change that can leave
+  the shell unable to start must fall back to plain `bash`.
 - Never pass credentials in argv or print them; credentials come from the
   environment or a hidden prompt (see `cli.rs`). Never commit `.env` files or
   tokens: the pre-commit hook blocks them, and a missing `gitleaks` blocks the
   commit too. Do not bypass with `--no-verify`.
 - Ask first before running anything that changes the host or running
   OpenShell state: `osh setup|upgrade|uninstall|gateway-docker|gateway add|gateway remove` (and the `just`
-  wrappers), `just release` (pushes a commit, a tag, a GitHub release and the Homebrew tap; `release-dry-run` is fine), `osh gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
+  wrappers), `just release` (runs `just release-gate` first, in containers, and stops on any failure; never skip or edit the gate; pushes a commit, a tag, a GitHub release and the Homebrew tap; `release-dry-run` is fine), `osh gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
   (it is interactive and talks to the live gateway), and any
   `openshell sandbox|provider|policy` write command. Read-only ones
   (`openshell status`, `... list`, `provider profile lint`) are fine.

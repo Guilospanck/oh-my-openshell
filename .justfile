@@ -66,6 +66,10 @@ test-linux-real runtime="podman":
 test-linux-kvm *args:
 	@"{{justfile_directory()}}/tests/linux/kvm.sh" {{args}}
 
+# Real sandbox in the disposable systemd container of test-linux-real (never on this machine): creates a sandbox from sandbox-policy.yaml and the claude-code image, checks a terminal opens, tmux keeps a session and writes work (podman|docker)
+test-sandbox runtime="podman":
+	@"{{justfile_directory()}}/tests/linux/real.sh" {{runtime}}
+
 # macOS only, changes nothing on the Mac: the macOS build against recording brew/launchctl/colima/podman stand-ins in a sandboxed throwaway HOME, plutil -lint on the agents
 test-macos:
 	@"{{justfile_directory()}}/tests/macos/run.sh"
@@ -146,6 +150,15 @@ release-formula version:
 # Everything except pushing: check, version bump, archives, formula lint; then reverts the bump. Needs a clean main level with origin
 release-dry-run version *args:
 	@"{{justfile_directory()}}/scripts/publish" {{version}} --dry-run {{args}}
+
+# The suites a release must pass, all in disposable containers: distro build and setup (test-linux), real Linux with podman and with docker (test-linux-real: gateways, sandbox terminal and tmux, uninstall). `just release` runs it and stops on the first failure; it cannot be skipped. The VM type needs KVM and is not part of the gate
+release-gate:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	"{{justfile_directory()}}/tests/linux/run.sh"
+	"{{justfile_directory()}}/tests/linux/real.sh" podman
+	"{{justfile_directory()}}/tests/linux/real.sh" docker
+	echo "release gate passed"
 
 # Full release: check, bump Cargo version (commit), archives, formula lint, tag, push, GitHub release, push formula to Guilospanck/homebrew-tap. Usage: just release v0.2.0 ["notes" [--linux amd64 arm64 | --no-linux]]
 release version $notes="" *args:

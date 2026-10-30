@@ -6,6 +6,8 @@
 #
 #   1. preflight   clean tree, on main and level with origin, tag and release free, tools, tap access
 #   2. just check  fmt, clippy, tests
+#      just release-gate  the container suites: distro build and setup, real Linux with podman and docker
+#                 (sandbox terminal, tmux, gateways, uninstall). Any failure stops the release; there is no flag to skip it.
 #   3. bump        tui/Cargo.toml and Cargo.lock to the version (committed only after the build works)
 #   4. build       scripts/release: this Mac, plus Linux amd64 and arm64 in containers
 #   5. lint        renders the formula and runs `brew style` on it
@@ -99,6 +101,9 @@ echo "ok"
 
 say "just check"
 just --justfile "$repo/.justfile" check
+
+say "just release-gate (container suites; slow)"
+just --justfile "$repo/.justfile" release-gate
 
 say "bump to $version"
 perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' tui/Cargo.toml

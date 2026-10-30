@@ -66,7 +66,7 @@ and prints the `gh release create` command; it never uploads. Pushing a `v*` tag
 
 Releasing from this machine, the same steps as the workflow plus the Homebrew formula: `just release-setup`
 (read-only check of `gh` login, push access to the tap, Docker, Zig), then `just release-dry-run vX.Y.Z` (check,
-version bump, archives, formula lint; pushes nothing, reverts the bump), then `just release vX.Y.Z ["notes"]`
+`just release-gate`, version bump, archives, formula lint; pushes nothing, reverts the bump), then `just release vX.Y.Z ["notes"]`
 (commits the `tui/Cargo.toml` bump, tags, pushes, `gh release create`, pushes `Formula/oh-my-openshell.rb` to
 `Guilospanck/homebrew-tap`). It needs a clean `main` level with `origin`, and never runs `osh` or `osh setup`.
 On Apple Silicon the Linux arm64 archive builds in a separate Colima instance (`scripts/release-colima`; needs
@@ -75,6 +75,10 @@ Docker instead); your own Colima is not touched. The x86_64 Linux archive is opt
 on Apple Silicon the linker crashed in a test, so it is left to CI's native runner and the formula omits that block.
 Users then run `brew install Guilospanck/tap/oh-my-openshell`; the formula installs only the binary. A Mac builds
 only its own architecture, so an Apple Silicon release has no Intel macOS archive and the formula omits that block.
+`just release-gate` runs the container suites (distro build and setup, real Linux with podman and docker,
+including the sandbox terminal and tmux checks) and `just release` stops if any of them fails; there is
+no flag to skip it.
+
 `just release-setup-ci-key` is the one-time deploy key (stored as the repo secret `HOMEBREW_TAP_DEPLOY_KEY`) the workflow uses to push the tap; once Actions run again, release by pushing the tag only, since `just release` also creates the GitHub release and would make the workflow fail. From a
 checkout, `./osh` is a launcher that builds the TUI with cargo when its sources
 change and sets `OSH_DIR` to the checkout, so edits to the repo's providers and
@@ -100,7 +104,11 @@ they never go through argv. The footer shows the keys for the current tab.
 
 `Enter` on a sandbox opens `bash` in it, inside osh. When the image has `tmux`
 (the Claude Code image does) the shell runs in a tmux session named `osh`, and opening the
-shell again reattaches to it; this is what `workmux` and `/orchestrate` need.
+shell again reattaches to it; this is what `workmux` and `/orchestrate` need. New sandboxes are
+created with `sandbox-policy.yaml`: the whole filesystem is writable inside the sandbox (network,
+credentials and the shared folder are what keep it from the host), which also lets tmux open a
+terminal, something OpenShell's default policy denies. Sandboxes made before
+this need to be recreated; until then the shell falls back to plain `bash`.
 When `workmux` hooks run in the sandbox (`workmux set-window-status` in the sandbox's Claude
 settings), osh mirrors the most urgent state of its shells (waiting, working, done) onto its own
 tmux window with the host's `workmux set-window-status`. The shell's bar also shows the git branch of the
@@ -322,7 +330,8 @@ test and change the repo. For humans: `just doctor` checks the prerequisites,
 and a bare `just` lists the recipes. Both build on macOS and Linux (Zig 0.15 on
 PATH, or `brew install zig@0.15` with Homebrew or Linuxbrew). The Linux
 install, uninstall and gateway-reset paths follow OpenShell's packaged systemd
-service. `just test-linux` checks them in Docker (Ubuntu, Fedora, Arch) with real
+service. `just test-sandbox` runs the real-Linux machine below and, in it only, creates a sandbox and checks a
+terminal, tmux and writes work. `just test-linux` checks them in Docker (Ubuntu, Fedora, Arch) with real
 package installs and stubbed OpenShell and systemd, and `just test-linux-real
 podman|docker|vm` in a systemd container with nothing stubbed (vm needs /dev/kvm
 on the Docker host and is skipped without it); they have not run on a real Linux
