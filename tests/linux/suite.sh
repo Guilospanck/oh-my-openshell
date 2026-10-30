@@ -125,7 +125,7 @@ printf 'uninstall\n' | with_stubs "$OSH" uninstall >"$HOME/out.log" 2>&1; rc=$?
 check "uninstall disables the user service" logged "systemctl --user disable --now openshell-gateway"
 check "uninstall removes the config dir" test ! -e "$XDG_CONFIG_HOME/openshell"
 check "uninstall prints the package removal commands" grep -q 'apt remove' "$HOME/out.log"
-check "uninstall keeps the osh data dir" test -d "$HOME/.local/share/osh"
+check "uninstall removes the osh data dir" test ! -e "$HOME/.local/share/osh"
 fresh_home; mkdir -p "$XDG_CONFIG_HOME/openshell"
 printf 'no\n' | with_stubs "$OSH" uninstall >/dev/null 2>&1 && fail "uninstall aborts on a wrong answer" || pass "uninstall aborts on a wrong answer"
 check "an aborted uninstall keeps the config dir" test -d "$XDG_CONFIG_HOME/openshell"
