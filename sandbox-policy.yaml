@@ -1,0 +1,29 @@
+# Filesystem policy for sandboxes created by osh. The sandbox is the boundary, so inside it the
+# agent may do anything: the system directories are read-write, /dev included. OpenShell's default
+# policy leaves /dev read-only, so opening a pseudo-terminal is denied and tmux fails with "create
+# window failed: fork failed: Permission denied". "/" itself is rejected by OpenShell as overly
+# broad, hence the list.
+#
+# What must not leak to the host is held elsewhere, not here: network access is granted per
+# provider and binary, credentials are injected by the gateway, and the only host files a sandbox
+# sees are those of a folder the user chose to share (include_workdir).
+version: 1
+filesystem_policy:
+  include_workdir: true
+  read_write:
+    - /bin
+    - /usr
+    - /lib
+    - /etc
+    - /var
+    - /opt
+    - /home
+    - /root
+    - /run
+    - /srv
+    - /tmp
+    - /dev
+    - /proc
+    - /sandbox
+landlock:
+  compatibility: best_effort

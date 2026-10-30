@@ -162,6 +162,11 @@ if [[ -n "$extra" ]]; then
   check "the real gateway accepts the extra's config" openshell-gateway config preflight --path "$data/gateways/$extra.toml"
 fi
 
+if [[ "$runtime" != vm ]]; then
+  source /repo/tests/sandbox/checks.sh
+  sandbox_checks
+fi
+
 echo "== setup again does nothing"
 out="$(osh setup --gateways "$gateways" --yes 2>&1)"; rc=$?
 [[ $rc -eq 0 && "$out" == *"Nothing to do"* ]] && pass "a second setup is a no-op" || fail "a second setup is a no-op" "rc=$rc $out"

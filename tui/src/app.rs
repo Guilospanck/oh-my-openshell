@@ -2033,6 +2033,14 @@ impl App {
             });
         }
         let mut args: Vec<String> = vec!["sandbox".into(), "create".into()];
+        // The default policy denies opening a PTY, which tmux needs in the shell.
+        args.extend([
+            "--policy".into(),
+            self.dir
+                .join("sandbox-policy.yaml")
+                .to_string_lossy()
+                .into(),
+        ]);
         if !plan.name.is_empty() {
             args.extend(["--name".into(), plan.name.clone()]);
         }
@@ -3877,6 +3885,10 @@ mod tests {
         assert!(
             text.contains(" build ") && text.contains("sandbox create"),
             "{text}"
+        );
+        assert!(
+            text.contains("--policy ") && text.contains("sandbox-policy.yaml"),
+            "tmux needs the PTY devices the default policy denies: {text}"
         );
 
         a.on_select(SelKind::Rebuild(plan), vec![items[1].clone()]);

@@ -669,10 +669,12 @@ fn start_script(dirs: &[String]) -> String {
         ));
     }
     // tmux when the image has it, so tools that need a tmux session (workmux, /orchestrate)
-    // work; `-A` reattaches to the same session when the shell is opened again.
+    // work; `-A` reattaches to the same session when the shell is opened again. When tmux cannot
+    // start (a sandbox policy can deny its fork: "create window failed") plain bash takes over,
+    // so the shell still opens.
     script.push_str(
         "true; if command -v tmux >/dev/null 2>&1 && [ -z \"$TMUX\" ]; \
-         then exec tmux new-session -A -s osh bash; else exec bash; fi",
+         then tmux new-session -A -s osh bash || exec bash; else exec bash; fi",
     );
     script
 }
@@ -1035,7 +1037,7 @@ mod tests {
         assert_eq!(
             start_script(&[]),
             "export PATH=\"$HOME/.local/bin:$PATH\"; true; if command -v tmux >/dev/null 2>&1 \
-             && [ -z \"$TMUX\" ]; then exec tmux new-session -A -s osh bash; else exec bash; fi"
+             && [ -z \"$TMUX\" ]; then tmux new-session -A -s osh bash || exec bash; else exec bash; fi"
         );
         let s = start_script(&["/sandbox/it's/src".into(), "/sandbox/it's".into()]);
         assert!(s.contains(

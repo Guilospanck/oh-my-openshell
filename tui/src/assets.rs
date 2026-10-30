@@ -50,6 +50,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../gateway-podman.toml"),
     ),
     ("gateway.env", include_str!("../../gateway.env")),
+    (
+        "sandbox-policy.yaml",
+        include_str!("../../sandbox-policy.yaml"),
+    ),
     (".gitleaks.toml", include_str!("../../.gitleaks.toml")),
     (
         "gateway-docker.toml",
@@ -181,6 +185,35 @@ mod tests {
         let d = std::env::temp_dir().join(format!("osh-assets-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         d
+    }
+
+    /// The default OpenShell policy denies opening a PTY, which broke tmux in every sandbox once.
+    /// `just test-sandbox` proves the real thing; this keeps the policy from losing the grant.
+    #[test]
+    fn sandbox_policy_lets_a_terminal_open_and_is_written() {
+        let p = embedded("sandbox-policy.yaml").expect("policy is embedded");
+        let writable: Vec<&str> = p
+            .lines()
+            .skip_while(|l| !l.trim_start().starts_with("read_write:"))
+            .skip(1)
+            .take_while(|l| l.trim_start().starts_with("- "))
+            .map(|l| l.trim_start().trim_start_matches("- ").trim())
+            .collect();
+        let covers = |path: &str| {
+            writable
+                .iter()
+                .any(|w| *w == "/" || path == *w || path.starts_with(&format!("{w}/")))
+        };
+        assert!(covers("/dev/ptmx"), "tmux opens /dev/ptmx: {writable:?}");
+        assert!(
+            covers("/dev/pts/0"),
+            "and the slave in /dev/pts: {writable:?}"
+        );
+        assert!(covers("/tmp"), "{writable:?}");
+        let d = tmp("policy");
+        materialize(&d).unwrap();
+        assert!(d.join("sandbox-policy.yaml").is_file());
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
