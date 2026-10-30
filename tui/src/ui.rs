@@ -33,7 +33,13 @@ fn status_spans(app: &App, text: &str, base: Style, done: Color) -> Vec<Span<'st
         return vec![
             Span::styled(format!(" {frame} "), base.fg(c).add_modifier(bold)),
             Span::styled(format!("{text} "), base.fg(c)),
-        ];
+        ]
+        .into_iter()
+        .chain(
+            app.busy_for()
+                .map(|d| Span::styled(format!("({}s) ", d.as_secs()), base.fg(c))),
+        )
+        .collect();
     }
     let failed = ["Error", "Step failed", "Cancelled"]
         .iter()

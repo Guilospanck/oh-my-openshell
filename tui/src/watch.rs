@@ -533,7 +533,7 @@ pub fn allow(gateway: &str, sandbox: &str, b: &Blocked, all: bool) -> Result<Str
     cli::run("openshell", &args, &[])?;
     let what = if all { "all methods" } else { "read-only" };
     Ok(format!(
-        "Allowed {} to reach {} ({what}) in {sandbox}",
+        "Allowed {} to reach {} ({what}) in {sandbox}; it is live, ask again",
         b.program(),
         b.target()
     ))

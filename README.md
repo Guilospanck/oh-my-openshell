@@ -142,7 +142,9 @@ Requests cut off by a policy reload (`policy generation is stale`) are
 not shown. Allowing adds exactly that `host:port` for
 exactly that binary to the running sandbox (`openshell policy update
 --add-endpoint host:port:read-only:rest:enforce` or `host:port:full`); the
-result shows in the status bar. Denials that a host rule cannot fix (an L7
+result shows in the status bar: a seconds counter while the sandbox loads the rule, then
+`Allowed ...; it is live, ask again` (kept for 20 s). The request that was blocked is not retried;
+ask the tool again once it shows. Denials that a host rule cannot fix (an L7
 rule rejecting the request) show a notice with the reason instead. `p` on the
 Sandboxes tab, or `Blocked requests` in the `Ctrl-]` menu of a shell, lists what was seen in
 the sandbox and stays open, adding new denials as they arrive (the prompt does not cover it

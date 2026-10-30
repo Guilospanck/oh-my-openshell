@@ -975,13 +975,25 @@ impl App {
     }
 
     /// The status, while it is new enough to show over a shell (always while busy).
+    /// "Allowed ..." stays longer: it is the cue to retry the request that was blocked.
     pub fn flash(&self) -> Option<&str> {
+        let keep = if self.status.starts_with("Allowed ") {
+            Duration::from_secs(20)
+        } else {
+            Duration::from_secs(6)
+        };
         self.status_at
             .as_ref()
-            .filter(|(s, t)| {
-                *s == self.status && (self.busy() || t.elapsed() < Duration::from_secs(6))
-            })
+            .filter(|(s, t)| *s == self.status && (self.busy() || t.elapsed() < keep))
             .map(|(s, _)| s.as_str())
+    }
+
+    /// How long the current status has been shown, once it is long enough to be worth a count.
+    pub fn busy_for(&self) -> Option<Duration> {
+        let (s, t) = self.status_at.as_ref()?;
+        (*s == self.status && self.busy())
+            .then(|| t.elapsed())
+            .filter(|d| *d >= Duration::from_secs(2))
     }
 
     pub fn session(&self) -> Option<&Session> {
@@ -3618,6 +3630,27 @@ mod tests {
     use std::sync::mpsc;
 
     use crate::gwmodel::{GatewaySpec, GwKind};
+
+    #[test]
+    fn a_pending_allow_counts_seconds_and_the_result_stays_visible_longer() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut a = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let ago = |s: u64| Instant::now() - Duration::from_secs(s);
+        a.status = "Allowing curl to reach example.com:443 in sb...".into();
+        a.status_at = Some((a.status.clone(), ago(1)));
+        assert_eq!(a.busy_for(), None);
+        a.status_at = Some((a.status.clone(), ago(12)));
+        assert!(a.busy_for().unwrap() >= Duration::from_secs(12));
+        a.status =
+            "Allowed curl to reach example.com:443 (all methods) in sb; it is live, ask again"
+                .into();
+        a.status_at = Some((a.status.clone(), ago(10)));
+        assert!(a.flash().is_some());
+        a.status = "Ignored curl -> example.com:443 this time".into();
+        a.status_at = Some((a.status.clone(), ago(10)));
+        assert!(a.flash().is_none());
+    }
 
     fn gw(name: &str, port: u16) -> cli::Gateway {
         cli::Gateway {
