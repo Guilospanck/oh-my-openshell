@@ -5,3 +5,5 @@ dist/
 /gateways.json
 /wizard.json
 .act-run.*
+/rw-shares.json
+.e2e-dist/

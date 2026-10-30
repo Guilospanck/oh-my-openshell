@@ -470,6 +470,9 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(table, area, &mut table_state(app.cursor[4]));
 }
 
+/// The keys every tab has, last in the footer.
+pub const GLOBAL_HELP: &str = "Tab/1-5 switch  j/k move  g gateway  r refresh  ! alerts  q quit";
+
 /// The per-tab key hints in the footer.
 pub fn footer_help(tab: Tab) -> &'static str {
     match tab {
@@ -491,7 +494,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Color::Green,
         )),
         Line::styled(
-            format!("{help}  |  Tab/1-5 switch  j/k move  g gateway  r refresh  ! alerts  q quit"),
+            format!("{help}  |  {GLOBAL_HELP}"),
             Style::default().fg(Color::DarkGray),
         ),
     ];

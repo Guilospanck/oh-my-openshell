@@ -43,6 +43,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 | `.justfile` | Developer entry points: checks and build, thin wrappers over `osh setup|upgrade|uninstall|gateway-docker`, hooks |
 | `install.sh` | Release installer (`curl ... | sh`): downloads and checksums `osh-VERSION-OS-ARCH.tar.gz`, installs `osh`, runs `osh setup`; `OSH_VERSION`, `OSH_BIN_DIR`, `OSH_RELEASE_BASE`, `OSH_NO_SETUP` |
 | `sandbox-policy.yaml`, `tests/sandbox/checks.sh` | Filesystem policy every osh-created sandbox gets (`--policy`; embedded, written to the data dir); `just test-sandbox` proves PTY, tmux and writes in a real sandbox inside the disposable test container |
+| `tests/e2e` | End-to-end suite: `driver.py` runs the real `osh` in a pseudo-terminal with a screen emulator (pyte), `scenarios.py` has one `@scenario` per action, `actions.txt` lists every key and command with its scenario. Runs inside the real Linux test machine, after the sandbox checks, on podman and docker |
 | `tests/linux`, `tests/macos`, `tests/release` | The container, VM and stand-in suites behind the `just test-*` recipes (see Platforms) |
 | `scripts/release` | Local release build (archives per platform); the GitHub workflow runs the same script |
 | `scripts/publish`, `scripts/render-formula`, `scripts/brew-style`, `scripts/release-colima` | `just release`: check, bump, build, lint, tag, GitHub release, Homebrew tap push (`Guilospanck/homebrew-tap`, formula `oh-my-openshell`); `--dry-run` pushes nothing |
@@ -110,6 +111,11 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   behavior you change; keep `just check` green; keep README tables and key
   lists in step with code changes (the footer keys and the README tab table
   must agree).
+- Every key in a tab footer or the global footer must be in `tests/e2e/actions.txt` with an end-to-end
+  scenario (or a stated reason it cannot run here); a unit test fails `just check` otherwise. Write the
+  scenario in `tests/e2e/scenarios.py` and watch it pass on a real screen: develop against a kept
+  machine with `OSH_REAL_STOP=e2e OSH_REAL_KEEP=1 OSH_E2E_ONLY=<id> tests/linux/real.sh podman`,
+  then `docker exec -u tester` into it (see the head of `tests/linux/real.sh`).
 - Anything that runs a new program, device or path inside a sandbox (a shell wrapper, an image
   tool, a policy change) needs a check in a real sandbox, not only a unit test: unit tests passed
   while tmux could not start anywhere, because OpenShell's default policy denies opening a

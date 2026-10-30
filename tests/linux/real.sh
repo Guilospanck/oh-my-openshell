@@ -79,7 +79,9 @@ docker exec "$name" loginctl enable-linger tester
 docker exec "$name" systemctl start "user@${uid}.service"
 for _ in $(seq 20); do docker exec "$name" test -S "/run/user/$uid/bus" && break; sleep 1; done
 
+# Survives the re-run after a new login, which does not keep the environment.
+[[ -n "${OSH_REAL_STOP:-}" ]] && docker exec "$name" bash -c "echo '$OSH_REAL_STOP' > /home/tester/.osh-real-stop"
 echo "== running the suite as an ordinary user"
-docker exec -u tester -e XDG_RUNTIME_DIR="/run/user/$uid" \
+docker exec -u tester -e XDG_RUNTIME_DIR="/run/user/$uid" -e OSH_REAL_STOP="${OSH_REAL_STOP:-}" -e OSH_E2E_ONLY="${OSH_E2E_ONLY:-}" \
   -e DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
   "$name" bash /repo/tests/linux/real-suite.sh "$runtime"

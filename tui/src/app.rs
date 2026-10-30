@@ -248,7 +248,7 @@ pub enum Modal {
         title: String,
         text: String,
         scroll: u16,
-        back: Box<Modal>,
+        back: Option<Box<Modal>>,
     },
 }
 
@@ -1014,11 +1014,7 @@ impl App {
         let n = self.alerts.len();
         let text = self.alerts_text();
         self.toast = None;
-        self.open_viewer(
-            &format!("Alerts ({n})"),
-            text,
-            back.unwrap_or_else(|| Modal::Info(String::new())),
-        );
+        self.open_viewer(&format!("Alerts ({n})"), text, back);
     }
 
     /// Whether the status names work still in progress (`Detaching x...`).
@@ -3544,12 +3540,12 @@ impl App {
         self.bg_msg(move || cli::sync_profile(&dir, &id, None));
     }
 
-    fn open_viewer(&mut self, title: &str, text: String, back: Modal) {
+    fn open_viewer(&mut self, title: &str, text: String, back: Option<Modal>) {
         self.modal = Some(Modal::Viewer {
             title: title.into(),
             text,
             scroll: 0,
-            back: Box::new(back),
+            back: back.map(Box::new),
         });
     }
 
@@ -3572,7 +3568,7 @@ impl App {
         match modal {
             Modal::Info(text) => {
                 if key.code == KeyCode::Char('v') {
-                    self.open_viewer("Details", text.clone(), Modal::Info(text));
+                    self.open_viewer("Details", text.clone(), Some(Modal::Info(text)));
                 }
             }
             Modal::Providers {
@@ -3609,7 +3605,7 @@ impl App {
                 let last = (text.lines().count() as u16).saturating_sub(rows);
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
-                        self.modal = Some(*back);
+                        self.modal = back.map(|b| *b);
                         return;
                     }
                     KeyCode::Char('j') | KeyCode::Down => scroll = (scroll + 1).min(last),
@@ -3634,7 +3630,7 @@ impl App {
                         ConfKind::SyncGen { yaml, .. } => yaml.clone(),
                         _ => text.clone(),
                     };
-                    self.open_viewer("Details", full, Modal::Confirm { text, kind });
+                    self.open_viewer("Details", full, Some(Modal::Confirm { text, kind }));
                 }
                 KeyCode::Char('n') | KeyCode::Esc => {
                     self.cleanup_sync_stage();
@@ -3913,6 +3909,54 @@ mod tests {
         }
     }
 
+    /// The first word of each footer entry (`Enter`, `a/x`, `Tab/1-5`), split at `/`.
+    fn footer_keys(help: &str) -> Vec<String> {
+        help.split("  ")
+            .filter_map(|e| e.split_whitespace().next())
+            .flat_map(|k| k.split('/'))
+            .filter(|k| !k.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Every key in the footer must be in tests/e2e/actions.txt with a scenario that exists (or a
+    /// stated reason it cannot run), so a new key cannot ship without an end-to-end check.
+    #[test]
+    fn every_footer_key_has_an_end_to_end_scenario() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../tests/e2e");
+        let manifest = std::fs::read_to_string(root.join("actions.txt")).expect("actions.txt");
+        let scenarios = std::fs::read_to_string(root.join("scenarios.py")).expect("scenarios.py");
+        let rows: Vec<Vec<&str>> = manifest
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+            .map(|l| l.split('|').map(str::trim).collect())
+            .collect();
+        for r in &rows {
+            assert_eq!(r.len(), 3, "surface | key | scenario: {r:?}");
+            if let Some(why) = r[2].strip_prefix("SKIP:") {
+                assert!(why.trim().len() > 15, "give a real reason: {r:?}");
+            } else {
+                assert!(
+                    scenarios.contains(&format!("@scenario(\"{}\")", r[2])),
+                    "no scenario {} in scenarios.py for {r:?}",
+                    r[2]
+                );
+            }
+        }
+        let has = |surface: &str, key: &str| rows.iter().any(|r| r[0] == surface && r[1] == key);
+        for (tab, name) in TABS {
+            for k in footer_keys(crate::ui::footer_help(tab)) {
+                assert!(
+                    has(name, &k),
+                    "{name} footer key {k:?} is not in actions.txt"
+                );
+            }
+        }
+        for k in footer_keys(crate::ui::GLOBAL_HELP) {
+            assert!(has("global", &k), "global key {k:?} is not in actions.txt");
+        }
+    }
+
     fn app() -> App {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
@@ -3956,6 +4000,19 @@ mod tests {
             "newest first"
         );
         assert!(text.contains("[HIGH]") && text.contains("look at it"));
+    }
+
+    #[test]
+    fn closing_the_alert_list_leaves_no_box_behind() {
+        let mut a = app();
+        a.push_alert(alert("x"));
+        a.on_key(KeyEvent::from(KeyCode::Char('!')));
+        assert!(matches!(a.modal, Some(Modal::Viewer { .. })));
+        a.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(
+            a.modal.is_none(),
+            "found by the end-to-end suite: an empty Info box stayed"
+        );
     }
 
     #[test]

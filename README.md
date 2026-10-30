@@ -338,7 +338,8 @@ test and change the repo. For humans: `just doctor` checks the prerequisites,
 and a bare `just` lists the recipes. Both build on macOS and Linux (Zig 0.15 on
 PATH, or `brew install zig@0.15` with Homebrew or Linuxbrew). The Linux
 install, uninstall and gateway-reset paths follow OpenShell's packaged systemd
-service. `just test-sandbox` runs the real-Linux machine below and, in it only, creates a sandbox and checks a
+service. `just test-sandbox` runs the real-Linux machine below, which also drives the dashboard key by key in a
+pseudo-terminal (`tests/e2e`: every key in the footer has a scenario, listed in `tests/e2e/actions.txt`), and, in it only, creates a sandbox and checks a
 terminal, tmux and writes work. `just test-linux` checks them in Docker (Ubuntu, Fedora, Arch) with real
 package installs and stubbed OpenShell and systemd, and `just test-linux-real
 podman|docker|vm` in a systemd container with nothing stubbed (vm needs /dev/kvm

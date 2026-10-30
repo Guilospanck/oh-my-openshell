@@ -165,6 +165,10 @@ fi
 if [[ "$runtime" != vm ]]; then
   source /repo/tests/sandbox/checks.sh
   sandbox_checks
+  source /repo/tests/e2e/run.sh
+  e2e_run
+  # Development of the e2e scenarios: OSH_REAL_STOP=e2e OSH_REAL_KEEP=1 stops here, machine kept.
+  [[ "$(cat "$HOME/.osh-real-stop" 2>/dev/null)" == e2e ]] && { echo "stopped after e2e"; exit "$((fails > 0))"; }
 fi
 
 echo "== setup again does nothing"

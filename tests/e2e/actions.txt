@@ -1,0 +1,44 @@
+# Every key and command of the osh dashboard and what proves it works end to end.
+# surface | key or command | scenario id in scenarios.py (or SKIP: reason it cannot run here)
+# tests/e2e guard (a unit test in tui/src/app.rs) fails when the footer has a key that is not
+# listed here, or a listed scenario does not exist. Add the key, then write the scenario.
+global | Tab | nav-tabs
+global | 1-5 | nav-tabs
+global | j | nav-move
+global | k | nav-move
+global | g | nav-gateway
+global | r | nav-refresh
+global | ! | nav-alerts
+global | q | nav-quit
+Sandboxes | Enter | sandbox-shell
+Sandboxes | l | sandbox-logs
+Sandboxes | p | sandbox-blocked
+Sandboxes | n | sandbox-create
+Sandboxes | d | sandbox-delete
+Sandboxes | s | sandbox-stop-start
+Sandboxes | S | sandbox-stop-start
+Sandboxes | a | sandbox-providers
+Sandboxes | x | sandbox-providers
+Sandboxes | K | sandbox-skills
+Sandboxes | t | SKIP: renewing a GitHub repo token needs a real GitHub token and network access to github.com
+Providers | n | provider-create
+Providers | u | provider-update
+Providers | d | provider-delete
+Profiles | u | profile-import
+Profiles | Enter | profile-import
+Images | b | image-build
+Images | Enter | image-build
+Gateways | Enter | gateway-select
+Gateways | a | gateway-add
+Gateways | d | gateway-wipe
+Gateways | x | gateway-remove
+shell | ctrl-] menu | shell-menu
+shell | alerts | alerts-toast
+command | osh doctor | cmd-doctor
+command | osh setup | SKIP: covered by tests/linux/real-suite.sh (setup, wizard, idempotence) which runs before these scenarios
+command | osh upgrade | SKIP: needs a published newer release; covered by unit tests of its plan
+command | osh uninstall | SKIP: covered by tests/linux/real-suite.sh (runs last, removes osh itself)
+command | osh gateway add | gateway-add
+command | osh gateway remove | gateway-remove
+command | osh gateway-reset | gateway-wipe
+command | osh sync-agents | cmd-sync-agents
