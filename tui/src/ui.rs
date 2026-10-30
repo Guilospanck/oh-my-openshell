@@ -59,7 +59,49 @@ fn highlight() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
+/// The newest alert in a box at the top-right, over whatever else is drawn. Red for high.
+fn draw_toast(f: &mut Frame, app: &App) {
+    let Some(a) = app.toast() else { return };
+    let area = f.area();
+    let w = 52.min(area.width);
+    if w < 12 || area.height < 5 {
+        return;
+    }
+    let color = if a.sev == crate::alerts::Severity::High {
+        Color::Red
+    } else {
+        Color::Yellow
+    };
+    let inner = usize::from(w.saturating_sub(2)).max(1);
+    let lines = |t: &str| t.chars().count().div_ceil(inner);
+    let h =
+        (lines(&a.title) + lines(&a.detail) + 3).min(usize::from(area.height / 2).max(5)) as u16;
+    let rect = Rect::new(area.x + area.width - w, area.y, w, h);
+    f.render_widget(Clear, rect);
+    let text = vec![
+        Line::styled(
+            a.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Line::raw(a.detail.clone()),
+    ];
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color))
+                .title(" ! alert (Esc dismisses, ! lists) "),
+        ),
+        rect,
+    );
+}
+
 pub fn draw(f: &mut Frame, app: &App) {
+    draw_screen(f, app);
+    draw_toast(f, app);
+}
+
+fn draw_screen(f: &mut Frame, app: &App) {
     if let Some(s) = app.session() {
         draw_session(f, app, s);
         if let Some(m) = &app.modal {
@@ -449,7 +491,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             Color::Green,
         )),
         Line::styled(
-            format!("{help}  |  Tab/1-5 switch  j/k move  g gateway  r refresh  q quit"),
+            format!("{help}  |  Tab/1-5 switch  j/k move  g gateway  r refresh  ! alerts  q quit"),
             Style::default().fg(Color::DarkGray),
         ),
     ];

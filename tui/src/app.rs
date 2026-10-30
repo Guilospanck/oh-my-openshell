@@ -33,6 +33,9 @@ pub const TABS: [(Tab, &str); 5] = [
 ];
 
 /// Entry in the Providers tab's create list that starts the repo token flow.
+/// How long an alert stays top-right.
+pub const TOAST_FOR: Duration = Duration::from_secs(5);
+
 const GH_REPO_ITEM: &str = "GitHub repo, read/write (fine-grained token)...";
 
 #[derive(Clone, Default)]
@@ -435,6 +438,9 @@ pub struct App {
     pub awaiting_snapshot: bool,
     /// When `status` last changed; a shell's status bar shows it for a few seconds.
     status_at: Option<(String, Instant)>,
+    /// Everything raised since osh started, newest last, and the one shown top-right for 5 s.
+    pub alerts: Vec<crate::alerts::Alert>,
+    toast: Option<(crate::alerts::Alert, Instant)>,
     /// Start of the run, the clock the spinner frames are read from.
     born: Instant,
     pub quit: bool,
@@ -769,6 +775,8 @@ impl App {
             snap_status: String::new(),
             awaiting_snapshot: true,
             status_at: None,
+            alerts: Vec::new(),
+            toast: None,
             born: Instant::now(),
             quit: false,
             job: None,
@@ -960,6 +968,57 @@ impl App {
         {
             self.status_at = Some((self.status.clone(), Instant::now()));
         }
+    }
+
+    /// Keep `a` in the log and show it top-right until it times out or is dismissed.
+    pub fn push_alert(&mut self, a: crate::alerts::Alert) {
+        self.toast = Some((a.clone(), Instant::now()));
+        self.alerts.push(a);
+    }
+
+    /// The alert still on screen: shown for `TOAST_FOR`, or until dismissed.
+    pub fn toast(&self) -> Option<&crate::alerts::Alert> {
+        self.toast
+            .as_ref()
+            .filter(|(_, t)| t.elapsed() < TOAST_FOR)
+            .map(|(a, _)| a)
+    }
+
+    pub fn dismiss_toast(&mut self) -> bool {
+        self.toast
+            .take()
+            .is_some_and(|(_, t)| t.elapsed() < TOAST_FOR)
+    }
+
+    /// Every alert as text, newest first, for the viewer behind `!`.
+    fn alerts_text(&self) -> String {
+        if self.alerts.is_empty() {
+            return "Nothing suspicious seen since osh started.".into();
+        }
+        self.alerts
+            .iter()
+            .rev()
+            .map(|a| {
+                let tag = if a.sev == crate::alerts::Severity::High {
+                    "HIGH"
+                } else {
+                    "warn"
+                };
+                format!("[{tag}] {}\n      {}", a.title, a.detail)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+
+    fn show_alerts(&mut self, back: Option<Modal>) {
+        let n = self.alerts.len();
+        let text = self.alerts_text();
+        self.toast = None;
+        self.open_viewer(
+            &format!("Alerts ({n})"),
+            text,
+            back.unwrap_or_else(|| Modal::Info(String::new())),
+        );
     }
 
     /// Whether the status names work still in progress (`Detaching x...`).
@@ -2500,6 +2559,8 @@ impl App {
                     if let Some(name) = self.session().map(|s| s.sandbox.clone()) {
                         self.review(name);
                     }
+                } else if first.starts_with("Alerts") {
+                    self.show_alerts(None);
                 } else if first.starts_with("Dashboard") {
                     self.active = None;
                     self.status = "Shell kept running; Enter on its sandbox returns to it".into();
@@ -2883,8 +2944,20 @@ impl App {
     }
 
     fn ask_access(&mut self, plan: Plan) {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let title = match crate::alerts::risky_share(&plan.share, &home) {
+            Some(why) => {
+                self.push_alert(crate::alerts::Alert {
+                    sev: crate::alerts::Severity::High,
+                    title: format!("Sharing {} is risky", plan.share),
+                    detail: format!("{why}. Share the project folder instead."),
+                });
+                format!("Access to the shared folder (RISKY: {why})")
+            }
+            None => "Access to the shared folder".to_string(),
+        };
         self.select(
-            "Access to the shared folder",
+            &title,
             vec!["Read-only".into(), "Read-write".into()],
             false,
             SelKind::ShareAccess(plan),
@@ -2941,27 +3014,32 @@ impl App {
 
     fn on_confirm(&mut self, kind: ConfKind) {
         match kind {
-            ConfKind::CreateSandbox(mut plan) => match plan.gh.take() {
-                None => self.job = Some(self.sandbox_steps(&plan)),
-                Some(g) => {
-                    let provider = ghrepo::provider_name(&plan.name, &g.repo);
-                    plan.gh = Some(GhGrant {
-                        repo: g.repo.clone(),
-                        token: String::new(),
-                    });
-                    plan.resume = Resume::Create;
-                    self.status = format!("Creating provider {provider}...");
-                    self.bg(move || {
-                        cli::create_repo_provider(&g.repo, &provider, &g.token)?;
-                        Ok(Done {
-                            msg: format!("Created provider {provider}"),
-                            next: Some((plan, vec![])),
-                            sync: None,
-                            gh: None,
-                        })
-                    });
+            ConfKind::CreateSandbox(mut plan) => {
+                if plan.share_rw && !plan.share.is_empty() {
+                    let _ = crate::alerts::register_rw_share(&self.dir, &plan.share);
                 }
-            },
+                match plan.gh.take() {
+                    None => self.job = Some(self.sandbox_steps(&plan)),
+                    Some(g) => {
+                        let provider = ghrepo::provider_name(&plan.name, &g.repo);
+                        plan.gh = Some(GhGrant {
+                            repo: g.repo.clone(),
+                            token: String::new(),
+                        });
+                        plan.resume = Resume::Create;
+                        self.status = format!("Creating provider {provider}...");
+                        self.bg(move || {
+                            cli::create_repo_provider(&g.repo, &provider, &g.token)?;
+                            Ok(Done {
+                                msg: format!("Created provider {provider}"),
+                                next: Some((plan, vec![])),
+                                sync: None,
+                                gh: None,
+                            })
+                        });
+                    }
+                }
+            }
             ConfKind::Restart(names) => {
                 self.status = format!("Restarting {}...", names.join(", "));
                 self.bg_msg(move || {
@@ -3088,6 +3166,10 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Esc if self.toast().is_some() => {
+                self.dismiss_toast();
+            }
+            KeyCode::Char('!') => self.show_alerts(None),
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Tab => self.switch((self.idx() + 1) % TABS.len()),
             KeyCode::BackTab => self.switch((self.idx() + TABS.len() - 1) % TABS.len()),
@@ -3120,10 +3202,12 @@ impl App {
                     .session()
                     .map(|s| s.sandbox.clone())
                     .unwrap_or_default();
+                self.toast = None;
                 let items = vec![
                     "Back to the session".into(),
                     "Providers and their permissions".into(),
                     "Blocked requests".into(),
+                    format!("Alerts ({})", self.alerts.len()),
                     "Dashboard (keep the session running)".into(),
                     "Close the session".into(),
                 ];
@@ -3833,6 +3917,80 @@ mod tests {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
         App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done)
+    }
+
+    fn alert(title: &str) -> crate::alerts::Alert {
+        crate::alerts::Alert {
+            sev: crate::alerts::Severity::High,
+            title: title.into(),
+            detail: "look at it".into(),
+        }
+    }
+
+    #[test]
+    fn an_alert_shows_for_five_seconds_and_stays_in_the_log() {
+        let mut a = app();
+        assert!(a.toast().is_none());
+        a.push_alert(alert(".envrc appeared in app"));
+        assert_eq!(a.toast().unwrap().title, ".envrc appeared in app");
+        a.toast.as_mut().unwrap().1 = Instant::now() - TOAST_FOR - Duration::from_millis(10);
+        assert!(a.toast().is_none(), "gone after 5 s");
+        assert_eq!(a.alerts.len(), 1, "but still listed");
+    }
+
+    #[test]
+    fn esc_dismisses_the_alert_and_bang_lists_them() {
+        let mut a = app();
+        a.push_alert(alert("first"));
+        a.push_alert(alert("second"));
+        assert_eq!(a.toast().unwrap().title, "second", "the newest shows");
+        a.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(a.toast().is_none());
+        a.on_key(KeyEvent::from(KeyCode::Char('!')));
+        let Some(Modal::Viewer { title, text, .. }) = &a.modal else {
+            panic!("no list");
+        };
+        assert!(title.contains("Alerts (2)"), "{title}");
+        assert!(
+            text.find("second").unwrap() < text.find("first").unwrap(),
+            "newest first"
+        );
+        assert!(text.contains("[HIGH]") && text.contains("look at it"));
+    }
+
+    #[test]
+    fn the_alert_list_says_so_when_empty() {
+        let mut a = app();
+        a.on_key(KeyEvent::from(KeyCode::Char('!')));
+        let Some(Modal::Viewer { text, .. }) = &a.modal else {
+            panic!("no list");
+        };
+        assert!(text.contains("Nothing suspicious"));
+    }
+
+    #[test]
+    fn sharing_the_home_folder_raises_a_high_alert_and_warns_in_the_question() {
+        let mut a = app();
+        let home = std::env::var("HOME").unwrap();
+        a.ask_access(Plan {
+            share: home.clone(),
+            ..Plan::default()
+        });
+        let t = a.toast().expect("alert");
+        assert!(t.title.contains("risky") && t.sev == crate::alerts::Severity::High);
+        let Some(Modal::Select { title, .. }) = &a.modal else {
+            panic!("no question");
+        };
+        assert!(title.contains("RISKY"), "{title}");
+        let mut b = app();
+        b.ask_access(Plan {
+            share: format!("{home}/code/app"),
+            ..Plan::default()
+        });
+        assert!(
+            b.toast().is_none() && b.alerts.is_empty(),
+            "a project folder is fine"
+        );
     }
 
     #[test]

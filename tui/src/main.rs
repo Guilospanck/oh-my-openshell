@@ -1,6 +1,7 @@
 //! osh: ratatui front end for OpenShell. Dashboard of sandboxes with live
 //! status, embedded sandbox shells, plus creating, providers, profiles and images.
 mod agents;
+mod alerts;
 mod app;
 mod assets;
 mod cli;
@@ -574,6 +575,9 @@ fn main() -> io::Result<()> {
     let selected = Arc::new(Mutex::new(None));
     cli::spawn_poller(dir.clone(), snap_tx, selected.clone(), wake_rx);
 
+    let (alert_tx, alert_rx) = mpsc::channel();
+    alerts::spawn_watch(dir.clone(), alert_tx, Duration::from_secs(4));
+
     let mut app = App::new(dir, selected, wake_tx, done_tx);
     if !std::env::args().any(|a| a == "--ui") {
         app.jump_to(cli::find_shared());
@@ -588,6 +592,9 @@ fn main() -> io::Result<()> {
             }
             app.pump_sessions();
             app.pump_watch();
+            while let Ok(a) = alert_rx.try_recv() {
+                app.push_alert(a);
+            }
             app.tick();
             let focused = app.active.is_some();
             if focused != captured {
@@ -813,6 +820,47 @@ mod tests {
     }
 
     #[test]
+    fn an_alert_is_drawn_top_right_on_the_dashboard_and_over_a_shell() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        app.push_alert(alerts::Alert {
+            sev: alerts::Severity::High,
+            title: ".envrc appeared in app".into(),
+            detail: "direnv runs it".into(),
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let rows: Vec<String> = (0..24)
+            .map(|y| {
+                (0..100)
+                    .map(|x| term.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        let hit = rows
+            .iter()
+            .position(|r| r.contains(".envrc appeared in app"))
+            .expect("drawn");
+        assert!(hit <= 2, "at the top: row {hit}");
+        assert!(
+            rows[hit].find(".envrc").unwrap() > 40,
+            "on the right: {}",
+            rows[hit]
+        );
+        let s = term::Session::spawn("sb".into(), app.snap.gateway.clone(), "cat", &[], 60, 19)
+            .unwrap();
+        app.sessions.push(s);
+        app.active = Some(0);
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let all: String = (0..24)
+            .flat_map(|y| (0..100).map(move |x| (x, y)))
+            .map(|(x, y)| term.backend().buffer()[(x, y)].symbol().to_string())
+            .collect();
+        assert!(all.contains("direnv runs it"), "also over a shell");
+    }
+
+    #[test]
     fn session_view_routes_keys_and_draws_its_menu() {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
@@ -828,7 +876,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL));
         assert!(app.modal.is_some());
         term.draw(|f| ui::draw(f, &app)).unwrap();
-        for _ in 0..3 {
+        for _ in 0..4 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));
@@ -836,7 +884,7 @@ mod tests {
         term.draw(|f| ui::draw(f, &app)).unwrap();
         app.active = Some(0);
         app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));

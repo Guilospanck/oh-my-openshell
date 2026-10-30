@@ -102,6 +102,14 @@ they never go through argv. The footer shows the keys for the current tab.
 
 ### Embedded shells
 
+Alerts (`!` lists them): osh warns, in a box at the top-right that goes away after 5 seconds (`Esc`
+dismisses it), when you pick a risky folder to share (the whole disk, your home folder, `~/.ssh`, a system
+folder) and, for read-write shares, when something appears or changes in the folder that would run on
+this machine later: `.git/hooks`, `.git/config` keys that run programs, `.envrc`, `Makefile`, `justfile`,
+`package.json` scripts, `.vscode/tasks.json`, shell startup files, symlinks that point outside the
+folder, and setuid files. The folder is checked every few seconds; the first check is the baseline.
+Every alert also stays in the list and in the shell menu (`Alerts (n)`).
+
 `Enter` on a sandbox opens `bash` in it, inside osh. When the image has `tmux`
 (the Claude Code image does) the shell runs in a tmux session named `osh`, and opening the
 shell again reattaches to it; this is what `workmux` and `/orchestrate` need. New sandboxes are
