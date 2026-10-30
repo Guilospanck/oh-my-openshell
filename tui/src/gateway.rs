@@ -476,6 +476,13 @@ pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
             ],
         ),
     ));
+    // Last: the running binary goes away only after everything that needed it.
+    steps.push(step(
+        "uninstall-binary",
+        "Remove the osh program",
+        script(REMOVE_BINARY_SCRIPT, &[&p.exe.to_string_lossy()]),
+    ));
+    let mut steps = chain(steps, None);
     if f.os == Os::Linux {
         let mut s = step(
             "uninstall-packages",
@@ -485,17 +492,13 @@ pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
                     .into(),
             ),
         );
-        // Left to the user, so it must not make the run count as failed.
+        // Left to the user, so it must not make the run count as failed. It sits outside the
+        // chain: a manual step never "succeeds", so chained in it would block removing the program.
         s.optional = true;
-        steps.push(s);
+        s.after = steps.get(steps.len() - 2).map(|p| p.id);
+        steps.insert(steps.len() - 1, s);
     }
-    // Last: the running binary goes away only after everything that needed it.
-    steps.push(step(
-        "uninstall-binary",
-        "Remove the osh program",
-        script(REMOVE_BINARY_SCRIPT, &[&p.exe.to_string_lossy()]),
-    ));
-    chain(steps, None)
+    steps
 }
 
 /// `KEY=value` lines as `gateway.env` writes them: optional quotes, `${HOME}` expanded.
@@ -1268,6 +1271,24 @@ mod tests {
             .iter()
             .filter(|s| matches!(s.kind, StepKind::Manual(_)))
             .all(|s| s.optional));
+    }
+
+    /// Found by the real Linux suite: the manual package step, chained in, blocked removing the
+    /// program and made `osh uninstall` exit 1.
+    #[test]
+    fn uninstall_runs_every_automatic_step_and_counts_as_done_on_linux() {
+        let h = FakeHost::default();
+        let steps = uninstall_steps(&facts(Os::Linux), &paths());
+        let r = execute(&steps, &h, &Options::default(), &mut |_| Answer::Yes);
+        for (s, r) in steps.iter().zip(&r) {
+            let want = if matches!(s.kind, StepKind::Manual(_)) {
+                Outcome::Manual
+            } else {
+                Outcome::Done
+            };
+            assert_eq!(r.outcome, want, "{}", s.title);
+        }
+        assert_eq!(steps.last().unwrap().id, "uninstall-binary");
     }
 
     #[test]
