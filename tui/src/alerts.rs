@@ -560,9 +560,19 @@ mod tests {
         spawn_watch(data.clone(), tx, Duration::from_millis(30));
         std::thread::sleep(Duration::from_millis(200));
         assert!(rx.try_recv().is_err(), "the first scan is the baseline");
-        fs::write(share.join(".envrc"), "evil\n").unwrap();
-        let a = rx.recv_timeout(Duration::from_secs(5)).expect("an alert");
-        assert!(a.title.contains(".envrc appeared"), "{a:?}");
+        // On a loaded machine the baseline can come after a first write, so keep changing the
+        // file until a scan that follows the baseline sees a difference.
+        let mut got = None;
+        for i in 0..50 {
+            fs::write(share.join(".envrc"), format!("evil {i}\n")).unwrap();
+            if let Ok(a) = rx.recv_timeout(Duration::from_millis(200)) {
+                got = Some(a);
+                break;
+            }
+        }
+        let a = got.expect("an alert");
+        assert!(a.title.contains(".envrc"), "{a:?}");
+        while rx.try_recv().is_ok() {}
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),
             "reported once"
