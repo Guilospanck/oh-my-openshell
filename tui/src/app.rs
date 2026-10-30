@@ -150,10 +150,10 @@ pub enum SelKind {
         port: u16,
         binary: String,
     },
-    /// Denials seen in a sandbox (`p`); choosing a blocked one asks again.
+    /// Denials seen in a sandbox (`p`, or the shell menu); refreshed as new ones arrive.
+    /// Choosing a blocked one asks again.
     Review {
         sandbox: String,
-        denials: Vec<Denial>,
     },
 }
 
@@ -1180,6 +1180,7 @@ impl App {
             let f = self.follows.remove(i);
             self.status = format!("Blocked-request watcher for {} stopped: {last}", f.sandbox);
         }
+        self.refresh_review();
         if self.watch.has_queued()
             && self.modal.is_none()
             && self.logview.is_none()
@@ -1286,28 +1287,62 @@ impl App {
         Some((host.to_string(), port, binary))
     }
 
-    /// `p`: the denials seen in a sandbox while its shell was open.
-    fn review(&mut self, sandbox: String) {
-        let seen = self.watch.for_sandbox(&sandbox);
-        if seen.is_empty() {
-            let how = if self.has_session(&sandbox) {
-                ""
-            } else {
-                " The watcher runs while its shell is open (Enter)."
-            };
-            self.modal = Some(Modal::Info(format!(
-                "No blocked requests seen in {sandbox}.{how}"
-            )));
-            return;
+    /// Shown in the review list while nothing was blocked yet; choosing it does nothing.
+    const REVIEW_EMPTY: &'static str = "Nothing blocked yet; new requests appear here";
+
+    /// The review list for `sandbox` as items: one per denial seen, or the placeholder.
+    fn review_items(&self, sandbox: &str) -> Vec<String> {
+        let items: Vec<String> = self
+            .watch
+            .for_sandbox(sandbox)
+            .iter()
+            .map(|s| review_label(s))
+            .collect();
+        if items.is_empty() {
+            vec![Self::REVIEW_EMPTY.into()]
+        } else {
+            items
         }
-        let items = seen.iter().map(|s| review_label(s)).collect();
-        let denials = seen.iter().map(|s| s.denial.clone()).collect();
-        self.select(
-            &format!("Blocked in {sandbox}; Enter asks again"),
+    }
+
+    /// `p` or the shell menu: the denials seen in a sandbox while its shell was open.
+    /// The list stays open and fills in as the watcher sees more (`pump_watch`).
+    fn review(&mut self, sandbox: String) {
+        let items = self.review_items(&sandbox);
+        let title = if self.has_session(&sandbox) {
+            format!("Blocked in {sandbox}; Enter asks again")
+        } else {
+            format!(
+                "Blocked in {sandbox}; Enter asks again (the watcher runs while its shell is open)"
+            )
+        };
+        self.select(&title, items, false, SelKind::Review { sandbox });
+    }
+
+    /// Rebuild an open review list from what the watcher has seen, keeping the cursor on the
+    /// same denial (by its position; entries are only ever appended).
+    fn refresh_review(&mut self) {
+        let Some(Modal::Select {
+            kind: SelKind::Review { sandbox },
+            ..
+        }) = &self.modal
+        else {
+            return;
+        };
+        let new = self.review_items(&sandbox.clone());
+        if let Some(Modal::Select {
             items,
-            false,
-            SelKind::Review { sandbox, denials },
-        );
+            cursor,
+            marked,
+            ..
+        }) = &mut self.modal
+        {
+            if *items != new {
+                *cursor = (*cursor).min(new.len() - 1);
+                *marked = vec![false; new.len()];
+                *items = new;
+            }
+        }
     }
 
     pub fn on_paste(&mut self, text: String) {
@@ -2408,16 +2443,15 @@ impl App {
                     self.bg_msg(move || cli::allow_slashes(&sandbox, &host, port, &binary));
                 }
             }
-            SelKind::Review { sandbox, denials } => {
-                let Some(i) = self
+            SelKind::Review { sandbox } => {
+                let seen: Vec<Denial> = self
                     .watch
                     .for_sandbox(&sandbox)
                     .iter()
-                    .position(|s| review_label(s) == first)
-                else {
-                    return;
-                };
-                match denials.get(i).cloned() {
+                    .filter(|s| review_label(s) == first)
+                    .map(|s| s.denial.clone())
+                    .collect();
+                match seen.into_iter().next() {
                     Some(Denial::Blocked(b)) => {
                         let gateway = self.snap.gateway.clone();
                         self.watch.reprompt(&sandbox, &gateway, b);
@@ -2426,7 +2460,10 @@ impl App {
                     Some(Denial::Notice { what, reason }) => {
                         self.modal = Some(Modal::Info(notice_text(&sandbox, &what, &reason)));
                     }
-                    None => {}
+                    None => {
+                        // The list changed under the cursor (or the placeholder): keep it open.
+                        self.review(sandbox);
+                    }
                 }
             }
             SelKind::SessionMenu => {
@@ -2438,6 +2475,10 @@ impl App {
                             perms,
                             scroll: 0,
                         });
+                    }
+                } else if first.starts_with("Blocked") {
+                    if let Some(name) = self.session().map(|s| s.sandbox.clone()) {
+                        self.review(name);
                     }
                 } else if first.starts_with("Dashboard") {
                     self.active = None;
@@ -3062,6 +3103,7 @@ impl App {
                 let items = vec![
                     "Back to the session".into(),
                     "Providers and their permissions".into(),
+                    "Blocked requests".into(),
                     "Dashboard (keep the session running)".into(),
                     "Close the session".into(),
                 ];

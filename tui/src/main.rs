@@ -828,7 +828,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL));
         assert!(app.modal.is_some());
         term.draw(|f| ui::draw(f, &app)).unwrap();
-        for _ in 0..2 {
+        for _ in 0..3 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));
@@ -836,11 +836,50 @@ mod tests {
         term.draw(|f| ui::draw(f, &app)).unwrap();
         app.active = Some(0);
         app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
-        for _ in 0..3 {
+        for _ in 0..4 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.active.is_none() && app.sessions.is_empty());
+    }
+
+    #[test]
+    fn shell_menu_lists_blocked_requests_and_updates_live() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let s = term::Session::spawn("sb".into(), app.snap.gateway.clone(), "cat", &[], 60, 19)
+            .unwrap();
+        app.sessions.push(s);
+        app.active = Some(0);
+        app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+        for _ in 0..2 {
+            app.on_key(KeyEvent::from(KeyCode::Char('j')));
+        }
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        // Nothing seen yet: the list is open with a placeholder, and Enter keeps it open.
+        assert!(
+            matches!(&app.modal, Some(app::Modal::Select { items, .. }) if items.len() == 1 && items[0].starts_with("Nothing blocked"))
+        );
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(matches!(&app.modal, Some(app::Modal::Select { items, .. }) if items.len() == 1));
+        // A denial arriving while the list is open shows up without reopening it, and the
+        // prompt does not cover the list.
+        let line = "[1] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(0) -> example.com:443 [reason:transparent_tcp_policy_denied]";
+        app.watch.push("sb", "gw", watch::parse(line).unwrap());
+        app.pump_watch();
+        match &app.modal {
+            Some(app::Modal::Select { items, .. }) => {
+                assert_eq!(items.len(), 1);
+                assert!(items[0].starts_with("pending"), "{items:?}");
+            }
+            _ => panic!("list closed"),
+        }
+        // Enter asks with the usual choices.
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title.starts_with("curl was blocked"))
+        );
     }
 
     #[test]

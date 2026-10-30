@@ -107,7 +107,8 @@ tmux window with the host's `workmux set-window-status`. The shell's bar also sh
 shell's current directory (read by the sandbox's tmux, so it follows `cd` and `git switch`, refreshed every 5 s); it needs osh itself to run in tmux with
 `workmux` on the host. Every key goes to the
 shell; `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
-each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), dashboard (the shell keeps
+each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), the blocked requests
+seen in the sandbox (same list as `p`, below), dashboard (the shell keeps
 running, marked `●`; `Enter` on it returns), or close it. Shells keep their
 size when the window resizes, focused or not. `Shift-PgUp`/`PgDn` and the
 mouse wheel scroll back on the main screen; programs that ask for the mouse
@@ -143,8 +144,9 @@ exactly that binary to the running sandbox (`openshell policy update
 --add-endpoint host:port:read-only:rest:enforce` or `host:port:full`); the
 result shows in the status bar. Denials that a host rule cannot fix (an L7
 rule rejecting the request) show a notice with the reason instead. `p` on the
-Sandboxes tab lists what was seen in the selected sandbox; `Enter` on an entry
-asks again.
+Sandboxes tab, or `Blocked requests` in the `Ctrl-]` menu of a shell, lists what was seen in
+the sandbox and stays open, adding new denials as they arrive (the prompt does not cover it
+meanwhile); `Enter` on an entry asks again with the choices above.
 
 ### Selection and copy
 
