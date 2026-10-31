@@ -125,6 +125,53 @@ fn host_modes(on: bool, keys: HostKeys) {
             DisableFocusChange
         );
     }
+    host_tmux_passthrough(on);
+}
+
+/// The tmux args that hand every key to the program in the pane (`on`) or give them back to
+/// tmux. The `off` key table has no bindings and the prefix is `None` (tmux still takes the prefix
+/// with the table alone), so the host's `C-a` and
+/// `M-h` reach the shell's own tmux instead of being taken here first. Unsetting the session
+/// options falls back to the global ones.
+fn passthrough_args(on: bool) -> Vec<&'static str> {
+    if on {
+        vec![
+            "set-option",
+            "key-table",
+            "off",
+            ";",
+            "set-option",
+            "prefix",
+            "None",
+        ]
+    } else {
+        vec![
+            "set-option",
+            "-u",
+            "key-table",
+            ";",
+            "set-option",
+            "-u",
+            "prefix",
+        ]
+    }
+}
+
+/// While a shell has focus the host tmux (if osh runs in one) stops interpreting keys, so
+/// the shortcuts of the tmux inside the sandbox work. `Ctrl-]` is osh's own and still leaves
+/// the shell. `OSH_TMUX_PASSTHROUGH=0` keeps the host tmux's keys. After a crash,
+/// `tmux set-option -u key-table \; set-option -u prefix` restores them.
+fn host_tmux_passthrough(on: bool) {
+    if std::env::var_os("TMUX").is_none()
+        || std::env::var("OSH_TMUX_PASSTHROUGH").is_ok_and(|v| v == "0")
+    {
+        return;
+    }
+    let _ = Command::new("tmux")
+        .args(passthrough_args(on))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// Single-quote `s` for `sh -c`.
@@ -1001,6 +1048,34 @@ mod tests {
             matches!(&app.modal, Some(app::Modal::Select { title, .. }) if title.starts_with("curl was blocked"))
         );
         assert!(app.prompt_at.is_some());
+    }
+
+    #[test]
+    fn passthrough_turns_the_host_key_table_off_and_back() {
+        assert_eq!(
+            passthrough_args(true),
+            [
+                "set-option",
+                "key-table",
+                "off",
+                ";",
+                "set-option",
+                "prefix",
+                "None"
+            ]
+        );
+        assert_eq!(
+            passthrough_args(false),
+            [
+                "set-option",
+                "-u",
+                "key-table",
+                ";",
+                "set-option",
+                "-u",
+                "prefix"
+            ]
+        );
     }
 
     #[test]

@@ -57,6 +57,9 @@ pub struct Env {
     pub gitleaks: Option<PathBuf>,
     /// The project whose Claude memory is offered for upload.
     pub memory_repo: PathBuf,
+    /// The host's tmux config, offered for upload so the tmux in the sandbox has the same
+    /// prefix and bindings.
+    pub tmux_conf: Option<PathBuf>,
     /// graphify's version when already known; otherwise `graphify --version` is run.
     pub graphify_version: Option<String>,
     /// OpenShell sets HOME inside sandboxes (`/workspace` on docker, `/sandbox` on vm).
@@ -79,6 +82,9 @@ impl Env {
             gitleaks_config: data_dir.join(".gitleaks.toml"),
             gitleaks: which("gitleaks"),
             memory_repo,
+            tmux_conf: [home.join(".tmux.conf"), home.join(".config/tmux/tmux.conf")]
+                .into_iter()
+                .find(|p| p.is_file()),
             graphify_version: None,
             sandbox_home: sandbox_home.trim_end_matches('/').to_string(),
         }
@@ -464,6 +470,26 @@ fn stage_and_describe(env: &Env, own: &[PathBuf], stage: &Path) -> io::Result<Ve
             true,
             vec![],
             "",
+        ));
+    }
+    if let Some(conf) = env.tmux_conf.as_ref().filter(|c| c.is_file()) {
+        let dst = stage.join("tmux.conf");
+        fs::copy(conf, &dst)?;
+        let src = dst.to_string_lossy().into_owned();
+        let up = Spec::Upload {
+            src,
+            dest: format!("{h}/.tmux.conf"),
+            result: format!("{h}/.tmux.conf"),
+        };
+        items.push(item(
+            "context",
+            "tmux.conf",
+            "tmux prefix and bindings".into(),
+            vec![("claude-code", up.clone()), ("pi", up)],
+            "upload",
+            true,
+            vec![],
+            "read after the image's /etc/tmux.conf; lines for host-only tools (pbcopy) print errors in the sandbox's tmux",
         ));
     }
     let mem = memory_dir(env);
@@ -1230,6 +1256,7 @@ mod tests {
             gitleaks_config: repo().join(".gitleaks.toml"),
             gitleaks: None,
             memory_repo: repo(),
+            tmux_conf: None,
             graphify_version: Some("1.2.3".into()),
             sandbox_home: "/workspace".into(),
         }
@@ -1611,5 +1638,33 @@ mod tests {
             );
         }
         assert!(manifest(&env_with(Path::new("/x")), "bogus").is_err());
+    }
+
+    #[test]
+    fn host_tmux_conf_is_offered_for_upload_to_the_sandbox_home() {
+        let root = tmp("tmuxconf");
+        let claude = fixture(&root);
+        let conf = root.join("tmux.conf");
+        fs::write(&conf, "set -g prefix C-a\n").unwrap();
+        let env = Env {
+            tmux_conf: Some(conf),
+            ..env_with(&claude)
+        };
+        let v = normalized(&manifest(&env, "pi").unwrap());
+        let without = normalized(&manifest(&env_with(&claude), "pi").unwrap());
+        let _ = fs::remove_dir_all(&root);
+        let item = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "tmux.conf")
+            .expect("tmux.conf item");
+        assert_eq!(item["group"], "context");
+        assert_eq!(item["agents"]["pi"]["dest"], "/workspace/.tmux.conf");
+        assert!(without["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["name"] != "tmux.conf"));
     }
 }

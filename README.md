@@ -122,7 +122,11 @@ settings), osh mirrors the most urgent state of its shells (waiting, working, do
 tmux window with the host's `workmux set-window-status`. The shell's bar also shows the git branch of the
 shell's current directory (read by the sandbox's tmux, so it follows `cd` and `git switch`, refreshed every 5 s); it needs osh itself to run in tmux with
 `workmux` on the host. Every key goes to the
-shell; `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
+shell, host tmux shortcuts included: when osh runs in tmux, the host tmux stops reading keys
+(`key-table off`, prefix `None`) while a shell has focus, so your prefix and `M-h` reach the
+tmux inside the sandbox, and gets them back when you leave the shell. `OSH_TMUX_PASSTHROUGH=0`
+turns this off; after a crash, `tmux set-option -u key-table \; set-option -u prefix` restores
+the host. Send `tmux.conf` to the sandbox with `K` (sync agents); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
 each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), the blocked requests
 seen in the sandbox (same list as `p`, below), dashboard (the shell keeps
 running, marked `●`; `Enter` on it returns), or close it. Shells keep their
@@ -247,7 +251,8 @@ In `osh`, Sandboxes, select a sandbox and press `K`: pick the agent
 (`claude-code`, `pi` or `both`), mark the items, and confirm. The TUI checks
 the sandbox's network policy first and lists any missing access. Items are
 reinstalled from their sources (`npx skills`, `claude plugin install`,
-`pi install`, graphify from PyPI); only your own skills and `CLAUDE.md` are
+`pi install`, graphify from PyPI); only your own skills, `CLAUDE.md` and your host `tmux.conf`
+(to `~/.tmux.conf` in the sandbox, so its tmux has your prefix and bindings) are
 uploaded, after a secret scan (findings block the upload). The OpenShell skills
 and the language-server plugins are left out. Versions are pinned: the `skills`
 CLI to `SKILLS_CLI` in `tui/src/agents.rs`, graphify to the host's version, and
