@@ -477,7 +477,7 @@ pub const GLOBAL_HELP: &str = "Tab/1-5 switch  j/k move  g gateway  r refresh  !
 pub fn footer_help(tab: Tab) -> &'static str {
     match tab {
         Tab::Sandboxes => "Enter shell (● running)  l logs  p blocked  n new  d delete  s stop  S start  a/x attach/detach provider  K skills  t renew GitHub token",
-        Tab::Providers => "n create  u update credentials (renews GitHub repo tokens)  d delete",
+        Tab::Providers => "n create  u update credentials  d delete",
         Tab::Profiles => "u / Enter import or update from providers/",
         Tab::Images => "b / Enter build",
         Tab::Gateways => "Enter select  a add  d wipe (delete all data)  x remove",

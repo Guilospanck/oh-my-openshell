@@ -456,6 +456,9 @@ pub struct App {
     pub capture: bool,
     /// The sync plan the running job installs.
     running_sync: Option<SyncPlan>,
+    /// A detached sandbox being created: its name (empty = generated) and the names that existed
+    /// before, so the host tmux config can be copied in once the job ends.
+    tmux_after_create: Option<(String, Vec<String>)>,
     /// Embedded sandbox shells; they keep running while the dashboard is shown.
     pub sessions: Vec<Session>,
     /// Last status sent to the host tmux window (`workmux set-window-status`).
@@ -782,6 +785,7 @@ impl App {
             job: None,
             capture: false,
             running_sync: None,
+            tmux_after_create: None,
             sessions: Vec::new(),
             host_status: None,
             active: None,
@@ -1571,7 +1575,7 @@ impl App {
                 match plan.resume {
                     Resume::Name => self.ask_name(plan),
                     Resume::Command => self.ask_command(plan),
-                    Resume::Create => self.job = Some(self.sandbox_steps(&plan)),
+                    Resume::Create => self.start_create(&plan),
                 }
             } else {
                 let p = missing.remove(0);
@@ -1947,6 +1951,13 @@ impl App {
     /// and a retry from that step.
     pub fn finish_job(&mut self, failed: Option<Failed>) {
         self.capture = false;
+        if let Some((name, before)) = self.tmux_after_create.take() {
+            if failed.is_none() {
+                let dir = self.dir.clone();
+                self.status = "Copying the host tmux config...".into();
+                self.bg_msg(move || cli::install_tmux_conf(&dir, &name, &before));
+            }
+        }
         if let Some(f) = &failed {
             self.status = format!("Step failed: {} ({})", f.label, f.status);
         }
@@ -2072,6 +2083,15 @@ impl App {
             text: format!("{extra}Run:\n{summary}\n\nContinue?"),
             kind: ConfKind::CreateSandbox(plan),
         });
+    }
+
+    /// Queue the create job; a detached sandbox then gets the host's tmux config (`finish_job`).
+    fn start_create(&mut self, plan: &Plan) {
+        if plan.command.is_empty() {
+            let before = self.snap.sandboxes.iter().map(|s| s.name.clone()).collect();
+            self.tmux_after_create = Some((plan.name.clone(), before));
+        }
+        self.job = Some(self.sandbox_steps(plan));
     }
 
     fn sandbox_steps(&self, plan: &Plan) -> Vec<Step> {
@@ -3015,7 +3035,7 @@ impl App {
                     let _ = crate::alerts::register_rw_share(&self.dir, &plan.share);
                 }
                 match plan.gh.take() {
-                    None => self.job = Some(self.sandbox_steps(&plan)),
+                    None => self.start_create(&plan),
                     Some(g) => {
                         let provider = ghrepo::provider_name(&plan.name, &g.repo);
                         plan.gh = Some(GhGrant {
@@ -4068,6 +4088,26 @@ mod tests {
         assert_eq!(a.host_status_change(), Some("working"));
         a.sessions.clear();
         assert_eq!(a.host_status_change(), Some("clear"));
+    }
+
+    #[test]
+    fn only_a_detached_create_copies_the_host_tmux_config_afterwards() {
+        let mut a = app();
+        a.snap.sandboxes = vec![cli::Sandbox {
+            name: "old".into(),
+            ..cli::Sandbox::default()
+        }];
+        a.start_create(&Plan::default());
+        assert_eq!(
+            a.tmux_after_create,
+            Some((String::new(), vec!["old".to_string()]))
+        );
+        a.tmux_after_create = None;
+        a.start_create(&Plan {
+            command: "true".into(),
+            ..Plan::default()
+        });
+        assert_eq!(a.tmux_after_create, None);
     }
 
     #[test]

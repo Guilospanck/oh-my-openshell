@@ -92,7 +92,7 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 | Tab | What you can do |
 | --- | --- |
 | Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a GitHub repo token (`t`), install skills and plugins (`K`, below) |
-| Providers | create from a `providers/*.yaml` profile or a read/write GitHub repo token (`n`), update credentials (`u`; renews a repo token), delete (`d`) |
+| Providers | create from a `providers/*.yaml` profile or a read/write GitHub repo token (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from) |
 | Gateways | switch (`g` / `Enter`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
@@ -122,11 +122,12 @@ settings), osh mirrors the most urgent state of its shells (waiting, working, do
 tmux window with the host's `workmux set-window-status`. The shell's bar also shows the git branch of the
 shell's current directory (read by the sandbox's tmux, so it follows `cd` and `git switch`, refreshed every 5 s); it needs osh itself to run in tmux with
 `workmux` on the host. Every key goes to the
-shell, host tmux shortcuts included: when osh runs in tmux, the host tmux stops reading keys
-(`key-table off`, prefix `None`) while a shell has focus, so your prefix and `M-h` reach the
-tmux inside the sandbox, and gets them back when you leave the shell. `OSH_TMUX_PASSTHROUGH=0`
-turns this off; after a crash, `tmux set-option -u key-table \; set-option -u prefix` restores
-the host. Send `tmux.conf` to the sandbox with `K` (sync agents); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
+shell, host tmux shortcuts included: when osh runs in tmux, the host's prefix and root-table bindings
+(`M-h`, new tab, ...) are wrapped as "if this window is an osh shell with focus, send the key to the
+pane, else run the original", so they reach the tmux inside the sandbox only in that window and the rest
+of the host session keeps its shortcuts (needs tmux 3.2+; `Ctrl-]` still leaves the shell). While osh runs, the host's global `prefix` is `None` and the
+prefix key is a wrapped root binding; osh puts it back when it quits. `OSH_TMUX_PASSTHROUGH=0`
+turns this off. After a crash, `tmux set-option -g prefix "$(tmux show -gv @osh_prefix)"` restores the prefix. A new sandbox gets your host `tmux.conf` automatically when its image has tmux (secret-scanned first); resend it later with `K` (sync agents); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
 each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), the blocked requests
 seen in the sandbox (same list as `p`, below), dashboard (the shell keeps
 running, marked `●`; `Enter` on it returns), or close it. Shells keep their

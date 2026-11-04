@@ -82,9 +82,7 @@ impl Env {
             gitleaks_config: data_dir.join(".gitleaks.toml"),
             gitleaks: which("gitleaks"),
             memory_repo,
-            tmux_conf: [home.join(".tmux.conf"), home.join(".config/tmux/tmux.conf")]
-                .into_iter()
-                .find(|p| p.is_file()),
+            tmux_conf: host_tmux_conf(&home),
             graphify_version: None,
             sandbox_home: sandbox_home.trim_end_matches('/').to_string(),
         }
@@ -187,6 +185,92 @@ fn run_out(prog: &str, args: &[&str]) -> String {
         .output()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default()
+}
+
+/// The host's tmux config under `home`, in the two places tmux reads.
+fn host_tmux_conf(home: &Path) -> Option<PathBuf> {
+    [home.join(".tmux.conf"), home.join(".config/tmux/tmux.conf")]
+        .into_iter()
+        .find(|p| p.is_file())
+}
+
+/// A host tmux config made fit for a sandbox: drops what only works on the host (`default-shell`
+/// and `default-command` name host paths, `run-shell` and `source-file` load host files and
+/// plugins) and, when `known` lists the options the sandbox's tmux has, `set` lines for any other
+/// option (the image's tmux can be older than the host's: `extended-keys-format` needs 3.5).
+/// Only top-level single-line commands are judged; blocks and continuations are kept.
+pub fn sandbox_tmux_conf(text: &str, known: Option<&std::collections::HashSet<String>>) -> String {
+    const HOST_ONLY: [&str; 6] = [
+        "run-shell",
+        "run",
+        "source-file",
+        "source",
+        "default-shell",
+        "default-command",
+    ];
+    const SET: [&str; 4] = ["set", "set-option", "setw", "set-window-option"];
+    let mut out = String::new();
+    for line in text.lines() {
+        let mut words = line.split_whitespace();
+        let cmd = words.next().unwrap_or("");
+        // The option is the first word that is not a flag (`-t` takes a target after it).
+        let mut option = None;
+        if SET.contains(&cmd) {
+            while let Some(w) = words.next() {
+                if w == "-t" {
+                    words.next();
+                } else if !w.starts_with('-') {
+                    option = Some(w.split('[').next().unwrap_or(w));
+                    break;
+                }
+            }
+        }
+        let host_only = HOST_ONLY.contains(&cmd) || option.is_some_and(|o| HOST_ONLY.contains(&o));
+        let unknown =
+            option.is_some_and(|o| !o.starts_with('@') && known.is_some_and(|k| !k.contains(o)));
+        if host_only || unknown {
+            out.push_str("# osh: left out for the sandbox: ");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// The host tmux config to put in a new sandbox, as a private regular-file copy (home-manager and
+/// stow make `~/.tmux.conf` a symlink, which would arrive dangling): `Ok(None)` when the host has
+/// none, `Err` when the secret scan flags it (a config can hold a token in a `run-shell` line).
+/// Without gitleaks the scan is skipped, as for the other uploads. The caller removes the
+/// copy's directory (its parent) after the upload.
+pub fn tmux_conf_for_new_sandbox(
+    data_dir: &Path,
+    known: Option<&std::collections::HashSet<String>>,
+) -> Result<Option<PathBuf>, String> {
+    let env = Env::detect(data_dir, "");
+    let Some(conf) = env.tmux_conf.clone() else {
+        return Ok(None);
+    };
+    let stage = std::env::temp_dir().join(format!("osh-tmuxconf-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    fs::set_permissions(&stage, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .map_err(|e| e.to_string())?;
+    let copy = stage.join("tmux.conf");
+    let clean = fs::read_to_string(&conf)
+        .and_then(|t| fs::write(&copy, sandbox_tmux_conf(&t, known)))
+        .map_err(|e| e.to_string())
+        .map(|_| scan(&env, &stage).unwrap_or_default().is_empty());
+    match clean {
+        Ok(true) => Ok(Some(copy)),
+        Ok(false) => {
+            let _ = fs::remove_dir_all(&stage);
+            Err("the secret scan flagged your tmux config".into())
+        }
+        Err(e) => {
+            let _ = fs::remove_dir_all(&stage);
+            Err(e)
+        }
+    }
 }
 
 fn which(bin: &str) -> Option<PathBuf> {
@@ -474,7 +558,7 @@ fn stage_and_describe(env: &Env, own: &[PathBuf], stage: &Path) -> io::Result<Ve
     }
     if let Some(conf) = env.tmux_conf.as_ref().filter(|c| c.is_file()) {
         let dst = stage.join("tmux.conf");
-        fs::copy(conf, &dst)?;
+        fs::write(&dst, sandbox_tmux_conf(&fs::read_to_string(conf)?, None))?;
         let src = dst.to_string_lossy().into_owned();
         let up = Spec::Upload {
             src,
@@ -1638,6 +1722,35 @@ mod tests {
             );
         }
         assert!(manifest(&env_with(Path::new("/x")), "bogus").is_err());
+    }
+
+    #[test]
+    fn the_sandbox_tmux_conf_drops_host_only_lines_and_options_the_image_lacks() {
+        let conf = "set -g mouse on\nset -g default-shell /bin/zsh\nset -g extended-keys-format csi-u\nset -ag terminal-overrides \",*:RGB\"\nset -g @plugin 'x'\nrun '~/.tmux/plugins/tpm/tpm'\nbind q source-file ~/.tmux.conf\nbind -n M-f if-shell -F '#{==:#{session_name},a}' { detach-client } { display-popup -E 'tmux new-session -A -s a' }\n";
+        let known: std::collections::HashSet<String> = ["mouse", "terminal-overrides"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let out = sandbox_tmux_conf(conf, Some(&known));
+        let left_out = |l: &str| out.contains(&format!("# osh: left out for the sandbox: {l}"));
+        assert!(left_out("set -g default-shell /bin/zsh"));
+        assert!(left_out("set -g extended-keys-format csi-u"));
+        assert!(left_out("run '~/.tmux/plugins/tpm/tpm'"));
+        assert!(!left_out("set -g mouse on"));
+        assert!(!left_out("set -ag terminal-overrides"));
+        assert!(
+            !left_out("set -g @plugin 'x'"),
+            "user options are always fine"
+        );
+        assert!(
+            !left_out("bind q source-file"),
+            "bindings stay, only the top-level command is judged"
+        );
+        assert!(!left_out("bind -n M-f"));
+        // Without the sandbox's option list only the host-only lines go.
+        let static_only = sandbox_tmux_conf(conf, None);
+        assert!(static_only.contains("# osh: left out for the sandbox: set -g default-shell"));
+        assert!(!static_only.contains("left out for the sandbox: set -g extended-keys-format"));
     }
 
     #[test]

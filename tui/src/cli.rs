@@ -1158,6 +1158,122 @@ fn sandbox_home(sandbox: &str) -> String {
         .unwrap_or_else(|| "/workspace".into())
 }
 
+/// Put the host's tmux config in a sandbox just created, so its tmux has the host's prefix and
+/// bindings from the first shell. `name` is empty when OpenShell generated it: the sandbox is
+/// then the first one not in `before`. Skipped (with the reason) when the host has no config,
+/// the secret scan flags it, or the image has no tmux.
+pub fn install_tmux_conf(dir: &Path, name: &str, before: &[String]) -> Result<String, String> {
+    if agents::Env::detect(dir, "").tmux_conf.is_none() {
+        return Ok("Sandbox created (no host tmux config to copy)".into());
+    }
+    upload_tmux_conf(dir, name, before)
+}
+
+fn upload_tmux_conf(dir: &Path, name: &str, before: &[String]) -> Result<String, String> {
+    let mut name = name.to_string();
+    let mut home = String::new();
+    // A detached create can return before the sandbox accepts commands.
+    for _ in 0..30 {
+        if name.is_empty() {
+            if let Ok(v) = os(&["sandbox", "list", "--output", "json"]).and_then(|t| parse(&t)) {
+                name = v["sandboxes"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|s| text(&s["name"]))
+                    .find(|n| !before.contains(n))
+                    .unwrap_or_default();
+            }
+        }
+        if !name.is_empty() {
+            let args: Vec<String> = [
+                "sandbox",
+                "exec",
+                "-n",
+                &name,
+                "--timeout",
+                "30",
+                "--",
+                "sh",
+                "-c",
+                "if command -v tmux >/dev/null 2>&1; then printf %s \"$HOME\"; else printf none; fi",
+            ]
+            .map(String::from)
+            .to_vec();
+            if let Ok(t) = exec("openshell", &args, &[]) {
+                home = t.trim().to_string();
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    if name.is_empty() || home.is_empty() {
+        return Err("Sandbox created, tmux config not copied: sandbox not ready".into());
+    }
+    if !home.starts_with('/') {
+        return Ok(format!("Sandbox created ({name}'s image has no tmux)"));
+    }
+    // The image's tmux can be older than the host's: leave out the options it does not have.
+    let known = exec(
+        "openshell",
+        &sandbox_sh(
+            &name,
+            "tmux -L oshchk -f /dev/null new-session -d 'sleep 30' >/dev/null 2>&1; \
+             for f in -g -gw -gs; do tmux -L oshchk show-options $f; done 2>/dev/null; \
+             tmux -L oshchk kill-server >/dev/null 2>&1; true",
+        ),
+        &[],
+    )
+    .ok()
+    .map(|t| {
+        t.lines()
+            .filter_map(|l| l.split_whitespace().next())
+            .map(|o| o.split('[').next().unwrap_or(o).to_string())
+            .collect::<std::collections::HashSet<_>>()
+    })
+    .filter(|k| !k.is_empty());
+    let conf = match agents::tmux_conf_for_new_sandbox(dir, known.as_ref()) {
+        Ok(Some(c)) => c,
+        Ok(None) => return Ok("Sandbox created (no host tmux config to copy)".into()),
+        Err(e) => return Err(format!("Sandbox created, tmux config not copied: {e}")),
+    };
+    let args: Vec<String> = [
+        "sandbox",
+        "upload",
+        &name,
+        &conf.to_string_lossy(),
+        &format!("{home}/.tmux.conf"),
+        "--no-git-ignore",
+    ]
+    .map(String::from)
+    .to_vec();
+    let result = exec("openshell", &args, &[])
+        .map(|_| format!("Sandbox created; host tmux config copied to {name}"))
+        .map_err(|e| format!("Sandbox created, tmux config not copied: {e}"));
+    if let Some(stage) = conf.parent() {
+        let _ = std::fs::remove_dir_all(stage);
+    }
+    result
+}
+
+/// `openshell sandbox exec` arguments that run `script` under `sh -c` in `sandbox`.
+fn sandbox_sh(sandbox: &str, script: &str) -> Vec<String> {
+    [
+        "sandbox",
+        "exec",
+        "-n",
+        sandbox,
+        "--timeout",
+        "30",
+        "--",
+        "sh",
+        "-c",
+        script,
+    ]
+    .map(String::from)
+    .to_vec()
+}
+
 /// The profile (YAML) that grants exactly what the selected installs still lack.
 pub fn sync_gen_profile(
     dir: &Path,
