@@ -672,9 +672,11 @@ fn start_script(dirs: &[String]) -> String {
     // work; `-A` reattaches to the same session when the shell is opened again. When tmux cannot
     // start (a sandbox policy can deny its fork: "create window failed") plain bash takes over,
     // so the shell still opens.
+    // `-u` and a UTF-8 locale: a sandbox without LANG makes tmux draw every non-ASCII glyph
+    // (Claude Code's bullets, box lines) as `_`.
     script.push_str(
-        "true; if command -v tmux >/dev/null 2>&1 && [ -z \"$TMUX\" ]; \
-         then tmux new-session -A -s osh bash || exec bash; else exec bash; fi",
+        "true; export LANG=C.UTF-8 LC_ALL=C.UTF-8; if command -v tmux >/dev/null 2>&1 && [ -z \"$TMUX\" ]; \
+         then tmux -u new-session -A -s osh bash || exec bash; else exec bash; fi",
     );
     script
 }
@@ -1036,8 +1038,9 @@ mod tests {
     fn start_script_tries_each_dir_and_quotes_them() {
         assert_eq!(
             start_script(&[]),
-            "export PATH=\"$HOME/.local/bin:$PATH\"; true; if command -v tmux >/dev/null 2>&1 \
-             && [ -z \"$TMUX\" ]; then tmux new-session -A -s osh bash || exec bash; else exec bash; fi"
+            "export PATH=\"$HOME/.local/bin:$PATH\"; true; export LANG=C.UTF-8 LC_ALL=C.UTF-8; \
+             if command -v tmux >/dev/null 2>&1 \
+             && [ -z \"$TMUX\" ]; then tmux -u new-session -A -s osh bash || exec bash; else exec bash; fi"
         );
         let s = start_script(&["/sandbox/it's/src".into(), "/sandbox/it's".into()]);
         assert!(s.contains(
