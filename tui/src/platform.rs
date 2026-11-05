@@ -282,6 +282,8 @@ pub struct Facts {
     pub has_openshell: bool,
     pub has_curl: bool,
     pub has_tmux: bool,
+    /// The `ssh` client: `openshell sandbox upload` spawns it on this machine.
+    pub has_ssh: bool,
     pub has_gh: bool,
     /// A tool that reads host clipboard images: pngpaste (macOS), wl-paste or xclip (Linux).
     pub has_clipboard: bool,
@@ -468,6 +470,7 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
         has_openshell: h.which("openshell"),
         has_curl: h.which("curl"),
         has_tmux: h.which("tmux"),
+        has_ssh: h.which("ssh"),
         has_gh: h.which("gh"),
         has_clipboard: match os {
             Os::MacOs => h.which("pngpaste"),
@@ -529,6 +532,7 @@ pub mod testing {
             has_openshell: true,
             has_curl: true,
             has_tmux: true,
+            has_ssh: true,
             has_gh: true,
             has_clipboard: true,
             runtimes_installed: vec![],

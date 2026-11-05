@@ -115,6 +115,9 @@ fn pkg_name(tool: &'static str, pm: PkgMgr) -> &'static str {
         ("gh", PkgMgr::Pacman) => "github-cli",
         ("docker", PkgMgr::Apt) => "docker.io",
         ("docker", PkgMgr::Dnf) => "moby-engine",
+        ("ssh", PkgMgr::Apt) => "openssh-client",
+        ("ssh", PkgMgr::Dnf | PkgMgr::Zypper) => "openssh-clients",
+        ("ssh", PkgMgr::Pacman) => "openssh",
         _ => tool,
     }
 }
@@ -565,6 +568,7 @@ fn plan_for_gateways(f: &Facts, o: &Options) -> (Vec<Step>, Vec<Option<&'static 
             false,
         );
     }
+    p.ssh_client();
     let main = o.gateways[0];
     let mut after = None;
     if !f.has_openshell {
@@ -614,6 +618,19 @@ fn plan_for_gateways(f: &Facts, o: &Options) -> (Vec<Step>, Vec<Option<&'static 
 }
 
 impl Planner {
+    /// Linux only: macOS ships `ssh`. `openshell sandbox upload` spawns it on this machine, so
+    /// without it the tmux config, git config, pasted images and sync-agents files all fail.
+    fn ssh_client(&mut self) {
+        if self.f.os == Os::Linux && !self.f.has_ssh {
+            self.pkg(
+                "ssh",
+                "Install the ssh client (uploads into sandboxes need it)",
+                &["ssh"],
+                false,
+            );
+        }
+    }
+
     fn optional_tools(&mut self) {
         let f = self.f.clone();
         let mac_brew = f.os == Os::MacOs && f.pkg == PkgMgr::Brew;
@@ -657,6 +674,7 @@ pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
             false,
         );
     }
+    p.ssh_client();
     // OpenShell's installer waits for `openshell status` to report connected, and on Linux the
     // gateway cannot connect before a container runtime works, so the runtime goes first there.
     // (The macOS vm gateway needs none.)
@@ -1153,6 +1171,21 @@ pub fn doctor(f: &Facts, runtime_needed: bool) -> (String, bool) {
             );
         }
     }
+    if f.has_ssh {
+        line("ok", "ssh", "");
+    } else {
+        ok = false;
+        let note = match f.os {
+            Os::Linux => format!(
+                "needed to upload files into sandboxes (osh setup installs it); {}",
+                hint("ssh", f.os, f.pkg, f.wayland)
+            ),
+            Os::MacOs => "needed to upload files into sandboxes; it ships with macOS, so \
+                          check your PATH"
+                .to_string(),
+        };
+        line("MISSING", "ssh", &note);
+    }
     for (have, name, why) in [
         (f.has_tmux, "tmux", "sandbox sessions in tmux"),
         (f.has_gh, "gh", "GitHub repo picker"),
@@ -1371,6 +1404,7 @@ mod tests {
             has_openshell: false,
             has_curl: true,
             has_tmux: false,
+            has_ssh: true,
             has_gh: false,
             has_clipboard: false,
             runtimes_installed: vec![],
@@ -3141,6 +3175,71 @@ mod tests {
     }
 
     #[test]
+    fn plan_installs_the_ssh_client_per_package_manager_when_missing() {
+        for (pm, pkg) in [
+            (PkgMgr::Apt, "openssh-client"),
+            (PkgMgr::Dnf, "openssh-clients"),
+            (PkgMgr::Pacman, "openssh"),
+            (PkgMgr::Zypper, "openssh-clients"),
+        ] {
+            let mut f = facts(Os::Linux, pm);
+            f.has_ssh = false;
+            let steps = plan(&f, &Options::default());
+            let s = steps.iter().find(|s| s.id == "ssh").expect("ssh planned");
+            assert!(!s.optional);
+            let text = format!("{:?}", s.kind);
+            assert!(text.contains(pkg), "{pm:?}: {text}");
+        }
+        let mut f = facts(Os::Linux, PkgMgr::None);
+        f.has_ssh = false;
+        let steps = plan(&f, &Options::default());
+        let s = steps.iter().find(|s| s.id == "ssh").unwrap();
+        assert!(matches!(s.kind, StepKind::Manual(_)));
+        // Also with explicit gateways, and before the first upload-capable step.
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_ssh = false;
+        let o = Options {
+            gateways: vec![GwKind::Docker],
+            ..Options::default()
+        };
+        assert!(plan(&f, &o).iter().any(|s| s.id == "ssh"));
+    }
+
+    #[test]
+    fn plan_skips_ssh_when_present_and_on_macos() {
+        let f = facts(Os::Linux, PkgMgr::Apt);
+        assert!(!plan(&f, &Options::default()).iter().any(|s| s.id == "ssh"));
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.has_ssh = false;
+        assert!(!plan(&f, &Options::default()).iter().any(|s| s.id == "ssh"));
+        assert!(!plan(
+            &f,
+            &Options {
+                gateways: vec![GwKind::Vm],
+                ..Options::default()
+            }
+        )
+        .iter()
+        .any(|s| s.id == "ssh"));
+    }
+
+    #[test]
+    fn doctor_reports_ssh() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        assert!(doctor(&f, false).0.contains("ok       ssh"));
+        f.has_ssh = false;
+        let (text, ok) = doctor(&f, false);
+        assert!(!ok);
+        assert!(
+            text.contains("MISSING  ssh") && text.contains("openssh-client"),
+            "{text}"
+        );
+        let mut m = facts(Os::MacOs, PkgMgr::Brew);
+        m.has_ssh = false;
+        assert!(doctor(&m, false).0.contains("MISSING  ssh"));
+    }
+
+    #[test]
     fn doctor_tells_a_permission_problem_from_a_stopped_daemon() {
         let mut f = facts(Os::Linux, PkgMgr::Apt);
         f.runtimes_installed = vec![Runtime::Docker];
@@ -3216,7 +3315,7 @@ mod tests {
 
     #[test]
     fn doctor_is_ok_with_openshell_and_a_ready_runtime() {
-        let h = FakeHost::with_bins(&["openshell", "podman"]);
+        let h = FakeHost::with_bins(&["openshell", "podman", "ssh"]);
         let (text, ok) = doctor(&gather_for(&h, Os::Linux), true);
         assert!(ok, "{text}");
         assert!(text.contains("ok       container runtime (podman)"));

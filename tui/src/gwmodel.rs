@@ -363,6 +363,7 @@ mod tests {
             has_openshell: true,
             has_curl: true,
             has_tmux: true,
+            has_ssh: true,
             has_gh: true,
             has_clipboard: true,
             runtimes_installed: vec![],

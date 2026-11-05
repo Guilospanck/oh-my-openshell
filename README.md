@@ -54,7 +54,7 @@ step, with `sudo` marked), **Install** (live progress; `Esc` stops after the ste
 detects the OS and package manager (Homebrew, apt, dnf, pacman, zypper) and
 installs OpenShell, the gateway configs and services, whatever each ticked type
 needs (Docker Engine, Podman, Colima, a Podman machine, `e2fsprogs`, KVM access),
-and the optional tools: `tmux`, `gh` and a clipboard tool. `--runtime docker|podman`
+the `ssh` client on Linux (macOS ships it; `openshell sandbox upload` runs it on your machine, so without it nothing can be uploaded into a sandbox, and `osh doctor` reports it), and the optional tools: `tmux`, `gh` and a clipboard tool. `--runtime docker|podman`
 is an alias for `--gateways docker|podman`. It never installs silently: each step is shown first, and what
 it cannot do for you (no sudo, unknown distro, a stopped Docker daemon) is
 printed as the command to run yourself. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the

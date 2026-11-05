@@ -99,7 +99,7 @@ if ! "${refresh[@]}" >/dev/null 2>&1; then
 else
 with_stubs "$OSH" setup --yes --gateways podman >"$HOME/out.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "setup exits 0" || { fail "setup exits 0" "rc=$rc"; tail -25 "$HOME/out.log"; }
-for tool in podman tmux gh xclip; do
+for tool in podman ssh tmux gh xclip; do
   check "setup installed $tool with the distro's package manager" command -v "$tool"
 done
 check "setup ran the OpenShell installer" logged installer-ran
