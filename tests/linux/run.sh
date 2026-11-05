@@ -45,7 +45,7 @@ done
 
 # The release workflow is linted here; `just test-release` runs its Linux jobs under act.
 echo "######## .github/workflows (actionlint)"
-docker run --rm -v "$repo:/repo:ro" -w /repo rhysd/actionlint:1.7.7 -color || failed+=("actionlint")
+docker run --rm -v "$repo:/repo:ro" -w /repo rhysd/actionlint:1.7.10 -color || failed+=("actionlint")
 
 if [[ ${#failed[@]} -gt 0 ]]; then echo "FAILED distros: ${failed[*]}" >&2; exit 1; fi
 echo "all distros passed: ${distros[*]}"
