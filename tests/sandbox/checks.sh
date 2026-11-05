@@ -37,8 +37,8 @@ sandbox_checks() {
   printf '[alias]\n\toshhi = !echo osh-git-alias\n' >"$HOME/osh-gitconfig"
   local home; home="$(ex 'printf %s "$HOME"')"
   ex 'mkdir -p "$HOME/.config/osh"' >/dev/null
-  openshell -g "$main" sandbox upload "$name" "$HOME/osh-gitconfig" "$home/.config/osh/gitconfig" --no-git-ignore >/dev/null 2>&1 \
-    && pass "the git config uploads to a nested path" || fail "the git config uploads to a nested path"
+  out="$(openshell -g "$main" sandbox upload "$name" "$HOME/osh-gitconfig" "$home/.config/osh/gitconfig" --no-git-ignore 2>&1)" \
+    && pass "the git config uploads to a nested path" || fail "the git config uploads to a nested path" "home=[$home] $out"
   local inc="if [ -e \"\$HOME/.gitconfig\" ]; then git config --global --get-all include.path | grep -qxF '~/.config/osh/gitconfig' || git config --global --add include.path '~/.config/osh/gitconfig'; else printf '[include]\\n\\tpath = ~/.config/osh/gitconfig\\n' > \"\$HOME/.gitconfig\"; fi"
   out="$(ex "$inc; $inc; git oshhi; git config --global --get-all include.path | grep -c osh/gitconfig")"
   [[ "$out" == *osh-git-alias* && "$out" == *$'\n'1* ]] && pass "a host git alias works and the include is added once" \
