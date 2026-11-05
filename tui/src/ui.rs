@@ -306,7 +306,7 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
                 .map(|t| {
                     let now = ghrepo::now_secs();
                     (
-                        format!("{}: {}", t.repo, ghrepo::expiry_note(now, t.expiry_ms)),
+                        format!("{}: {}", t.shown().1, ghrepo::expiry_note(now, t.expiry_ms)),
                         ghrepo::days_left(now, t.expiry_ms) <= ghrepo::WARN_DAYS,
                     )
                 });
@@ -476,7 +476,7 @@ pub const GLOBAL_HELP: &str = "Tab/1-5 switch  j/k move  g gateway  r refresh  !
 /// The per-tab key hints in the footer.
 pub fn footer_help(tab: Tab) -> &'static str {
     match tab {
-        Tab::Sandboxes => "Enter shell (● running)  l logs  p blocked  n new  d delete  s stop  S start  a/x attach/detach provider  K skills  t renew GitHub token",
+        Tab::Sandboxes => "Enter shell (● running)  l logs  p blocked  n new  d delete  s stop  S start  a/x attach/detach provider  K skills  t renew repo token",
         Tab::Providers => "n create  u update credentials  d delete",
         Tab::Profiles => "u / Enter import or update from providers/",
         Tab::Images => "b / Enter build",

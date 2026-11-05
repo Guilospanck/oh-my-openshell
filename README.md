@@ -91,8 +91,8 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a GitHub repo token (`t`), install skills and plugins (`K`, below) |
-| Providers | create from a `providers/*.yaml` profile or a read/write GitHub repo token (`n`), update credentials (`u`), delete (`d`) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a repo token (`t`), install skills and plugins (`K`, below) |
+| Providers | create from a `providers/*.yaml` profile or a read/write repo token for GitHub, GitLab, Bitbucket or Forgejo (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from) |
 | Gateways | switch (`g` / `Enter`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
@@ -314,7 +314,7 @@ osh then imports a profile `gh-<owner>-<repo>`: the `github` profile's read
 access plus `POST .../<owner>/<repo>.git/git-receive-pack`, so pushes reach
 that repo only. The token lives in a provider created from it: `github-<sandbox>-<repo>`
 for one sandbox, or `github-<repo>` when you pick "shared by sandboxes" (also
-`n` on the Providers tab, "GitHub repo, read/write"; attach it to other
+`n` on the Providers tab, "Git repo, read/write"; attach it to other
 sandboxes with `a` or pick it in the wizard). A sandbox's own provider is deleted
 with the sandbox, and osh then offers to open GitHub's token list and names the token to delete there
 (GitHub has no API for that); a shared one stays until you delete it.
@@ -335,6 +335,58 @@ secret in). Without the helper git sends no credentials and fails with `could
 not read Username`. The repo's `.git/config` on the host is not changed, and
 programs that did not start in an osh shell (for example another `exec`) do not
 get this setup.
+
+### Repo access per git provider
+
+When the shared folder's `origin` is on another host than `github.com` (https,
+ssh or `git@HOST:` form), the wizard asks once "Which git provider hosts
+HOST?": GitHub, GitLab, Bitbucket, Forgejo, or "None / other (no repo
+access)". The likely one is first (`gitlab.com` GitLab, `bitbucket.org`
+Bitbucket, `codeberg.org` Forgejo, else GitHub). The answer, "none" included,
+is kept per host in `~/.local/state/osh/git-hosts` (with the remote's ssh port,
+when not 22), so it is never asked again; hosts an earlier osh remembered as
+Forgejo in `forgejo-hosts` still count as Forgejo, and hosts answered "no"
+there are asked again. Bitbucket on `bitbucket.org` is Bitbucket Cloud; on any
+other host it is Bitbucket Data Center. GitHub is supported on `github.com`
+only.
+
+Then come the same choices as for GitHub: none, read-only where osh ships a
+read-only profile (`github`, `forgejo`, with the host filled in; GitLab and
+Bitbucket have none), an existing provider of the repo's profile, or read and
+write with a token for this sandbox or one shared by sandboxes. On the
+Providers tab, `n`, "Git repo, read/write" takes `OWNER/REPO` (GitHub) or
+`HOST/PATH` as in the clone URL, and asks a new host's provider the same way.
+
+| Provider | Token | Where osh sends you | Permissions | Expiry | Caveats |
+| --- | --- | --- | --- | --- | --- |
+| GitHub | fine-grained personal access token | prefilled `github.com/settings/personal-access-tokens/new` | Contents, Pull requests, Workflows: read and write; only the selected repo | 30 days, tracked | an organization may have to approve it |
+| GitLab (any host) | project access token, role Developer | `https://HOST/GROUP/.../REPO/-/settings/access_tokens` (name and scopes in the URL; the steps do not rely on it) | `read_api`, `write_repository` | 30 days, tracked | on gitlab.com project tokens need Premium or Ultimate; on Free use a personal access token with the same scopes, which reaches every project your account can |
+| Bitbucket Cloud | repository access token | `https://bitbucket.org/WS/REPO/admin/access-tokens` (Repository settings > Security > Access tokens) | Repositories: Read, Write | 30 days if the workspace lets you choose; tracked as 30 days | app passwords no longer work |
+| Bitbucket Data Center | repository HTTP access token | `https://HOST/projects/PROJ/repos/REPO/settings`, then HTTP access tokens | Repository write | 30 days if offered; tracked as 30 days | https on port 443 with no context path only: `https://HOST/scm/PROJ/REPO` or `ssh://git@HOST:PORT/PROJ/REPO` |
+| Forgejo | access token | `https://HOST/user/settings/applications/tokens/new` | Specific repositories: the repo; scope `write:repository` | none, not tracked | delete it yourself when no sandbox needs it |
+
+osh checks a pasted token with a read-only GET before using it (GitLab
+`/api/v4/projects/<encoded path>` with `PRIVATE-TOKEN`, Bitbucket Cloud
+`api.bitbucket.org/2.0/repositories/WS/REPO`, Data Center
+`/rest/api/1.0/projects/PROJ/repos/REPO`, Forgejo `/api/v1/repos/OWNER/REPO`,
+all others as bearer; the token goes through a private header file, never
+argv). Read/write imports a profile `gl-`, `bb-` or `fj-<host>-<owner>-<repo>`:
+API reads (Bitbucket Cloud on `api.bitbucket.org`, read-only), git clone and
+fetch, and `POST .../git-receive-pack` for that repo only (under `/scm/` on
+Data Center), for `git` and `curl` only. Providers are `gitlab-`,
+`bitbucket-` or `forgejo-<sandbox>-<repo>`, or `...-<repo>` when shared, with
+the token in `GITLAB_TOKEN`, `BITBUCKET_TOKEN` or `FORGEJO_TOKEN`. GitLab and
+Bitbucket tokens are tracked and renewed like GitHub's (`u`, `t`, banner).
+Deleting a sandbox removes its own repo provider and names the token and the
+page to delete it on.
+
+Shells opened by osh also rewrite ssh remotes of every remembered GitLab,
+Bitbucket and Forgejo host to https (Data Center `ssh://git@HOST:PORT/` to
+`https://HOST/scm/`) and add a credential helper per host that gives git the
+token placeholder with the username the provider expects (`oauth2` for GitLab
+and Forgejo, `x-token-auth` for Bitbucket). Only GitHub's git-over-HTTPS path
+has been tested through the gateway; GitLab, Bitbucket and Forgejo follow their
+documentation and are untested against live services.
 
 ## Development and agents
 

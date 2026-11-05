@@ -1,6 +1,6 @@
 //! Thin wrappers around the `openshell` and container runtime (`docker` or `podman`) CLIs.
 use crate::agents;
-use crate::ghrepo::{self, GhRepo, Tracked};
+use crate::ghrepo::{self, Forge, GhRepo, Tracked};
 use crate::platform::{self, Runtime};
 use serde_json::Value;
 use std::{
@@ -441,10 +441,11 @@ pub fn attach_profile(dir: &Path, sandbox: &str, id: &str) -> Result<String, Str
     .map(|_| format!("Attached {id} to {sandbox}"))
 }
 
-/// The GitHub repository the `origin` remote of git folder `dir` points at, if any.
-pub fn repo_origin(dir: &str) -> Option<GhRepo> {
+/// The `origin` remote of git folder `dir`, on any host. Which provider hosts it is the
+/// caller's question to settle (`Remote::repo`).
+pub fn origin_remote(dir: &str) -> Option<ghrepo::Remote> {
     let args = ["-C", dir, "remote", "get-url", "origin"].map(String::from);
-    ghrepo::parse_remote(&run("git", &args, &[]).ok()?)
+    ghrepo::parse_url(&run("git", &args, &[]).ok()?)
 }
 
 /// Open `url` in the host's browser. False when no opener could be started.
@@ -463,10 +464,11 @@ pub fn open_url(url: &str) -> bool {
         .is_ok()
 }
 
-/// HTTP status of `GET /repos/OWNER/REPO` with `token`. The token reaches curl in a private
-/// header file, so it never appears in argv.
+/// HTTP status of a read-only GET of the repo on its provider (`ghrepo::check_request`) with
+/// `token`. The token reaches curl in a private header file, so it never appears in argv.
 pub fn repo_status(repo: &GhRepo, token: &str) -> Result<u16, String> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    let (auth, accept, url) = ghrepo::check_request(repo);
     let file = std::env::temp_dir().join(format!(
         "osh-hdr-{}-{}",
         std::process::id(),
@@ -478,7 +480,7 @@ pub fn repo_status(repo: &GhRepo, token: &str) -> Result<u16, String> {
         .mode(0o600)
         .open(&file)
         .map_err(|e| e.to_string())?;
-    let written = writeln!(f, "Authorization: Bearer {token}");
+    let written = writeln!(f, "{auth}{token}");
     drop(f);
     let out = written.map_err(|e| e.to_string()).and_then(|_| {
         let args = [
@@ -492,34 +494,70 @@ pub fn repo_status(repo: &GhRepo, token: &str) -> Result<u16, String> {
             "-H".into(),
             format!("@{}", file.display()),
             "-H".into(),
-            "Accept: application/vnd.github+json".into(),
+            accept.into(),
             "-H".into(),
             "User-Agent: osh".into(),
-            format!("https://api.github.com/repos/{}", repo.full()),
+            url,
         ];
         run("curl", &args, &[])
     });
     let _ = fs::remove_file(&file);
     out?.trim()
         .parse()
-        .map_err(|_| "GitHub gave no HTTP status".to_string())
+        .map_err(|_| format!("{} gave no HTTP status", host_name(repo)))
+}
+
+/// How the repo's host is named in messages: the provider for the fixed cloud hosts, the
+/// hostname for self-hosted ones.
+pub fn host_name(repo: &GhRepo) -> &str {
+    match repo.forge {
+        Forge::GitHub => "GitHub",
+        Forge::BitbucketCloud => "Bitbucket",
+        _ => &repo.host,
+    }
 }
 
 /// Why a repo check failed, or `None` when `status` means the token can see the repo.
 pub fn repo_status_problem(status: u16, repo: &GhRepo) -> Option<String> {
     let full = repo.full();
-    match status {
-        200 => None,
-        401 => Some("GitHub rejected the token (401): copy all of it, and check it has not expired".into()),
-        403 => Some(format!(
+    let host = host_name(repo);
+    let expired = "copy all of it, and check it has not expired";
+    let msg = match (repo.forge, status) {
+        (_, 200) => return None,
+        (Forge::GitHub, 401) => format!("GitHub rejected the token (401): {expired}"),
+        (Forge::GitHub, 403) => format!(
             "GitHub refused the token for {full} (403): the organization may need to approve it"
-        )),
-        404 => Some(format!(
+        ),
+        (Forge::GitHub, 404) => format!(
             "The token cannot see {full} (404): set Resource owner to {} and select that repository",
             repo.owner
-        )),
-        s => Some(format!("GitHub answered {s} for {full}")),
-    }
+        ),
+        (Forge::Forgejo, 401) => format!("{host} rejected the token (401): copy all of it"),
+        (_, 401) => format!("{host} rejected the token (401): {expired}"),
+        (Forge::GitLab, 403) => format!(
+            "{host} refused the token for {full} (403): it needs the scope read_api"
+        ),
+        (Forge::GitLab, 404) => format!(
+            "The token cannot see {full} on {host} (404): check the project path, and that the token was made in that project (or its user can access it)"
+        ),
+        (Forge::BitbucketCloud, 403) => format!(
+            "Bitbucket refused the token for {full} (403): it needs Repositories Read"
+        ),
+        (Forge::BitbucketDc, 403) => format!(
+            "{host} refused the token for {full} (403): it needs Repository read or write"
+        ),
+        (Forge::BitbucketCloud | Forge::BitbucketDc, 404) => format!(
+            "The token cannot see {full} on {host} (404): create it in that repository's settings"
+        ),
+        (Forge::Forgejo, 403) => format!(
+            "{host} refused the token for {full} (403): it needs the scope write:repository"
+        ),
+        (Forge::Forgejo, 404) => format!(
+            "The token cannot see {full} on {host} (404): check the repository name, and that the token lists it under Specific repositories"
+        ),
+        (_, s) => format!("{host} answered {s} for {full}"),
+    };
+    Some(msg)
 }
 
 fn track_repo(provider: &str, repo: &GhRepo) {
@@ -529,7 +567,8 @@ fn track_repo(provider: &str, repo: &GhRepo) {
         provider.into(),
         "--credential-expires-at".into(),
         format!(
-            "GITHUB_TOKEN={}",
+            "{}={}",
+            ghrepo::token_env(repo),
             ghrepo::expiry_ms(ghrepo::now_secs(), ghrepo::TOKEN_DAYS)
         ),
     ];
@@ -540,7 +579,7 @@ fn track_repo(provider: &str, repo: &GhRepo) {
             gateway: gateway(),
             provider: provider.into(),
             expiry_ms: ghrepo::expiry_ms(ghrepo::now_secs(), ghrepo::TOKEN_DAYS),
-            repo: repo.full(),
+            repo: repo.spec(),
         },
     );
 }
@@ -548,6 +587,7 @@ fn track_repo(provider: &str, repo: &GhRepo) {
 /// Import the repo's push profile when the gateway lacks it, then create `provider` from it
 /// with `token`. The token goes through the environment, never argv.
 pub fn create_repo_provider(repo: &GhRepo, provider: &str, token: &str) -> Result<String, String> {
+    let var = ghrepo::token_env(repo);
     let id = ghrepo::profile_id(repo);
     let imported = os(&["profile", "describe", &id]).is_err();
     if imported {
@@ -565,26 +605,32 @@ pub fn create_repo_provider(repo: &GhRepo, provider: &str, token: &str) -> Resul
         "--type",
         &id,
         "--credential",
-        "GITHUB_TOKEN",
+        var,
     ]
     .map(String::from)
     .to_vec();
-    let env = [("GITHUB_TOKEN".to_string(), token.to_string())];
+    let env = [(var.to_string(), token.to_string())];
     if let Err(e) = exec("openshell", &args, &env) {
         if imported {
             let _ = os(&["profile", "delete", &id]);
         }
         return Err(e);
     }
-    track_repo(provider, repo);
-    Ok(format!("Created provider {provider} for {}", repo.full()))
+    // Forgejo tokens never expire: nothing to track or warn about.
+    if repo.forge.expires() {
+        track_repo(provider, repo);
+    }
+    Ok(format!("Created provider {provider} for {}", repo.shown()))
 }
 
 /// Swap in a new token for a repo provider and restart its 30 day clock.
 pub fn renew_repo_token(repo: &GhRepo, provider: &str, token: &str) -> Result<String, String> {
-    update_credentials(provider, &[("GITHUB_TOKEN".into(), token.into())])?;
+    update_credentials(provider, &[(ghrepo::token_env(repo).into(), token.into())])?;
     track_repo(provider, repo);
-    Ok(format!("Renewed the token of {provider} ({})", repo.full()))
+    Ok(format!(
+        "Renewed the token of {provider} ({})",
+        repo.shown()
+    ))
 }
 
 /// Running sandboxes among `sandboxes` that have `provider` attached.
@@ -603,44 +649,122 @@ pub fn restart_sandbox(sandbox: &str) -> Result<(), String> {
     os(&["sandbox", "start", sandbox]).map(|_| ())
 }
 
+/// A repo provider removed with its sandbox, and the token behind it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dropped {
+    pub provider: String,
+    /// The token name osh asked for, to find it in the token list.
+    pub token: String,
+    /// Where a non-GitHub token is revoked, as (provider, page); `None` for GitHub, whose
+    /// token list osh offers to open.
+    pub page: Option<(String, String)>,
+}
+
+/// The Forgejo repo providers `sandbox` owned, among `providers`, as (provider, host). Forgejo
+/// tokens are not tracked (they never expire), so they are told apart by shape: the profile
+/// id is `fj-<host>-<owner>-<repo>` and the provider `forgejo-<sandbox>-<repo>`. `hosts` are
+/// the hosts remembered as Forgejo, to read the host back out of the profile id.
+fn forgejo_owned(sandbox: &str, providers: &[Provider], hosts: &[String]) -> Vec<(String, String)> {
+    let prefix = ghrepo::sandbox_prefix(Forge::Forgejo, sandbox);
+    providers
+        .iter()
+        .filter_map(|p| {
+            let rest = p.name.strip_prefix(&prefix)?;
+            let body = p.ty.strip_prefix("fj-")?;
+            if rest.is_empty() || !body.ends_with(&format!("-{rest}")) {
+                return None;
+            }
+            let host = hosts
+                .iter()
+                .find(|h| body.starts_with(&format!("{}-", ghrepo::slug(h))))?;
+            Some((p.name.clone(), host.clone()))
+        })
+        .collect()
+}
+
 /// Remove the per-sandbox repo providers of a deleted sandbox, and their profiles once no
-/// other provider uses them. Returns each provider removed with the name of the GitHub token
-/// behind it, which stays valid on github.com until the user deletes it there.
-pub fn drop_repo_providers(sandbox: &str, providers: &[Provider]) -> Vec<(String, String)> {
+/// other provider uses them. Returns each provider removed with the name of the token behind
+/// it, which stays valid on its host until the user deletes it there.
+pub fn drop_repo_providers(sandbox: &str, providers: &[Provider]) -> Vec<Dropped> {
     let file = ghrepo::tracked_path();
     let gw = gateway();
     let mine: Vec<Tracked> = ghrepo::load_tracked(file.as_deref())
         .into_iter()
         .filter(|t| {
             t.gateway == gw
-                && ghrepo::parse_remote(&format!("https://github.com/{}", t.repo))
+                && GhRepo::from_spec(&t.repo)
                     .is_some_and(|r| ghrepo::provider_name(sandbox, &r) == t.provider)
         })
         .collect();
-    let mut removed: Vec<(String, String)> = Vec::new();
-    for t in &mine {
-        if os(&["provider", "delete", &t.provider]).is_ok() {
-            ghrepo::untrack(file.as_deref(), &gw, &t.provider);
+    let hosts: Vec<String> = ghrepo::load_hosts(ghrepo::hosts_path().as_deref())
+        .into_iter()
+        .filter(|e| e.forge == Some(Forge::Forgejo))
+        .map(|e| e.host)
+        .collect();
+    drop_owned(
+        sandbox,
+        providers,
+        &mine,
+        &forgejo_owned(sandbox, providers, &hosts),
+        &mut |args| os(args).is_ok(),
+        &mut |p| ghrepo::untrack(file.as_deref(), &gw, p),
+    )
+}
+
+/// The removal itself, with the gateway call (`del`: true on success) and the untracking
+/// passed in so it can be tested. `tracked` are the sandbox's tokens with an expiry (GitHub,
+/// GitLab, Bitbucket); `forgejo` its Forgejo providers as (provider, host).
+fn drop_owned(
+    sandbox: &str,
+    providers: &[Provider],
+    tracked: &[Tracked],
+    forgejo: &[(String, String)],
+    del: &mut dyn FnMut(&[&str]) -> bool,
+    untrack: &mut dyn FnMut(&str),
+) -> Vec<Dropped> {
+    let mut removed: Vec<Dropped> = Vec::new();
+    for t in tracked {
+        if del(&["provider", "delete", &t.provider]) {
+            untrack(&t.provider);
             let repo = t.repo.rsplit('/').next().unwrap_or(&t.repo);
-            removed.push((
-                t.provider.clone(),
-                ghrepo::token_name(&format!("{sandbox}-{repo}")),
-            ));
+            removed.push(Dropped {
+                provider: t.provider.clone(),
+                token: ghrepo::token_name(&format!("{sandbox}-{repo}")),
+                page: GhRepo::from_spec(&t.repo)
+                    .filter(|r| !r.is_github())
+                    .map(|r| (r.forge.label().to_string(), ghrepo::tokens_page(&r))),
+            });
         }
     }
-    for t in &mine {
-        let Some(ty) = providers
-            .iter()
-            .find(|p| p.name == t.provider)
-            .map(|p| &p.ty)
-        else {
+    for (name, host) in forgejo {
+        if del(&["provider", "delete", name]) {
+            let repo = name
+                .strip_prefix(&ghrepo::sandbox_prefix(Forge::Forgejo, sandbox))
+                .unwrap_or(name);
+            removed.push(Dropped {
+                provider: name.clone(),
+                token: ghrepo::token_name(&format!("{sandbox}-{repo}")),
+                page: Some((
+                    Forge::Forgejo.label().to_string(),
+                    ghrepo::forgejo_tokens_page(host),
+                )),
+            });
+        }
+    }
+    let names: Vec<&String> = tracked
+        .iter()
+        .map(|t| &t.provider)
+        .chain(forgejo.iter().map(|f| &f.0))
+        .collect();
+    for name in names {
+        let Some(ty) = providers.iter().find(|p| &p.name == name).map(|p| &p.ty) else {
             continue;
         };
         let used = providers
             .iter()
-            .any(|p| &p.ty == ty && !removed.iter().any(|(r, _)| r == &p.name));
+            .any(|p| &p.ty == ty && !removed.iter().any(|r| r.provider == p.name));
         if !used {
-            let _ = os(&["profile", "delete", ty]);
+            let _ = del(&["profile", "delete", ty]);
         }
     }
     removed
@@ -898,15 +1022,7 @@ pub fn spawn_poller(
 }
 
 pub fn valid_host(h: &str) -> bool {
-    !h.is_empty()
-        && h.len() <= 253
-        && h.split('.').all(|l| {
-            !l.is_empty()
-                && l.len() <= 63
-                && !l.starts_with('-')
-                && !l.ends_with('-')
-                && l.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-        })
+    ghrepo::valid_host(h)
 }
 
 /// Write the repo profile to a temp file, rendering `${FORGEJO_HOST}`, with an
@@ -1524,18 +1640,162 @@ mod tests {
         assert!(text.contains("POST /a/git-receive-pack") && text.contains("/usr/bin/x"));
     }
 
+    fn r(forge: Forge, host: &str, owner: &str) -> GhRepo {
+        GhRepo {
+            forge,
+            host: host.into(),
+            owner: owner.into(),
+            repo: "app".into(),
+        }
+    }
+
     #[test]
     fn repo_status_problems_tell_the_user_what_to_fix() {
-        let r = GhRepo {
-            owner: "acme".into(),
-            repo: "app".into(),
-        };
+        let r = r(Forge::GitHub, "github.com", "acme");
         assert_eq!(repo_status_problem(200, &r), None);
         assert!(repo_status_problem(401, &r).unwrap().contains("expired"));
         assert!(repo_status_problem(403, &r).unwrap().contains("approve"));
         let nf = repo_status_problem(404, &r).unwrap();
         assert!(nf.contains("acme/app") && nf.contains("Resource owner to acme"));
         assert!(repo_status_problem(500, &r).unwrap().contains("500"));
+    }
+
+    #[test]
+    fn forgejo_status_problems_use_forgejo_words() {
+        let r = r(Forge::Forgejo, "example.org", "acme");
+        assert_eq!(repo_status_problem(200, &r), None);
+        let p401 = repo_status_problem(401, &r).unwrap();
+        assert!(p401.contains("example.org") && !p401.contains("expired"));
+        assert!(repo_status_problem(403, &r)
+            .unwrap()
+            .contains("write:repository"));
+        let nf = repo_status_problem(404, &r).unwrap();
+        assert!(
+            nf.contains("acme/app") && !nf.contains("GitHub") && !nf.contains("Resource owner")
+        );
+        assert!(nf.contains("Specific repositories"));
+        assert!(repo_status_problem(500, &r).unwrap().contains("500"));
+    }
+
+    #[test]
+    fn gitlab_and_bitbucket_status_problems_name_what_to_fix() {
+        let gl = r(Forge::GitLab, "gitlab.com", "grp/sub");
+        let p = |s, r: &GhRepo| repo_status_problem(s, r).unwrap();
+        assert!(p(401, &gl).contains("gitlab.com") && p(401, &gl).contains("expired"));
+        assert!(p(403, &gl).contains("read_api"));
+        assert!(p(404, &gl).contains("grp/sub/app") && p(404, &gl).contains("project path"));
+        let bc = r(Forge::BitbucketCloud, "bitbucket.org", "ws");
+        assert!(p(401, &bc).starts_with("Bitbucket rejected"));
+        assert!(p(403, &bc).contains("Repositories Read"));
+        assert!(p(404, &bc).contains("ws/app"));
+        let dc = r(Forge::BitbucketDc, "example.net", "PROJ");
+        assert!(p(403, &dc).contains("example.net") && p(403, &dc).contains("Repository read"));
+        assert!(p(502, &dc).contains("502"));
+        assert_eq!(repo_status_problem(200, &dc), None);
+        assert_eq!(host_name(&dc), "example.net");
+        assert_eq!(host_name(&bc), "Bitbucket");
+    }
+
+    fn prov(name: &str, ty: &str) -> Provider {
+        Provider {
+            name: name.into(),
+            ty: ty.into(),
+            keys: vec![],
+        }
+    }
+
+    #[test]
+    fn a_deleted_sandbox_takes_its_forgejo_providers_and_unused_profiles() {
+        let providers = vec![
+            prov("forgejo-dev-app", "fj-example-org-acme-app"),
+            // shared token: not the sandbox's own, shares the profile
+            prov("forgejo-app", "fj-example-org-acme-app"),
+            prov("forgejo-dev-lib", "fj-example-org-acme-lib"),
+            prov("forgejo-other-app", "fj-example-org-acme-app"),
+            prov("forgejo", "forgejo"),
+            prov("github-dev-app", "gh-acme-app"),
+        ];
+        let hosts = vec!["example.org".to_string()];
+        let owned = forgejo_owned("dev", &providers, &hosts);
+        assert_eq!(
+            owned,
+            [
+                ("forgejo-dev-app".to_string(), "example.org".to_string()),
+                ("forgejo-dev-lib".to_string(), "example.org".to_string()),
+            ]
+        );
+        assert!(forgejo_owned("dev", &providers, &[]).is_empty());
+        let mut calls: Vec<String> = Vec::new();
+        let gone = drop_owned(
+            "dev",
+            &providers,
+            &[],
+            &owned,
+            &mut |a| {
+                calls.push(a.join(" "));
+                true
+            },
+            &mut |_| {},
+        );
+        assert_eq!(gone.len(), 2);
+        assert_eq!(
+            gone[0].page,
+            Some((
+                "Forgejo".to_string(),
+                "https://example.org/user/settings/applications".to_string()
+            ))
+        );
+        assert_eq!(gone[0].token, "osh-dev-app");
+        // the app profile is still used by two other providers; the lib one is not
+        assert!(calls.contains(&"profile delete fj-example-org-acme-lib".to_string()));
+        assert!(!calls
+            .iter()
+            .any(|c| c == "profile delete fj-example-org-acme-app"));
+    }
+
+    #[test]
+    fn a_deleted_sandbox_takes_its_tracked_gitlab_and_github_tokens() {
+        let gl = r(Forge::GitLab, "gitlab.com", "grp/sub");
+        let t = |p: &str, repo: String| Tracked {
+            gateway: "vm".into(),
+            provider: p.into(),
+            expiry_ms: 1,
+            repo,
+        };
+        let tracked = [
+            t("gitlab-dev-app", gl.spec()),
+            t("github-dev-app", "acme/app".into()),
+        ];
+        let providers = vec![
+            prov("gitlab-dev-app", "gl-gitlab-com-grp-sub-app"),
+            prov("github-dev-app", "gh-acme-app"),
+            prov("github-app", "gh-acme-app"),
+        ];
+        let mut calls: Vec<String> = Vec::new();
+        let mut untracked: Vec<String> = Vec::new();
+        let gone = drop_owned(
+            "dev",
+            &providers,
+            &tracked,
+            &[],
+            &mut |a| {
+                calls.push(a.join(" "));
+                true
+            },
+            &mut |p| untracked.push(p.into()),
+        );
+        assert_eq!(untracked, ["gitlab-dev-app", "github-dev-app"]);
+        assert_eq!(gone[0].token, "osh-dev-app");
+        assert_eq!(
+            gone[0].page,
+            Some((
+                "GitLab".to_string(),
+                "https://gitlab.com/grp/sub/app/-/settings/access_tokens".to_string()
+            ))
+        );
+        assert_eq!(gone[1].page, None);
+        assert!(calls.contains(&"profile delete gl-gitlab-com-grp-sub-app".to_string()));
+        assert!(!calls.contains(&"profile delete gh-acme-app".to_string()));
     }
 
     #[test]

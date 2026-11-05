@@ -762,13 +762,13 @@ pub fn shown_title(title: &str) -> &str {
 impl Session {
     /// `bash` in the sandbox with `~/.local/bin` on PATH, like the other in-sandbox commands.
     /// A sandbox sharing the current project starts inside the shared folder. Git there uses
-    /// the host's `user.name` and `user.email`, GitHub remotes use HTTPS, and the provider's
-    /// token is handed to git.
+    /// the host's `user.name` and `user.email`, GitHub remotes (and those of hosts remembered
+    /// as GitLab, Bitbucket or Forgejo) use HTTPS, and the provider's token is handed to git.
     pub fn open(sandbox: String, cols: u16, rows: u16) -> Result<Self, String> {
         let script = git_identity_exports(
             host_git("user.name").as_deref(),
             host_git("user.email").as_deref(),
-        ) + ghrepo::git_github_exports()
+        ) + &ghrepo::git_exports(&ghrepo::load_hosts(ghrepo::hosts_path().as_deref()))
             + &start_script(&cli::start_dirs(&sandbox));
         let args = cli::with_gateway(vec![
             "sandbox".into(),

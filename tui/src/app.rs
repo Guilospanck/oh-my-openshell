@@ -36,7 +36,25 @@ pub const TABS: [(Tab, &str); 5] = [
 /// How long an alert stays top-right.
 pub const TOAST_FOR: Duration = Duration::from_secs(5);
 
-const GH_REPO_ITEM: &str = "GitHub repo, read/write (fine-grained token)...";
+/// Why a remote gets no repo access although its host has a provider: osh supports GitHub on
+/// github.com only, Bitbucket Data Center https remotes need `/scm/` without a context path.
+fn unfit(remote: &ghrepo::Remote, forge: Option<ghrepo::Forge>) -> String {
+    match forge {
+        None => format!("No repo access for {}", remote.host),
+        Some(ghrepo::Forge::GitHub) => format!(
+            "No repo access: osh supports GitHub on github.com only, not {}",
+            remote.host
+        ),
+        Some(f) => format!(
+            "No repo access: {}/{} is not a {} repository path osh understands",
+            remote.host,
+            remote.path.join("/"),
+            f.label()
+        ),
+    }
+}
+
+const GH_REPO_ITEM: &str = "Git repo, read/write (GitHub, GitLab, Bitbucket or Forgejo token)...";
 
 #[derive(Clone, Default)]
 pub struct Plan {
@@ -51,7 +69,8 @@ pub struct Plan {
     /// Absolute host folder mounted at `/sandbox/<folder name>`; empty = none.
     pub share: String,
     pub share_rw: bool,
-    /// Read/write access to the shared folder's GitHub repo; the provider is created on confirm.
+    /// Read/write access to the shared folder's repo (GitHub, GitLab, Bitbucket or Forgejo);
+    /// the provider is created on confirm.
     pub gh: Option<GhGrant>,
     /// Where the wizard continues once a provider the plan needs exists.
     pub resume: Resume,
@@ -109,8 +128,11 @@ pub enum SelKind {
     AttachProvider(String),
     DetachProvider(String),
     NewProvider,
-    /// GitHub access for the repo of the shared folder.
+    /// Repo access for the repo of the shared folder, once its provider is known.
     GhAccess(Plan, GhRepo),
+    /// Which git provider hosts the remote; the answer is remembered per host. The plan is the
+    /// wizard's; `None` is the Providers tab's shared token.
+    GitProvider(Option<Plan>, ghrepo::Remote),
     /// Which tracked repo token of a sandbox to renew.
     RenewPick(Vec<ghrepo::Tracked>),
     Gateway,
@@ -367,8 +389,12 @@ pub enum GhStage {
         token: String,
         problem: Option<String>,
     },
-    /// A sandbox was deleted with its token providers; the tokens still live on GitHub.
-    Leftover(Vec<String>),
+    /// A sandbox was deleted with its token providers; the tokens still live where they were
+    /// made: GitHub token names, and (provider, token name, page) for the other providers.
+    Leftover {
+        github: Vec<String>,
+        other: Vec<(String, String, String)>,
+    },
 }
 
 /// Result of a background step of the "add skills to a sandbox" flow.
@@ -481,6 +507,8 @@ pub struct App {
     temp_access: Option<(String, String)>,
     /// Repo tokens osh created, with their expiry; shown on the Providers tab.
     pub tracked: Vec<ghrepo::Tracked>,
+    /// Where "Which git provider hosts HOST?" answers are kept; `None` under test.
+    pub hosts_file: Option<PathBuf>,
     selected: Arc<Mutex<Option<String>>>,
     /// Sandbox (gateway, name) to open once that gateway's snapshot has loaded.
     pending_open: Option<(String, String)>,
@@ -799,6 +827,7 @@ impl App {
             registry,
             legacy_kind: installed_driver(),
             tracked: ghrepo::load_tracked(ghrepo::tracked_path().as_deref()),
+            hosts_file: ghrepo::hosts_path(),
             temp_access: None,
             selected,
             pending_open: None,
@@ -1552,16 +1581,32 @@ impl App {
                 }
                 return;
             }
-            Some(GhStage::Leftover(names)) => {
-                self.modal = Some(Modal::Confirm {
-                    text: format!(
+            Some(GhStage::Leftover { github, other }) => {
+                let mut text = String::new();
+                if !github.is_empty() {
+                    text = format!(
                         "The GitHub token{} only this sandbox used {} still valid on github.com: {}.\n\nGitHub has no way to delete a token from here. Open your token list now so you can delete {}?",
-                        if names.len() == 1 { "" } else { "s" },
-                        if names.len() == 1 { "is" } else { "are" },
-                        names.join(", "),
-                        if names.len() == 1 { "it" } else { "them" },
-                    ),
-                    kind: ConfKind::OpenTokenPage(names),
+                        if github.len() == 1 { "" } else { "s" },
+                        if github.len() == 1 { "is" } else { "are" },
+                        github.join(", "),
+                        if github.len() == 1 { "it" } else { "them" },
+                    );
+                }
+                for (label, token, page) in &other {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&format!(
+                        "The {label} token {token} stays valid until you delete it at {page}."
+                    ));
+                }
+                self.modal = Some(if github.is_empty() {
+                    Modal::Info(text)
+                } else {
+                    Modal::Confirm {
+                        text,
+                        kind: ConfKind::OpenTokenPage(github),
+                    }
                 });
                 return;
             }
@@ -2072,11 +2117,16 @@ impl App {
             .collect::<Vec<_>>()
             .join("\n");
         let extra = plan.gh.as_ref().map_or(String::new(), |g| {
+            // Forgejo tokens never expire, so they get no expiry line.
+            let expiry = if g.repo.forge.expires() {
+                format!(" (expires in {} days)", ghrepo::TOKEN_DAYS)
+            } else {
+                String::new()
+            };
             format!(
-                "First creates provider {} for {} from the pasted token (expires in {} days).\n\n",
+                "First creates provider {} for {} from the pasted token{expiry}.\n\n",
                 ghrepo::provider_name(&plan.name, &g.repo),
-                g.repo.full(),
-                ghrepo::TOKEN_DAYS
+                g.repo.shown(),
             )
         });
         self.modal = Some(Modal::Confirm {
@@ -2264,14 +2314,20 @@ impl App {
             }
             SelKind::GhAccess(mut plan, repo) => {
                 if first.starts_with("Read-only") {
-                    if !plan.providers.iter().any(|p| p == "github") {
-                        plan.providers.push("github".into());
+                    // Only offered where a read-only profile ships (GitHub, Forgejo).
+                    let read = repo.forge.read_profile().unwrap_or("github");
+                    if !plan.providers.iter().any(|p| p == read) {
+                        plan.providers.push(read.into());
                     }
-                    if self.missing(&["github".to_string()]).is_empty() {
+                    if self.missing(&[read.to_string()]).is_empty() {
                         self.ask_command(plan);
                     } else {
                         plan.resume = Resume::Command;
-                        self.start_creds("github".into(), false, Some((plan, vec![])));
+                        if repo.is_github() {
+                            self.start_creds("github".into(), false, Some((plan, vec![])));
+                        } else {
+                            self.start_forgejo_creds(&repo.host, plan);
+                        }
                     }
                 } else if let Some(name) = first.strip_prefix("Use existing provider ") {
                     plan.providers.push(name.into());
@@ -2292,6 +2348,25 @@ impl App {
                     });
                 } else {
                     self.ask_command(plan);
+                }
+            }
+            SelKind::GitProvider(plan, remote) => {
+                let forge = ghrepo::chosen_forge(&first, &remote.host);
+                ghrepo::remember_host(
+                    self.hosts_file.as_deref(),
+                    &remote.host,
+                    forge,
+                    remote.ssh_port,
+                );
+                match plan {
+                    Some(plan) => self.with_forge(plan, &remote, forge),
+                    None => match forge.and_then(|f| remote.repo(f)) {
+                        Some(repo) => self.repo_steps(RepoFlow {
+                            repo,
+                            goal: Goal::Shared,
+                        }),
+                        None => self.status = unfit(&remote, forge),
+                    },
                 }
             }
             SelKind::RenewPick(tracked) => {
@@ -2591,15 +2666,12 @@ impl App {
             }
             SelKind::NewProvider => {
                 if first == GH_REPO_ITEM {
-                    let hint = cli::project_dirs()
-                        .iter()
-                        .find_map(|d| cli::repo_origin(d))
-                        .map(|r| r.full())
-                        .unwrap_or_default();
+                    let hint = self.project_repo().map(|r| r.shown()).unwrap_or_default();
                     let title = if hint.is_empty() {
-                        "Repository, OWNER/REPO".to_string()
+                        "Repository, OWNER/REPO on github.com, or HOST/PATH as in its clone URL"
+                            .to_string()
                     } else {
-                        format!("Repository, OWNER/REPO (empty = {hint})")
+                        format!("Repository, OWNER/REPO or HOST/PATH (empty = {hint})")
                     };
                     self.input(&title, false, InKind::RepoName);
                 } else if self.snap.providers.iter().any(|p| p.name == first) {
@@ -2613,15 +2685,83 @@ impl App {
         }
     }
 
-    /// After the share is set: offer GitHub access when the shared folder is a GitHub repo.
+    /// The repo of the first project folder on GitHub or on a host with a remembered provider.
+    fn project_repo(&self) -> Option<GhRepo> {
+        cli::project_dirs()
+            .iter()
+            .filter_map(|d| cli::origin_remote(d))
+            .find_map(|r| {
+                let forge = if r.host == ghrepo::GITHUB_HOST {
+                    Some(ghrepo::Forge::GitHub)
+                } else {
+                    ghrepo::host_entry(self.hosts_file.as_deref(), &r.host)?.forge
+                };
+                r.repo(forge?)
+            })
+    }
+
+    /// The provider of `host`: GitHub for github.com, else the remembered answer (`Some(None)`
+    /// for "none / other"), else `None` when the user has not been asked.
+    fn known_forge(&self, host: &str) -> Option<Option<ghrepo::Forge>> {
+        if host == ghrepo::GITHUB_HOST {
+            return Some(Some(ghrepo::Forge::GitHub));
+        }
+        ghrepo::host_entry(self.hosts_file.as_deref(), host).map(|e| e.forge)
+    }
+
+    fn ask_provider(&mut self, plan: Option<Plan>, remote: ghrepo::Remote) {
+        let title = format!("Which git provider hosts {}?", remote.host);
+        let items = ghrepo::provider_choices(&remote.host);
+        self.select(&title, items, false, SelKind::GitProvider(plan, remote));
+    }
+
+    /// After the share is set: offer repo access when the shared folder's `origin` is on
+    /// github.com, or on a host whose provider the user names (asked once per host, then
+    /// remembered).
     fn ask_github(&mut self, plan: Plan) {
-        let Some(repo) = cli::repo_origin(&plan.share) else {
+        let Some(remote) = cli::origin_remote(&plan.share) else {
             return self.ask_command(plan);
         };
-        let mut items = vec![
-            "No GitHub access".to_string(),
-            "Read-only (the github provider)".into(),
-        ];
+        match self.known_forge(&remote.host) {
+            Some(forge) => self.with_forge(plan, &remote, forge),
+            None => self.ask_provider(Some(plan), remote),
+        }
+    }
+
+    /// The access question for `remote` on `forge`; straight on to the command for "none", or
+    /// with a status line when the remote does not fit that provider.
+    fn with_forge(&mut self, plan: Plan, remote: &ghrepo::Remote, forge: Option<ghrepo::Forge>) {
+        match forge.and_then(|f| remote.repo(f)) {
+            Some(repo) => self.ask_repo_access(plan, repo),
+            None => {
+                if forge.is_some() {
+                    self.status = unfit(remote, forge);
+                }
+                self.ask_command(plan);
+            }
+        }
+    }
+
+    /// A shared token from the Providers tab for a repo given as HOST/PATH.
+    fn shared_on(&mut self, remote: ghrepo::Remote) {
+        match self.known_forge(&remote.host) {
+            Some(forge) => match forge.and_then(|f| remote.repo(f)) {
+                Some(repo) => self.repo_steps(RepoFlow {
+                    repo,
+                    goal: Goal::Shared,
+                }),
+                None => self.status = unfit(&remote, forge),
+            },
+            None => self.ask_provider(None, remote),
+        }
+    }
+
+    fn ask_repo_access(&mut self, plan: Plan, repo: GhRepo) {
+        let label = repo.forge.label();
+        let mut items = vec![format!("No {label} access")];
+        if let Some(read) = repo.forge.read_profile() {
+            items.push(format!("Read-only (the {read} provider)"));
+        }
         let id = ghrepo::profile_id(&repo);
         let now = ghrepo::now_secs();
         for p in self.snap.providers.iter().filter(|p| p.ty == id) {
@@ -2636,8 +2776,25 @@ impl App {
             "Read and write, a token shared by sandboxes ({})",
             ghrepo::shared_provider_name(&repo)
         ));
-        let title = format!("GitHub access to {}", repo.full());
+        let title = format!("{label} access to {}", repo.shown());
         self.select(&title, items, false, SelKind::GhAccess(plan, repo));
+    }
+
+    /// Create the read-only `forgejo` provider with its host already filled in.
+    fn start_forgejo_creds(&mut self, host: &str, plan: Plan) {
+        let keys = cli::profile_env_keys(&self.dir, "forgejo");
+        let values = if keys.first().map(String::as_str) == Some("FORGEJO_HOST") {
+            vec![("FORGEJO_HOST".to_string(), host.to_string())]
+        } else {
+            vec![]
+        };
+        self.cred_step(InKind::Cred {
+            provider: "forgejo".into(),
+            keys,
+            values,
+            update: false,
+            next: Some((plan, vec![])),
+        });
     }
 
     /// `base`, or `base-2`, `base-3`... when a sandbox of that name exists.
@@ -2661,11 +2818,12 @@ impl App {
     }
 
     fn repo_steps(&mut self, flow: RepoFlow) {
-        let url = ghrepo::token_url(&flow.repo, &self.repo_label(&flow));
+        let label = self.repo_label(&flow);
+        let url = ghrepo::token_url(&flow.repo, &label);
         self.modal = Some(Modal::Confirm {
             text: format!(
                 "{}\n\nOpen the page now and paste the token next?",
-                ghrepo::steps(&flow.repo, &url)
+                ghrepo::steps_for(&flow.repo, &url, &label)
             ),
             kind: ConfKind::RepoSteps(flow),
         });
@@ -2688,7 +2846,7 @@ impl App {
     }
 
     fn renew(&mut self, t: &ghrepo::Tracked) {
-        match ghrepo::parse_remote(&format!("https://github.com/{}", t.repo)) {
+        match GhRepo::from_spec(&t.repo) {
             Some(repo) => self.repo_steps(RepoFlow {
                 repo,
                 goal: Goal::Renew(t.provider.clone()),
@@ -2864,8 +3022,15 @@ impl App {
             }
             InKind::RepoName => {
                 let text = text.trim();
+                let text = text.strip_prefix("https://").unwrap_or(text);
                 let repo = if text.is_empty() {
-                    cli::project_dirs().iter().find_map(|d| cli::repo_origin(d))
+                    self.project_repo()
+                } else if text.split('/').count() >= 3 {
+                    // HOST/PATH: the host's provider, asked once like in the wizard.
+                    match ghrepo::parse_url(&format!("https://{text}")) {
+                        Some(remote) => return self.shared_on(remote),
+                        None => None,
+                    }
                 } else {
                     ghrepo::parse_remote(&format!("https://github.com/{text}"))
                 };
@@ -2874,7 +3039,10 @@ impl App {
                         repo,
                         goal: Goal::Shared,
                     }),
-                    None => self.status = "Error: expected OWNER/REPO on github.com".into(),
+                    None => {
+                        self.status =
+                            "Error: expected OWNER/REPO on github.com, or HOST/PATH".into()
+                    }
                 }
             }
             InKind::RepoToken(flow) => {
@@ -2883,11 +3051,14 @@ impl App {
                     self.status = "Cancelled: empty value".into();
                     return;
                 }
-                self.status = format!("Checking the token against {}...", flow.repo.full());
+                self.status = format!("Checking the token against {}...", flow.repo.shown());
                 self.bg(move || {
                     let problem = match cli::repo_status(&flow.repo, &token) {
                         Ok(s) => cli::repo_status_problem(s, &flow.repo),
-                        Err(e) => Some(format!("Could not reach GitHub: {e}")),
+                        Err(e) => Some(format!(
+                            "Could not reach {}: {e}",
+                            cli::host_name(&flow.repo)
+                        )),
                     };
                     Ok(Done {
                         msg: "Checked the token".into(),
@@ -3070,7 +3241,7 @@ impl App {
                 if !cli::open_url(&url) {
                     self.status = "Could not open a browser; use the URL shown".into();
                 }
-                let title = format!("Token for {} (hidden)", flow.repo.full());
+                let title = format!("Token for {} (hidden)", flow.repo.shown());
                 self.input(&title, true, InKind::RepoToken(flow));
             }
             ConfKind::OpenTokenPage(names) => {
@@ -3088,15 +3259,23 @@ impl App {
                     let msg = if gone.is_empty() {
                         format!("Deleted sandbox {name}")
                     } else {
-                        let names: Vec<&str> = gone.iter().map(|(p, _)| p.as_str()).collect();
+                        let names: Vec<&str> = gone.iter().map(|d| d.provider.as_str()).collect();
                         format!("Deleted sandbox {name} and {}", names.join(", "))
                     };
+                    let mut github = Vec::new();
+                    let mut other = Vec::new();
+                    for d in gone {
+                        match d.page {
+                            Some((label, page)) => other.push((label, d.token, page)),
+                            None => github.push(d.token),
+                        }
+                    }
+                    let any = !github.is_empty() || !other.is_empty();
                     Ok(Done {
                         msg,
                         next: None,
                         sync: None,
-                        gh: (!gone.is_empty())
-                            .then(|| GhStage::Leftover(gone.into_iter().map(|(_, t)| t).collect())),
+                        gh: any.then_some(GhStage::Leftover { github, other }),
                     })
                 })
             }
@@ -3344,7 +3523,7 @@ impl App {
                 match mine.len() {
                     0 => {
                         self.modal = Some(Modal::Info(format!(
-                            "{name} has no GitHub repo token created by osh."
+                            "{name} has no repo token created by osh."
                         )))
                     }
                     1 => self.renew(&mine[0]),
@@ -3356,7 +3535,7 @@ impl App {
                                 format!(
                                     "{} ({}, {})",
                                     t.provider,
-                                    t.repo,
+                                    t.shown().1,
                                     ghrepo::expiry_note(now, t.expiry_ms)
                                 )
                             })
@@ -4272,6 +4451,8 @@ mod tests {
 
     fn repo() -> GhRepo {
         GhRepo {
+            forge: ghrepo::Forge::GitHub,
+            host: "github.com".into(),
             owner: "acme".into(),
             repo: "app".into(),
         }
@@ -4325,6 +4506,10 @@ mod tests {
 
         let mut a = app();
         let d = git_dir("other", Some("git@example.com:acme/app.git"));
+        let hosts = std::env::temp_dir().join(format!("osh-app-hosts-{}", std::process::id()));
+        let _ = std::fs::remove_file(&hosts);
+        a.hosts_file = Some(hosts.clone());
+        ghrepo::remember_host(Some(&hosts), "example.com", None, None);
         a.ask_github(Plan {
             share: d.clone(),
             ..Plan::default()
@@ -4336,7 +4521,313 @@ mod tests {
                 ..
             })
         ));
+        let _ = std::fs::remove_file(hosts);
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    fn forgejo_repo() -> GhRepo {
+        GhRepo {
+            forge: ghrepo::Forge::Forgejo,
+            host: "example.org".into(),
+            owner: "acme".into(),
+            repo: "app".into(),
+        }
+    }
+
+    /// The remote `ask_github` would read from `url`.
+    fn remote(url: &str) -> ghrepo::Remote {
+        ghrepo::parse_url(url).unwrap()
+    }
+
+    fn asks_for_command(a: &App) -> bool {
+        matches!(
+            &a.modal,
+            Some(Modal::Input {
+                kind: InKind::Command(_),
+                ..
+            })
+        )
+    }
+
+    #[test]
+    fn an_unknown_host_is_asked_about_once_and_the_answer_is_remembered() {
+        let hosts = std::env::temp_dir().join(format!("osh-app-ask-{}", std::process::id()));
+        let _ = std::fs::remove_file(&hosts);
+        let url = "git@example.org:acme/app.git";
+        let d = git_dir("fjask", Some(url));
+        let plan = Plan {
+            share: d.clone(),
+            ..Plan::default()
+        };
+        let mut a = app();
+        a.hosts_file = Some(hosts.clone());
+        a.ask_github(plan.clone());
+        let (title, items) = select_items(&a);
+        assert_eq!(title, "Which git provider hosts example.org?");
+        assert_eq!(
+            items,
+            [
+                "GitHub",
+                "GitLab",
+                "Bitbucket",
+                "Forgejo",
+                ghrepo::NO_PROVIDER_ITEM
+            ]
+        );
+        a.on_select(
+            SelKind::GitProvider(Some(plan.clone()), remote(url)),
+            vec!["Forgejo".into()],
+        );
+        let (title, items) = select_items(&a);
+        assert_eq!(title, "Forgejo access to example.org/acme/app");
+        assert_eq!(items[0], "No Forgejo access");
+        assert_eq!(items[1], "Read-only (the forgejo provider)");
+        assert!(items
+            .iter()
+            .any(|i| i.contains("shared by sandboxes (forgejo-app)")));
+        // Remembered: no question the second time.
+        a.ask_github(plan.clone());
+        assert_eq!(select_items(&a).0, "Forgejo access to example.org/acme/app");
+        // "None / other" is remembered too and never asked again.
+        let mut b = app();
+        b.hosts_file = Some(hosts.clone());
+        b.on_select(
+            SelKind::GitProvider(Some(plan.clone()), remote(url)),
+            vec![ghrepo::NO_PROVIDER_ITEM.into()],
+        );
+        assert!(asks_for_command(&b));
+        b.modal = None;
+        b.ask_github(plan);
+        assert!(asks_for_command(&b));
+        let _ = std::fs::remove_file(hosts);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn the_provider_question_puts_the_likely_one_first() {
+        let hosts = std::env::temp_dir().join(format!("osh-app-likely-{}", std::process::id()));
+        let _ = std::fs::remove_file(&hosts);
+        let d = git_dir("likely", Some("https://gitlab.com/grp/sub/app.git"));
+        let mut a = app();
+        a.hosts_file = Some(hosts.clone());
+        a.ask_github(Plan {
+            share: d.clone(),
+            ..Plan::default()
+        });
+        let (title, items) = select_items(&a);
+        assert_eq!(title, "Which git provider hosts gitlab.com?");
+        assert_eq!(items[0], "GitLab");
+        assert_eq!(items.last().unwrap(), ghrepo::NO_PROVIDER_ITEM);
+        let _ = std::fs::remove_file(hosts);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn gitlab_access_has_no_read_only_item_and_shows_gitlab_steps() {
+        let hosts = std::env::temp_dir().join(format!("osh-app-gl-{}", std::process::id()));
+        let _ = std::fs::remove_file(&hosts);
+        let url = "https://gitlab.com/grp/sub/app.git";
+        let mut a = app();
+        a.hosts_file = Some(hosts.clone());
+        a.on_select(
+            SelKind::GitProvider(Some(Plan::default()), remote(url)),
+            vec!["GitLab".into()],
+        );
+        let (title, items) = select_items(&a);
+        assert_eq!(title, "GitLab access to gitlab.com/grp/sub/app");
+        assert_eq!(items[0], "No GitLab access");
+        assert!(!items.iter().any(|i| i.starts_with("Read-only")));
+        assert!(items
+            .iter()
+            .any(|i| i.contains("shared by sandboxes (gitlab-app)")));
+        assert_eq!(
+            ghrepo::host_entry(Some(&hosts), "gitlab.com")
+                .unwrap()
+                .forge,
+            Some(ghrepo::Forge::GitLab)
+        );
+        let Some(Modal::Select { kind, .. }) = a.modal.take() else {
+            panic!("no select")
+        };
+        a.on_select(
+            kind,
+            vec!["Read and write, a token for this sandbox".into()],
+        );
+        match &a.modal {
+            Some(Modal::Confirm { text, .. }) => {
+                assert!(text.contains("project access token for grp/sub/app on gitlab.com"));
+                assert!(text.contains("read_api and write_repository"));
+                assert!(text.contains("/grp/sub/app/-/settings/access_tokens"));
+            }
+            _ => panic!("no steps"),
+        }
+        let _ = std::fs::remove_file(hosts);
+    }
+
+    #[test]
+    fn a_remote_that_does_not_fit_the_provider_gets_no_access() {
+        let hosts = std::env::temp_dir().join(format!("osh-app-unfit-{}", std::process::id()));
+        let _ = std::fs::remove_file(&hosts);
+        let mut a = app();
+        a.hosts_file = Some(hosts.clone());
+        // An https Data Center remote must be /scm/PROJECT/REPO.
+        a.on_select(
+            SelKind::GitProvider(
+                Some(Plan::default()),
+                remote("https://example.net/bitbucket/scm/P/app.git"),
+            ),
+            vec!["Bitbucket".into()],
+        );
+        assert!(asks_for_command(&a));
+        assert!(a.status.contains("Bitbucket Data Center"), "{}", a.status);
+        // GitHub is github.com only.
+        a.on_select(
+            SelKind::GitProvider(Some(Plan::default()), remote("git@example.invalid:a/b.git")),
+            vec!["GitHub".into()],
+        );
+        assert!(asks_for_command(&a));
+        assert!(a.status.contains("github.com only"), "{}", a.status);
+        let _ = std::fs::remove_file(hosts);
+    }
+
+    #[test]
+    fn the_providers_tab_asks_the_provider_of_a_new_host_then_shows_its_steps() {
+        let hosts = std::env::temp_dir().join(format!("osh-app-tab-{}", std::process::id()));
+        let _ = std::fs::remove_file(&hosts);
+        let mut a = app();
+        a.hosts_file = Some(hosts.clone());
+        a.on_input(InKind::RepoName, "example.net/scm/PROJ/app.git".into());
+        let (title, _) = select_items(&a);
+        assert_eq!(title, "Which git provider hosts example.net?");
+        let Some(Modal::Select { kind, .. }) = a.modal.take() else {
+            panic!("no select")
+        };
+        a.on_select(kind, vec!["Bitbucket".into()]);
+        match &a.modal {
+            Some(Modal::Confirm { text, kind }) => {
+                assert!(text.contains("HTTP access tokens > Create token"));
+                assert!(matches!(
+                    kind,
+                    ConfKind::RepoSteps(RepoFlow {
+                        goal: Goal::Shared,
+                        ..
+                    })
+                ));
+            }
+            _ => panic!("no steps"),
+        }
+        // Remembered: straight to the steps.
+        a.modal = None;
+        a.on_input(InKind::RepoName, "example.net/scm/PROJ/lib".into());
+        assert!(matches!(&a.modal, Some(Modal::Confirm { .. })));
+        let _ = std::fs::remove_file(hosts);
+    }
+
+    #[test]
+    fn a_deleted_sandbox_with_a_gitlab_token_names_its_page() {
+        let mut a = app();
+        a.on_done(Done {
+            msg: "Deleted sandbox dev and gitlab-dev-app".into(),
+            next: None,
+            sync: None,
+            gh: Some(GhStage::Leftover {
+                github: vec![],
+                other: vec![(
+                    "GitLab".into(),
+                    "osh-dev-app".into(),
+                    "https://gitlab.com/a/app/-/settings/access_tokens".into(),
+                )],
+            }),
+        });
+        match &a.modal {
+            Some(Modal::Info(text)) => {
+                assert!(text.contains("The GitLab token osh-dev-app"));
+                assert!(text.contains("https://gitlab.com/a/app/-/settings/access_tokens"));
+            }
+            _ => panic!("no gitlab note"),
+        }
+    }
+
+    #[test]
+    fn forgejo_read_write_shows_steps_without_any_expiry() {
+        let mut a = app();
+        a.on_select(
+            SelKind::GhAccess(Plan::default(), forgejo_repo()),
+            vec!["Read and write, a token shared by sandboxes (forgejo-app)".into()],
+        );
+        match &a.modal {
+            Some(Modal::Confirm { text, kind }) => {
+                assert!(text.contains("https://example.org/user/settings/applications/tokens/new"));
+                assert!(text.contains("write:repository") && text.contains("osh-app"));
+                assert!(!text.contains("30") && !text.contains("expires in"));
+                assert!(matches!(
+                    kind,
+                    ConfKind::RepoSteps(RepoFlow {
+                        goal: Goal::SharedFor(_),
+                        ..
+                    })
+                ));
+            }
+            _ => panic!("no steps"),
+        }
+    }
+
+    #[test]
+    fn the_create_confirmation_has_an_expiry_line_for_github_only() {
+        let plan = |repo: GhRepo| Plan {
+            name: "dev".into(),
+            gh: Some(GhGrant {
+                repo,
+                token: "t".into(),
+            }),
+            ..Plan::default()
+        };
+        let mut a = app();
+        a.confirm_create(plan(repo()));
+        let Some(Modal::Confirm { text, .. }) = &a.modal else {
+            panic!("no confirm")
+        };
+        assert!(text.contains("github-dev-app") && text.contains("expires in 30 days"));
+        a.confirm_create(plan(forgejo_repo()));
+        let Some(Modal::Confirm { text, .. }) = &a.modal else {
+            panic!("no confirm")
+        };
+        assert!(
+            text.contains("forgejo-dev-app") && !text.contains("expires"),
+            "{text}"
+        );
+        let steps = a.sandbox_steps(&plan(forgejo_repo()));
+        assert!(steps
+            .last()
+            .unwrap()
+            .args
+            .join(" ")
+            .contains("--provider forgejo-dev-app"));
+    }
+
+    #[test]
+    fn a_deleted_sandbox_with_a_forgejo_token_names_the_host_page() {
+        let mut a = app();
+        a.on_done(Done {
+            msg: "Deleted sandbox dev and forgejo-dev-app".into(),
+            next: None,
+            sync: None,
+            gh: Some(GhStage::Leftover {
+                github: vec![],
+                other: vec![(
+                    "Forgejo".into(),
+                    "osh-dev-app".into(),
+                    ghrepo::forgejo_tokens_page("example.org"),
+                )],
+            }),
+        });
+        match &a.modal {
+            Some(Modal::Info(text)) => {
+                assert!(text.contains("osh-dev-app") && text.contains("example.org"));
+                assert!(text.contains("https://example.org/user/settings/applications"));
+            }
+            _ => panic!("no forgejo note"),
+        }
     }
 
     #[test]
@@ -4488,7 +4979,10 @@ mod tests {
             msg: "Deleted sandbox dev and github-dev-app".into(),
             next: None,
             sync: None,
-            gh: Some(GhStage::Leftover(vec!["osh-dev-app".into()])),
+            gh: Some(GhStage::Leftover {
+                github: vec!["osh-dev-app".into()],
+                other: vec![],
+            }),
         });
         match &a.modal {
             Some(Modal::Confirm {
