@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # Claude Code executes shell commands and needs OS tools.
-FROM node:24-bookworm-slim AS claude-install
+FROM node:24-trixie-slim AS claude-install
 
 # Rebuild with --no-cache to refresh the latest version.
 ARG CLAUDE_CODE_VERSION=latest
@@ -10,7 +10,7 @@ RUN npm install --global --omit=dev --allow-scripts=@anthropic-ai/claude-code \
     "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
     && claude --version
 
-FROM node:24-bookworm-slim AS runtime
+FROM node:24-trixie-slim AS runtime
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \

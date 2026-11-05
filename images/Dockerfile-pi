@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # pi (https://github.com/badlogic/pi-mono) executes shell commands and needs OS tools.
-FROM node:24-bookworm-slim AS runtime
+FROM node:24-trixie-slim AS runtime
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
