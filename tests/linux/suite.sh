@@ -66,7 +66,8 @@ echo "== real: just check and build"
 OSH="$REPO/tui/target/release/osh-tui"
 if [[ -f /etc/os-release ]]; then . /etc/os-release; else . /usr/lib/os-release; fi
 case "$ID" in
-  ubuntu|debian) docker_pkg_line='apt-get install -y docker.io' ;;
+  ubuntu) docker_pkg_line='apt-get install -y docker.io' ;;
+  debian) docker_pkg_line='apt-get install -y docker-ce docker-ce-cli containerd.io' ;;
   fedora) docker_pkg_line='dnf install -y moby-engine' ;;
   arch|archarm) docker_pkg_line='pacman -S --noconfirm --needed docker' ;;
 esac

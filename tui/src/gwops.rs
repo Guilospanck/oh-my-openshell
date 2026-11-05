@@ -1176,6 +1176,8 @@ mod tests {
             docker_desktop: false,
             podman_machine: PodmanMachine::None,
             has_e2fsprogs: true,
+            debian: false,
+            docker_version: None,
         }
     }
 

@@ -308,6 +308,11 @@ pub struct Facts {
     pub podman_machine: PodmanMachine,
     /// `mke2fs` is available, which the VM driver needs to build sandbox disks.
     pub has_e2fsprogs: bool,
+    /// Linux: /etc/os-release says `ID=debian` itself (not Ubuntu or another derivative). Debian's
+    /// packaged `docker.io` is too old for OpenShell, so setup uses Docker's own apt repository.
+    pub debian: bool,
+    /// `docker version` server version, when a Docker daemon answered.
+    pub docker_version: Option<String>,
 }
 
 impl Facts {
@@ -326,6 +331,13 @@ impl Facts {
                 |(_, p)| p.to_string_lossy().into_owned(),
             )
     }
+}
+
+/// True when `ID` of /etc/os-release is exactly `debian` (Ubuntu and derivatives are not).
+pub fn is_debian(text: &str) -> bool {
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .any(|(k, v)| k == "ID" && v.trim().trim_matches(['"', '\'']) == "debian")
 }
 
 /// Maps `ID` / `ID_LIKE` of /etc/os-release to the package manager of that family.
@@ -427,6 +439,18 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
             Ok(_) => runtimes_ready.push(*r),
         }
     }
+    let docker_version = if runtimes_ready.contains(&Runtime::Docker) {
+        h.run("docker", &["version", "--format", "{{.Server.Version}}"])
+            .ok()
+            .map(|o| o.trim().to_string())
+            .filter(|v| !v.is_empty())
+    } else {
+        None
+    };
+    let debian = os == Os::Linux
+        && h.read(Path::new("/etc/os-release"))
+            .or_else(|| h.read(Path::new("/usr/lib/os-release")))
+            .is_some_and(|t| is_debian(&t));
     let kvm = match os {
         Os::MacOs => Kvm::Usable,
         Os::Linux if !h.exists(Path::new("/dev/kvm")) => Kvm::Absent,
@@ -486,6 +510,8 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
         docker_desktop: os == Os::MacOs && h.exists(Path::new("/Applications/Docker.app")),
         podman_machine,
         has_e2fsprogs,
+        debian,
+        docker_version,
     }
 }
 
@@ -549,6 +575,8 @@ pub mod testing {
             docker_desktop: false,
             podman_machine: PodmanMachine::None,
             has_e2fsprogs: false,
+            debian: false,
+            docker_version: None,
         }
     }
 
@@ -653,6 +681,15 @@ mod tests {
     }
 
     #[test]
+    fn only_plain_debian_is_debian() {
+        assert!(is_debian(
+            "PRETTY_NAME=\"Debian GNU/Linux 13\"\nID=debian\n"
+        ));
+        assert!(!is_debian("ID=ubuntu\nID_LIKE=debian\n"));
+        assert!(!is_debian("ID=fedora\n"));
+    }
+
+    #[test]
     fn os_release_fedora_is_dnf() {
         assert_eq!(parse_os_release("ID=fedora\n"), PkgMgr::Dnf);
     }
@@ -732,6 +769,23 @@ mod tests {
         let mut h = FakeHost::with_bins(&["docker"]);
         h.failing.insert("docker info".into());
         assert!(!gather_for(&h, Os::Linux).docker_permission_denied);
+    }
+
+    #[test]
+    fn gather_reads_debian_and_the_docker_server_version() {
+        let mut h = FakeHost::with_bins(&["docker"]);
+        h.files
+            .insert("/etc/os-release".into(), "ID=debian\n".into());
+        h.outputs.insert(
+            "docker version --format {{.Server.Version}}".into(),
+            "26.1.5\n".into(),
+        );
+        let f = gather_for(&h, Os::Linux);
+        assert!(f.debian);
+        assert_eq!(f.docker_version.as_deref(), Some("26.1.5"));
+        let mut down = FakeHost::with_bins(&["docker"]);
+        down.failing.insert("docker info".into());
+        assert_eq!(gather_for(&down, Os::Linux).docker_version, None);
     }
 
     #[test]

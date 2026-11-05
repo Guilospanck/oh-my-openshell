@@ -109,6 +109,39 @@ pub struct StepResult {
     pub outcome: Outcome,
 }
 
+/// Fingerprint of Docker's apt signing key (primary key 8D81803C0EBFCD88), as printed by
+/// `gpg --show-keys --with-colons` on https://download.docker.com/linux/debian/gpg
+/// (9DC8 5822 9FC7 DD38 854A E2D8 8D81 803C 0EBF CD88). Docker's install page does not print the
+/// fingerprint: this value was computed with gpg from the key that URL served on 2026-11-05 and
+/// matches Docker's long-known release key. Update it only after verifying a key rotation.
+const DOCKER_GPG_FINGERPRINT: &str = "9DC858229FC7DD38854AE2D88D81803C0EBFCD88";
+
+/// Downloads the key to a temporary file and installs it only when its fingerprint matches;
+/// otherwise the destination is deleted and the step fails.
+const DOCKER_KEY_SCRIPT: &str = r#"# fetch Docker's apt key and verify its fingerprint
+set -e
+key=/etc/apt/keyrings/docker.asc
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg -o "$tmp/docker.asc"
+keys=$(GNUPGHOME="$tmp" gpg --batch --show-keys --with-colons "$tmp/docker.asc")
+# Exactly one primary key: apt would trust every key in the file, not only the one checked.
+pubs=$(printf '%s\n' "$keys" | awk -F: '$1=="pub"' | wc -l)
+fpr=$(printf '%s\n' "$keys" | awk -F: '$1=="fpr"{print $10; exit}')
+if [ "$pubs" -ne 1 ] || [ "$fpr" != "@FPR@" ]; then
+  rm -f "$key"
+  echo "Docker's apt key file has $pubs key(s), fingerprint '$fpr'; expected one key, @FPR@" >&2
+  exit 1
+fi
+install -m 0644 "$tmp/docker.asc" "$key""#;
+
+const DOCKER_SOURCE_SCRIPT: &str = r#"# write /etc/apt/sources.list.d/docker.sources
+set -e
+. /etc/os-release
+[ -n "$VERSION_CODENAME" ] || { echo "no VERSION_CODENAME in /etc/os-release" >&2; exit 1; }
+printf 'Types: deb\nURIs: https://download.docker.com/linux/debian\nSuites: %s\nComponents: stable\nArchitectures: %s\nSigned-By: /etc/apt/keyrings/docker.asc\n' "$VERSION_CODENAME" "$(dpkg --print-architecture)" > /etc/apt/sources.list.d/docker.sources"#;
+
 /// Package name of a tool for a package manager, where it differs.
 fn pkg_name(tool: &'static str, pm: PkgMgr) -> &'static str {
     match (tool, pm) {
@@ -223,6 +256,65 @@ impl Planner {
         self.push(id, title, kind, optional);
     }
 
+    /// Docker's official packages on Debian. Debian's `docker.io` (26.1) cannot `docker cp` into a
+    /// container created with `--user UID:GID` ("unable to find entry in passwd database"), which
+    /// is how OpenShell's Docker driver provisions every sandbox; Docker 27+ can. Follows
+    /// https://docs.docker.com/engine/install/debian/ with the key's fingerprint checked.
+    fn docker_ce_debian(&mut self) {
+        self.pkg(
+            "runtime-repo-deps",
+            "Install the tools for Docker's apt repository",
+            &["ca-certificates", "curl", "gnupg"],
+            false,
+        );
+        let steps: [(&'static str, &str, &'static str, String); 4] = [
+            (
+                "runtime-repo-key",
+                "Fetch Docker's apt signing key and check its fingerprint",
+                "runtime-repo-deps",
+                DOCKER_KEY_SCRIPT.replace("@FPR@", DOCKER_GPG_FINGERPRINT),
+            ),
+            (
+                "runtime-repo-source",
+                "Add Docker's apt repository",
+                "runtime-repo-key",
+                DOCKER_SOURCE_SCRIPT.to_string(),
+            ),
+            (
+                "runtime-repo-update",
+                "Refresh the apt package index",
+                "runtime-repo-source",
+                String::new(),
+            ),
+            (
+                "runtime",
+                "Install docker",
+                "runtime-repo-update",
+                String::new(),
+            ),
+        ];
+        for (id, title, after, script) in steps {
+            let argv: Vec<String> = match id {
+                "runtime-repo-update" => ["apt-get", "update"].map(String::from).to_vec(),
+                "runtime" => [
+                    "apt-get",
+                    "install",
+                    "-y",
+                    "docker-ce",
+                    "docker-ce-cli",
+                    "containerd.io",
+                ]
+                .map(String::from)
+                .to_vec(),
+                _ => vec!["sh".into(), "-c".into(), script],
+            };
+            let kind = self.privileged(argv);
+            self.push(id, title, kind, false);
+            let after = self.rid(after);
+            self.steps.last_mut().unwrap().after = Some(after);
+        }
+    }
+
     fn manual_runtime_started(&self, rt: Runtime) -> String {
         match (self.f.os, rt) {
             (Os::Linux, Runtime::Docker) => {
@@ -320,7 +412,11 @@ impl Planner {
             }
             (Os::Linux, _) => {
                 let title = format!("Install {}", rt.bin());
-                self.pkg("runtime", &title, &[rt.bin()], false);
+                if rt == Runtime::Docker && f.debian && f.pkg == PkgMgr::Apt {
+                    self.docker_ce_debian();
+                } else {
+                    self.pkg("runtime", &title, &[rt.bin()], false);
+                }
                 if matches!(
                     self.steps.last().map(|s| &s.kind),
                     Some(StepKind::Manual(_))
@@ -1171,6 +1267,31 @@ pub fn doctor(f: &Facts, runtime_needed: bool) -> (String, bool) {
             );
         }
     }
+    if let Some(v) = &f.docker_version {
+        // Unparseable: say nothing rather than fail doctor over it.
+        if let Some(major) = v.split('.').next().and_then(|m| m.parse::<u32>().ok()) {
+            if major < 27 {
+                let fix = if f.debian {
+                    "on Debian install docker-ce from Docker's apt repository (osh setup does \
+                     on a fresh machine): https://docs.docker.com/engine/install/debian/"
+                } else {
+                    "upgrade Docker to 27 or newer: https://docs.docker.com/engine/install/"
+                };
+                let note = format!(
+                    "Docker {v} cannot copy files into the containers OpenShell sandboxes use \
+                     (docker cp into a --user uid:gid container fails); {fix}"
+                );
+                if runtime_needed {
+                    ok = false;
+                    line("BROKEN", "docker version", &note);
+                } else {
+                    line("optional", "docker version", &note);
+                }
+            } else {
+                line("ok", &format!("docker version {v}"), "");
+            }
+        }
+    }
     if f.has_ssh {
         line("ok", "ssh", "");
     } else {
@@ -1417,6 +1538,8 @@ mod tests {
             docker_desktop: false,
             podman_machine: PodmanMachine::None,
             has_e2fsprogs: false,
+            debian: false,
+            docker_version: None,
         }
     }
 
@@ -1466,6 +1589,128 @@ mod tests {
         assert!(has(&steps, "sudo apt-get install -y docker.io"));
         assert!(has(&steps, "sudo systemctl enable --now docker"));
         assert!(has(&steps, "sudo usermod -aG docker ana"));
+    }
+
+    fn docker_opts() -> Options {
+        Options {
+            runtime: Some(Runtime::Docker),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn plan_debian_installs_docker_ce_from_dockers_repo() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.debian = true;
+        let steps = plan(&f, &docker_opts());
+        assert!(!has(&steps, "docker.io"));
+        assert!(has(&steps, "install -y ca-certificates curl gnupg"));
+        let key = steps
+            .iter()
+            .position(|s| s.id == "runtime-repo-key")
+            .unwrap();
+        let line = steps[key].command_line();
+        assert!(line.starts_with("sudo sh -c"), "{line}");
+        assert!(line.contains("https://download.docker.com/linux/debian/gpg"));
+        assert!(line.contains(DOCKER_GPG_FINGERPRINT));
+        assert!(
+            line.contains("rm -f \"$key\""),
+            "a bad fingerprint deletes the key"
+        );
+        assert!(!line.contains("| sh") && !line.contains("|sh"));
+        let src = steps
+            .iter()
+            .position(|s| s.id == "runtime-repo-source")
+            .unwrap();
+        let l = steps[src].command_line();
+        assert!(l.contains("VERSION_CODENAME") && l.contains("dpkg --print-architecture"));
+        assert!(l.contains("Signed-By: /etc/apt/keyrings/docker.asc"));
+        assert!(l.contains("/etc/apt/sources.list.d/docker.sources"));
+        let install = steps.iter().position(|s| s.id == "runtime").unwrap();
+        assert_eq!(
+            steps[install].command_line(),
+            "sudo apt-get install -y docker-ce docker-ce-cli containerd.io"
+        );
+        assert!(key < src && src < install);
+        assert_eq!(steps[install].after, Some("runtime-repo-update"));
+        assert_eq!(steps[src].after, Some("runtime-repo-key"));
+        assert!(has(&steps, "sudo systemctl enable --now docker"));
+    }
+
+    #[test]
+    fn plan_debian_leaves_podman_and_ubuntu_docker_alone() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.debian = true;
+        let podman = Options {
+            runtime: Some(Runtime::Podman),
+            ..Default::default()
+        };
+        assert!(has(&plan(&f, &podman), "apt-get install -y podman"));
+        assert!(!has(&plan(&f, &podman), "docker.io"));
+        f.debian = false;
+        let steps = plan(&f, &docker_opts());
+        assert!(has(&steps, "sudo apt-get install -y docker.io"));
+        assert!(!has(&steps, "docker-ce"));
+    }
+
+    #[test]
+    fn plan_debian_with_docker_io_installed_is_not_touched() {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.debian = true;
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.runtimes_ready = vec![Runtime::Docker];
+        f.docker_version = Some("26.1.5".into());
+        let steps = plan(&f, &docker_opts());
+        assert!(!has(&steps, "docker-ce") && !has(&steps, "docker.io"));
+    }
+
+    #[test]
+    fn docker_repo_scripts_are_valid_shell() {
+        for script in [
+            DOCKER_KEY_SCRIPT.replace("@FPR@", DOCKER_GPG_FINGERPRINT),
+            DOCKER_SOURCE_SCRIPT.to_string(),
+        ] {
+            let st = std::process::Command::new("sh")
+                .args(["-n", "-c", &script])
+                .status()
+                .unwrap();
+            assert!(st.success(), "{script}");
+        }
+    }
+
+    fn doctor_with_docker(version: Option<&str>, debian: bool, needed: bool) -> (String, bool) {
+        let mut f = facts(Os::Linux, PkgMgr::Apt);
+        f.has_openshell = true;
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.runtimes_ready = vec![Runtime::Docker];
+        f.docker_version = version.map(String::from);
+        f.debian = debian;
+        doctor(&f, needed)
+    }
+
+    #[test]
+    fn doctor_flags_docker_below_27() {
+        let (out, ok) = doctor_with_docker(Some("26.1.5"), true, true);
+        assert!(!ok);
+        assert!(out.contains("BROKEN") && out.contains("26.1.5"), "{out}");
+        assert!(
+            out.contains("docs.docker.com/engine/install/debian"),
+            "{out}"
+        );
+        let (out, ok) = doctor_with_docker(Some("26.1.5"), false, true);
+        assert!(!ok && out.contains("upgrade Docker to 27"), "{out}");
+        let (_, ok) = doctor_with_docker(Some("26.1.5"), true, false);
+        assert!(ok, "an optional runtime does not fail doctor");
+    }
+
+    #[test]
+    fn doctor_passes_new_docker_and_skips_unknown() {
+        let (out, ok) = doctor_with_docker(Some("29.9.3"), true, true);
+        assert!(ok && out.contains("docker version 29.9.3") && !out.contains("BROKEN"));
+        for v in [None, Some("weird")] {
+            let (out, ok) = doctor_with_docker(v, true, true);
+            assert!(ok && !out.contains("docker version"), "{out}");
+        }
     }
 
     #[test]

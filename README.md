@@ -55,7 +55,7 @@ detects the OS and package manager (Homebrew, apt, dnf, pacman, zypper) and
 installs OpenShell, the gateway configs and services, whatever each ticked type
 needs (Docker Engine, Podman, Colima, a Podman machine, `e2fsprogs`, KVM access),
 the `ssh` client on Linux (macOS ships it; `openshell sandbox upload` runs it on your machine, so without it nothing can be uploaded into a sandbox, and `osh doctor` reports it), and the optional tools: `tmux`, `gh` and a clipboard tool. `--runtime docker|podman`
-is an alias for `--gateways docker|podman`. It never installs silently: each step is shown first, and what
+is an alias for `--gateways docker|podman`. On Debian, setup installs Docker from Docker's own apt repository (`docker-ce`, after checking the signing key's fingerprint) instead of Debian's `docker.io`, because `docker.io` 26 cannot copy files into the `--user uid:gid` containers OpenShell creates, so every Docker sandbox would fail to provision; Ubuntu's `docker.io` is new enough and is kept. `osh doctor` reports a Docker server older than 27 as broken for sandboxes and says how to fix it (an existing `docker.io` is never replaced by setup). It never installs silently: each step is shown first, and what
 it cannot do for you (no sudo, unknown distro, a stopped Docker daemon) is
 printed as the command to run yourself. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the
 dashboard; image builds need a container runtime.
