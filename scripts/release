@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# scripts/release VERSION [--out DIR] [--no-host] [--linux ARCH...]
+# scripts/release VERSION [--out DIR] [--no-host] [--linux ARCH...] [--macos ARCH...]
 #
-# Builds the osh release archive for this machine, and with --linux also for Linux in containers
-# (ARCH: amd64, arm64; needs Docker or Podman). The GitHub workflow runs this same script on one
+# Builds the osh release archive for this machine, with --linux also for Linux in containers
+# (ARCH: amd64, arm64; needs Docker or Podman), and with --macos also for the other Mac CPU
+# (cross-compiled here; needs `rustup target add`). The GitHub workflow runs this same script on one
 # runner per platform, so a local release and a CI release are built the same way.
 #
 #   scripts/release v0.2.0                       this machine only, into dist/
 #   scripts/release v0.2.0 --linux amd64 arm64   plus both Linux architectures, via containers
+#   scripts/release v0.2.0 --macos amd64 arm64   plus both macOS architectures (on a Mac)
+#
+# Nothing is emulated: the container runs at the engine's own architecture and cross-compiles
+# the other one (Ubuntu's cross gcc; Zig cross-compiles libghostty-vt). Under QEMU the linker
+# crashed (cc: internal compiler error: Segmentation fault) building linux/amd64 on Apple Silicon.
 #
 # Writes dist/osh-VERSION-OS-ARCH.tar.gz and a .sha256 next to each (OS: darwin|linux, ARCH:
 # x86_64|aarch64). Never uploads: it prints the `gh release create` command to run yourself.
@@ -16,10 +22,11 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 version="${1:-}"
-[[ "$version" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "usage: scripts/release vX.Y.Z [--out DIR] [--linux amd64|arm64...]" >&2; exit 2; }
+[[ "$version" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "usage: scripts/release vX.Y.Z [--out DIR] [--linux amd64|arm64...] [--macos amd64|arm64...]" >&2; exit 2; }
 shift
 out="$repo/dist"
 linux=()
+macos=()
 host=1
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,11 +35,15 @@ while [[ $# -gt 0 ]]; do
     --linux) shift; while [[ $# -gt 0 && "$1" != --* ]]; do
         case "$1" in amd64|arm64) linux+=("$1") ;; *) echo "unknown architecture $1" >&2; exit 2 ;; esac; shift
       done; continue ;;
+    --macos) shift; while [[ $# -gt 0 && "$1" != --* ]]; do
+        case "$1" in amd64|arm64) macos+=("$1") ;; *) echo "unknown architecture $1" >&2; exit 2 ;; esac; shift
+      done; continue ;;
     *) echo "unknown option $1" >&2; exit 2 ;;
   esac
   shift
 done
 mkdir -p "$out"
+[[ ${#macos[@]} -eq 0 || "$(uname)" == Darwin ]] || { echo "scripts/release: --macos builds only on a Mac" >&2; exit 2; }
 
 sha256() { if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 
@@ -49,31 +60,64 @@ package() {
 }
 
 host_arch() { case "$(uname -m)" in arm64|aarch64) echo aarch64 ;; *) echo x86_64 ;; esac; }
+arch_of() { case "$1" in amd64) echo x86_64 ;; arm64) echo aarch64 ;; esac; }
 
-# This machine.
-if [[ $host -eq 1 ]]; then
+if [[ $host -eq 1 || ${#macos[@]} -gt 0 ]]; then
   # shellcheck source=../dev-env
   source "$repo/dev-env"
   osh_use_zig || { echo "scripts/release: Zig 0.15 is required (run: just doctor)" >&2; exit 1; }
+fi
+
+# This machine.
+if [[ $host -eq 1 ]]; then
   cargo build --release --manifest-path "$repo/tui/Cargo.toml"
   package "$repo/tui/target/release/osh-tui" "$(uname | tr '[:upper:]' '[:lower:]')" "$(host_arch)"
 fi
+
+# The other Mac CPU, cross-compiled here (this Mac's own one is the host archive above).
+for a in ${macos[@]+"${macos[@]}"}; do
+  arch="$(arch_of "$a")"
+  [[ "$arch" != "$(host_arch)" ]] || continue
+  triple="$arch-apple-darwin"
+  rustup target list --installed 2>/dev/null | grep -qx "$triple" \
+    || { echo "scripts/release: the Rust target $triple is missing (run: rustup target add $triple)" >&2; exit 1; }
+  cargo build --release --target "$triple" --manifest-path "$repo/tui/Cargo.toml"
+  package "$repo/tui/target/$triple/release/osh-tui" darwin "$arch"
+done
 
 # Linux, in containers.
 if [[ ${#linux[@]} -gt 0 ]]; then
   runtime="$(command -v docker || command -v podman || true)"
   [[ -n "$runtime" ]] || { echo "scripts/release: --linux needs docker or podman" >&2; exit 1; }
+  # The engine's own architecture: no --platform, so nothing runs under emulation.
+  image="osh-release"
+  "$runtime" build -t "$image" "$repo/tests/linux"
   for a in "${linux[@]}"; do
-    case "$a" in amd64) arch=x86_64 ;; arm64) arch=aarch64 ;; esac
-    image="osh-release-$a"
-    "$runtime" build --platform "linux/$a" -t "$image" "$repo/tests/linux"
+    arch="$(arch_of "$a")"
     # Under $out, not /tmp: a container VM (Colima, Docker Desktop) shares the home folder, not /var.
     work="$(mktemp -d "$out/.build.XXXXXX")"
     # The container compiles a copy of the tree (tracked and untracked files), not the host's target dir.
+    # shellcheck disable=SC2016  # the script expands its variables in the container
     (cd "$repo" && COPYFILE_DISABLE=1 git ls-files -z --cached --others --exclude-standard |
       COPYFILE_DISABLE=1 tar --null -T - -cf -) |
-      "$runtime" run --rm -i --platform "linux/$a" -v "$work:/out" "$image" bash -c \
-        'tar --warning=no-unknown-keyword -x -C /work && cd /work && source dev-env && osh_use_zig && cargo build --release --manifest-path tui/Cargo.toml && cp tui/target/release/osh-tui /out/osh-tui'
+      "$runtime" run --rm -i -e "ARCH=$arch" -v "$work:/out" "$image" bash -c '
+        set -euo pipefail
+        tar --warning=no-unknown-keyword -x -C /work && cd /work && source dev-env && osh_use_zig
+        if [[ "$(uname -m)" == "$ARCH" ]]; then
+          cargo build --release --manifest-path tui/Cargo.toml
+          cp tui/target/release/osh-tui /out/osh-tui
+          exit 0
+        fi
+        # Cross-compile. The cross glibc comes from the same Ubuntu, so the binary needs the same 2.39.
+        case "$ARCH" in x86_64) gcc=x86-64 libc=amd64 ;; aarch64) gcc=aarch64 libc=arm64 ;; esac
+        apt-get update -qq
+        apt-get install --yes -qq --no-install-recommends "gcc-$gcc-linux-gnu" "g++-$gcc-linux-gnu" "libc6-dev-$libc-cross" >/dev/null
+        triple="$ARCH-unknown-linux-gnu"
+        rustup target add "$triple"
+        t="${triple//-/_}"
+        export "CARGO_TARGET_${t^^}_LINKER=$ARCH-linux-gnu-gcc" "CC_$t=$ARCH-linux-gnu-gcc" "CXX_$t=$ARCH-linux-gnu-g++"
+        cargo build --release --target "$triple" --manifest-path tui/Cargo.toml
+        cp "tui/target/$triple/release/osh-tui" /out/osh-tui'
     package "$work/osh-tui" linux "$arch"
     rm -rf "$work"
   done

@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # scripts/release-colima up|down
 #
-# A separate Colima instance for the Linux release archives on an Apple Silicon Mac. linux/arm64
-# containers run natively. linux/amd64 ones run under QEMU emulation inside the VM, which crashed
-# the linker (cc: Segmentation fault) while building osh, so scripts/publish builds only arm64 unless
-# asked (--linux amd64). Nothing is installed on the Mac.
+# A separate Colima instance for the Linux release archives on an Apple Silicon Mac. Its containers
+# are linux/arm64; scripts/release cross-compiles the amd64 archive in them rather than emulating
+# amd64 (under QEMU the linker crashed building osh). Nothing is installed on the Mac.
 #
 #   up     starts it if needed and prints the Docker socket path on stdout (everything else on stderr)
 #   down   deletes the instance and its disk

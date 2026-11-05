@@ -1,6 +1,7 @@
 # Builds the release archives with the same script a local release uses (scripts/release), one
 # runner per platform, then publishes them. Not exercised while Actions credits are exhausted:
-# use `scripts/release vX.Y.Z --linux amd64 arm64` and `gh release create` by hand until then.
+# use `just release` (all four archives from one Mac) until then. macos-15-intel is the Intel runner
+# (macos-13 was retired in December 2025).
 name: release
 on:
   push:
@@ -11,7 +12,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [macos-14, macos-13, ubuntu-24.04, ubuntu-24.04-arm]
+        os: [macos-14, macos-15-intel, ubuntu-24.04, ubuntu-24.04-arm]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

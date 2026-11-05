@@ -109,6 +109,10 @@ release-setup:
 	command -v just >/dev/null 2>&1 && ok just || no just "brew install just"
 	source "{{justfile_directory()}}/dev-env"
 	osh_use_zig && ok "zig 0.15" || no "zig 0.15" "brew install zig@0.15"
+	if [[ "$(uname)" == Darwin ]]; then
+	    other="$( [[ "$(uname -m)" == arm64 ]] && echo x86_64 || echo aarch64 )-apple-darwin"
+	    rustup target list --installed 2>/dev/null | grep -qx "$other" && ok "rust target $other (the other macOS archive)" || no "rust target $other" "rustup target add $other"
+	fi
 	if [[ "$(uname)" == Darwin && "$(uname -m)" == arm64 ]]; then
 	    # The Linux archives build in their own Colima instance (scripts/release-colima)
 	    command -v colima >/dev/null 2>&1 && command -v limactl >/dev/null 2>&1 && ok "colima, limactl" || no "colima and limactl" "brew install colima lima docker"
@@ -139,9 +143,9 @@ release-setup-ci-key:
 	for id in $old_ids; do gh repo deploy-key delete "$id" -R "$tap" && echo "removed the earlier deploy key $id"; done
 	echo "deploy key added to homebrew-tap (write) and stored as HOMEBREW_TAP_DEPLOY_KEY"
 
-# Builds the archives into dist/ (this Mac plus Linux arm64 in a container; add --linux amd64 arm64 for x86_64, which crashes under QEMU on Apple Silicon); uploads nothing. Usage: just release-build v0.2.0 (uses the Docker you already have; `just release` uses its own Colima on Apple Silicon)
+# Builds the archives into dist/ (this machine, Linux arm64 and amd64 in containers, and on a Mac both macOS CPUs; the foreign ones are cross-compiled); uploads nothing. Usage: just release-build v0.2.0 (uses the Docker you already have; `just release` uses its own Colima on Apple Silicon)
 release-build version:
-	@"{{justfile_directory()}}/scripts/release" {{version}} --linux arm64
+	@"{{justfile_directory()}}/scripts/release" {{version}} --linux arm64 amd64 {{ if os() == "macos" { "--macos arm64 amd64" } else { "" } }}
 
 # Prints the Homebrew formula for the archives already in dist/. Usage: just release-formula v0.2.0
 release-formula version:

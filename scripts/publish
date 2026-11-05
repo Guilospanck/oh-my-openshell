@@ -9,11 +9,12 @@
 #      just release-gate  the container suites: distro build and setup, real Linux with podman and docker
 #                 (sandbox terminal, tmux, gateways, uninstall). Any failure stops the release; there is no flag to skip it.
 #   3. bump        tui/Cargo.toml and Cargo.lock to the version (committed only after the build works)
-#   4. build       scripts/release: this Mac, plus Linux amd64 and arm64 in containers
+#   4. build       scripts/release: macOS arm64 and x86_64 on this Mac, Linux arm64 and amd64 in containers
 #   5. lint        renders the formula and runs `brew style` on it
 #   6. publish     commits the bump, pushes it and the tag, `gh release create`, pushes the tap
 #
-# The Linux archives build in containers (arm64 by default, see --linux). On an Apple Silicon Mac that is a separate Colima instance
+# The Linux archives build in containers (both by default, see --linux); the one that is not the
+# engine's own architecture is cross-compiled, not emulated. On an Apple Silicon Mac that is a separate Colima instance
 # (scripts/release-colima), started for the run and deleted afterwards (--keep-vm keeps
 # it); --host-docker uses the Docker you already have instead. Elsewhere the current Docker or Podman.
 #
@@ -31,9 +32,10 @@ shift
 version="${tag#v}"
 dry=0
 notes=""
-# Native arm64 only by default: x86_64 under QEMU on Apple Silicon crashed the linker (cc: internal
-# compiler error: Segmentation fault), so --linux amd64 is opt-in. CI builds it on a native runner.
-linux=(arm64)
+linux=(arm64 amd64)
+# Both Mac CPUs; scripts/release cross-compiles the one this Mac is not.
+macos=()
+[[ "$(uname)" != Darwin ]] || macos=(arm64 amd64)
 own_vm=1
 keep_vm=0
 vm_up=0
@@ -68,6 +70,10 @@ trap 'exit 130' INT TERM
 
 say "preflight"
 for t in git gh just cargo brew; do command -v "$t" >/dev/null 2>&1 || die "$t is required"; done
+if [[ ${#macos[@]} -gt 0 ]]; then
+  other="$( [[ "$(uname -m)" == arm64 ]] && echo x86_64 || echo aarch64 )-apple-darwin"
+  rustup target list --installed 2>/dev/null | grep -qx "$other" || die "the Rust target $other is missing (run: rustup target add $other)"
+fi
 gh auth status >/dev/null 2>&1 || die "gh is not logged in (run: gh auth login)"
 [[ -z "$(git status --porcelain)" ]] || die "working tree not clean: commit or stash first"
 [[ "$(git rev-parse --abbrev-ref HEAD)" == main ]] || die "release from main"
@@ -80,8 +86,7 @@ if [[ $dry -eq 0 ]]; then
     || die "no push access to $tap_repo (run: just release-setup)"
 fi
 
-# Containers for the Linux archives. Foreign architectures need an emulator in the VM, or the
-# build dies with "exec format error".
+# Containers for the Linux archives.
 if [[ ${#linux[@]} -gt 0 ]]; then
   if [[ $own_vm -eq 1 && "$(uname)" == Darwin && "$(uname -m)" == arm64 ]]; then
     say "release Colima instance"
@@ -92,10 +97,6 @@ if [[ ${#linux[@]} -gt 0 ]]; then
   fi
   rt=docker; docker info >/dev/null 2>&1 || rt=podman
   "$rt" info >/dev/null 2>&1 || die "the Linux archives need a running Docker or Podman (start Colima, or pass --no-linux)"
-  for a in "${linux[@]}"; do
-    "$rt" run --rm --platform "linux/$a" busybox true >/dev/null 2>&1 \
-      || die "cannot run linux/$a containers here (no emulator). Use the default release Colima (drop --host-docker), register one: $rt run --privileged --rm tonistiigi/binfmt --install $a; or build only what runs: --linux arm64"
-  done
 fi
 echo "ok"
 
@@ -108,7 +109,7 @@ just --justfile "$repo/.justfile" release-gate
 say "bump to $version"
 perl -0pi -e 's/^version = "[^"]*"/version = "'"$version"'"/m' tui/Cargo.toml
 rm -rf "$repo/dist"
-"$repo/scripts/release" "$tag" --out "$repo/dist" ${linux[@]+--linux "${linux[@]}"}
+"$repo/scripts/release" "$tag" --out "$repo/dist" ${linux[@]+--linux "${linux[@]}"} ${macos[@]+--macos "${macos[@]}"}
 git diff --quiet -- tui/Cargo.toml && die "version bump changed nothing (Cargo.toml is already $version)"
 host_bin="$repo/tui/target/release/osh-tui"
 [[ "$("$host_bin" --version)" == "osh $version" ]] || die "built binary reports '$("$host_bin" --version)', expected 'osh $version'"

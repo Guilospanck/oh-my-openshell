@@ -34,10 +34,10 @@ osh setup                                      # then install what osh needs (as
 ```
 
 Homebrew installs only the `osh` binary; it does not install OpenShell, a container runtime or a gateway until you
-run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. To remove everything, run `osh uninstall` (it also runs `brew uninstall` for you); a bare `brew uninstall` removes only the binary and leaves OpenShell, its gateways and osh's data behind. After such a reinstall, `osh` prints a one-time notice that it found that data and is using it. Releases currently ship Apple Silicon macOS and arm64
-Linux archives, so Intel Macs and x86_64 Linux need to build from source until those archives are added.
+run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. To remove everything, run `osh uninstall` (it also runs `brew uninstall` for you); a bare `brew uninstall` removes only the binary and leaves OpenShell, its gateways and osh's data behind. After such a reinstall, `osh` prints a one-time notice that it found that data and is using it. Releases ship
+macOS and Linux archives for both aarch64 (Apple Silicon, arm64) and x86_64 (Intel, AMD).
 
-Install from a release (Linux or macOS, aarch64; x86_64 once those archives are published): `curl -fsSL
+Install from a release (Linux or macOS, aarch64 or x86_64): `curl -fsSL
 https://raw.githubusercontent.com/Guilospanck/oh-my-openshell/main/install.sh | sh` downloads
 `osh-VERSION-OS-ARCH.tar.gz`, checks its `.sha256`, puts `osh` in `~/.local/bin` and runs `osh setup`
 (asking before each step, on the terminal even when piped). Environment: `OSH_VERSION` (release tag; default the
@@ -60,7 +60,7 @@ it cannot do for you (no sudo, unknown distro, a stopped Docker daemon) is
 printed as the command to run yourself. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the
 dashboard; image builds need a container runtime.
 
-Release archives: `scripts/release vX.Y.Z [--linux amd64 arm64]` builds them into `dist/` with a `.sha256` each
+Release archives: `scripts/release vX.Y.Z [--linux amd64 arm64] [--macos amd64 arm64]` builds them into `dist/` with a `.sha256` each
 and prints the `gh release create` command; it never uploads. Pushing a `v*` tag runs the same script in
 `.github/workflows/release.yml` (one runner per platform, then publish), which has not yet run on GitHub.
 
@@ -69,12 +69,13 @@ Releasing from this machine, the same steps as the workflow plus the Homebrew fo
 `just release-gate`, version bump, archives, formula lint; pushes nothing, reverts the bump), then `just release vX.Y.Z ["notes"]`
 (commits the `tui/Cargo.toml` bump, tags, pushes, `gh release create`, pushes `Formula/oh-my-openshell.rb` to
 `Guilospanck/homebrew-tap`). It needs a clean `main` level with `origin`, and never runs `osh` or `osh setup`.
-On Apple Silicon the Linux arm64 archive builds in a separate Colima instance (`scripts/release-colima`; needs
+On Apple Silicon the Linux archives build in a separate Colima instance (`scripts/release-colima`; needs
 `colima` and `lima`), created for the run and deleted after it (`--keep-vm` keeps it, `--host-docker` uses your own
-Docker instead); your own Colima is not touched. The x86_64 Linux archive is opt-in (`--linux amd64`): under QEMU
-on Apple Silicon the linker crashed in a test, so it is left to CI's native runner and the formula omits that block.
-Users then run `brew install Guilospanck/tap/oh-my-openshell`; the formula installs only the binary. A Mac builds
-only its own architecture, so an Apple Silicon release has no Intel macOS archive and the formula omits that block.
+Docker instead); your own Colima is not touched. Nothing is emulated (under QEMU the linker crashed): the container
+runs at the engine's own architecture and cross-compiles the other Linux archive with Ubuntu's cross gcc, and the Mac
+cross-compiles the other macOS one, which needs `rustup target add x86_64-apple-darwin` once (`just release-setup`
+checks it). Users then run `brew install Guilospanck/tap/oh-my-openshell`; the formula installs only the binary, and
+a platform without an archive gets no block.
 `just release-gate` runs the container suites (distro build and setup, real Linux with podman and docker,
 including the sandbox terminal and tmux checks) and `just release` stops if any of them fails; there is
 no flag to skip it.
