@@ -26,8 +26,8 @@ devices=()
 if [[ "$runtime" == vm ]]; then
   # Asked of the Docker host itself (on a Mac that is the Colima or Docker Desktop VM, not macOS).
   # A probe that fails for another reason (no image, no network) is an error, not a skip.
-  docker run --rm ubuntu:24.04 true >/dev/null || { echo "cannot run ubuntu:24.04 to probe for /dev/kvm" >&2; exit 1; }
-  if ! docker run --rm --device /dev/kvm ubuntu:24.04 test -c /dev/kvm >/dev/null 2>&1; then
+  docker run --rm debian:trixie true >/dev/null || { echo "cannot run debian:trixie to probe for /dev/kvm" >&2; exit 1; }
+  if ! docker run --rm --device /dev/kvm debian:trixie test -c /dev/kvm >/dev/null 2>&1; then
     cat >&2 <<'EOF'
 ################################################################################
 SKIPPED: the VM gateway scenario did not run.

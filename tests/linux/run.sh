@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run the Linux test suite in Docker containers, one per distro. Needs a running Docker daemon.
-#   tests/linux/run.sh                  all distros (ubuntu, fedora, arch)
+#   tests/linux/run.sh                  all distros (debian, ubuntu, fedora, arch)
 #   tests/linux/run.sh --distro fedora  one distro
 #   tests/linux/run.sh --rebuild        rebuild the images first
 # Copies tracked and untracked files (not ignored ones) into the container, so uncommitted
@@ -10,15 +10,15 @@ set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # The official archlinux image is amd64 only; lopsided/archlinux is the multi-arch community build.
 case "$(uname -m)" in arm64|aarch64) arch_base=lopsided/archlinux:latest ;; *) arch_base=archlinux:latest ;; esac
-declare -A bases=([ubuntu]=ubuntu:24.04 [fedora]=fedora:41 [arch]="$arch_base")
-distros=(ubuntu fedora arch)
+declare -A bases=([debian]=debian:trixie [ubuntu]=ubuntu:24.04 [fedora]=fedora:41 [arch]="$arch_base")
+distros=(debian ubuntu fedora arch)
 rebuild=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --rebuild) rebuild=1 ;;
-    --distro) shift; [[ -n "${bases[${1:-}]:-}" ]] || { echo "unknown distro ${1:-}; use ubuntu, fedora or arch" >&2; exit 2; }; distros=("$1") ;;
-    *) echo "usage: run.sh [--rebuild] [--distro ubuntu|fedora|arch]" >&2; exit 2 ;;
+    --distro) shift; [[ -n "${bases[${1:-}]:-}" ]] || { echo "unknown distro ${1:-}; use debian, ubuntu, fedora or arch" >&2; exit 2; }; distros=("$1") ;;
+    *) echo "usage: run.sh [--rebuild] [--distro debian|ubuntu|fedora|arch]" >&2; exit 2 ;;
   esac
   shift
 done

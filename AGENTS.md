@@ -70,7 +70,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   except repairing a launchd agent whose program is gone (`gwops::stale_agent_steps`: the older
   `just gateway-docker` agent pointed at the deleted `gateway-docker-service`). Branch on `Os` / `PkgMgr` / `cfg!(target_os)`.
 - `just test-linux` (Docker; `tests/linux/`) runs the real build, clippy and
-  tests on Ubuntu, Fedora and Arch, and `osh setup` with real package installs
+  tests on Debian, Ubuntu, Fedora and Arch, and `osh setup` with real package installs
   (OpenShell installer, systemd and the container runtime daemons stubbed); `just test-linux-real
   podman|docker|vm` boots a systemd machine with nothing stubbed and runs the two-gateway
   scenarios (add, remove, reset, uninstall); the podman run also drives the wizard in a real
