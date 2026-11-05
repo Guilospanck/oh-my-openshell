@@ -1274,20 +1274,42 @@ fn sandbox_home(sandbox: &str) -> String {
         .unwrap_or_else(|| "/workspace".into())
 }
 
-/// Put the host's tmux config in a sandbox just created, so its tmux has the host's prefix and
-/// bindings from the first shell. `name` is empty when OpenShell generated it: the sandbox is
-/// then the first one not in `before`. Skipped (with the reason) when the host has no config,
-/// the secret scan flags it, or the image has no tmux.
-pub fn install_tmux_conf(dir: &Path, name: &str, before: &[String]) -> Result<String, String> {
-    if agents::Env::detect(dir, "").tmux_conf.is_none() {
-        return Ok("Sandbox created (no host tmux config to copy)".into());
+/// Put the host's tmux config and a filtered copy of its global git config (allowlist in
+/// `agents::filter_git_config`) in a sandbox just created, so its tmux has the host's prefix and
+/// bindings and its git the host's aliases and colours from the first shell. `name` is empty when
+/// OpenShell generated it: the sandbox is then the first one not in `before`. One wait for the
+/// sandbox serves both. Each copy is skipped (with the reason) when the host has none, the secret
+/// scan flags it, or the image lacks the tool; a skip never fails the creation.
+pub fn install_sandbox_confs(dir: &Path, name: &str, before: &[String]) -> Result<String, String> {
+    let has_tmux = agents::Env::detect(dir, "").tmux_conf.is_some();
+    let git = agents::gitconfig_for_new_sandbox(dir);
+    if !has_tmux && !matches!(git, Ok(Some(_))) {
+        let git_note = match &git {
+            Err(e) => format!("git config not copied: {e}"),
+            _ => "no host git config to copy".into(),
+        };
+        return Ok(format!(
+            "Sandbox created (no host tmux config to copy; {git_note})"
+        ));
     }
-    upload_tmux_conf(dir, name, before)
+    let result = upload_sandbox_confs(dir, name, before, has_tmux, &git);
+    if let Ok(Some(f)) = &git {
+        if let Some(stage) = f.parent() {
+            let _ = std::fs::remove_dir_all(stage);
+        }
+    }
+    result
 }
 
-fn upload_tmux_conf(dir: &Path, name: &str, before: &[String]) -> Result<String, String> {
+fn upload_sandbox_confs(
+    dir: &Path,
+    name: &str,
+    before: &[String],
+    has_tmux: bool,
+    git: &Result<Option<PathBuf>, String>,
+) -> Result<String, String> {
     let mut name = name.to_string();
-    let mut home = String::new();
+    let mut probe = String::new();
     // A detached create can return before the sandbox accepts commands.
     for _ in 0..30 {
         if name.is_empty() {
@@ -1302,38 +1324,76 @@ fn upload_tmux_conf(dir: &Path, name: &str, before: &[String]) -> Result<String,
             }
         }
         if !name.is_empty() {
-            let args: Vec<String> = [
-                "sandbox",
-                "exec",
-                "-n",
-                &name,
-                "--timeout",
-                "30",
-                "--",
-                "sh",
-                "-c",
-                "if command -v tmux >/dev/null 2>&1; then printf %s \"$HOME\"; else printf none; fi",
-            ]
-            .map(String::from)
-            .to_vec();
-            if let Ok(t) = exec("openshell", &args, &[]) {
-                home = t.trim().to_string();
+            let script = "printf '%s\\n' \"$HOME\"; \
+                command -v tmux >/dev/null 2>&1 && echo tmux; \
+                command -v git >/dev/null 2>&1 && echo git; true";
+            if let Ok(t) = exec("openshell", &sandbox_sh(&name, script), &[]) {
+                probe = t;
                 break;
             }
         }
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    if name.is_empty() || home.is_empty() {
-        return Err("Sandbox created, tmux config not copied: sandbox not ready".into());
+    let mut lines = probe.lines();
+    let home = lines.next().unwrap_or("").trim().to_string();
+    if name.is_empty() || !home.starts_with('/') {
+        return Err("Sandbox created, host configs not copied: sandbox not ready".into());
     }
-    if !home.starts_with('/') {
-        return Ok(format!("Sandbox created ({name}'s image has no tmux)"));
-    }
+    let tools: Vec<&str> = lines.collect();
+    let tmux = if !has_tmux {
+        "no host tmux config to copy".to_string()
+    } else if !tools.contains(&"tmux") {
+        format!("{name}'s image has no tmux")
+    } else {
+        match upload_tmux_conf(dir, &name, &home) {
+            Ok(m) => m,
+            Err(e) => format!("tmux config not copied: {e}"),
+        }
+    };
+    let gitmsg = match git {
+        Err(e) => format!("git config not copied: {e}"),
+        Ok(None) => "no host git config to copy".into(),
+        Ok(Some(_)) if !tools.contains(&"git") => format!("{name}'s image has no git"),
+        Ok(Some(f)) => match upload_git_conf(&name, &home, f) {
+            Ok(m) => m,
+            Err(e) => format!("git config not copied: {e}"),
+        },
+    };
+    Ok(format!("Sandbox created ({tmux}; {gitmsg})"))
+}
+
+/// Upload the filtered git config and make the sandbox's `~/.gitconfig` include it.
+fn upload_git_conf(name: &str, home: &str, file: &Path) -> Result<String, String> {
+    exec(
+        "openshell",
+        &sandbox_sh(name, "mkdir -p \"$HOME/.config/osh\""),
+        &[],
+    )?;
+    let args: Vec<String> = [
+        "sandbox",
+        "upload",
+        name,
+        &file.to_string_lossy(),
+        &format!("{home}/.config/osh/gitconfig"),
+        "--no-git-ignore",
+    ]
+    .map(String::from)
+    .to_vec();
+    exec("openshell", &args, &[])?;
+    exec(
+        "openshell",
+        &sandbox_sh(name, &agents::git_include_script()),
+        &[],
+    )?;
+    Ok("host git config copied".into())
+}
+
+fn upload_tmux_conf(dir: &Path, name: &str, home: &str) -> Result<String, String> {
     // The image's tmux can be older than the host's: leave out the options it does not have.
     let known = exec(
         "openshell",
         &sandbox_sh(
-            &name,
+            name,
             "tmux -L oshchk -f /dev/null new-session -d 'sleep 30' >/dev/null 2>&1; \
              for f in -g -gw -gs; do tmux -L oshchk show-options $f; done 2>/dev/null; \
              tmux -L oshchk kill-server >/dev/null 2>&1; true",
@@ -1350,22 +1410,20 @@ fn upload_tmux_conf(dir: &Path, name: &str, before: &[String]) -> Result<String,
     .filter(|k| !k.is_empty());
     let conf = match agents::tmux_conf_for_new_sandbox(dir, known.as_ref()) {
         Ok(Some(c)) => c,
-        Ok(None) => return Ok("Sandbox created (no host tmux config to copy)".into()),
-        Err(e) => return Err(format!("Sandbox created, tmux config not copied: {e}")),
+        Ok(None) => return Ok("no host tmux config to copy".into()),
+        Err(e) => return Err(e),
     };
     let args: Vec<String> = [
         "sandbox",
         "upload",
-        &name,
+        name,
         &conf.to_string_lossy(),
         &format!("{home}/.tmux.conf"),
         "--no-git-ignore",
     ]
     .map(String::from)
     .to_vec();
-    let result = exec("openshell", &args, &[])
-        .map(|_| format!("Sandbox created; host tmux config copied to {name}"))
-        .map_err(|e| format!("Sandbox created, tmux config not copied: {e}"));
+    let result = exec("openshell", &args, &[]).map(|_| "host tmux config copied".to_string());
     if let Some(stage) = conf.parent() {
         let _ = std::fs::remove_dir_all(stage);
     }

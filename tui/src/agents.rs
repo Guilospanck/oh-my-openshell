@@ -273,6 +273,110 @@ pub fn tmux_conf_for_new_sandbox(
     }
 }
 
+/// Git keys safe to copy into a sandbox (compared lowercase): behaviour and looks only. Anything
+/// that holds a credential, runs a host program or names a host path (`credential.*`, `http.*`,
+/// `url.*`, `include*`, `gpg.*`, signing, `core.sshcommand|editor|pager|hookspath|excludesfile`,
+/// tool and filter drivers, `safe.directory`) is not here and so is dropped.
+const GIT_PREFIXES: [&str; 2] = ["alias.", "color."];
+const GIT_KEYS: [&str; 14] = [
+    "init.defaultbranch",
+    "push.default",
+    "push.autosetupremote",
+    "pull.rebase",
+    "merge.conflictstyle",
+    "diff.algorithm",
+    "diff.colormoved",
+    "branch.sort",
+    "rebase.autosquash",
+    "rebase.autostash",
+    "fetch.prune",
+    "rerere.enabled",
+    "core.autocrlf",
+    "core.whitespace",
+];
+
+/// The `(key, value)` pairs of `git config --global --list -z` (`key\nvalue\0` entries, so values
+/// may hold newlines) that the allowlist keeps, in order, repeated keys included.
+pub fn filter_git_config(list_z: &str) -> Vec<(String, String)> {
+    list_z
+        .split('\0')
+        .filter_map(|e| {
+            let (k, v) = e.split_once('\n').unwrap_or((e, ""));
+            let lk = k.to_ascii_lowercase();
+            let ok =
+                GIT_PREFIXES.iter().any(|p| lk.starts_with(p)) || GIT_KEYS.contains(&lk.as_str());
+            (ok && !k.is_empty()).then(|| (k.to_string(), v.to_string()))
+        })
+        .collect()
+}
+
+/// The shell run in a sandbox (as `sh -c`) after the filtered config is uploaded to
+/// `~/.config/osh/gitconfig`: make `~/.gitconfig` include it. An existing `~/.gitconfig` is never
+/// overwritten, only given the include line once. osh's per-shell git env (identity, credential
+/// helpers, `GIT_CONFIG_COUNT`) overrides files, so it keeps precedence over this copy.
+pub fn git_include_script() -> String {
+    "if [ -e \"$HOME/.gitconfig\" ]; then \
+       git config --global --get-all include.path | grep -qxF '~/.config/osh/gitconfig' \
+         || git config --global --add include.path '~/.config/osh/gitconfig'; \
+     else \
+       printf '[include]\\n\\tpath = ~/.config/osh/gitconfig\\n' > \"$HOME/.gitconfig\"; \
+     fi"
+    .into()
+}
+
+/// The host's global git config, filtered, as a private file to upload to a new sandbox:
+/// `Ok(None)` when nothing is kept, `Err` when the secret scan flags it. The caller removes the
+/// file's directory (its parent) after the upload.
+pub fn gitconfig_for_new_sandbox(data_dir: &Path) -> Result<Option<PathBuf>, String> {
+    let list = Command::new("git")
+        .args(["config", "--global", "--list", "-z"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let kept = filter_git_config(&list);
+    if kept.is_empty() {
+        return Ok(None);
+    }
+    let env = Env::detect(data_dir, "");
+    let stage = std::env::temp_dir().join(format!("osh-gitconfig-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&stage);
+    let fail = |e: String| {
+        let _ = fs::remove_dir_all(&stage);
+        Err(e)
+    };
+    if let Err(e) = fs::create_dir_all(&stage).and_then(|_| {
+        fs::set_permissions(&stage, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+    }) {
+        return fail(e.to_string());
+    }
+    let file = stage.join("gitconfig");
+    if let Err(e) = fs::write(&file, "").and_then(|_| {
+        fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+    }) {
+        return fail(e.to_string());
+    }
+    for (k, v) in &kept {
+        let ok = Command::new("git")
+            .args(["config", "--file"])
+            .arg(&file)
+            .args(["--add", "--", k, v])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return fail(format!("git could not write {k}"));
+        }
+    }
+    if scan(&env, &stage).unwrap_or_default().is_empty() {
+        Ok(Some(file))
+    } else {
+        fail("the secret scan flagged your git config".into())
+    }
+}
+
 fn which(bin: &str) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|d| d.join(bin))
@@ -1655,6 +1759,52 @@ mod tests {
         v.as_object_mut().unwrap().remove("stage_dir");
         let _ = fs::remove_dir_all(&stage);
         serde_json::from_str(&v.to_string().replace(&stage, "<STAGE>")).unwrap()
+    }
+
+    #[test]
+    fn git_config_filter_keeps_only_the_allowlist() {
+        let list =
+            "user.name\nA B\0user.email\na@b.c\0Alias.Co\ncheckout\0alias.sh\n!echo a=b  c\0\
+            COLOR.ui\nauto\0Init.DefaultBranch\nmain\0pull.rebase\ntrue\0alias.ml\nl1\nl2\0\
+            credential.helper\n!store\0credential.https://x.com.username\nu\0http.proxy\nh\0\
+            url.git@x:.insteadof\nhttps://x/\0include.path\n/x\0includeIf.gitdir:/a.path\n/y\0\
+            gpg.program\ng\0commit.gpgsign\ntrue\0tag.gpgsign\ntrue\0user.signingkey\nk\0\
+            core.sshcommand\ns\0core.editor\nvim\0core.pager\nless\0core.hookspath\n/h\0\
+            core.excludesfile\n/e\0core.autocrlf\ninput\0diff.tool\nx\0merge.tool\nx\0\
+            filter.lfs.clean\ngit lfs\0safe.directory\n*\0";
+        let got = filter_git_config(list);
+        let keys: Vec<&str> = got.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "Alias.Co",
+                "alias.sh",
+                "COLOR.ui",
+                "Init.DefaultBranch",
+                "pull.rebase",
+                "alias.ml",
+                "core.autocrlf"
+            ]
+        );
+        assert_eq!(got[1].1, "!echo a=b  c");
+        assert_eq!(got[5].1, "l1\nl2");
+    }
+
+    #[test]
+    fn git_config_filter_of_nothing_useful_is_empty() {
+        assert!(filter_git_config("").is_empty());
+        assert!(filter_git_config("user.name\nA\0credential.helper\nx\0").is_empty());
+    }
+
+    #[test]
+    fn git_include_script_never_overwrites_an_existing_gitconfig() {
+        let s = git_include_script();
+        assert!(s.contains("[ -e \"$HOME/.gitconfig\" ]"));
+        assert!(s.contains("--get-all include.path"));
+        assert!(s.contains("--add include.path '~/.config/osh/gitconfig'"));
+        // The only plain write is in the branch for an absent file.
+        assert_eq!(s.matches("> \"$HOME/.gitconfig\"").count(), 1);
+        assert!(s.contains("[include]"));
     }
 
     fn tmp(name: &str) -> PathBuf {

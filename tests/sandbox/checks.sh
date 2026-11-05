@@ -10,7 +10,7 @@
 
 sandbox_checks() {
   local name=osh-test tag=claude-code out
-  echo "== a sandbox made from osh's policy and image: terminal, tmux, writes"
+  echo "== a sandbox made from osh's policy and image: terminal, tmux, writes, git config"
   check "osh wrote the sandbox policy" test -f "$data/sandbox-policy.yaml"
   "$runtime" build -f "$data/images/Dockerfile-claude_code" -t "$tag" "$data/images" >"$HOME/image.log" 2>&1 \
     && pass "the claude-code image builds" || { fail "the claude-code image builds"; tail -8 "$HOME/image.log"; return; }
@@ -31,6 +31,18 @@ sandbox_checks() {
   # Landlock allows the system directories; plain file modes still apply to the sandbox user.
   out="$(ex 'touch /tmp/osh-w "$HOME/osh-w" /dev/shm/osh-w && echo write-ok')"
   [[ "$out" == *write-ok* ]] && pass "the sandbox user can write to its home, /tmp and /dev/shm" || fail "the sandbox user can write to its home, /tmp and /dev/shm" "$out"
+
+  # The host git config copy (cli::install_sandbox_confs): upload to a nested path, then the
+  # include script from agents::git_include_script, run twice to prove it adds the line once.
+  printf '[alias]\n\toshhi = !echo osh-git-alias\n' >"$HOME/osh-gitconfig"
+  local home; home="$(ex 'printf %s "$HOME"')"
+  ex 'mkdir -p "$HOME/.config/osh"' >/dev/null
+  openshell -g "$main" sandbox upload "$name" "$HOME/osh-gitconfig" "$home/.config/osh/gitconfig" --no-git-ignore >/dev/null 2>&1 \
+    && pass "the git config uploads to a nested path" || fail "the git config uploads to a nested path"
+  local inc="if [ -e \"\$HOME/.gitconfig\" ]; then git config --global --get-all include.path | grep -qxF '~/.config/osh/gitconfig' || git config --global --add include.path '~/.config/osh/gitconfig'; else printf '[include]\\n\\tpath = ~/.config/osh/gitconfig\\n' > \"\$HOME/.gitconfig\"; fi"
+  out="$(ex "$inc; $inc; git oshhi; git config --global --get-all include.path | grep -c osh/gitconfig")"
+  [[ "$out" == *osh-git-alias* && "$out" == *$'\n'1* ]] && pass "a host git alias works and the include is added once" \
+    || fail "a host git alias works and the include is added once" "$out"
 
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
 }

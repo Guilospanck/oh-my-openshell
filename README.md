@@ -127,7 +127,7 @@ shell, host tmux shortcuts included: when osh runs in tmux, the host's prefix an
 pane, else run the original", so they reach the tmux inside the sandbox only in that window and the rest
 of the host session keeps its shortcuts (needs tmux 3.2+; `Ctrl-]` still leaves the shell). While osh runs, the host's global `prefix` is `None` and the
 prefix key is a wrapped root binding; osh puts it back when it quits. `OSH_TMUX_PASSTHROUGH=0`
-turns this off. After a crash, `tmux set-option -g prefix "$(tmux show -gv @osh_prefix)"` restores the prefix. A new sandbox gets your host `tmux.conf` automatically when its image has tmux (secret-scanned first); resend it later with `K` (sync agents); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
+turns this off. After a crash, `tmux set-option -g prefix "$(tmux show -gv @osh_prefix)"` restores the prefix. A new sandbox gets your host `tmux.conf` automatically when its image has tmux (secret-scanned first), and a filtered copy of your global git config (only aliases, colours and a few behaviour keys such as `init.defaultBranch`, `push.default`, `pull.rebase`; never credentials, URLs rewrites, signing, editor or hook settings) in `~/.config/osh/gitconfig`, included from the sandbox's `~/.gitconfig` (an existing one is kept; osh's own git identity and credentials still win); resend the tmux one later with `K` (sync agents); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
 each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), the blocked requests
 seen in the sandbox (same list as `p`, below), dashboard (the shell keeps
 running, marked `●`; `Enter` on it returns), or close it. Shells keep their

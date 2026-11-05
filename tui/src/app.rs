@@ -1999,8 +1999,8 @@ impl App {
         if let Some((name, before)) = self.tmux_after_create.take() {
             if failed.is_none() {
                 let dir = self.dir.clone();
-                self.status = "Copying the host tmux config...".into();
-                self.bg_msg(move || cli::install_tmux_conf(&dir, &name, &before));
+                self.status = "Copying the host tmux and git config...".into();
+                self.bg_msg(move || cli::install_sandbox_confs(&dir, &name, &before));
             }
         }
         if let Some(f) = &failed {
