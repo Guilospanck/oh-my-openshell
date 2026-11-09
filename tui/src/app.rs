@@ -10,7 +10,11 @@ use std::{
     io::Write,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{atomic::Ordering, mpsc::Sender, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::Sender,
+        Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -504,6 +508,8 @@ pub struct App {
     follows: Vec<Follow>,
     /// When the last watcher prompt opened; keys typed just before it are not answers.
     pub prompt_at: Option<Instant>,
+    /// An automatic-allow batch is running: `policy update` calls must not overlap.
+    auto_running: Arc<AtomicBool>,
     /// Credential flow waiting on a running `claude setup-token`.
     token_flow: Option<InKind>,
     /// Staging directory of an in-progress "add skills" flow; removed when it ends.
@@ -827,6 +833,7 @@ impl App {
             watch: Watch::with_never_file(watch::never_path()),
             follows: Vec::new(),
             prompt_at: None,
+            auto_running: Arc::new(AtomicBool::new(false)),
             token_flow: None,
             sync_stage: None,
             sync_secret: None,
@@ -1309,6 +1316,7 @@ impl App {
             self.status = format!("Blocked-request watcher for {} stopped: {last}", f.sandbox);
         }
         self.refresh_review();
+        self.apply_auto_allows();
         let here = self.session().map(|s| s.sandbox.clone());
         if self.watch.has_queued(here.as_deref())
             && self.modal.is_none()
@@ -1317,6 +1325,39 @@ impl App {
         {
             self.show_prompt();
         }
+    }
+
+    /// Apply the allows decided without a prompt, one `policy update` at a time.
+    fn apply_auto_allows(&mut self) {
+        if self.auto_running.load(Ordering::Relaxed) {
+            return;
+        }
+        let batch = self.watch.take_auto();
+        if batch.is_empty() {
+            return;
+        }
+        self.auto_running.store(true, Ordering::Relaxed);
+        let running = self.auto_running.clone();
+        self.status = format!("Allowing {} web read(s)...", batch.len());
+        self.bg_msg(move || {
+            let mut done = Vec::new();
+            let mut errs = Vec::new();
+            for (sandbox, gateway, b) in &batch {
+                match watch::allow(gateway, sandbox, b, false) {
+                    Ok(_) => done.push(b.target()),
+                    Err(e) => errs.push(format!("{}: {e}", b.target())),
+                }
+            }
+            running.store(false, Ordering::Relaxed);
+            if errs.is_empty() {
+                Ok(format!(
+                    "Allowed web reads: {}; they are live, ask again",
+                    done.join(", ")
+                ))
+            } else {
+                Err(format!("Error: could not allow {}", errs.join("; ")))
+            }
+        });
     }
 
     fn show_prompt(&mut self) {
@@ -1354,6 +1395,11 @@ impl App {
                     items.push(format!("Allow read-only (GET/HEAD/OPTIONS) for {prog}"));
                 }
                 items.push(format!("Allow all methods for {prog}"));
+                if watch::is_web_read(&b) && !self.watch.auto_web_on(&sandbox) {
+                    items.push(format!(
+                        "Allow web reads (GET/HEAD/OPTIONS) by curl and Claude Code in {sandbox} until the session ends, no more prompts"
+                    ));
+                }
                 items.push("Ignore this time".into());
                 items.push("Ignore until the session ends".into());
                 items.push(format!("Never allow {} in {sandbox}", b.target()));
@@ -2616,6 +2662,14 @@ impl App {
                 } else if first.starts_with("Never allow ") {
                     self.watch.decide(&sandbox, &b, State::Never);
                     self.status = format!("Never asking about {} in {sandbox}", b.target());
+                } else if first.starts_with("Allow web reads") {
+                    self.watch.enable_auto_web(&sandbox);
+                    self.watch.decide(&sandbox, &b, State::Allowed(false));
+                    self.status = format!(
+                        "Web reads by curl and Claude Code are allowed in {sandbox} until the session ends; allowing {}...",
+                        b.target()
+                    );
+                    self.watch.auto_allow(&sandbox, &gateway, b);
                 } else if let Some(rest) = first.strip_prefix("Allow ") {
                     let all = rest.starts_with("all");
                     self.watch.decide(&sandbox, &b, State::Allowed(all));

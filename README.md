@@ -277,6 +277,15 @@ to `providers/web.yaml` as you need them; reads can still carry data out in a UR
 only where that is acceptable and detach it afterwards). A blocked-request prompt offers
 `rust`, `go` or `web` when the blocked host is one of theirs and no ordinary profile covers it.
 
+For open-ended research ("any website") there is no profile, because OpenShell refuses `*`
+hosts. Instead, when `curl` or Claude Code is blocked on a web host (ports 80/443), the prompt
+offers "Allow web reads ... until the session ends, no more prompts". From then on, until that
+sandbox's shell closes, osh answers every such denial for those two programs with the same
+read-only allow you would have picked (one `policy update` at a time, no popups). The first
+request to each new host still fails once; the retry works. Reads can carry data out in a URL,
+so use it only in a sandbox without secrets worth stealing. Other programs and write methods
+still ask.
+
 When access is missing, `K` offers either the built-in profiles above or a
 generated one: `osh sync-agents --gen-profile` writes a profile that grants only
 the hosts and programs still missing (no credential), shows you a summary,

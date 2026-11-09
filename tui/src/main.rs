@@ -984,7 +984,13 @@ mod tests {
                     "curl was blocked from reaching example.com:443 in sb (2x)"
                 );
                 assert_eq!(items[0], "Allow read-only (GET/HEAD/OPTIONS) for curl");
-                assert_eq!(items.len(), 5);
+                assert_eq!(items.len(), 6);
+                assert!(
+                    items[2].starts_with(
+                        "Allow web reads (GET/HEAD/OPTIONS) by curl and Claude Code in sb"
+                    ),
+                    "{items:?}"
+                );
             }
             _ => panic!("no prompt"),
         }

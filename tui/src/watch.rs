@@ -121,6 +121,17 @@ pub fn parse(line: &str) -> Option<Denial> {
     }
 }
 
+/// Programs the "web reads" shortcut covers: `curl` and Claude Code.
+const WEB_PROGRAMS: &[&str] = &["curl", "claude.exe", "claude"];
+
+/// A read of a web host (HTTP ports, a plain name) by one of `WEB_PROGRAMS`.
+pub fn is_web_read(b: &Blocked) -> bool {
+    matches!(b.port, 80 | 443)
+        && WEB_PROGRAMS.contains(&b.program())
+        && cli::valid_host(&b.host)
+        && !is_ip(&b.host)
+}
+
 /// `(sandbox, binary, host, port)`: what a decision applies to.
 pub type Key = (String, String, String, u16);
 
@@ -178,6 +189,12 @@ pub struct Watch {
     /// `(sandbox, host, port)` the user never wants to allow; kept in `never_file`.
     never: HashSet<(String, String, u16)>,
     never_file: Option<PathBuf>,
+    /// Sandboxes where web reads by `curl` and Claude Code are allowed without asking, for the
+    /// session. OpenShell refuses wildcard hosts, so this is how "any website" is done: each
+    /// denial is answered with the same read-only allow a person would have picked.
+    auto_web: HashSet<String>,
+    /// Allows decided without a prompt, waiting for the app to apply them.
+    auto: Vec<(String, String, Blocked)>,
 }
 
 /// After an allow, repeats of the same denial are in flight, not a new request.
@@ -292,6 +309,12 @@ impl Watch {
                         }
                     }
                 }
+                if self.auto_web.contains(sandbox) && is_web_read(&b) {
+                    self.allowed_at.insert(k, Instant::now());
+                    self.set(sandbox, &Denial::Blocked(b.clone()), State::Allowed(false));
+                    self.auto.push((sandbox.into(), gateway.into(), b));
+                    return;
+                }
                 self.set(sandbox, &Denial::Blocked(b.clone()), State::Pending);
                 self.queue.push_back(Prompt::Blocked {
                     sandbox: sandbox.into(),
@@ -365,6 +388,42 @@ impl Watch {
         self.set(sandbox, &Denial::Blocked(b.clone()), state);
     }
 
+    /// From now until the shell closes, allow web reads by `curl` and Claude Code in `sandbox`
+    /// without asking; prompts already queued for it that qualify are answered the same way.
+    pub fn enable_auto_web(&mut self, sandbox: &str) {
+        self.auto_web.insert(sandbox.into());
+        let queued: Vec<Prompt> = self.queue.drain(..).collect();
+        for p in queued {
+            match p {
+                Prompt::Blocked {
+                    sandbox: s,
+                    gateway,
+                    b,
+                    ..
+                } if s == sandbox && is_web_read(&b) => {
+                    self.allowed_at.insert(key(&s, &b), Instant::now());
+                    self.set(&s, &Denial::Blocked(b.clone()), State::Allowed(false));
+                    self.auto.push((s, gateway, b));
+                }
+                other => self.queue.push_back(other),
+            }
+        }
+    }
+
+    /// Apply `b` through the same one-at-a-time path as the automatic allows.
+    pub fn auto_allow(&mut self, sandbox: &str, gateway: &str, b: Blocked) {
+        self.auto.push((sandbox.into(), gateway.into(), b));
+    }
+
+    pub fn auto_web_on(&self, sandbox: &str) -> bool {
+        self.auto_web.contains(sandbox)
+    }
+
+    /// The allows decided without a prompt since the last call.
+    pub fn take_auto(&mut self) -> Vec<(String, String, Blocked)> {
+        std::mem::take(&mut self.auto)
+    }
+
     /// Ask about `b` again now, whatever was decided before.
     pub fn reprompt(&mut self, sandbox: &str, gateway: &str, b: Blocked) {
         let k = key(sandbox, &b);
@@ -389,6 +448,8 @@ impl Watch {
 
     /// The shell in `sandbox` closed: forget its ignores and queued prompts.
     pub fn end_session(&mut self, sandbox: &str) {
+        self.auto_web.remove(sandbox);
+        self.auto.retain(|a| a.0 != sandbox);
         self.ignored.retain(|k| k.0 != sandbox);
         self.allowed_at.retain(|k, _| k.0 != sandbox);
         self.queue.retain(|p| match p {
@@ -617,6 +678,34 @@ mod tests {
             "example.com:443:read-only:rest:enforce"
         );
         assert_eq!(endpoint(&curl(), true), "example.com:443:full");
+    }
+
+    #[test]
+    fn web_reads_by_curl_are_allowed_without_a_prompt_once_enabled() {
+        let mut w = Watch::default();
+        w.push("a", "gw", Denial::Blocked(curl()));
+        w.enable_auto_web("a");
+        assert!(!w.has_queued(None), "the queued curl prompt was answered");
+        assert_eq!(w.take_auto().len(), 1);
+        let mut other = curl();
+        other.host = "docs.rs".into();
+        w.push("a", "gw", Denial::Blocked(other));
+        assert!(!w.has_queued(None));
+        assert_eq!(w.take_auto()[0].2.host, "docs.rs");
+        let mut node = curl();
+        node.binary = "/usr/local/bin/node".into();
+        node.host = "evil.example".into();
+        w.push("a", "gw", Denial::Blocked(node));
+        assert!(w.has_queued(None), "only curl and claude are covered");
+        let mut ssh = curl();
+        ssh.port = 22;
+        ssh.host = "git.example".into();
+        w.push("a", "gw", Denial::Blocked(ssh));
+        assert!(w.take_auto().is_empty(), "only HTTP ports");
+        w.push("b", "gw", Denial::Blocked(curl()));
+        assert!(w.take_auto().is_empty(), "another sandbox still asks");
+        w.end_session("a");
+        assert!(!w.auto_web_on("a"));
     }
 
     #[test]

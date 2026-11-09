@@ -65,5 +65,15 @@ sandbox_checks() {
   out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 -X POST https://docs.rs/')"
   [[ "$out" != 2* ]] && pass "web profile: a POST is refused" || fail "web profile: a POST is refused" "$out"
 
+  # What the "Allow web reads ... until the session ends" prompt option runs for each new host
+  # (watch::allow): curl is refused, the exact allow osh issues is applied, curl then succeeds.
+  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 20 https://www.iana.org/')"
+  [[ "$out" != 200 ]] && pass "an unlisted host is refused before the allow" || fail "an unlisted host is refused before the allow" "$out"
+  openshell -g "$main" policy update "$name" --add-endpoint www.iana.org:443:read-only:rest:enforce \
+    --binary /usr/bin/curl --wait --timeout 60 >"$HOME/auto-allow.log" 2>&1 \
+    && pass "the read-only allow osh issues is accepted" || fail "the read-only allow osh issues is accepted" "$(tail -5 "$HOME/auto-allow.log")"
+  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://www.iana.org/')"
+  [[ "$out" == 200 ]] && pass "curl reads the host once it is allowed" || fail "curl reads the host once it is allowed" "$out"
+
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
 }
