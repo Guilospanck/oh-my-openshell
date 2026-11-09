@@ -1977,10 +1977,9 @@ mod tests {
         assert!(profiles_for_host(&dir, "example.com").is_empty());
         assert_eq!(profiles_for_host(&dir, "static.crates.io"), ["rust"]);
         assert_eq!(profiles_for_host(&dir, "proxy.golang.org"), ["go"]);
-        assert_eq!(profiles_for_host(&dir, "docs.rs"), ["web"]);
         assert!(
             git.iter()
-                .all(|id| !["go", "js", "rust", "web"].contains(&id.as_str())),
+                .all(|id| !["go", "js", "rust"].contains(&id.as_str())),
             "language profiles are not offered for github.com: {git:?}"
         );
     }

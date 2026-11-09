@@ -8,7 +8,7 @@ use std::{
 
 /// Profiles the user attaches on purpose (language toolchains, web browsing). `K` (agent installs)
 /// never picks them, and a blocked-request prompt offers them only for hosts they are made for.
-pub const OPT_IN_PROFILES: &[&str] = &["go", "js", "rust", "web"];
+pub const OPT_IN_PROFILES: &[&str] = &["go", "js", "rust"];
 
 /// (path relative to the data directory, contents).
 const FILES: &[(&str, &str)] = &[
@@ -33,10 +33,6 @@ const FILES: &[(&str, &str)] = &[
     (
         "providers/rust.yaml",
         include_str!("../../providers/rust.yaml"),
-    ),
-    (
-        "providers/web.yaml",
-        include_str!("../../providers/web.yaml"),
     ),
     (
         "providers/npm.yaml",
