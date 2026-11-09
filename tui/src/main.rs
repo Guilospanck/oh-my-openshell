@@ -12,6 +12,7 @@ mod gwmodel;
 mod gwops;
 mod logview;
 mod platform;
+mod ports;
 mod setup;
 mod term;
 mod tmuxpass;
@@ -880,7 +881,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL));
         assert!(app.modal.is_some());
         term.draw(|f| ui::draw(f, &app)).unwrap();
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));
@@ -888,7 +889,7 @@ mod tests {
         term.draw(|f| ui::draw(f, &app)).unwrap();
         app.active = Some(0);
         app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
-        for _ in 0..5 {
+        for _ in 0..6 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));

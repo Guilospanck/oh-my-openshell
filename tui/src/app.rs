@@ -3,6 +3,7 @@ use crate::cli::{self, Snapshot};
 use crate::clip;
 use crate::ghrepo::{self, GhRepo};
 use crate::logview::LogView;
+use crate::ports::{self, Ports, Scan};
 use crate::term::{self, Session};
 use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -174,6 +175,17 @@ pub enum SelKind {
         gateway: String,
         b: Blocked,
     },
+    /// The shell menu's port list: stop a forward, forward a listener, or type a port.
+    Forwards {
+        sandbox: String,
+        gateway: String,
+    },
+    /// A port started listening in a sandbox: forward it to the host?
+    Forward {
+        sandbox: String,
+        gateway: String,
+        port: u16,
+    },
     /// A rejected request-target holds an encoded `/`: allow it through a generated provider.
     Slashes {
         sandbox: String,
@@ -191,6 +203,11 @@ pub enum SelKind {
 #[derive(Clone)]
 pub enum InKind {
     OtherImage,
+    /// A port to forward from this sandbox.
+    ForwardPort {
+        sandbox: String,
+        gateway: String,
+    },
     Name(Plan),
     Cpu(Plan),
     Memory(Plan),
@@ -506,6 +523,10 @@ pub struct App {
     pub watch: Watch,
     /// One log follower per open shell, feeding `watch`.
     follows: Vec<Follow>,
+    /// Listening ports of the sandboxes with a shell open, and the forward offers still to show.
+    pub ports: Ports,
+    /// One listener poller per open shell, feeding `ports`.
+    scans: Vec<Scan>,
     /// When the last watcher prompt opened; keys typed just before it are not answers.
     pub prompt_at: Option<Instant>,
     /// An automatic-allow batch is running: `policy update` calls must not overlap.
@@ -681,6 +702,14 @@ fn notice_text(sandbox: &str, what: &str, reason: &str) -> String {
     )
 }
 
+/// Stop the forward osh started for `port`, off the UI thread; a forward already gone is fine.
+fn stop_forward(sandbox: &str, gateway: &str, port: u16) {
+    let args = ports::forward_args("stop", sandbox, gateway, port);
+    thread::spawn(move || {
+        let _ = cli::run("openshell", &args, &[]);
+    });
+}
+
 fn prog_of(binary: &str) -> &str {
     binary.rsplit('/').next().unwrap_or(binary)
 }
@@ -832,6 +861,8 @@ impl App {
             active: None,
             watch: Watch::with_never_file(watch::never_path()),
             follows: Vec::new(),
+            ports: Ports::default(),
+            scans: Vec::new(),
             prompt_at: None,
             auto_running: Arc::new(AtomicBool::new(false)),
             token_flow: None,
@@ -1151,6 +1182,7 @@ impl App {
             Ok(s) => {
                 self.sessions.push(s);
                 self.active = Some(self.sessions.len() - 1);
+                self.scans.push(Scan::spawn(sandbox.clone(), gw.clone()));
                 match Follow::spawn(sandbox.clone(), gw) {
                     Ok(f) => self.follows.push(f),
                     Err(e) => {
@@ -1166,12 +1198,21 @@ impl App {
         let s = self.sessions.remove(i);
         self.follows
             .retain(|f| !(f.sandbox == s.sandbox && f.gateway == s.gateway));
+        self.scans
+            .retain(|f| !(f.sandbox == s.sandbox && f.gateway == s.gateway));
         if !self.sessions.iter().any(|o| o.sandbox == s.sandbox) {
             if s.pasted.load(Ordering::Relaxed) {
                 let (gateway, sandbox) = (s.gateway.clone(), s.sandbox.clone());
                 thread::spawn(move || clip::clean(&gateway, &sandbox));
             }
             self.watch.end_session(&s.sandbox);
+            for port in self.ports.end_session(&s.sandbox) {
+                stop_forward(&s.sandbox, &s.gateway, port);
+            }
+            if matches!(&self.modal, Some(Modal::Select { kind: SelKind::Forward { sandbox, .. }, .. }) if *sandbox == s.sandbox)
+            {
+                self.modal = None;
+            }
             if matches!(&self.modal, Some(Modal::Select { kind: SelKind::Blocked { sandbox, .. }, .. }) if *sandbox == s.sandbox)
             {
                 self.modal = None;
@@ -1315,15 +1356,110 @@ impl App {
             let f = self.follows.remove(i);
             self.status = format!("Blocked-request watcher for {} stopped: {last}", f.sandbox);
         }
+        for sc in &mut self.scans {
+            if let Some(now) = sc.latest() {
+                self.ports.observe(&sc.sandbox, &sc.gateway, &now);
+            }
+        }
+        for (sandbox, gateway, port) in self.ports.take_gone() {
+            stop_forward(&sandbox, &gateway, port);
+        }
         self.refresh_review();
         self.apply_auto_allows();
         let here = self.session().map(|s| s.sandbox.clone());
-        if self.watch.has_queued(here.as_deref())
-            && self.modal.is_none()
-            && self.logview.is_none()
-            && self.job.is_none()
-        {
+        let idle = self.modal.is_none() && self.logview.is_none() && self.job.is_none();
+        if self.watch.has_queued(here.as_deref()) && idle {
             self.show_prompt();
+        } else if self.ports.has_queued(here.as_deref()) && idle {
+            self.show_forward_offer();
+        }
+    }
+
+    /// The shell menu's list of forwards and forwardable listeners.
+    fn show_forwards(&mut self) {
+        let Some((sandbox, gateway)) = self
+            .session()
+            .map(|s| (s.sandbox.clone(), s.gateway.clone()))
+        else {
+            return;
+        };
+        let mut items: Vec<String> = self
+            .ports
+            .forwards(&sandbox)
+            .into_iter()
+            .map(|p| format!("Stop forwarding localhost:{p}"))
+            .collect();
+        items.extend(
+            self.ports
+                .unforwarded(&sandbox)
+                .into_iter()
+                .map(|p| format!("Forward port {p} (listening in the sandbox)")),
+        );
+        items.push("Forward another port...".into());
+        self.select(
+            &format!("Port forwards of {sandbox}"),
+            items,
+            false,
+            SelKind::Forwards { sandbox, gateway },
+        );
+    }
+
+    /// Ask whether the next listening port should be forwarded to the host.
+    fn show_forward_offer(&mut self) {
+        let here = self.session().map(|s| s.sandbox.clone());
+        let Some(o) = self.ports.next(here.as_deref()) else {
+            return;
+        };
+        self.prompt_at = Some(Instant::now());
+        let mut title = format!("Port {} started listening", o.port);
+        if here.as_deref() != Some(o.sandbox.as_str()) {
+            title.push_str(&format!(" in {}", o.sandbox));
+        }
+        title.push_str(": forward it to this computer?");
+        let items = vec![
+            format!("Forward to localhost:{}", o.port),
+            format!("Forward to localhost:{} and open the browser", o.port),
+            "Not now".into(),
+            "Ignore this port until the session ends".into(),
+        ];
+        self.select(
+            &title,
+            items,
+            false,
+            SelKind::Forward {
+                sandbox: o.sandbox,
+                gateway: o.gateway,
+                port: o.port,
+            },
+        );
+    }
+
+    fn answer_forward(&mut self, sandbox: String, gateway: String, port: u16, first: &str) {
+        if first.starts_with("Ignore") {
+            self.ports.ignore(&sandbox, port);
+            self.status = format!("Not asking about port {port} in {sandbox} again this session");
+        } else if first.starts_with("Forward") {
+            if !ports::host_port_free(port) {
+                self.status = format!(
+                    "Error: port {port} is already in use on this computer; stop what uses it and start the server again"
+                );
+                return;
+            }
+            let open = first.ends_with("browser");
+            self.ports.forwarded(&sandbox, port);
+            self.status = format!("Forwarding localhost:{port} to {sandbox}...");
+            self.bg_msg(move || {
+                cli::run(
+                    "openshell",
+                    &ports::forward_args("start", &sandbox, &gateway, port),
+                    &[],
+                )?;
+                let url = format!("http://localhost:{port}");
+                if open && !cli::open_url(&url) {
+                    return Ok(format!("Forwarding {url}; no browser could be started"));
+                }
+                Ok(format!("Forwarding {url} to {sandbox}"))
+            });
         }
     }
 
@@ -2695,6 +2831,31 @@ impl App {
                     self.status = format!("Ignored {} -> {} {how}", b.program(), b.target());
                 }
             }
+            SelKind::Forwards { sandbox, gateway } => {
+                let port = |s: &str| {
+                    s.rsplit(|c: char| !c.is_ascii_digit())
+                        .find(|t| !t.is_empty())
+                        .and_then(|t| t.parse::<u16>().ok())
+                };
+                if let (true, Some(p)) = (first.starts_with("Stop "), port(&first)) {
+                    self.ports.unforward(&sandbox, p);
+                    stop_forward(&sandbox, &gateway, p);
+                    self.status = format!("Stopped forwarding localhost:{p}");
+                } else if first.starts_with("Forward another") {
+                    self.input(
+                        "Port in the sandbox to forward (the host uses the same number)",
+                        false,
+                        InKind::ForwardPort { sandbox, gateway },
+                    );
+                } else if let Some(p) = port(&first) {
+                    self.answer_forward(sandbox, gateway, p, &format!("Forward to localhost:{p}"));
+                }
+            }
+            SelKind::Forward {
+                sandbox,
+                gateway,
+                port,
+            } => self.answer_forward(sandbox, gateway, port, &first),
             SelKind::Slashes {
                 sandbox,
                 host,
@@ -2743,6 +2904,8 @@ impl App {
                     if let Some(name) = self.session().map(|s| s.sandbox.clone()) {
                         self.review(name);
                     }
+                } else if first.starts_with("Port forwards") {
+                    self.show_forwards();
                 } else if first.starts_with("Alerts") {
                     self.show_alerts(None);
                 } else if first.starts_with("Dashboard") {
@@ -3026,6 +3189,12 @@ impl App {
                     });
                 }
             }
+            InKind::ForwardPort { sandbox, gateway } => match text.trim().parse::<u16>() {
+                Ok(p) if p > 0 => {
+                    self.answer_forward(sandbox, gateway, p, &format!("Forward to localhost:{p}"))
+                }
+                _ => self.status = "Error: a port is a number from 1 to 65535".into(),
+            },
             InKind::GenName(sync) => {
                 let raw = if text.trim().is_empty() {
                     format!("install-{}", sync.sandbox)
@@ -3500,6 +3669,7 @@ impl App {
                     "Back to the session".into(),
                     "Providers and their permissions".into(),
                     "Blocked requests".into(),
+                    format!("Port forwards ({})", self.ports.forwards(&name).len()),
                     format!("Alerts ({})", self.visible_alerts().len()),
                     "Dashboard (keep the session running)".into(),
                     "Close the session".into(),
@@ -3881,7 +4051,7 @@ impl App {
                 modal,
                 Modal::Info(_)
                     | Modal::Select {
-                        kind: SelKind::Blocked { .. },
+                        kind: SelKind::Blocked { .. } | SelKind::Forward { .. },
                         ..
                     }
             )
@@ -3999,6 +4169,9 @@ impl App {
                 KeyCode::Esc if matches!(kind, SelKind::SessionMenu | SelKind::Review { .. }) => {}
                 KeyCode::Esc if matches!(kind, SelKind::Blocked { .. }) => {
                     self.on_select(kind, vec!["Ignore this time".into()])
+                }
+                KeyCode::Esc if matches!(kind, SelKind::Forward { .. }) => {
+                    self.on_select(kind, vec!["Not now".into()])
                 }
                 KeyCode::Esc => self.cleanup_sync_stage(),
                 KeyCode::Enter => {
@@ -4411,6 +4584,64 @@ mod tests {
             matches!(a.modal, Some(Modal::Select { .. })),
             "Enter inside the grace period is the shell's, not an answer"
         );
+    }
+
+    #[test]
+    fn a_new_listening_port_is_offered_for_forwarding_and_esc_declines() {
+        let none = std::collections::BTreeSet::new();
+        let mut a = app();
+        a.ports.observe("sb", "gw", &none);
+        a.ports
+            .observe("sb", "gw", &[8000u16].into_iter().collect());
+        a.pump_watch();
+        let Some(Modal::Select { title, items, .. }) = &a.modal else {
+            panic!("no offer");
+        };
+        assert!(title.contains("Port 8000") && title.contains("in sb"));
+        assert_eq!(items[0], "Forward to localhost:8000");
+        a.prompt_at = None;
+        a.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(a.modal.is_none() && !a.ports.has_queued(None));
+    }
+
+    #[test]
+    fn the_port_forwards_list_shows_forwards_and_listeners() {
+        use crate::term::Session;
+        let mut a = app();
+        a.ports.observe("sb", "gw", &Default::default());
+        a.ports
+            .observe("sb", "gw", &[8000u16, 9000].into_iter().collect());
+        a.ports.forwarded("sb", 8000);
+        let s = Session::spawn("sb".into(), "gw".into(), "cat", &[], 20, 5).unwrap();
+        a.sessions.push(s);
+        a.active = Some(0);
+        a.show_forwards();
+        let Some(Modal::Select { items, .. }) = &a.modal else {
+            panic!("no list");
+        };
+        assert_eq!(
+            items,
+            &[
+                "Stop forwarding localhost:8000",
+                "Forward port 9000 (listening in the sandbox)",
+                "Forward another port..."
+            ]
+        );
+    }
+
+    #[test]
+    fn ignoring_a_port_for_the_session_stops_the_offers() {
+        let mut a = app();
+        a.answer_forward(
+            "sb".into(),
+            "gw".into(),
+            8000,
+            "Ignore this port until the session ends",
+        );
+        a.ports.observe("sb", "gw", &Default::default());
+        a.ports
+            .observe("sb", "gw", &[8000u16].into_iter().collect());
+        assert!(!a.ports.has_queued(None));
     }
 
     #[test]

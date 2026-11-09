@@ -30,7 +30,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 
 | Path | What |
 | --- | --- |
-| `tui/src/` | Rust TUI (crate `osh-tui`). `main.rs` event loop and subcommands (`doctor`, `setup`, `upgrade`, `uninstall`, `gateway add|remove`, `gateway-docker`, `gateway-reset`, `gateway-service`, `sync-agents`), `app.rs` state and tabs, `ui.rs` drawing, `cli.rs` wrappers around the `openshell` and container runtime CLIs, `term.rs` embedded shells (libghostty-vt + portable-pty), `watch.rs` log watcher, `logview.rs`, `clip.rs` clipboard |
+| `tui/src/` | Rust TUI (crate `osh-tui`). `main.rs` event loop and subcommands (`doctor`, `setup`, `upgrade`, `uninstall`, `gateway add|remove`, `gateway-docker`, `gateway-reset`, `gateway-service`, `sync-agents`), `app.rs` state and tabs, `ui.rs` drawing, `cli.rs` wrappers around the `openshell` and container runtime CLIs, `term.rs` embedded shells (libghostty-vt + portable-pty), `watch.rs` log watcher, `ports.rs` listening-port watcher and forward offers (`sandbox exec` reads `/proc/net/tcp*`; `forward start -d`), `logview.rs`, `clip.rs` clipboard |
 | `tui/src/platform.rs` | `Os`, `PkgMgr`, `Runtime` (Docker/Podman), the `Host` trait (the only door to the host; `FakeHost` in tests) and `Facts` |
 | `tui/src/setup.rs` | Pure planner (`plan`: Facts in, `Step`s out), `execute` with consent, `doctor`, `hint` |
 | `tui/src/gateway.rs` | Gateway config install, service restart, macOS Docker gateway (launchd), reset, upgrade, uninstall: all as `Step`s |

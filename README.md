@@ -172,6 +172,24 @@ Sandboxes tab, or `Blocked requests` in the `Ctrl-]` menu of a shell, lists what
 the sandbox and stays open, adding new denials as they arrive (the prompt does not cover it
 meanwhile); `Enter` on an entry asks again with the choices above.
 
+### Forwarding a server to your computer
+
+While a shell is open, osh polls the sandbox's TCP listeners every 3 seconds. When a program
+starts listening on a new port (a web server, a served page), a prompt asks
+`Port 8000 started listening: forward it to this computer?` with `Forward to localhost:8000`,
+`Forward to localhost:8000 and open the browser`, `Not now` (`Esc`; asks again if the port
+closes and opens again) and `Ignore this port until the session ends`. Forwarding runs
+`openshell forward start -d PORT SANDBOX`, so the page is at `http://localhost:PORT`; the host
+port is the sandbox's port, and osh refuses when something on your computer already uses it.
+Ports already listening when the shell opens, the policy proxy (3128) and listeners bound to one
+other interface are not offered. osh stops its forwards when the port closes or the shell closes.
+
+`Port forwards (n)` in the `Ctrl-]` menu of a shell works at any time, without waiting for a
+prompt: it lists the forwards osh runs for the sandbox (`Stop forwarding localhost:N`), the ports
+now listening there that are not forwarded (`Forward port N`), and `Forward another port...`,
+which asks for a port number.
+Prompts follow the same rule as blocked requests: a sandbox's offers wait until its shell has focus.
+
 ### Selection and copy
 
 Drag with the left button to select text in a shell (hold `Shift` when the

@@ -68,5 +68,18 @@ sandbox_checks() {
   out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://www.iana.org/')"
   [[ "$out" == 200 ]] && pass "curl reads the host once it is allowed" || fail "curl reads the host once it is allowed" "$out"
 
+  # Port forwarding offers (ports.rs): the scan osh runs must list a new listener, and the
+  # forward osh starts must reach it from the host.
+  ex 'nohup python3 -m http.server 18765 --bind 127.0.0.1 >/dev/null 2>&1 & sleep 2' >/dev/null
+  out="$(openshell -g "$main" sandbox exec --name "$name" --timeout 10 --no-tty -- cat /proc/net/tcp /proc/net/tcp6 2>/dev/null)"
+  # 18765 is 494D in hex.
+  [[ "$out" == *":494D "* ]] && pass "a listener in the sandbox shows in /proc/net/tcp as osh's scan reads it" \
+    || fail "a listener in the sandbox shows in /proc/net/tcp as osh's scan reads it" "$out"
+  openshell -g "$main" forward start -d 18765 "$name" >"$HOME/forward.log" 2>&1 \
+    && pass "forward start -d accepts the port osh offers" || fail "forward start -d accepts the port osh offers" "$(tail -5 "$HOME/forward.log")"
+  out="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 http://localhost:18765/ 2>&1)"
+  [[ "$out" == 200 ]] && pass "the forwarded port answers on the host" || fail "the forwarded port answers on the host" "$out"
+  openshell -g "$main" forward stop 18765 "$name" >/dev/null 2>&1 && pass "forward stop ends it" || fail "forward stop ends it"
+
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
 }
