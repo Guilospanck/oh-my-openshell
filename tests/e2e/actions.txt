@@ -20,6 +20,7 @@ Sandboxes | S | sandbox-stop-start
 Sandboxes | a | sandbox-providers
 Sandboxes | x | sandbox-providers
 Sandboxes | K | sandbox-skills
+Sandboxes | T | sandbox-transfer
 Sandboxes | t | SKIP: renewing a repo token needs a real GitHub token and network access to github.com
 Providers | n | provider-create
 Providers | u | provider-update

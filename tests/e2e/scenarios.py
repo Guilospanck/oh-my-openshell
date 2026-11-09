@@ -370,6 +370,26 @@ def sandbox_skills():
         assert "claude-code" in o.text() and "pi" in o.text() and "both" in o.text()
         o.press("esc"); o.wait_gone("Add skills and plugins for", 5)
 
+@scenario("sandbox-transfer")
+def sandbox_transfer():
+    ensure_sandbox()
+    other = SB + "-xfer"
+    clean(other); wait_cli(gone(other), "old target gone", 120)
+    rc, out = osc(f"sandbox exec -n {SB} -- sh -c 'echo moved-$((40+2)) > \"$HOME/transfer-probe.txt\"'")
+    assert rc == 0, out
+    with dashboard() as o:
+        create_sandbox(o, other)
+        wait_cli(ready(other), "the target Ready", 300)
+        o.press("r"); o.wait("Ready", 60)
+        select_sandbox(o)
+        o.press("T"); o.wait("Transfer the state of", 20)
+        choose(o, other)
+        o.wait("overwritten", 10); o.press("y")
+        o.wait("Transferred", 600)
+    rc, out = osc(f"sandbox exec -n {other} -- sh -c 'cat \"$HOME/transfer-probe.txt\"'")
+    assert "moved-42" in out, out
+    clean(other)
+
 @scenario("sandbox-delete")
 def sandbox_delete():
     ensure_sandbox()

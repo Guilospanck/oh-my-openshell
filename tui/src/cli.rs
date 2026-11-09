@@ -1274,6 +1274,76 @@ fn sandbox_home(sandbox: &str) -> String {
         .unwrap_or_else(|| "/workspace".into())
 }
 
+/// The `openshell` arguments that put one top-level entry of the downloaded home into the target
+/// sandbox's home. The CLI nests a directory under its own name inside DEST, so a directory goes
+/// to the home itself; a single file needs the trailing slash to land inside it.
+fn transfer_upload_args(to: &str, entry: &Path, is_dir: bool, to_home: &str) -> Vec<String> {
+    let dest = if is_dir {
+        to_home.to_string()
+    } else {
+        format!("{}/", to_home.trim_end_matches('/'))
+    };
+    [
+        "sandbox",
+        "upload",
+        to,
+        &entry.to_string_lossy(),
+        &dest,
+        "--no-git-ignore",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Copy the home directory of sandbox `from` (workspace, dotfiles, tool caches) into the home of
+/// `to`, through a temporary folder on the host that is removed afterwards. Files that exist in
+/// both are overwritten; files only in `to` stay. Installed system packages (`apt`) cannot move:
+/// the new sandbox's image has to carry them.
+pub fn transfer_state(from: &str, to: &str) -> Result<String, String> {
+    if from == to {
+        return Err("Pick a different sandbox as the target".into());
+    }
+    let (from_home, to_home) = (sandbox_home(from), sandbox_home(to));
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("osh-transfer-{}-{stamp}", std::process::id()));
+    let result = copy_home(from, to, &from_home, &to_home, &tmp);
+    let _ = std::fs::remove_dir_all(&tmp);
+    result.map(|n| format!("Transferred {n} entries from {from} ({from_home}) to {to} ({to_home})"))
+}
+
+fn copy_home(
+    from: &str,
+    to: &str,
+    from_home: &str,
+    to_home: &str,
+    tmp: &Path,
+) -> Result<usize, String> {
+    std::fs::create_dir_all(tmp).map_err(|e| format!("Error: {}: {e}", tmp.display()))?;
+    let tmp_s = tmp.to_string_lossy().to_string();
+    os(&["sandbox", "download", from, from_home, &tmp_s])
+        .map_err(|e| format!("Error: download from {from} failed: {e}"))?;
+    let mut entries: Vec<_> = std::fs::read_dir(tmp)
+        .map_err(|e| format!("Error: {}: {e}", tmp.display()))?
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+    for e in &entries {
+        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        let args = transfer_upload_args(to, &e.path(), is_dir, to_home);
+        exec("openshell", &args, &[]).map_err(|err| {
+            format!(
+                "Error: upload of {} to {to} failed: {err}",
+                e.file_name().to_string_lossy()
+            )
+        })?;
+    }
+    Ok(entries.len())
+}
+
 /// Put the host's tmux config and a filtered copy of its global git config (allowlist in
 /// `agents::filter_git_config`) in a sandbox just created, so its tmux has the host's prefix and
 /// bindings and its git the host's aliases and colours from the first shell. `name` is empty when
@@ -1877,5 +1947,24 @@ mod tests {
         assert!(y.starts_with("id: slash-registry-npmjs-org\n"));
         assert!(y.contains("    allow_encoded_slash: true\n"));
         assert!(y.ends_with("binaries: [/usr/local/bin/node]\n"));
+    }
+
+    #[test]
+    fn transfer_uploads_a_directory_to_the_home_and_a_file_into_it() {
+        let dir = transfer_upload_args("b", Path::new("/t/.cargo"), true, "/sandbox");
+        assert_eq!(
+            dir,
+            [
+                "sandbox",
+                "upload",
+                "b",
+                "/t/.cargo",
+                "/sandbox",
+                "--no-git-ignore"
+            ]
+        );
+        let file = transfer_upload_args("b", Path::new("/t/.gitconfig"), false, "/sandbox/");
+        assert_eq!(file[4], "/sandbox/");
+        assert!(transfer_state("a", "a").unwrap_err().contains("different"));
     }
 }

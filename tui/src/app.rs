@@ -127,6 +127,8 @@ pub enum SelKind {
     ShareAccess(Plan),
     AttachProvider(String),
     DetachProvider(String),
+    /// Which sandbox receives the state of this one.
+    TransferTo(String),
     NewProvider,
     /// Repo access for the repo of the shared folder, once its provider is known.
     GhAccess(Plan, GhRepo),
@@ -214,6 +216,11 @@ pub enum ConfKind {
     /// Stop and start these sandboxes so they pick up a renewed token.
     Restart(Vec<String>),
     DeleteSandbox(String),
+    /// Copy the home directory of `from` into `to`.
+    Transfer {
+        from: String,
+        to: String,
+    },
     /// Open GitHub's token list; the carried names are the tokens to delete there.
     OpenTokenPage(Vec<String>),
     DeleteProvider(String),
@@ -2256,6 +2263,14 @@ impl App {
                 plan.providers = picks;
                 self.proceed(plan);
             }
+            SelKind::TransferTo(from) => {
+                self.modal = Some(Modal::Confirm {
+                    text: format!(
+                        "Copy the home directory of '{from}' into '{first}'? Files with the same path in '{first}' are overwritten. This can take a while."
+                    ),
+                    kind: ConfKind::Transfer { from, to: first },
+                });
+            }
             SelKind::AttachProvider(sb) => {
                 self.bg_msg(move || {
                     cli::os(&[
@@ -3251,6 +3266,10 @@ impl App {
                     format!("Could not open a browser; go to {}", ghrepo::TOKENS_PAGE)
                 };
             }
+            ConfKind::Transfer { from, to } => {
+                self.status = format!("Transferring {from} to {to}...");
+                self.bg_msg(move || cli::transfer_state(&from, &to));
+            }
             ConfKind::DeleteSandbox(name) => {
                 let providers = self.snap.providers.clone();
                 self.bg(move || {
@@ -3502,7 +3521,8 @@ impl App {
         let Some(name) = self.selected_sandbox().map(|s| s.name.clone()) else {
             if matches!(
                 code,
-                KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p' | 't') | KeyCode::Enter
+                KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p' | 't' | 'T')
+                    | KeyCode::Enter
             ) {
                 self.modal = Some(Modal::Info(
                     "No sandbox selected. This gateway has none: press n to create one (g switches gateway).".into(),
@@ -3561,6 +3581,21 @@ impl App {
             KeyCode::Char('S') => self.bg_msg(move || {
                 cli::os(&["sandbox", "start", &name]).map(|_| format!("Started {name}"))
             }),
+            KeyCode::Char('T') => {
+                let others = self
+                    .snap
+                    .sandboxes
+                    .iter()
+                    .map(|s| s.name.clone())
+                    .filter(|n| *n != name)
+                    .collect();
+                self.select(
+                    &format!("Transfer the state of {name} to"),
+                    others,
+                    false,
+                    SelKind::TransferTo(name),
+                );
+            }
             KeyCode::Char('K') => {
                 let items = vec!["claude-code".into(), "pi".into(), "both".into()];
                 self.select(
@@ -4267,6 +4302,46 @@ mod tests {
         assert_eq!(a.host_status_change(), Some("working"));
         a.sessions.clear();
         assert_eq!(a.host_status_change(), Some("clear"));
+    }
+
+    #[test]
+    fn transfer_offers_the_other_sandboxes_and_asks_before_copying() {
+        let mut a = app();
+        a.snap.sandboxes = ["one", "two", "three"]
+            .iter()
+            .map(|n| cli::Sandbox {
+                name: n.to_string(),
+                ..cli::Sandbox::default()
+            })
+            .collect();
+        a.cursor[0] = 1;
+        a.sandbox_key(KeyCode::Char('T'));
+        match &a.modal {
+            Some(Modal::Select {
+                items,
+                kind: SelKind::TransferTo(from),
+                ..
+            }) => {
+                assert_eq!(from, "two");
+                assert_eq!(items, &["one".to_string(), "three".to_string()]);
+            }
+            _ => panic!("expected the target list"),
+        }
+        a.on_select(SelKind::TransferTo("two".into()), vec!["three".into()]);
+        match &a.modal {
+            Some(Modal::Confirm {
+                text,
+                kind: ConfKind::Transfer { from, to },
+            }) => {
+                assert_eq!((from.as_str(), to.as_str()), ("two", "three"));
+                assert!(text.contains("overwritten"), "{text}");
+            }
+            _ => panic!("expected a confirmation"),
+        }
+        a.snap.sandboxes.truncate(1);
+        a.cursor[0] = 0;
+        a.sandbox_key(KeyCode::Char('T'));
+        assert!(matches!(&a.modal, Some(Modal::Info(t)) if t.contains("Nothing to choose")));
     }
 
     #[test]
