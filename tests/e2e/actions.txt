@@ -30,6 +30,7 @@ Profiles | Enter | profile-import
 Images | b | image-build
 Images | Enter | image-build
 Gateways | Enter | gateway-select
+Gateways | s | gateway-default
 Gateways | a | gateway-add
 Gateways | d | gateway-wipe
 Gateways | x | gateway-remove

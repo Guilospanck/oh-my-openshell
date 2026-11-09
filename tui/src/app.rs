@@ -3782,6 +3782,15 @@ impl App {
                 let name = g.name.clone();
                 self.change_gateway(&name);
             }
+            KeyCode::Char('s') => {
+                if g.active {
+                    self.status = format!("{} is already the default gateway", g.name);
+                    return;
+                }
+                let name = g.name.clone();
+                self.status = format!("Making {name} the default gateway...");
+                self.bg_msg(move || cli::select_default_gateway(&name));
+            }
             _ => {}
         }
     }
@@ -4059,6 +4068,7 @@ mod tests {
         cli::Gateway {
             name: name.into(),
             endpoint: format!("https://localhost:{port}"),
+            ..Default::default()
         }
     }
 
@@ -4176,6 +4186,21 @@ mod tests {
         on_gateways(&mut app, vec![gw("somebody-elses", 9000)]);
         app.gateway_key(KeyCode::Char('d'));
         assert!(matches!(&app.modal, Some(Modal::Info(t)) if t.contains("not managed")));
+    }
+
+    #[test]
+    fn s_on_the_default_gateway_says_so_without_running_anything() {
+        let mut app = app();
+        app.snap.gateways = vec![cli::Gateway {
+            name: "openshell-docker".into(),
+            endpoint: "e".into(),
+            active: true,
+        }];
+        app.gateway_key(KeyCode::Char('s'));
+        assert_eq!(
+            app.status,
+            "openshell-docker is already the default gateway"
+        );
     }
 
     #[test]
@@ -4594,10 +4619,12 @@ mod tests {
             cli::Gateway {
                 name: "openshell-docker".into(),
                 endpoint: "e1".into(),
+                ..Default::default()
             },
             cli::Gateway {
                 name: "openshell-vm".into(),
                 endpoint: "e2".into(),
+                ..Default::default()
             },
         ];
         a.cursor[4] = 1;
@@ -4658,6 +4685,7 @@ mod tests {
         s.gateways = vec![cli::Gateway {
             name: "g".into(),
             endpoint: "e".into(),
+            ..Default::default()
         }];
         a.on_snapshot(s);
         assert_eq!(a.cursor[4], 0);

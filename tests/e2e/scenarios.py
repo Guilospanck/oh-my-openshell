@@ -481,6 +481,23 @@ def gateway_select():
         move_to(o, rows[0].split()[0]); o.press("enter")
         o.wait(f"{rows[0].split()[0]} [", 30)
 
+@scenario("gateway-default")
+def gateway_default():
+    """`s` makes the highlighted gateway the OpenShell CLI default and marks its row."""
+    with dashboard() as o:
+        o.press("5"); o.wait("Gateways (a:", 10)
+        rows = gateway_rows(o)
+        assert sum("default" in r for r in rows) == 1, rows
+        if len(rows) == 1:
+            o.press("s"); o.wait("is already the default gateway", 10)
+            return
+        other = next(r for r in rows if "default" not in r).split()[0]
+        move_to(o, other); o.press("s")
+        o.wait("is now the default gateway", 30)
+        now = [r for r in gateway_rows(o) if "default" in r]
+        assert len(now) == 1 and now[0].startswith(other), gateway_rows(o)
+        sh(f"openshell gateway select {rows[0].split()[0]}")   # leave the machine as found
+
 @scenario("gateway-remove")
 def gateway_remove():
     with dashboard() as o:

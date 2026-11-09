@@ -89,6 +89,27 @@ pub fn have(bin: &str) -> bool {
 pub struct Gateway {
     pub name: String,
     pub endpoint: String,
+    /// The OpenShell CLI's default: what a bare `openshell` call (outside osh) talks to.
+    pub active: bool,
+}
+
+/// Parses `openshell gateway list -o json`.
+pub fn parse_gateways(v: &Value) -> Vec<Gateway> {
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .map(|g| Gateway {
+            name: text(&g["name"]),
+            endpoint: text(&g["endpoint"]),
+            active: g["active"].as_bool() == Some(true),
+        })
+        .collect()
+}
+
+/// Makes `name` the default gateway of the OpenShell CLI.
+pub fn select_default_gateway(name: &str) -> Result<String, String> {
+    os_global(&["gateway", "select", name])?;
+    Ok(format!("{name} is now the default gateway"))
 }
 
 #[derive(Clone, Default, Debug)]
@@ -829,15 +850,11 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
         ..Default::default()
     };
     if let Ok(v) = os_global(&["gateway", "list", "-o", "json"]).and_then(|t| parse(&t)) {
-        for g in v.as_array().into_iter().flatten() {
-            let name = text(&g["name"]);
-            if gateway().is_empty() && g["active"].as_bool() == Some(true) {
-                set_gateway(&name);
+        for g in parse_gateways(&v) {
+            if gateway().is_empty() && g.active {
+                set_gateway(&g.name);
             }
-            snap.gateways.push(Gateway {
-                name,
-                endpoint: text(&g["endpoint"]),
-            });
+            snap.gateways.push(g);
         }
     }
     snap.gateway = gateway();
@@ -1773,6 +1790,17 @@ pub fn sync_check(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gateway_list_marks_the_cli_default() {
+        let v: Value = serde_json::from_str(
+            r#"[{"name":"a","endpoint":"e1","active":false},{"name":"b","endpoint":"e2","active":true}]"#,
+        )
+        .unwrap();
+        let g = parse_gateways(&v);
+        assert_eq!(g.len(), 2);
+        assert!(!g[0].active && g[1].active && g[1].name == "b");
+    }
+
     use super::*;
 
     #[test]

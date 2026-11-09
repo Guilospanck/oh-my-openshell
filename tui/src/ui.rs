@@ -426,11 +426,13 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
         .map(|g| {
             let cur = g.name == app.snap.gateway;
             let info = app.gateway_info(&g.name, &g.endpoint);
-            let name = if info.main {
-                format!("{}  main", g.name)
-            } else {
-                g.name.clone()
-            };
+            let mut name = g.name.clone();
+            if info.main {
+                name.push_str("  main");
+            }
+            if g.active {
+                name.push_str("  default");
+            }
             let row = Row::new(vec![
                 name,
                 info.kind,
@@ -465,7 +467,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Gateways (a: add  x: remove  d: wipe) "),
+            .title(" Gateways (a: add  s: default  x: remove  d: wipe) "),
     );
     f.render_stateful_widget(table, area, &mut table_state(app.cursor[4]));
 }
@@ -480,7 +482,7 @@ pub fn footer_help(tab: Tab) -> &'static str {
         Tab::Providers => "n create  u update credentials  d delete",
         Tab::Profiles => "u / Enter import or update from providers/",
         Tab::Images => "b / Enter build",
-        Tab::Gateways => "Enter select  a add  d wipe (delete all data)  x remove",
+        Tab::Gateways => "Enter select  s make default  a add  d wipe (delete all data)  x remove",
     }
 }
 

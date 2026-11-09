@@ -96,7 +96,7 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 | Providers | create from a `providers/*.yaml` profile or a read/write repo token for GitHub, GitLab, Bitbucket or Forgejo (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`) |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from) |
-| Gateways | switch (`g` / `Enter`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
+| Gateways | switch (`g` / `Enter`), make one the OpenShell CLI default (`s`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
 
 Credentials are read from the environment when exported, else prompted hidden;
 they never go through argv. The footer shows the keys for the current tab.
