@@ -1,0 +1,30 @@
+# Local template: read-only web access for research, for curl and Claude Code.
+# Grants: GET, HEAD and OPTIONS on ANY host, ports 80 and 443, to the programs below only.
+# This is a deliberate hole. Reads can still carry data out (a secret in a URL or header), so
+# attach it only to sandboxes where the agent does research and holds no secrets worth
+# stealing, and detach it afterwards. Writes (POST, PUT, DELETE) stay denied, as do other
+# programs and other ports. The wildcard host may not be honoured by every OpenShell version:
+# `just test-sandbox` checks it against the real sandbox.
+# Edit `binaries` if Claude Code is installed elsewhere in your image.
+# Smoke test:
+#   openshell sandbox create --provider web -- curl -sI https://example.com
+id: web
+display_name: Web browsing (read-only)
+description: Read-only HTTP(S) to any host for curl and Claude Code
+category: data
+endpoints:
+  - host: "**"
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+  - host: "**"
+    port: 80
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+binaries:
+  - /usr/bin/curl
+  - /usr/local/bin/curl
+  - /usr/local/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+  - /usr/local/bin/claude

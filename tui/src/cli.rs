@@ -398,7 +398,7 @@ pub fn profile_path(dir: &Path, id: &str) -> PathBuf {
 /// gives a sandbox that host with the profile's exact settings.
 pub fn profiles_for_host(dir: &Path, host: &str) -> Vec<String> {
     let want = format!("host: {host}");
-    profile_ids(dir)
+    let mut all: Vec<String> = profile_ids(dir)
         .into_iter()
         .filter(|id| {
             profile_env_keys(dir, id).is_empty()
@@ -407,7 +407,15 @@ pub fn profiles_for_host(dir: &Path, host: &str) -> Vec<String> {
                     .lines()
                     .any(|l| l.trim().trim_start_matches("- ").trim() == want)
         })
-        .collect()
+        .collect();
+    // The opt-in profiles (language toolchains) are offered only where no ordinary profile
+    // answers, and never for GitHub, which each of them lists for git dependencies.
+    let opt = |id: &String| crate::assets::OPT_IN_PROFILES.contains(&id.as_str());
+    let github = matches!(host, "github.com" | "api.github.com");
+    if github || all.iter().any(|id| !opt(id)) {
+        all.retain(|id| !opt(id));
+    }
+    all
 }
 
 /// Profile for one `host:port` and one binary, with the options `policy update
@@ -1934,6 +1942,25 @@ mod tests {
         assert!(git.contains(&"claude-marketplace".to_string()));
         assert!(!git.contains(&"github".to_string()), "github needs a token");
         assert!(profiles_for_host(&dir, "example.com").is_empty());
+        assert_eq!(profiles_for_host(&dir, "static.crates.io"), ["rust"]);
+        assert_eq!(profiles_for_host(&dir, "proxy.golang.org"), ["go"]);
+        assert!(
+            git.iter()
+                .all(|id| !["go", "js", "rust", "web"].contains(&id.as_str())),
+            "language profiles are not offered for github.com: {git:?}"
+        );
+    }
+
+    #[test]
+    fn every_opt_in_profile_exists_and_is_anonymous() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for id in crate::assets::OPT_IN_PROFILES {
+            assert!(profile_ids(&dir).contains(&id.to_string()), "{id}");
+            assert!(
+                profile_env_keys(&dir, id).is_empty(),
+                "{id} needs no secret"
+            );
+        }
     }
 
     #[test]

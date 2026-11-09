@@ -1,0 +1,38 @@
+# Local template: Go modules, anonymous and download-only.
+# Grants: proxy.golang.org and sum.golang.org (module proxy and checksum database),
+# storage.googleapis.com (the proxy redirects large modules there), go.dev (toolchain
+# downloads), and git clone/fetch from github.com for modules fetched directly (push stays
+# denied, same shape as github.yaml so both attach together).
+# Binaries: the go tool and git (go runs git for direct VCS fetches). Edit the paths if your
+# image installs Go elsewhere. Not allowed: private module hosts, any other host.
+# Smoke test:
+#   openshell sandbox create --provider go -- go list -m -versions golang.org/x/text
+id: go
+display_name: Go modules
+description: Anonymous Go module and toolchain downloads, and git dependencies from GitHub
+category: data
+endpoints:
+  - host: proxy.golang.org
+    port: 443
+  - host: sum.golang.org
+    port: 443
+  - host: storage.googleapis.com
+    port: 443
+  - host: go.dev
+    port: 443
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
+binaries:
+  - /usr/local/go/bin/*
+  - /usr/local/go/pkg/tool/**
+  - /usr/bin/go
+  - /sandbox/go/bin/*
+  - /usr/bin/git
+  - /usr/local/bin/git

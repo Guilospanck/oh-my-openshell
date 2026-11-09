@@ -879,6 +879,9 @@ fn profile_table(env: &Env, anonymous: bool) -> Vec<Profile> {
         }) else {
             continue;
         };
+        if crate::assets::OPT_IN_PROFILES.contains(&id) {
+            continue;
+        }
         let mut binaries: Vec<String> = Vec::new();
         if let Some(i) = lines.iter().position(|l| l.starts_with("binaries:")) {
             binaries = lines[i + 1..]

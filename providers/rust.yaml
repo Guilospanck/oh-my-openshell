@@ -1,0 +1,39 @@
+# Local template: Rust crates and toolchains, anonymous and download-only.
+# Grants: index.crates.io and static.crates.io (crates), static.rust-lang.org (rustup and
+# toolchains), and git clone/fetch from github.com (Cargo git dependencies; push stays denied,
+# same shape as github.yaml so both attach together).
+# Binaries: rustup's launchers in ~/.cargo/bin are only symlinks to rustup, and the real
+# cargo/rustc live in the toolchain directory. OpenShell matches the executable that runs, so
+# both locations are listed (a launcher with only one of them was refused on static.crates.io).
+# The globs cover every toolchain and architecture; edit them if your image installs Rust
+# elsewhere (the Debian cargo package uses /usr/bin).
+# Not allowed: crates.io publishing or login (crates.io API), private registries, other hosts.
+# Smoke test:
+#   openshell sandbox create --provider rust -- cargo fetch
+id: rust
+display_name: Rust (cargo, rustup)
+description: Anonymous crate and toolchain downloads, and git dependencies from GitHub
+category: data
+endpoints:
+  - host: index.crates.io
+    port: 443
+  - host: static.crates.io
+    port: 443
+  - host: static.rust-lang.org
+    port: 443
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
+binaries:
+  - /sandbox/.cargo/bin/*
+  - /sandbox/.rustup/toolchains/*/bin/*
+  - /usr/local/cargo/bin/*
+  - /usr/local/rustup/toolchains/*/bin/*
+  - /usr/bin/cargo
+  - /usr/bin/rustc

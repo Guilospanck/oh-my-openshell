@@ -1,0 +1,46 @@
+# Local template: JavaScript and TypeScript package managers (npm, pnpm, yarn, bun, corepack),
+# anonymous and download-only. Superset of npm.yaml: the registry endpoint has the same shape
+# (rest, read-only, encoded slashes allowed) so both attach together.
+# Grants: registry.npmjs.org, registry.yarnpkg.com (yarn classic), repo.yarnpkg.com (yarn berry
+# via corepack), nodejs.org (node-gyp headers), and git clone/fetch from github.com (Git
+# dependencies; push stays denied, same shape as github.yaml).
+# Binaries: npm, pnpm and yarn are Node scripts, so the interpreter is what is authorized, as in
+# npm.yaml: this grants every program using these runtimes the access above. bun is its own
+# runtime. Not allowed: npm publish/login/token, other registries. --ignore-scripts reduces
+# install risk. Edit the paths if your image installs Node elsewhere.
+# Smoke test:
+#   openshell sandbox create --provider js -- npm view typescript version
+id: js
+display_name: JavaScript / TypeScript
+description: Anonymous npm, pnpm, yarn and bun package downloads, and git dependencies from GitHub
+category: data
+endpoints:
+  - host: registry.npmjs.org
+    port: 443
+    protocol: rest
+    access: read-only
+    enforcement: enforce
+    # Scoped packages (@scope/name) are requested as @scope%2fname.
+    allow_encoded_slash: true
+  - host: registry.yarnpkg.com
+    port: 443
+  - host: repo.yarnpkg.com
+    port: 443
+  - host: nodejs.org
+    port: 443
+  - host: github.com
+    port: 443
+    protocol: rest
+    enforcement: enforce
+    rules:
+      - allow: { method: GET, path: "**" }
+      - allow: { method: HEAD, path: "**" }
+      - allow: { method: OPTIONS, path: "**" }
+      - allow: { method: POST, path: "/**/git-upload-pack" }
+binaries:
+  - /usr/bin/node
+  - /usr/local/bin/node
+  - /usr/local/bin/bun
+  - /sandbox/.bun/bin/bun
+  - /usr/bin/git
+  - /usr/local/bin/git

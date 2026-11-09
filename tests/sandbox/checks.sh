@@ -44,5 +44,19 @@ sandbox_checks() {
   [[ "$out" == *osh-git-alias* && "$out" == *$'\n'1* ]] && pass "a host git alias works and the include is added once" \
     || fail "a host git alias works and the include is added once" "$out"
 
+  # Opt-in profiles (providers/{rust,go,js,web}.yaml): import, create and attach each, then prove
+  # the web profile's wildcard host really lets curl read and still refuses a write.
+  local pr
+  for pr in rust go js web; do
+    openshell -g "$main" provider profile import --file "$data/providers/$pr.yaml" >"$HOME/prof-$pr.log" 2>&1 \
+      && openshell -g "$main" provider create --name "$pr" --type "$pr" >>"$HOME/prof-$pr.log" 2>&1 \
+      && openshell -g "$main" sandbox provider attach "$name" "$pr" --wait --timeout 60 >>"$HOME/prof-$pr.log" 2>&1 \
+      && pass "the $pr profile imports, creates and attaches" || { fail "the $pr profile imports, creates and attaches" "$(tail -5 "$HOME/prof-$pr.log")"; }
+  done
+  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://example.com')"
+  [[ "$out" == 200 ]] && pass "web profile: curl reads an unlisted host" || fail "web profile: curl reads an unlisted host" "$out"
+  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 -X POST https://example.com')"
+  [[ "$out" != 200 && "$out" != 2* ]] && pass "web profile: a POST is refused" || fail "web profile: a POST is refused" "$out"
+
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
 }

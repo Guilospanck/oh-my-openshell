@@ -6,6 +6,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// Profiles the user attaches on purpose (language toolchains, web browsing). `K` (agent installs)
+/// never picks them, and a blocked-request prompt offers them only for hosts they are made for.
+pub const OPT_IN_PROFILES: &[&str] = &["go", "js", "rust", "web"];
+
 /// (path relative to the data directory, contents).
 const FILES: &[(&str, &str)] = &[
     (
@@ -23,6 +27,16 @@ const FILES: &[(&str, &str)] = &[
     (
         "providers/github.yaml",
         include_str!("../../providers/github.yaml"),
+    ),
+    ("providers/go.yaml", include_str!("../../providers/go.yaml")),
+    ("providers/js.yaml", include_str!("../../providers/js.yaml")),
+    (
+        "providers/rust.yaml",
+        include_str!("../../providers/rust.yaml"),
+    ),
+    (
+        "providers/web.yaml",
+        include_str!("../../providers/web.yaml"),
     ),
     (
         "providers/npm.yaml",
