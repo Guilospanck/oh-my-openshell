@@ -44,19 +44,26 @@ sandbox_checks() {
   [[ "$out" == *osh-git-alias* && "$out" == *$'\n'1* ]] && pass "a host git alias works and the include is added once" \
     || fail "a host git alias works and the include is added once" "$out"
 
-  # Opt-in profiles (providers/{rust,go,js,web}.yaml): import, create and attach each, then prove
-  # the web profile's wildcard host really lets curl read and still refuses a write.
+  # Opt-in profiles (providers/{rust,go,js,web}.yaml): import, create and attach each to the same
+  # sandbox (the gateway refuses endpoints that overlap with conflicting metadata, so this proves
+  # they compose), then prove the web profile lets curl read a listed host, not an unlisted one,
+  # and refuses a write. The attach is checked with --wait because the gateway saves an attachment
+  # whose composed policy the sandbox later rejects (an invalid host wildcard, for instance), and
+  # only the wait reports that.
   local pr
   for pr in rust go js web; do
     openshell -g "$main" provider profile import --file "$data/providers/$pr.yaml" >"$HOME/prof-$pr.log" 2>&1 \
       && openshell -g "$main" provider create --name "$pr" --type "$pr" >>"$HOME/prof-$pr.log" 2>&1 \
       && openshell -g "$main" sandbox provider attach "$name" "$pr" --wait --timeout 60 >>"$HOME/prof-$pr.log" 2>&1 \
+      && ! grep -q 'did not complete' "$HOME/prof-$pr.log" \
       && pass "the $pr profile imports, creates and attaches" || { fail "the $pr profile imports, creates and attaches" "$(tail -5 "$HOME/prof-$pr.log")"; }
   done
+  out="$(ex 'curl -sL -o /dev/null -w "%{http_code}" --max-time 30 https://docs.rs/')"
+  [[ "$out" == 2* ]] && pass "web profile: curl reads a listed host" || fail "web profile: curl reads a listed host" "$out"
   out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://example.com')"
-  [[ "$out" == 200 ]] && pass "web profile: curl reads an unlisted host" || fail "web profile: curl reads an unlisted host" "$out"
-  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 -X POST https://example.com')"
-  [[ "$out" != 200 && "$out" != 2* ]] && pass "web profile: a POST is refused" || fail "web profile: a POST is refused" "$out"
+  [[ "$out" != 2* ]] && pass "web profile: an unlisted host is refused" || fail "web profile: an unlisted host is refused" "$out"
+  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 -X POST https://docs.rs/')"
+  [[ "$out" != 2* ]] && pass "web profile: a POST is refused" || fail "web profile: a POST is refused" "$out"
 
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
 }

@@ -269,10 +269,13 @@ Opt-in profiles, attached on purpose from the Providers tab (never by `K`):
 `rust` (cargo and rustup: both the launcher in `~/.cargo/bin` and the real toolchain
 binaries, crates.io, rust-lang.org, git dependencies), `go` (module proxy and checksum
 database), `js` (npm, pnpm, yarn, bun; same registry shape as `npm`, so both attach
-together) and `web` (read-only GET/HEAD/OPTIONS to any host on ports 80 and 443 for `curl`
-and Claude Code, so research tasks stop asking; reads can still carry data out in a URL, so
-attach it only where that is acceptable and detach it afterwards). A blocked-request prompt
-offers `rust` or `go` when the blocked host is one of theirs and no ordinary profile covers it.
+together) and `web` (read-only GET/HEAD/OPTIONS on port 443 to a list of documentation and
+reference hosts, MDN, docs.rs, docs.python.org, Stack Overflow, Wikipedia and the like, for
+`curl` and Claude Code, so research tasks stop asking; it is a list and not "any host" because
+OpenShell rejects bare and TLD host wildcards when it composes the sandbox policy, so add hosts
+to `providers/web.yaml` as you need them; reads can still carry data out in a URL, so attach it
+only where that is acceptable and detach it afterwards). A blocked-request prompt offers
+`rust`, `go` or `web` when the blocked host is one of theirs and no ordinary profile covers it.
 
 When access is missing, `K` offers either the built-in profiles above or a
 generated one: `osh sync-agents --gen-profile` writes a profile that grants only
