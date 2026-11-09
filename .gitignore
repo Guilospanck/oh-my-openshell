@@ -9,3 +9,4 @@ dist/
 .e2e-dist/
 
 TASKS.md
+__pycache__/
