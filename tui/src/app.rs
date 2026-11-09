@@ -3809,9 +3809,11 @@ impl App {
     }
 
     fn modal_key(&mut self, modal: Modal, key: KeyEvent) {
-        // A prompt can open mid-typing: Enter meant for the shell must not pick an answer.
+        // A prompt can open mid-typing: Enter or Esc meant for the shell must not pick an answer.
+        // Moving the cursor is harmless, so it is never swallowed (it made `Down` need two presses).
         let fresh = self.prompt_at.is_some_and(|t| t.elapsed() < PROMPT_GRACE);
         if fresh
+            && matches!(key.code, KeyCode::Enter | KeyCode::Esc)
             && matches!(
                 modal,
                 Modal::Info(_)
@@ -4307,6 +4309,28 @@ mod tests {
         assert!(
             b.toast().is_none() && b.alerts.is_empty(),
             "a project folder is fine"
+        );
+    }
+
+    #[test]
+    fn a_prompt_moves_on_the_first_down_but_ignores_enter_while_fresh() {
+        let mut a = app();
+        let d = watch::parse(
+            "[1] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(0) -> example.com:443 [reason:transparent_tcp_policy_denied]",
+        )
+        .unwrap();
+        a.watch.push("sb", "gw", d);
+        a.pump_watch();
+        assert!(a.prompt_at.is_some());
+        a.on_key(KeyEvent::from(KeyCode::Down));
+        let Some(Modal::Select { cursor, .. }) = &a.modal else {
+            panic!("no prompt");
+        };
+        assert_eq!(*cursor, 1, "one Down, one step");
+        a.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(a.modal, Some(Modal::Select { .. })),
+            "Enter inside the grace period is the shell's, not an answer"
         );
     }
 
