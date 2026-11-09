@@ -1282,32 +1282,46 @@ fn sandbox_home(sandbox: &str) -> String {
         .unwrap_or_else(|| "/workspace".into())
 }
 
-/// The `openshell` arguments that put one top-level entry of the downloaded home into the target
-/// sandbox's home. The CLI nests a directory under its own name inside DEST, so a directory goes
-/// to the home itself; a single file needs the trailing slash to land inside it.
-fn transfer_upload_args(to: &str, entry: &Path, is_dir: bool, to_home: &str) -> Vec<String> {
-    let dest = if is_dir {
-        to_home.to_string()
-    } else {
-        format!("{}/", to_home.trim_end_matches('/'))
-    };
-    [
+/// Name of the archive a transfer stages in the sandboxes.
+const STAGE: &str = ".osh-transfer.tar";
+
+/// Run a shell script in `sandbox` as its user.
+fn run_in(sandbox: &str, script: &str) -> Result<String, String> {
+    os(&[
         "sandbox",
-        "upload",
-        to,
-        &entry.to_string_lossy(),
-        &dest,
-        "--no-git-ignore",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .collect()
+        "exec",
+        "-n",
+        sandbox,
+        "--timeout",
+        "600",
+        "--",
+        "sh",
+        "-c",
+        script,
+    ])
+}
+
+/// Script for the source sandbox: archive `$HOME` into the workspace and print the number of
+/// top-level entries and the archive's directory. `openshell sandbox download` only reads inside
+/// the workspace, and HOME is outside it on some drivers (`/home/node` against `/workspace`),
+/// so the home itself cannot be downloaded. Exit status 1 from tar (a file changed while it was
+/// read) still leaves a usable archive.
+fn pack_script() -> String {
+    format!(
+        "ws=$(pwd -P) && rm -f \"$ws/{STAGE}\" && {{ tar -C \"$HOME\" --exclude=./{STAGE} -cf \"$ws/{STAGE}\" . || [ $? -eq 1 ]; }} && ls -A \"$HOME\" | wc -l && pwd -P"
+    )
+}
+
+/// Script for the target sandbox: unpack the uploaded archive over `$HOME` and delete it.
+fn unpack_script(home: &str) -> String {
+    let stage = format!("{}/{STAGE}", home.trim_end_matches('/'));
+    format!("tar -C \"$HOME\" -xf \"{stage}\" ; rc=$? ; rm -f \"{stage}\" ; exit $rc")
 }
 
 /// Copy the home directory of sandbox `from` (workspace, dotfiles, tool caches) into the home of
-/// `to`, through a temporary folder on the host that is removed afterwards. Files that exist in
-/// both are overwritten; files only in `to` stay. Installed system packages (`apt`) cannot move:
-/// the new sandbox's image has to carry them.
+/// `to` as one archive, through a temporary folder on the host that is removed afterwards. Files
+/// that exist in both are overwritten; files only in `to` stay. Installed system packages (`apt`)
+/// cannot move: the new sandbox's image has to carry them.
 pub fn transfer_state(from: &str, to: &str) -> Result<String, String> {
     if from == to {
         return Err("Pick a different sandbox as the target".into());
@@ -1318,38 +1332,57 @@ pub fn transfer_state(from: &str, to: &str) -> Result<String, String> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = std::env::temp_dir().join(format!("osh-transfer-{}-{stamp}", std::process::id()));
-    let result = copy_home(from, to, &from_home, &to_home, &tmp);
+    let result = copy_home(from, to, &to_home, &tmp);
     let _ = std::fs::remove_dir_all(&tmp);
     result.map(|n| format!("Transferred {n} entries from {from} ({from_home}) to {to} ({to_home})"))
 }
 
-fn copy_home(
-    from: &str,
-    to: &str,
-    from_home: &str,
-    to_home: &str,
-    tmp: &Path,
-) -> Result<usize, String> {
+fn copy_home(from: &str, to: &str, to_home: &str, tmp: &Path) -> Result<usize, String> {
     std::fs::create_dir_all(tmp).map_err(|e| format!("Error: {}: {e}", tmp.display()))?;
+    let out = run_in(from, &pack_script())
+        .map_err(|e| format!("Error: archiving the home of {from} failed: {e}"))?;
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    let n: usize = lines.next().and_then(|l| l.parse().ok()).unwrap_or(0);
+    let ws = lines.next().unwrap_or("/workspace").to_string();
+    let remote = format!("{}/{STAGE}", ws.trim_end_matches('/'));
     let tmp_s = tmp.to_string_lossy().to_string();
-    os(&["sandbox", "download", from, from_home, &tmp_s])
-        .map_err(|e| format!("Error: download from {from} failed: {e}"))?;
-    let mut entries: Vec<_> = std::fs::read_dir(tmp)
-        .map_err(|e| format!("Error: {}: {e}", tmp.display()))?
-        .filter_map(|e| e.ok())
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-    for e in &entries {
-        let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        let args = transfer_upload_args(to, &e.path(), is_dir, to_home);
-        exec("openshell", &args, &[]).map_err(|err| {
-            format!(
-                "Error: upload of {} to {to} failed: {err}",
-                e.file_name().to_string_lossy()
-            )
-        })?;
+    let result = (|| {
+        os(&["sandbox", "download", from, &remote, &tmp_s])
+            .map_err(|e| format!("Error: download from {from} failed: {e}"))?;
+        let local = find_file(tmp, STAGE)
+            .ok_or_else(|| format!("Error: the archive from {from} did not arrive"))?;
+        let dest = format!("{}/", to_home.trim_end_matches('/'));
+        os(&[
+            "sandbox",
+            "upload",
+            to,
+            &local.to_string_lossy(),
+            &dest,
+            "--no-git-ignore",
+        ])
+        .map_err(|e| format!("Error: upload to {to} failed: {e}"))?;
+        run_in(to, &unpack_script(to_home))
+            .map_err(|e| format!("Error: unpacking in {to} failed: {e}"))?;
+        Ok(n)
+    })();
+    // Best effort: the archive is a full copy of a home, so it must not stay behind.
+    let _ = run_in(from, &format!("rm -f \"{remote}\""));
+    result
+}
+
+/// A file called `name` anywhere under `dir`.
+fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    for e in std::fs::read_dir(dir).ok()?.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if let Some(f) = find_file(&p, name) {
+                return Some(f);
+            }
+        } else if p.file_name().is_some_and(|n| n == name) {
+            return Some(p);
+        }
     }
-    Ok(entries.len())
+    None
 }
 
 /// Put the host's tmux config and a filtered copy of its global git config (allowlist in
@@ -1978,21 +2011,26 @@ mod tests {
     }
 
     #[test]
-    fn transfer_uploads_a_directory_to_the_home_and_a_file_into_it() {
-        let dir = transfer_upload_args("b", Path::new("/t/.cargo"), true, "/sandbox");
-        assert_eq!(
-            dir,
-            [
-                "sandbox",
-                "upload",
-                "b",
-                "/t/.cargo",
-                "/sandbox",
-                "--no-git-ignore"
-            ]
+    fn transfer_stages_one_archive_through_the_workspace() {
+        let pack = pack_script();
+        assert!(pack.contains("tar -C \"$HOME\"") && pack.contains("$ws/.osh-transfer.tar"));
+        assert!(
+            pack.contains("--exclude=./.osh-transfer.tar"),
+            "never archives itself"
         );
-        let file = transfer_upload_args("b", Path::new("/t/.gitconfig"), false, "/sandbox/");
-        assert_eq!(file[4], "/sandbox/");
+        let un = unpack_script("/home/node/");
+        assert!(un.contains("-xf \"/home/node/.osh-transfer.tar\""), "{un}");
+        assert!(un.contains("rm -f") && un.contains("exit $rc"));
         assert!(transfer_state("a", "a").unwrap_err().contains("different"));
+    }
+
+    #[test]
+    fn find_file_looks_in_subfolders() {
+        let d = std::env::temp_dir().join(format!("osh-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("a/b")).unwrap();
+        std::fs::write(d.join("a/b/x.tar"), "t").unwrap();
+        assert!(find_file(&d, "x.tar").is_some() && find_file(&d, "y.tar").is_none());
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

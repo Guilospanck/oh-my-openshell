@@ -385,7 +385,8 @@ def sandbox_transfer():
         o.press("T"); o.wait("Transfer the state of", 20)
         choose(o, other)
         o.wait("overwritten", 10); o.press("y")
-        o.wait("Transferred", 600)
+        screen = o.wait(("Transferred", "Error:"), 600)
+        assert "Transferred" in screen, screen
     rc, out = osc(f"sandbox exec -n {other} -- sh -c 'cat \"$HOME/transfer-probe.txt\"'")
     assert "moved-42" in out, out
     clean(other)
