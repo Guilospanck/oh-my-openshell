@@ -160,6 +160,14 @@ pub enum Prompt {
     },
 }
 
+impl Prompt {
+    pub fn sandbox(&self) -> &str {
+        match self {
+            Prompt::Blocked { sandbox, .. } | Prompt::Notice { sandbox, .. } => sandbox,
+        }
+    }
+}
+
 /// Decisions, the denials seen so far, and the prompts still to show (one at a time).
 #[derive(Default)]
 pub struct Watch {
@@ -320,12 +328,21 @@ impl Watch {
 
     /// The next prompt to show; it leaves the queue, so repeats while it is open queue again
     /// only once answered (`decide`) unless they coalesce into a later entry.
-    pub fn next(&mut self) -> Option<Prompt> {
-        self.queue.pop_front()
+    /// `only` names the sandbox whose shell is open: prompts of other sandboxes stay queued until
+    /// their own shell has focus, so one sandbox never interrupts another. `None` (dashboard)
+    /// takes any.
+    pub fn next(&mut self, only: Option<&str>) -> Option<Prompt> {
+        let i = self
+            .queue
+            .iter()
+            .position(|p| only.is_none_or(|o| p.sandbox() == o))?;
+        self.queue.remove(i)
     }
 
-    pub fn has_queued(&self) -> bool {
-        !self.queue.is_empty()
+    pub fn has_queued(&self, only: Option<&str>) -> bool {
+        self.queue
+            .iter()
+            .any(|p| only.is_none_or(|o| p.sandbox() == o))
     }
 
     /// Record the answer to a blocked prompt.
@@ -603,6 +620,18 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_waits_for_its_own_sandbox_shell() {
+        let mut w = Watch::default();
+        w.push("a", "gw", Denial::Blocked(curl()));
+        w.push("b", "gw", Denial::Blocked(curl()));
+        assert!(w.next(Some("c")).is_none());
+        assert!(
+            matches!(w.next(Some("b")), Some(Prompt::Blocked { sandbox, .. }) if sandbox == "b")
+        );
+        assert!(w.has_queued(Some("a")) && !w.has_queued(Some("b")));
+    }
+
+    #[test]
     fn bursts_coalesce_and_ignores_last_for_the_session() {
         let mut w = Watch::default();
         let d = Denial::Blocked(curl());
@@ -614,29 +643,29 @@ mod tests {
             ..curl()
         };
         w.push("sb", "gw", Denial::Blocked(other.clone()));
-        match w.next() {
+        match w.next(None) {
             Some(Prompt::Blocked { b, count, .. }) => assert_eq!((b, count), (curl(), 3)),
             p => panic!("{p:?}"),
         }
         // A repeat while the prompt is open queues once more; answering drops it.
         w.push("sb", "gw", d.clone());
         w.decide("sb", &curl(), State::Ignored);
-        assert!(matches!(w.next(), Some(Prompt::Blocked { b, .. }) if b == other));
-        assert!(w.next().is_none());
+        assert!(matches!(w.next(None), Some(Prompt::Blocked { b, .. }) if b == other));
+        assert!(w.next(None).is_none());
         w.push("sb", "gw", d.clone());
-        assert!(!w.has_queued(), "ignored until the session ends");
+        assert!(!w.has_queued(None), "ignored until the session ends");
         assert_eq!(w.for_sandbox("sb")[0].state, State::Ignored);
         // Once only: the next denial asks again.
         w.decide("sb", &other, State::IgnoredOnce);
         w.push("sb", "gw", Denial::Blocked(other.clone()));
-        assert!(w.has_queued());
+        assert!(w.has_queued(None));
         // Notices show once.
         let n = parse(L7).unwrap();
         w.push("sb", "gw", n.clone());
         w.push("sb", "gw", n);
-        assert!(matches!(w.next(), Some(Prompt::Blocked { .. })));
-        assert!(matches!(w.next(), Some(Prompt::Notice { .. })));
-        assert!(w.next().is_none());
+        assert!(matches!(w.next(None), Some(Prompt::Blocked { .. })));
+        assert!(matches!(w.next(None), Some(Prompt::Notice { .. })));
+        assert!(w.next(None).is_none());
         // Never: refused for good, even after the session ends, until asked again.
         let never = Blocked {
             host: "example.net".into(),
@@ -644,23 +673,23 @@ mod tests {
             ..curl()
         };
         w.push("sb", "gw", Denial::Blocked(never.clone()));
-        assert!(matches!(w.next(), Some(Prompt::Blocked { b, .. }) if b == never));
+        assert!(matches!(w.next(None), Some(Prompt::Blocked { b, .. }) if b == never));
         w.decide("sb", &never, State::Never);
         let same_host = Blocked {
             binary: "/usr/bin/curl".into(),
             ..never.clone()
         };
         w.push("sb", "gw", Denial::Blocked(same_host.clone()));
-        assert!(!w.has_queued(), "never covers every binary");
+        assert!(!w.has_queued(None), "never covers every binary");
         w.end_session("sb");
         w.push("sb", "gw", Denial::Blocked(same_host.clone()));
-        assert!(!w.has_queued(), "never outlives the session");
+        assert!(!w.has_queued(None), "never outlives the session");
         w.reprompt("sb", "gw", same_host);
-        assert!(w.has_queued(), "asking again lifts it");
-        w.next();
-        w.next();
+        assert!(w.has_queued(None), "asking again lifts it");
+        w.next(None);
+        w.next(None);
         w.end_session("sb");
         w.push("sb", "gw", d);
-        assert!(w.has_queued(), "ignores end with the session");
+        assert!(w.has_queued(None), "ignores end with the session");
     }
 }

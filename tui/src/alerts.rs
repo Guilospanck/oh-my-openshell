@@ -24,6 +24,8 @@ pub struct Alert {
     pub sev: Severity,
     pub title: String,
     pub detail: String,
+    /// The sandbox this is about; `None` is shown on the dashboard only, never inside a shell.
+    pub sandbox: Option<String>,
 }
 
 /// Folders under `$HOME` that hold secrets or tool configuration the host trusts.
@@ -345,6 +347,7 @@ pub fn diff(folder: &str, old: &Scan, new: &Scan) -> Vec<Alert> {
             let verb = if old.contains_key(k) { "changed" } else { "appeared" };
             let path = k.split_once(':').map_or(k.as_str(), |(_, r)| r);
             Alert {
+                sandbox: None,
                 sev: *sev,
                 title: format!("{path} {verb} in {folder}"),
                 detail: format!(
@@ -355,27 +358,93 @@ pub fn diff(folder: &str, old: &Scan, new: &Scan) -> Vec<Alert> {
         .collect()
 }
 
-/// The shared read-write folders osh recorded, one path per entry.
 const REGISTRY: &str = "rw-shares.json";
 
-pub fn rw_shares(data: &Path) -> Vec<String> {
-    fs::read_to_string(data.join(REGISTRY))
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+/// A shared read-write folder and the sandbox that mounts it.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Entry {
+    /// Older registries held bare paths: no sandbox is known, so dashboard only.
+    Path(String),
+    Share {
+        path: String,
+        sandbox: String,
+    },
 }
 
-/// Remember `path` as a folder to watch; a repeat adds nothing.
-pub fn register_rw_share(data: &Path, path: &str) -> std::io::Result<()> {
-    let mut all = rw_shares(data);
-    if all.iter().any(|p| p == path) {
+impl Entry {
+    fn path(&self) -> &str {
+        match self {
+            Entry::Path(p) | Entry::Share { path: p, .. } => p,
+        }
+    }
+    fn sandbox(&self) -> Option<&str> {
+        match self {
+            Entry::Path(_) => None,
+            Entry::Share { sandbox, .. } => Some(sandbox),
+        }
+    }
+}
+
+fn entries(data: &Path) -> Vec<Entry> {
+    use serde_json::Value;
+    let Some(Value::Array(v)) = fs::read_to_string(data.join(REGISTRY))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+    else {
+        return Vec::new();
+    };
+    v.iter()
+        .filter_map(|e| match e {
+            Value::String(p) => Some(Entry::Path(p.clone())),
+            Value::Object(o) => Some(Entry::Share {
+                path: o.get("path")?.as_str()?.to_string(),
+                sandbox: o.get("sandbox")?.as_str()?.to_string(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn to_json(all: &[Entry]) -> String {
+    let v: Vec<serde_json::Value> = all
+        .iter()
+        .map(|e| match e {
+            Entry::Path(p) => serde_json::json!(p),
+            Entry::Share { path, sandbox } => serde_json::json!({"path": path, "sandbox": sandbox}),
+        })
+        .collect();
+    serde_json::to_string(&v).unwrap_or_default()
+}
+
+/// The shared read-write folders osh recorded, one path per entry.
+#[cfg(test)]
+pub fn rw_shares(data: &Path) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for e in entries(data) {
+        if !v.iter().any(|p| p == e.path()) {
+            v.push(e.path().to_string());
+        }
+    }
+    v
+}
+
+/// Remember `path` as a folder to watch for `sandbox` (empty: unknown name, dashboard only); a
+/// repeat adds nothing.
+pub fn register_rw_share(data: &Path, path: &str, sandbox: &str) -> std::io::Result<()> {
+    let mut all = entries(data);
+    let e = if sandbox.is_empty() {
+        Entry::Path(path.to_string())
+    } else {
+        Entry::Share {
+            path: path.to_string(),
+            sandbox: sandbox.to_string(),
+        }
+    };
+    if all.contains(&e) {
         return Ok(());
     }
-    all.push(path.to_string());
-    fs::write(
-        data.join(REGISTRY),
-        serde_json::to_string(&all).unwrap_or_default(),
-    )
+    all.push(e);
+    fs::write(data.join(REGISTRY), to_json(&all))
 }
 
 /// Polls every read-write share every `every`; the first scan of a folder is its baseline and
@@ -384,21 +453,35 @@ pub fn spawn_watch(data: PathBuf, tx: Sender<Alert>, every: Duration) {
     std::thread::spawn(move || {
         let mut base: BTreeMap<String, Scan> = BTreeMap::new();
         loop {
-            for path in rw_shares(&data) {
-                let root = Path::new(&path);
+            let all = entries(&data);
+            let paths: std::collections::BTreeSet<&str> = all.iter().map(Entry::path).collect();
+            for path in paths {
+                let root = Path::new(path);
                 if !root.is_dir() {
                     continue;
                 }
                 let now = scan(root);
-                if let Some(old) = base.get(&path) {
-                    let folder = root.file_name().and_then(|n| n.to_str()).unwrap_or(&path);
+                if let Some(old) = base.get(path) {
+                    let folder = root.file_name().and_then(|n| n.to_str()).unwrap_or(path);
+                    // One alert per sandbox that mounts the folder, so each shell sees only its own.
+                    let owners: Vec<Option<&str>> = all
+                        .iter()
+                        .filter(|e| e.path() == path)
+                        .map(Entry::sandbox)
+                        .collect();
                     for a in diff(folder, old, &now) {
-                        if tx.send(a).is_err() {
-                            return;
+                        for o in &owners {
+                            let a = Alert {
+                                sandbox: o.map(str::to_string),
+                                ..a.clone()
+                            };
+                            if tx.send(a).is_err() {
+                                return;
+                            }
                         }
                     }
                 }
-                base.insert(path, now);
+                base.insert(path.to_string(), now);
             }
             std::thread::sleep(every);
         }
@@ -544,10 +627,22 @@ mod tests {
     fn registry_keeps_each_path_once() {
         let d = tmp("reg");
         assert!(rw_shares(&d).is_empty());
-        register_rw_share(&d, "/p/app").unwrap();
-        register_rw_share(&d, "/p/app").unwrap();
-        register_rw_share(&d, "/p/other").unwrap();
+        register_rw_share(&d, "/p/app", "a").unwrap();
+        register_rw_share(&d, "/p/app", "a").unwrap();
+        register_rw_share(&d, "/p/app", "b").unwrap();
+        register_rw_share(&d, "/p/other", "a").unwrap();
         assert_eq!(rw_shares(&d), vec!["/p/app", "/p/other"]);
+        assert_eq!(entries(&d).len(), 3, "one entry per (path, sandbox)");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_old_registry_of_bare_paths_still_loads_with_no_sandbox() {
+        let d = tmp("old");
+        fs::write(d.join(REGISTRY), r#"["/p/app"]"#).unwrap();
+        let e = entries(&d);
+        assert_eq!(e[0].path(), "/p/app");
+        assert_eq!(e[0].sandbox(), None);
         let _ = fs::remove_dir_all(&d);
     }
 
@@ -555,7 +650,7 @@ mod tests {
     fn the_watcher_baselines_silently_then_reports_changes() {
         let data = tmp("wdata");
         let share = tmp("wshare");
-        register_rw_share(&data, &share.to_string_lossy()).unwrap();
+        register_rw_share(&data, &share.to_string_lossy(), "sb").unwrap();
         let (tx, rx) = std::sync::mpsc::channel();
         spawn_watch(data.clone(), tx, Duration::from_millis(30));
         std::thread::sleep(Duration::from_millis(200));
@@ -572,6 +667,7 @@ mod tests {
         }
         let a = got.expect("an alert");
         assert!(a.title.contains(".envrc"), "{a:?}");
+        assert_eq!(a.sandbox.as_deref(), Some("sb"));
         while rx.try_recv().is_ok() {}
         assert!(
             rx.recv_timeout(Duration::from_millis(300)).is_err(),

@@ -109,7 +109,7 @@ folder) and, for read-write shares, when something appears or changes in the fol
 this machine later: `.git/hooks`, `.git/config` keys that run programs, `.envrc`, `Makefile`, `justfile`,
 `package.json` scripts, `.vscode/tasks.json`, shell startup files, symlinks that point outside the
 folder, and setuid files. The folder is checked every few seconds; the first check is the baseline.
-Every alert also stays in the list and in the shell menu (`Alerts (n)`).
+Every alert also stays in the list and in the shell menu (`Alerts (n)`). Alerts belong to the sandbox that mounts the folder: inside a shell you see only that sandbox's alerts and blocked-request prompts (other sandboxes' prompts wait until you open their shell); the dashboard shows all. Folders recorded by older osh versions have no sandbox and show on the dashboard only.
 
 `Enter` on a sandbox opens `bash` in it, inside osh. When the image has `tmux`
 (the Claude Code image does) the shell runs in a tmux session named `osh`, and opening the

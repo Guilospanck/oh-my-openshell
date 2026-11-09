@@ -831,6 +831,7 @@ mod tests {
             sev: alerts::Severity::High,
             title: ".envrc appeared in app".into(),
             detail: "direnv runs it".into(),
+            sandbox: Some("sb".into()),
         });
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|f| ui::draw(f, &app)).unwrap();

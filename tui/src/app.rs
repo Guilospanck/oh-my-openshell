@@ -1020,8 +1020,23 @@ impl App {
     pub fn toast(&self) -> Option<&crate::alerts::Alert> {
         self.toast
             .as_ref()
-            .filter(|(_, t)| t.elapsed() < TOAST_FOR)
+            .filter(|(a, t)| t.elapsed() < TOAST_FOR && self.alert_visible(a))
             .map(|(a, _)| a)
+    }
+
+    /// Inside a shell only that sandbox's alerts show; the dashboard shows all of them.
+    fn alert_visible(&self, a: &crate::alerts::Alert) -> bool {
+        match self.session() {
+            Some(s) => a.sandbox.as_deref() == Some(s.sandbox.as_str()),
+            None => true,
+        }
+    }
+
+    fn visible_alerts(&self) -> Vec<&crate::alerts::Alert> {
+        self.alerts
+            .iter()
+            .filter(|a| self.alert_visible(a))
+            .collect()
     }
 
     pub fn dismiss_toast(&mut self) -> bool {
@@ -1032,11 +1047,13 @@ impl App {
 
     /// Every alert as text, newest first, for the viewer behind `!`.
     fn alerts_text(&self) -> String {
-        if self.alerts.is_empty() {
+        let shown = self.visible_alerts();
+        if shown.is_empty() {
             return "Nothing suspicious seen since osh started.".into();
         }
-        self.alerts
-            .iter()
+        let on_dashboard = self.session().is_none();
+        shown
+            .into_iter()
             .rev()
             .map(|a| {
                 let tag = if a.sev == crate::alerts::Severity::High {
@@ -1044,14 +1061,18 @@ impl App {
                 } else {
                     "warn"
                 };
-                format!("[{tag}] {}\n      {}", a.title, a.detail)
+                let who = match (&a.sandbox, on_dashboard) {
+                    (Some(s), true) => format!(" ({s})"),
+                    _ => String::new(),
+                };
+                format!("[{tag}]{who} {}\n      {}", a.title, a.detail)
             })
             .collect::<Vec<_>>()
             .join("\n\n")
     }
 
     fn show_alerts(&mut self, back: Option<Modal>) {
-        let n = self.alerts.len();
+        let n = self.visible_alerts().len();
         let text = self.alerts_text();
         self.toast = None;
         self.open_viewer(&format!("Alerts ({n})"), text, back);
@@ -1288,7 +1309,8 @@ impl App {
             self.status = format!("Blocked-request watcher for {} stopped: {last}", f.sandbox);
         }
         self.refresh_review();
-        if self.watch.has_queued()
+        let here = self.session().map(|s| s.sandbox.clone());
+        if self.watch.has_queued(here.as_deref())
             && self.modal.is_none()
             && self.logview.is_none()
             && self.job.is_none()
@@ -1298,9 +1320,11 @@ impl App {
     }
 
     fn show_prompt(&mut self) {
-        let Some(p) = self.watch.next() else { return };
-        self.prompt_at = Some(Instant::now());
         let here = self.session().map(|s| s.sandbox.clone());
+        let Some(p) = self.watch.next(here.as_deref()) else {
+            return;
+        };
+        self.prompt_at = Some(Instant::now());
         match p {
             Prompt::Blocked {
                 sandbox,
@@ -3153,6 +3177,7 @@ impl App {
                     sev: crate::alerts::Severity::High,
                     title: format!("Sharing {} is risky", plan.share),
                     detail: format!("{why}. Share the project folder instead."),
+                    sandbox: Some(plan.name.clone()).filter(|n| !n.is_empty()),
                 });
                 format!("Access to the shared folder (RISKY: {why})")
             }
@@ -3218,7 +3243,7 @@ impl App {
         match kind {
             ConfKind::CreateSandbox(mut plan) => {
                 if plan.share_rw && !plan.share.is_empty() {
-                    let _ = crate::alerts::register_rw_share(&self.dir, &plan.share);
+                    let _ = crate::alerts::register_rw_share(&self.dir, &plan.share, &plan.name);
                 }
                 match plan.gh.take() {
                     None => self.start_create(&plan),
@@ -3421,7 +3446,7 @@ impl App {
                     "Back to the session".into(),
                     "Providers and their permissions".into(),
                     "Blocked requests".into(),
-                    format!("Alerts ({})", self.alerts.len()),
+                    format!("Alerts ({})", self.visible_alerts().len()),
                     "Dashboard (keep the session running)".into(),
                     "Close the session".into(),
                 ];
@@ -4202,6 +4227,7 @@ mod tests {
             sev: crate::alerts::Severity::High,
             title: title.into(),
             detail: "look at it".into(),
+            sandbox: None,
         }
     }
 
@@ -4282,6 +4308,41 @@ mod tests {
             b.toast().is_none() && b.alerts.is_empty(),
             "a project folder is fine"
         );
+    }
+
+    #[test]
+    fn a_shell_sees_only_its_own_sandbox_alerts_and_prompts() {
+        use crate::term::Session;
+        let mut a = app();
+        let scoped = |sb: Option<&str>, t: &str| crate::alerts::Alert {
+            sandbox: sb.map(str::to_string),
+            ..alert(t)
+        };
+        a.push_alert(scoped(Some("a"), "in a"));
+        a.push_alert(scoped(Some("b"), "in b"));
+        a.push_alert(scoped(None, "unknown"));
+        assert_eq!(a.visible_alerts().len(), 3, "dashboard sees all");
+        let s = Session::spawn("a".into(), String::new(), "cat", &[], 20, 5).unwrap();
+        a.sessions.push(s);
+        a.active = Some(0);
+        let v = a.visible_alerts();
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].title, "in a");
+        a.toast = Some((scoped(Some("b"), "in b"), Instant::now()));
+        assert!(a.toast().is_none(), "b's toast stays out of a's shell");
+        let text = a.alerts_text();
+        assert!(text.contains("in a") && !text.contains("in b") && !text.contains("unknown"));
+        // A denial in b waits while a's shell has focus, then shows on the dashboard.
+        let d = watch::parse(
+            "[1] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(0) -> example.com:443 [reason:transparent_tcp_policy_denied]",
+        )
+        .unwrap();
+        a.watch.push("b", "gw", d);
+        a.pump_watch();
+        assert!(a.modal.is_none(), "no popup from b inside a");
+        a.active = None;
+        a.pump_watch();
+        assert!(matches!(a.modal, Some(Modal::Select { .. })));
     }
 
     #[test]
