@@ -487,15 +487,31 @@ pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
     ));
     let mut steps = chain(steps, None);
     if f.os == Os::Linux {
-        let mut s = step(
-            "uninstall-packages",
-            "Remove the OpenShell packages",
-            StepKind::Manual(
-                "Debian/Ubuntu: sudo apt remove 'openshell*'    Fedora/RHEL: sudo dnf remove 'openshell*'"
+        // The packages OpenShell's installer added, removed with the package manager (through
+        // sudo, which asks for the password on this terminal).
+        let argv: Option<Vec<&str>> = match f.pkg {
+            PkgMgr::Apt => Some(vec!["apt-get", "remove", "-y", "openshell*"]),
+            PkgMgr::Dnf => Some(vec!["dnf", "remove", "-y", "openshell*"]),
+            _ => None,
+        };
+        let kind = match argv {
+            Some(a) if f.is_root => cmd(a[0], &a[1..]),
+            Some(a) if f.has_sudo => {
+                let mut with = vec!["sudo"];
+                with.extend(a);
+                cmd("sudo", &with[1..])
+            }
+            Some(a) => StepKind::Manual(format!(
+                "removing packages needs root, and sudo is not available to your user: as root, run {}",
+                a.join(" ")
+            )),
+            None => StepKind::Manual(
+                "remove the openshell packages with your package manager (osh knows apt and dnf only)"
                     .into(),
             ),
-        );
-        // Left to the user, so it must not make the run count as failed. It sits outside the
+        };
+        let mut s = step("uninstall-packages", "Remove the OpenShell packages", kind);
+        // Optional, so a refusal does not make the run count as failed. It sits outside the
         // chain: a manual step never "succeeds", so chained in it would block removing the program.
         s.optional = true;
         s.after = steps.get(steps.len() - 2).map(|p| p.id);
@@ -597,6 +613,7 @@ mod tests {
             has_tmux: true,
             has_ssh: true,
             has_gh: true,
+            has_gitleaks: true,
             has_clipboard: true,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
@@ -1253,7 +1270,12 @@ mod tests {
         assert!(t.contains(
             "rm -rf /h/.config/openshell /h/.local/state/openshell /h/.local/share/openshell"
         ));
-        assert!(t.contains("apt remove"));
+        // osh removes the packages itself, through sudo (the facts have apt and sudo).
+        assert!(t.contains("sudo apt-get remove -y openshell*"), "{t}");
+        let mut f = facts(Os::Linux);
+        f.has_sudo = false;
+        let t = texts(&uninstall_steps(&f, &paths()));
+        assert!(t.contains("sudo is not available"), "{t}");
     }
 
     #[test]

@@ -222,7 +222,10 @@ impl Planner {
                 args: argv,
             }
         } else {
-            StepKind::Manual(format!("as root, run: {}", argv.join(" ")))
+            StepKind::Manual(format!(
+                "this needs root, and sudo is not available to your user: as root, run {}",
+                argv.join(" ")
+            ))
         }
     }
 
@@ -361,7 +364,7 @@ impl Planner {
                 "runtime-relogin",
                 "Apply the new group",
                 StepKind::Manual(
-                    "log out and back in (or run `newgrp docker`), then run osh again".into(),
+                    "log out and back in (or run `newgrp docker`) so your user gets the docker group, then start osh again: it carries on where it stopped".into(),
                 ),
                 false,
             );
@@ -370,13 +373,21 @@ impl Planner {
         if let Some(rt) = f.runtimes_installed.first().copied() {
             // The default macOS vm gateway needs no runtime, so a stopped one is not worth a step.
             if f.os == Os::Linux {
-                let text = self.manual_runtime_started(rt);
-                self.push(
-                    "runtime",
-                    "Start the container runtime",
-                    StepKind::Manual(text),
-                    false,
-                );
+                // Started for the user instead of naming the command: the daemon through sudo,
+                // the Podman API socket as the user's own unit.
+                let kind = match rt {
+                    Runtime::Docker if f.has_sudo || f.is_root => {
+                        self.privileged(["systemctl", "start", "docker"].map(String::from).to_vec())
+                    }
+                    Runtime::Docker => StepKind::Manual(self.manual_runtime_started(rt)),
+                    Runtime::Podman => StepKind::Cmd {
+                        prog: "systemctl".into(),
+                        args: ["--user", "start", "podman.socket"]
+                            .map(String::from)
+                            .to_vec(),
+                    },
+                };
+                self.push("runtime", "Start the container runtime", kind, false);
             }
             return;
         }
@@ -395,21 +406,8 @@ impl Planner {
             return;
         };
         match (f.os, rt) {
-            (Os::MacOs, Runtime::Docker) => self.push(
-                "runtime",
-                "Install Docker",
-                StepKind::Manual("brew install colima docker, then colima start".into()),
-                true,
-            ),
-            (Os::MacOs, Runtime::Podman) => {
-                self.pkg("runtime", "Install Podman", &["podman"], true);
-                self.push(
-                    "runtime-machine",
-                    "Start the Podman machine",
-                    StepKind::Manual("podman machine init && podman machine start".into()),
-                    true,
-                );
-            }
+            // The same steps the wizard runs: install, then start (Colima, the Podman machine).
+            (Os::MacOs, rt) => self.mac_runtime(rt),
             (Os::Linux, _) => {
                 let title = format!("Install {}", rt.bin());
                 if rt == Runtime::Docker && f.debian && f.pkg == PkgMgr::Apt {
@@ -463,7 +461,7 @@ impl Planner {
                         "runtime-relogin",
                         "Apply the new group",
                         StepKind::Manual(
-                            "log out and back in (or reboot) so the docker group reaches your user services, then run osh setup again"
+                            "log out and back in (or reboot) so the docker group reaches your user services, then start osh again: it carries on where it stopped"
                                 .into(),
                         ),
                         false,
@@ -629,7 +627,7 @@ impl Planner {
                     self.push(
                         "kvm-relogin",
                         "Apply the new group",
-                        StepKind::Manual("log out and back in (or reboot) so the kvm group applies, then run osh setup again".into()),
+                        StepKind::Manual("log out and back in (or reboot) so the kvm group applies, then start osh again: it carries on where it stopped".into()),
                         false,
                     );
                     let group = self.rid("kvm-group");
@@ -753,7 +751,79 @@ impl Planner {
         if !f.has_gh {
             self.pkg("gh", "Install the GitHub CLI", &["gh"], true);
         }
+        if !f.has_gitleaks && f.pkg != PkgMgr::None {
+            self.pkg(
+                "gitleaks",
+                "Install gitleaks (secret scan of files copied into sandboxes)",
+                &["gitleaks"],
+                true,
+            );
+        }
     }
+}
+
+/// Steps that bring an installed but stopped container runtime up (Colima, the Podman machine,
+/// the Docker daemon, the Podman socket), without installing anything: what the dashboard offers
+/// when an image build finds no runtime. Empty when none is installed or one is ready; a runtime
+/// only the user can start (Docker Desktop) is a manual step that says so.
+pub fn runtime_start_steps(f: &Facts) -> Vec<Step> {
+    if !f.runtimes_ready.is_empty() {
+        return Vec::new();
+    }
+    let mut p = Planner::new(f);
+    for rt in f.runtimes_installed.clone() {
+        let before = p.steps.len();
+        let kind = match rt {
+            Runtime::Docker => GwKind::Docker,
+            Runtime::Podman => GwKind::Podman,
+        };
+        p.kind_prereqs(kind, None);
+        // Only starts: an install step here would mean the runtime is not really installed.
+        if p.steps[before..]
+            .iter()
+            .any(|s| s.title.starts_with("Install"))
+        {
+            p.steps.truncate(before);
+        }
+        if p.steps.len() > before {
+            break;
+        }
+    }
+    p.steps
+}
+
+/// The install step for one optional tool (`clipboard` or `gitleaks`), for the dashboard to offer
+/// where the tool is missing. Empty when it is there or this machine has no package manager.
+pub fn tool_steps(f: &Facts, tool: &str) -> Vec<Step> {
+    let mut p = Planner::new(f);
+    match tool {
+        "clipboard" if !f.has_clipboard => match f.os {
+            Os::MacOs if f.pkg == PkgMgr::Brew => p.pkg(
+                "pngpaste",
+                "Install pngpaste (paste host images with Ctrl-V)",
+                &["pngpaste"],
+                false,
+            ),
+            Os::Linux => {
+                let t = if f.wayland { "wl-clipboard" } else { "xclip" };
+                p.pkg(
+                    "clipboard",
+                    "Install a clipboard tool (paste host images with Ctrl-V)",
+                    &[t],
+                    false,
+                )
+            }
+            Os::MacOs => {}
+        },
+        "gitleaks" if !f.has_gitleaks && f.pkg != PkgMgr::None => p.pkg(
+            "gitleaks",
+            "Install gitleaks (secret scan of files copied into sandboxes)",
+            &["gitleaks"],
+            false,
+        ),
+        _ => {}
+    }
+    p.steps
 }
 
 pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
@@ -839,6 +909,14 @@ pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
     }
     if !f.has_gh {
         p.pkg("gh", "Install the GitHub CLI", &["gh"], true);
+    }
+    if !f.has_gitleaks && f.pkg != PkgMgr::None {
+        p.pkg(
+            "gitleaks",
+            "Install gitleaks (secret scan of files copied into sandboxes)",
+            &["gitleaks"],
+            true,
+        );
     }
     p.steps
 }
@@ -1311,6 +1389,11 @@ pub fn doctor(f: &Facts, runtime_needed: bool) -> (String, bool) {
         (f.has_tmux, "tmux", "sandbox sessions in tmux"),
         (f.has_gh, "gh", "GitHub repo picker"),
         (
+            f.has_gitleaks,
+            "gitleaks",
+            "secret scan of the tmux config and agent files copied into sandboxes",
+        ),
+        (
             f.has_clipboard,
             "clipboard tool",
             "paste host images with Ctrl-V",
@@ -1527,6 +1610,7 @@ mod tests {
             has_tmux: false,
             has_ssh: true,
             has_gh: false,
+            has_gitleaks: false,
             has_clipboard: false,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
@@ -1735,13 +1819,55 @@ mod tests {
     }
 
     #[test]
-    fn plan_installed_but_stopped_docker_is_manual_hint() {
+    fn plan_installed_but_stopped_docker_is_started_for_the_user() {
         let mut f = facts(Os::Linux, PkgMgr::Apt);
         f.runtimes_installed = vec![Runtime::Docker];
+        f.has_sudo = true;
+        let steps = plan(&f, &Options::default());
+        let start = steps.iter().find(|s| s.id == "runtime").unwrap();
+        assert!(!matches!(start.kind, StepKind::Manual(_)), "osh runs it");
+        assert!(start.command_line().contains("systemctl start docker"));
+        assert!(!has(&steps, "apt-get install -y docker"));
+        // Without sudo only the user can, and the step says what to run.
+        f.has_sudo = false;
         let steps = plan(&f, &Options::default());
         let hint = steps.iter().find(|s| s.id == "runtime").unwrap();
         assert!(matches!(&hint.kind, StepKind::Manual(t) if t.contains("systemctl start docker")));
-        assert!(!has(&steps, "apt-get install -y docker"));
+        // A stopped Podman's socket is the user's own unit: started without sudo.
+        f.runtimes_installed = vec![Runtime::Podman];
+        let steps = plan(&f, &Options::default());
+        let s = steps.iter().find(|s| s.id == "runtime").unwrap();
+        assert!(s
+            .command_line()
+            .contains("systemctl --user start podman.socket"));
+    }
+
+    #[test]
+    fn the_dashboard_offers_runtime_starts_and_tool_installs_without_installing_runtimes() {
+        let mut f = facts(Os::MacOs, PkgMgr::Brew);
+        f.runtimes_installed = vec![Runtime::Docker];
+        f.colima = true;
+        let steps = runtime_start_steps(&f);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].command_line(), "colima start");
+        f.runtimes_installed = vec![Runtime::Podman];
+        f.podman_machine = PodmanMachine::Stopped;
+        let steps = runtime_start_steps(&f);
+        assert!(has(&steps, "podman machine start") && !has(&steps, "brew install"));
+        f.runtimes_installed.clear();
+        assert!(
+            runtime_start_steps(&f).is_empty(),
+            "nothing installed: nothing to start"
+        );
+        f.runtimes_ready = vec![Runtime::Docker];
+        assert!(runtime_start_steps(&f).is_empty());
+        let f = facts(Os::Linux, PkgMgr::Apt);
+        assert!(has(&tool_steps(&f, "gitleaks"), "gitleaks"));
+        assert!(has(&tool_steps(&f, "clipboard"), "xclip"));
+        let mut g = f.clone();
+        g.has_gitleaks = true;
+        assert!(tool_steps(&g, "gitleaks").is_empty());
+        assert!(tool_steps(&f, "other").is_empty());
     }
 
     #[test]
@@ -1816,9 +1942,13 @@ mod tests {
         f.has_tmux = true;
         f.has_gh = true;
         f.has_clipboard = true;
+        f.has_gitleaks = true;
         f.runtimes_installed = vec![Runtime::Docker];
         f.runtimes_ready = vec![Runtime::Docker];
         assert!(plan(&f, &Options::default()).is_empty());
+        // gitleaks is offered while it is missing: the secret scan needs it.
+        f.has_gitleaks = false;
+        assert!(has(&plan(&f, &Options::default()), "gitleaks"));
     }
 
     #[test]

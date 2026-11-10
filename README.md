@@ -21,6 +21,8 @@ osh gateway add vm|docker|podman [--yes] [--dry-run]   # one more gateway
 osh gateway remove NAME [--delete-data]    # remove a gateway osh created (typed confirmation)
 osh gateway restart NAME    # start or restart a gateway with its current config (Gateways tab: R)
 osh gateway vm-size NAME VCPUS MEM_MIB     # the size of every sandbox on a VM gateway (Gateways tab: V)
+osh runtime-start           # start an installed, stopped container runtime (offered by the Images tab)
+osh install clipboard|gitleaks             # an optional tool (palette: Install ...)
 osh upgrade    # reinstall OpenShell, refresh the gateway config, restart the main gateway and its extras
 osh gateway-docker          # same as: osh gateway add docker
 osh uninstall  # remove OpenShell, its services and folders, osh's own data and the osh program (asks first; sandboxes are lost)
@@ -36,7 +38,7 @@ osh setup                                      # then install what osh needs (as
 ```
 
 Homebrew installs only the `osh` binary; it does not install OpenShell, a container runtime or a gateway until you
-run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. To remove everything, run `osh uninstall` (it also runs `brew uninstall` for you); a bare `brew uninstall` removes only the binary and leaves OpenShell, its gateways and osh's data behind. After such a reinstall, `osh` prints a one-time notice that it found that data and is using it. Releases ship
+run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. To remove everything, run `osh uninstall` or `Uninstall osh and OpenShell` in the palette (it also runs `brew uninstall` for you); a bare `brew uninstall` removes only the binary and leaves OpenShell, its gateways and osh's data behind. After such a reinstall, the dashboard shows a one-time alert that it found that data and is using it. Releases ship
 macOS and Linux archives for both aarch64 (Apple Silicon, arm64) and x86_64 (Intel, AMD).
 
 Install from a release (Linux or macOS, aarch64 or x86_64): `curl -fsSL
@@ -60,10 +62,12 @@ step, with `sudo` marked), **Install** (live progress; `Esc` stops after the ste
 detects the OS and package manager (Homebrew, apt, dnf, pacman, zypper) and
 installs OpenShell, the gateway configs and services, whatever each ticked type
 needs (Docker Engine, Podman, Colima, a Podman machine, `e2fsprogs`, KVM access),
-the `ssh` client on Linux (macOS ships it; `openshell sandbox upload` runs it on your machine, so without it nothing can be uploaded into a sandbox, and `osh doctor` reports it), and the optional tools: `tmux`, `gh` and a clipboard tool. `--runtime docker|podman`
+the `ssh` client on Linux (macOS ships it; `openshell sandbox upload` runs it on your machine, so without it nothing can be uploaded into a sandbox, and `osh doctor` reports it), and the optional tools: `tmux`, `gh`, a clipboard tool and `gitleaks` (the secret scan of files osh copies into sandboxes). `--runtime docker|podman`
 is an alias for `--gateways docker|podman`. On Debian, setup installs Docker from Docker's own apt repository (`docker-ce`, after checking the signing key's fingerprint) instead of Debian's `docker.io`, because `docker.io` 26 cannot copy files into the `--user uid:gid` containers OpenShell creates, so every Docker sandbox would fail to provision; Ubuntu's `docker.io` is new enough and is kept. `osh doctor` reports a Docker server older than 27 as broken for sandboxes and says how to fix it (an existing `docker.io` is never replaced by setup). It never installs silently: each step is shown first, and what
-it cannot do for you (no sudo, unknown distro, a stopped Docker daemon) is
-printed as the command to run yourself. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the
+it cannot do for you (no sudo, an unknown distro, Docker Desktop to start) is
+printed as the one thing left to do, with the reason. A stopped Docker daemon or Podman socket is started
+for you (the daemon through `sudo`), and on macOS `--runtime` installs and starts Colima or the Podman
+machine as the wizard does. Without a terminal (a pipe, CI) nothing runs unless you pass `--yes`. Only OpenShell is required to open the
 dashboard; image builds need a container runtime.
 
 Release archives: `scripts/release vX.Y.Z [--linux amd64 arm64] [--macos amd64 arm64]` builds them into `dist/` with a `.sha256` each
@@ -107,19 +111,73 @@ A few actions have no key and live only in the palette:
 | `Editor: switch auto / your own / built-in` | which editor the edit actions use: `auto` (yours when one is found, else the built-in one), always yours, or always the built-in one (kept across runs in `editor-mode` in the data folder) |
 | `Data files` | every file osh keeps in its data folder: view, edit, compare with the shipped default, restore it, delete; new profile or Dockerfile |
 | `Sandbox policy` | the same actions for `sandbox-policy.yaml`, the filesystem policy every new sandbox gets (checked as YAML with a `version` on save) |
+| `Resume or repair set-up` | the set-up wizard from its first screen: carries on a stopped install, installs what is missing |
+| `Upgrade OpenShell` | `osh upgrade`: latest OpenShell, fresh gateway configs, restarted gateways (each step asked) |
+| `Check this machine` | `osh doctor` in a viewer |
+| `Install gitleaks`, `Install the clipboard tool` | the optional tools: the secret scan of files copied into sandboxes, and image paste |
 | `Host tmux keys in sandbox shells` | switches passing the host tmux's keys to a focused shell on or off (kept across runs) |
 | `Git hosts: forget an answer` | drops a remembered "which git provider hosts HOST?" answer, `None / other` included, so osh asks again |
+| `Uninstall osh and OpenShell` | `osh uninstall` (you type `uninstall` to confirm; osh closes afterwards) |
 
 | Tab | What you can do |
 | --- | --- |
 | Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), settings and effective policy (`i`; the image, shared folder and toolchain hosts are fixed at creation), blocked requests (`p`), renew a repo token (`t`), install skills and plugins (`K`, below), transfer state to another sandbox (`T`: copies the home directory, workspace and tool caches through a temp folder on the host; same-path files are overwritten; system packages cannot move, so put those in the image) |
 | Providers | create from a `providers/*.yaml` profile or a read/write repo token for GitHub, GitLab, Bitbucket or Forgejo (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`; the file is linted first, and an update that reaches running sandboxes offers to restart them), the file's actions (`e`: view, edit, compare with the shipped default or the gateway's copy, restore, delete; save the gateway's copy as a file; delete the profile from the gateway), a new profile from a template (`n`). `.yml` files count too |
-| Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from) |
+| Images | build `images/Dockerfile-*` (`b`; with no runtime running, osh offers to start Colima, the Podman machine or the daemon); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from); the Dockerfile's actions (`e`), a new Dockerfile started from pi's (`n`) |
 | Gateways | switch (`g` / `Enter`), make one the OpenShell CLI default (`s`), add a gateway (`a`), start or restart it with its current config (`R`), follow its service log (`l`: the journal on Linux, the launchd or Homebrew log files on macOS; works while it is down), edit the config osh keeps for it (`e`; a restart is offered after saving), set the size of every sandbox on a VM gateway (`V`), remove one osh created (`x`), with its data too (`D` in that question), wipe and restart empty (`d`) |
 
-Credentials are read from the environment when exported, else prompted hidden;
-they never go through argv. The footer shows the keys for the current tab.
+Credentials are prompted hidden (or, for a new provider, read from the environment when exported, which the
+status line says); renewing them with `u` always asks. They never go through argv. The footer shows the keys for the current tab.
+
+### Editing files
+
+Every "edit this file" action opens your own editor inside osh's terminal (the one sandbox shells
+use), full screen above a status bar, so osh keeps running and its alerts still show. The editor is
+`$VISUAL`, else `$EDITOR` (arguments and quotes are split as a shell would, without running one,
+so `EDITOR="code --wait"` works), else the first of `nvim`, `vim`, `nano`, `vi` on `PATH`; a
+variable naming a program that is not there is skipped. osh hands the editor a copy of the file in
+a private temporary folder (mode 0700, the file 0600, with the real file name so the editor picks
+the syntax), and when the editor exits it reads the copy back: unchanged, or an editor that exits
+with an error, writes nothing; otherwise the file's check runs (the same checks as below) and only
+a file that passes replaces the real one. When the check fails a box shows the first line of the
+error; `Enter` or `r` reopens the editor on your edits, `d` discards them. The temporary folder is
+removed afterwards in every case. When no editor is found, or it does not start, osh opens its
+built-in editor instead and its status bar says why. The palette's `Editor: switch auto / your own
+/ built-in` forces one or the other (with "your own" forced and none found, osh says so and opens
+nothing).
+
+### Built-in editor
+
+The fallback editor runs inside the TUI with no outside program.
+Edit actions open it (when your editor is not used) with `Edit toolchains.toml` from the command palette (`:`) or from the toolchain pickers
+(new sandbox, and `Open the toolchain hosts` in the `Ctrl-]` menu; after either editor closes the picker comes
+back with the fresh groups), on any file under `Data files` or `Sandbox policy`, with `e` / `n` on the
+Profiles and Images tabs, and with `e` on the Gateways tab. Saving checks the file first:
+`toolchains.toml` must parse as TOML with exact host names, `sandbox-policy.yaml` must be YAML with a
+`version`, a profile must be YAML with an `id` and pass OpenShell's `profile lint`, a Dockerfile must
+start with `FROM`, other TOML and YAML files must parse; when it does not, nothing is written, the status bar shows the first line of the error and the
+cursor jumps to the line it names, so you fix it and save again. Closing with unsaved changes asks
+whether to save, discard or keep editing.
+
+| Key | What it does |
+| --- | --- |
+| `Ctrl-S` | Save (the file is checked first; a broken file is not written) |
+| `Esc` / `Ctrl-Q` | Close; asks to save or discard unsaved changes (`Esc` first clears a selection) |
+| Arrows, `Home` / `End`, `Ctrl-A` / `Ctrl-E` | Move; `Home` goes to the first non-blank, then the line start |
+| `Ctrl-Left` / `Ctrl-Right` (`Alt-b` / `Alt-f`) | Word left / right |
+| `PgUp` / `PgDn`, `Ctrl-Home` / `Ctrl-End` | Page; file start and end |
+| `Shift` + any move | Select; `Ctrl-Space` sets a mark so plain moves select; `Alt-a` selects all |
+| `Ctrl-C` / `Ctrl-X` / `Ctrl-V` | Copy, cut, paste; with nothing selected they take the whole line |
+| `Ctrl-Z` / `Ctrl-Y` | Undo / redo (a run of typing is one step) |
+| `Ctrl-K` / `Ctrl-W` (`Alt-Backspace`), `Alt-d` | Cut to the line end; delete the word before / after |
+| `Enter`, `Tab` / `Shift-Tab` | New line with the same indent; indent / outdent by two spaces (the selected lines too) |
+| `Ctrl-F`, then `Ctrl-N` / `Ctrl-P` (or `F3` / `Shift-F3`) | Find as you type (a capital letter makes it case-sensitive); next and previous, wrapping |
+| `Ctrl-G` | Go to a line, or `line:col` |
+
+Copy also puts the text on your computer's clipboard (OSC 52 through the terminal, plus `pbcopy` on
+macOS, as the shells do); `Ctrl-V` pastes the editor's own clipboard, and your terminal's paste
+(`Cmd-V`) arrives as one paste. Wide and combined characters count as the columns they take.
 
 ### Embedded shells
 
@@ -147,8 +205,8 @@ shell, host tmux shortcuts included: when osh runs in tmux, the host's prefix an
 (`M-h`, new tab, ...) are wrapped as "if this window is an osh shell with focus, send the key to the
 pane, else run the original", so they reach the tmux inside the sandbox only in that window and the rest
 of the host session keeps its shortcuts (needs tmux 3.2+; `Ctrl-]` still leaves the shell). While osh runs, the host's global `prefix` is `None` and the
-prefix key is a wrapped root binding; osh puts it back when it quits. `OSH_TMUX_PASSTHROUGH=0`
-turns this off. After a crash, `tmux set-option -g prefix "$(tmux show -gv @osh_prefix)"` restores the prefix. A new sandbox gets your host `tmux.conf` automatically when its image has tmux (secret-scanned first), and a filtered copy of your global git config (only aliases, colours and a few behaviour keys such as `init.defaultBranch`, `push.default`, `pull.rebase`; never credentials, URLs rewrites, signing, editor or hook settings) in `~/.config/osh/gitconfig`, included from the sandbox's `~/.gitconfig` (an existing one is kept; osh's own git identity and credentials still win); resend the tmux one later with `K` (sync agents); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
+prefix key is a wrapped root binding; osh puts it back when it quits. `Host tmux keys in sandbox shells`
+in the palette (or `OSH_TMUX_PASSTHROUGH=0`) turns this off. After a crash, the next start of osh gives the prefix back. A new sandbox gets your host `tmux.conf` automatically when its image has tmux (secret-scanned first when gitleaks is installed; the status line says when it was copied unscanned, and `Install gitleaks` is in the palette), and a filtered copy of your global git config (only aliases, colours and a few behaviour keys such as `init.defaultBranch`, `push.default`, `pull.rebase`; never credentials, URLs rewrites, signing, editor or hook settings) in `~/.config/osh/gitconfig`, included from the sandbox's `~/.gitconfig` (an existing one is kept; osh's own git identity and credentials still win); resend the tmux one later with `K` (sync agents); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
 each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), the blocked requests
 seen in the sandbox (same list as `p`, below), dashboard (the shell keeps
 running, marked `●`; `Enter` on it returns), or close it. Shells keep their
@@ -349,7 +407,7 @@ so use it only in a sandbox without secrets worth stealing. Other programs and w
 still ask.
 
 When access is missing, `K` offers either the built-in profiles above or a
-generated one: `osh sync-agents --gen-profile` writes a profile that grants only
+generated one (from the command line: `osh sync-agents --gen-profile`): a profile that grants only
 the hosts and programs still missing (no credential), shows you a summary,
 asks for a name (default `install-<sandbox>`), then imports it, creates the
 provider and attaches it. After the installs it offers to detach and delete
@@ -500,8 +558,10 @@ throwaway HOME, leaving your own Colima untouched. Docker Desktop is not tested.
 
 ## Setup without the dashboard
 
-Everything above runs from the shell (`osh setup`, `upgrade`, `uninstall`,
-`gateway add|remove`, `gateway-docker`, `gateway-reset`). The justfile keeps thin developer wrappers for
+Everything above also runs from the dashboard (the wizard, the Gateways tab keys and the palette's
+`Resume or repair set-up`, `Upgrade OpenShell`, `Check this machine` and `Uninstall`, which run the
+same code after their own question), and from the shell (`osh setup`, `upgrade`, `uninstall`,
+`gateway add|remove|restart|vm-size`, `gateway-docker`, `gateway-reset`, `runtime-start`, `install`). The justfile keeps thin developer wrappers for
 them (`just install`, `upgrade`, `uninstall`, `gateway-docker`, `tui`) and
 `just install-hooks` (below). Run recipes with `just --justfile .justfile <recipe>`.
 

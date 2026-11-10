@@ -666,6 +666,10 @@ pub struct App {
     born: Instant,
     pub quit: bool,
     pub job: Option<Vec<Step>>,
+    /// The job removes osh itself (uninstall): leave once it has run.
+    quit_after_job: bool,
+    /// The clipboard tool install was offered once this run.
+    clip_offered: bool,
     /// Set by `a` on the Gateways tab; the main loop opens the wizard and clears it.
     pub wizard_request: Option<crate::wizard::Mode>,
     /// The gateways osh created (`gateways.json`); reloaded on refresh.
@@ -1022,6 +1026,8 @@ impl App {
             born: Instant::now(),
             quit: false,
             job: None,
+            quit_after_job: false,
+            clip_offered: false,
             capture: false,
             running_sync: None,
             tmux_after_create: None,
@@ -2493,6 +2499,10 @@ impl App {
     /// and a retry from that step.
     pub fn finish_job(&mut self, failed: Option<Failed>) {
         self.capture = false;
+        if std::mem::take(&mut self.quit_after_job) && failed.is_none() {
+            self.quit = true;
+            return;
+        }
         if let Some((name, before)) = self.tmux_after_create.take() {
             if failed.is_none() {
                 let dir = self.dir.clone();
@@ -3798,12 +3808,28 @@ impl App {
             }
             C::DataFiles => self.data_files(),
             C::EditPolicy => self.file_menu("sandbox-policy.yaml".into()),
+            C::ResumeSetup => self.wizard_request = Some(crate::wizard::Mode::First),
+            C::Upgrade => {
+                self.modal = Some(Modal::Confirm {
+                    text: "Upgrade OpenShell?\n\nosh installs the latest OpenShell, refreshes the gateway configs and restarts the gateways; sandboxes lose their connections for a moment. Each step is shown and asked for before it runs.".into(),
+                    kind: ConfKind::OshJob(vec!["upgrade".into()]),
+                })
+            }
+            C::Doctor => {
+                let text = self.doctor_text();
+                self.open_viewer("This machine", text, None);
+            }
+            C::InstallGitleaks => self.offer_tool(
+                "gitleaks",
+                "gitleaks scans the files osh copies into sandboxes (tmux config, agent files) for secrets",
+            ),
+            C::InstallClipboard => {
+                self.offer_tool("clipboard", "The clipboard tool lets Ctrl-V paste host images")
+            }
             C::TmuxKeys => {
                 self.status = match crate::tmuxpass::toggle(&self.dir) {
                     Ok(true) => "Host tmux keys now go to a focused sandbox shell".into(),
-                    Ok(false) => {
-                        "Host tmux keys now stay with the host tmux, also in sandbox shells".into()
-                    }
+                    Ok(false) => "Host tmux keys now stay with the host tmux, also in sandbox shells".into(),
                     Err(e) => format!("Error: could not save the setting: {e}"),
                 }
             }
@@ -3819,8 +3845,7 @@ impl App {
                         format!(
                             "{}  ({})",
                             e.host,
-                            e.forge
-                                .map_or("None / other: no repo access", |f| f.label())
+                            e.forge.map_or("None / other: no repo access", |f| f.label())
                         )
                     })
                     .collect();
@@ -3830,6 +3855,12 @@ impl App {
                     false,
                     SelKind::ForgetHost,
                 );
+            }
+            C::Uninstall => {
+                self.modal = Some(Modal::Confirm {
+                    text: "Uninstall osh and OpenShell?\n\nThis removes OpenShell, its services, every gateway and sandbox, osh's data and the osh program. osh then asks you to type 'uninstall' before anything is removed, and closes when it is done.".into(),
+                    kind: ConfKind::OshJob(vec!["uninstall".into()]),
+                })
             }
         }
     }
@@ -4986,8 +5017,16 @@ impl App {
             return false;
         }
         let Some(png) = clip::host_image() else {
-            if let Some(hint) = clip::missing_tool_hint() {
-                self.status = hint;
+            if clip::missing_tool_hint().is_some() {
+                // Asked once per run: Ctrl-V is also the shell's own key, and it still gets it.
+                if std::mem::replace(&mut self.clip_offered, true) {
+                    self.status = "No clipboard tool for images: \"Install the clipboard tool\" is in the command palette".into();
+                } else {
+                    self.offer_tool(
+                        "clipboard",
+                        "Pasting an image needs a clipboard tool, which is not installed",
+                    );
+                }
             }
             return false;
         };
@@ -5043,8 +5082,7 @@ impl App {
                 }
                 if code == KeyCode::Char('b') || code == KeyCode::Enter {
                     if cli::runtime().is_none() {
-                        self.status = "No running container runtime: start Docker or Podman, or run `osh setup --runtime docker|podman`".into();
-                        return;
+                        return self.offer_runtime_start();
                     }
                     if let Some(img) = self.snap.images.get(self.current()) {
                         self.job = Some(vec![Step {
@@ -5423,6 +5461,9 @@ impl App {
     /// Run `osh ARGS` with the terminal handed over (see `ConfKind::OshJob`).
     fn osh_job(&mut self, args: Vec<String>) {
         let exe = std::env::current_exe().unwrap_or_else(|_| "osh".into());
+        if args.first().map(String::as_str) == Some("uninstall") {
+            self.quit_after_job = true;
+        }
         self.job = Some(vec![Step {
             prog: exe.to_string_lossy().into(),
             args,
@@ -5502,6 +5543,87 @@ impl App {
         };
         let (path, check) = (self.dir.join(&rel), crate::assets::check_for(&rel));
         self.open_editor(&rel, path, None, check, EditThen::Gateway(name.to_string()));
+    }
+
+    /// Read-only report of what this machine has (`osh doctor`), with what to do about gaps.
+    fn doctor_text(&self) -> String {
+        if cfg!(test) {
+            return "doctor".into();
+        }
+        let h = crate::platform::RealHost;
+        let f = crate::platform::gather(&h);
+        let p = crate::gateway::Paths::detect();
+        let needed = crate::setup::runtime_needed(
+            &f,
+            &self.registry,
+            std::fs::read_to_string(p.config_home.join("gateway.toml"))
+                .ok()
+                .as_deref(),
+        );
+        let (text, ok) = crate::setup::doctor(&f, needed);
+        format!(
+            "{text}\n{}",
+            if ok {
+                "Everything osh needs is here. Optional tools: \"Install gitleaks\" and \"Install the clipboard tool\" in the command palette."
+            } else {
+                "Something osh needs is missing: \"Resume or repair set-up\" in the command palette installs it."
+            }
+        )
+    }
+
+    /// An image build found no running runtime: offer to start the installed one.
+    fn offer_runtime_start(&mut self) {
+        if cfg!(test) {
+            self.status = "No running container runtime".into();
+            return;
+        }
+        let f = crate::platform::gather(&crate::platform::RealHost);
+        let steps = crate::setup::runtime_start_steps(&f);
+        if steps.is_empty() {
+            self.modal = Some(Modal::Info(
+                "No container runtime is installed, and image builds need Docker or Podman. Add a Docker or Podman gateway (a on the Gateways tab): its set-up installs and starts one.".into(),
+            ));
+            return;
+        }
+        let list: Vec<String> = steps
+            .iter()
+            .map(|s| format!("  {}: {}", s.title, s.display()))
+            .collect();
+        self.modal = Some(Modal::Confirm {
+            text: format!(
+                "No container runtime is running. Start it now?\n\n{}",
+                list.join("\n")
+            ),
+            kind: ConfKind::OshJob(vec!["runtime-start".into(), "--confirmed".into()]),
+        });
+    }
+
+    /// A feature found its tool missing: offer to install it (`osh install TOOL`).
+    fn offer_tool(&mut self, tool: &str, why: &str) {
+        if cfg!(test) {
+            self.status = format!("{tool} is missing");
+            return;
+        }
+        let f = crate::platform::gather(&crate::platform::RealHost);
+        let steps = crate::setup::tool_steps(&f, tool);
+        if steps.is_empty() {
+            self.status = if (tool == "clipboard" && f.has_clipboard)
+                || (tool == "gitleaks" && f.has_gitleaks)
+            {
+                format!("{tool} is installed already")
+            } else {
+                format!("{why}: osh cannot install it here (no supported package manager)")
+            };
+            return;
+        }
+        let list: Vec<String> = steps
+            .iter()
+            .map(|s| format!("  {}: {}", s.title, s.display()))
+            .collect();
+        self.modal = Some(Modal::Confirm {
+            text: format!("{why}. Install it now?\n\n{}", list.join("\n")),
+            kind: ConfKind::OshJob(vec!["install".into(), tool.into(), "--confirmed".into()]),
+        });
     }
 
     /// The data-dir path of a profile's file, relative: the one that exists, else `ID.yaml`.
@@ -7240,6 +7362,27 @@ mod tests {
             panic!("a second, stronger question");
         };
         assert!(args.contains(&"--delete-data".to_string()));
+    }
+
+    #[test]
+    fn setup_upgrade_doctor_and_uninstall_are_palette_commands() {
+        use crate::palette::Command as C;
+        let mut a = app();
+        a.run_command(C::ResumeSetup);
+        assert_eq!(a.wizard_request, Some(crate::wizard::Mode::First));
+        a.run_command(C::Upgrade);
+        assert!(
+            matches!(&a.modal, Some(Modal::Confirm { kind: ConfKind::OshJob(x), .. }) if x == &["upgrade"])
+        );
+        a.modal = None;
+        a.run_command(C::Doctor);
+        assert!(matches!(&a.modal, Some(Modal::Viewer { title, .. }) if title == "This machine"));
+        a.modal = None;
+        a.run_command(C::Uninstall);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.job.take().is_some());
+        a.finish_job(None);
+        assert!(a.quit, "osh closes once it has uninstalled itself");
     }
 
     #[test]

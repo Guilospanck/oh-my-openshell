@@ -425,6 +425,14 @@ def data_files():
         if os.path.exists(path + ".osh-bak"):
             os.remove(path + ".osh-bak")
 
+@scenario("palette-doctor")
+def palette_doctor():
+    with dashboard() as o:
+        o.press(":"); o.wait("Commands", 10)
+        o.type("check this machine"); o.wait("Check this machine", 5); o.press("enter")
+        o.wait("openshell", 30); o.wait("This machine", 5)
+        o.press("esc"); o.wait_gone("This machine", 5)
+
 def providers_out():
     return osc("provider list")[1]
 

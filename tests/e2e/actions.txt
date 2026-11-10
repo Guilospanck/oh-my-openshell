@@ -53,6 +53,11 @@ external-editor | $EDITOR with arguments runs inside osh | editor-external
 external-editor | Enter/r reopen after a failed check | editor-external
 external-editor | d discard after a failed check | SKIP: unit tests in app.rs drive the discard; editor-external covers the reopen path on the same screen
 palette | Sandbox policy | SKIP: opens the same file menu as Data files on sandbox-policy.yaml, which data-files drives end to end
+palette | Check this machine | palette-doctor
+palette | Resume or repair set-up | SKIP: opens the set-up wizard, which tests/linux/real-suite.sh drives in a real pseudo-terminal
+palette | Upgrade OpenShell | SKIP: runs osh upgrade, which needs a published newer release; covered by unit tests of its plan
+palette | Install gitleaks / the clipboard tool | SKIP: installs packages with sudo through osh install; unit tests cover tool_steps for each OS
+palette | Uninstall osh and OpenShell | SKIP: runs osh uninstall, covered by tests/linux/real-suite.sh (runs last, removes osh itself)
 editor | Ctrl-S save | editor-toolchains
 editor | Esc close | editor-toolchains
 editor | Ctrl-F find | editor-toolchains

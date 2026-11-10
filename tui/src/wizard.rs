@@ -815,7 +815,7 @@ fn draw_done(f: &mut Frame, w: &Wizard, p: &Progress, area: Rect) {
         }
         lines.push(Line::raw(""));
         lines.push(Line::from(dim(
-            "Do that, then run osh setup again: it carries on where it stopped.",
+            "Do that, then choose \"Resume set-up\" in the command palette (: or Ctrl-P), or start osh again: it carries on where it stopped.",
         )));
         f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
     }

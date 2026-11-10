@@ -21,6 +21,17 @@ pub enum Command {
     DataFiles,
     /// The filesystem policy every new sandbox gets (`sandbox-policy.yaml`).
     EditPolicy,
+    /// The set-up wizard from its first screen: resumes a stopped install, repairs what is missing.
+    ResumeSetup,
+    /// `osh upgrade`: the latest OpenShell, fresh gateway configs, restarted gateways.
+    Upgrade,
+    /// `osh doctor` in a viewer.
+    Doctor,
+    /// `osh uninstall`: OpenShell, its services, osh's data and osh itself.
+    Uninstall,
+    /// Install an optional tool osh uses.
+    InstallGitleaks,
+    InstallClipboard,
     /// Pass the host tmux's keys to a focused sandbox shell, or not.
     TmuxKeys,
     /// Forget a "Which git provider hosts HOST?" answer.
@@ -268,6 +279,31 @@ pub const ACTIONS: &[Action] = &[
     ),
     command(
         Global,
+        "Resume or repair set-up (the set-up wizard)",
+        Command::ResumeSetup,
+    ),
+    command(
+        Global,
+        "Upgrade OpenShell, refresh gateway configs, restart gateways",
+        Command::Upgrade,
+    ),
+    command(
+        Global,
+        "Check this machine (what osh needs and what is missing)",
+        Command::Doctor,
+    ),
+    command(
+        Global,
+        "Install gitleaks (secret scan of files copied into sandboxes)",
+        Command::InstallGitleaks,
+    ),
+    command(
+        Global,
+        "Install the clipboard tool (paste host images with Ctrl-V)",
+        Command::InstallClipboard,
+    ),
+    command(
+        Global,
         "Host tmux keys in sandbox shells: switch on or off",
         Command::TmuxKeys,
     ),
@@ -275,6 +311,11 @@ pub const ACTIONS: &[Action] = &[
         Global,
         "Git hosts: forget a \"which git provider hosts it\" answer",
         Command::ForgetGitHost,
+    ),
+    command(
+        Global,
+        "Uninstall osh and OpenShell (removes all sandboxes)",
+        Command::Uninstall,
     ),
 ];
 

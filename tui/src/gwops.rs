@@ -1354,6 +1354,7 @@ mod tests {
             has_tmux: true,
             has_ssh: true,
             has_gh: true,
+            has_gitleaks: true,
             has_clipboard: true,
             runtimes_installed: vec![],
             runtimes_ready: vec![],

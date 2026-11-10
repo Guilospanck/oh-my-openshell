@@ -1736,7 +1736,12 @@ fn upload_tmux_conf(dir: &Path, name: &str, home: &str) -> Result<String, String
     ]
     .map(String::from)
     .to_vec();
-    let result = exec("openshell", &args, &[]).map(|_| "host tmux config copied".to_string());
+    let copied = if have("gitleaks") {
+        "host tmux config copied (secret scan clean)"
+    } else {
+        "host tmux config copied unscanned: gitleaks is missing (Install gitleaks in the command palette)"
+    };
+    let result = exec("openshell", &args, &[]).map(|_| copied.to_string());
     if let Some(stage) = conf.parent() {
         let _ = std::fs::remove_dir_all(stage);
     }

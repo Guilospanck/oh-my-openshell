@@ -258,11 +258,56 @@ fn first_run(data: &Path) -> bool {
             return false;
         }
     }
-    if !cli::have("openshell") {
-        println!("OpenShell is installed but not on PATH yet: open a new terminal (or add its folder to PATH) and run osh again.");
+    if !cli::have("openshell") && !find_openshell() {
+        println!("OpenShell was installed, but osh cannot find the openshell program in the folders its installer uses ({}). Start osh again from a new terminal.", openshell_dirs().join(", "));
         return false;
     }
     true
+}
+
+/// Where OpenShell's installers put `openshell` (its own installer, Homebrew or Linuxbrew),
+/// relative to HOME when they do not start with `/`.
+fn openshell_dirs() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[".local/bin", "/opt/homebrew/bin", "/usr/local/bin"]
+    } else {
+        &[
+            ".local/bin",
+            "/home/linuxbrew/.linuxbrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+        ]
+    }
+}
+
+/// Right after the installer ran, this process's PATH can still lack the folder it installed into
+/// (a fresh `~/.local/bin`). Find `openshell` there and put the folder on osh's own PATH, so the
+/// dashboard opens now instead of asking for a new terminal.
+fn find_openshell() -> bool {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    let Some(dir) = openshell_dirs()
+        .iter()
+        .map(|d| {
+            if d.starts_with('/') {
+                PathBuf::from(d)
+            } else {
+                home.join(d)
+            }
+        })
+        .find(|d| d.join("openshell").is_file())
+    else {
+        return false;
+    };
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let mut dirs: Vec<PathBuf> = std::env::split_paths(&path).collect();
+    dirs.insert(0, dir);
+    if let Ok(joined) = std::env::join_paths(dirs) {
+        // Single-threaded here: the dashboard's threads start after first_run returns.
+        std::env::set_var("PATH", joined);
+    }
+    cli::have("openshell")
 }
 
 /// `osh doctor` and `osh setup [--yes] [--dry-run] [--runtime docker|podman]`; None for the dashboard.
@@ -356,6 +401,7 @@ fn subcommand(args: &[String]) -> Option<i32> {
             Some(setup::run_gateways(&o))
         }
         "gateway" => Some(gateway_add_remove(&args[1..])),
+        "runtime-start" | "install" => Some(host_steps(args)),
         "sync-agents" => Some(agents::cli_main(&args[1..], &assets::data_dir())),
         "upgrade" | "uninstall" | "gateway-reset" | "gateway-service" => {
             Some(gateway_command(args))
@@ -552,6 +598,29 @@ fn gateway_add_remove(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+/// `osh runtime-start` (start an installed container runtime) and `osh install clipboard|gitleaks`:
+/// what the dashboard offers when a build finds no runtime or a feature misses its tool. Each step
+/// is shown and asked for, unless the dashboard already asked (`--confirmed`).
+fn host_steps(args: &[String]) -> i32 {
+    let h = platform::RealHost;
+    let f = platform::gather(&h);
+    let steps = match args[0].as_str() {
+        "runtime-start" => setup::runtime_start_steps(&f),
+        _ => match args.get(1).map(String::as_str) {
+            Some(t @ ("clipboard" | "gitleaks")) => setup::tool_steps(&f, t),
+            _ => {
+                eprintln!("usage: osh install clipboard|gitleaks");
+                return 2;
+            }
+        },
+    };
+    let o = setup::Options {
+        yes: pre_confirmed(args),
+        ..Default::default()
+    };
+    i32::from(!setup::run_steps(&h, steps, &o, io::stdin().is_terminal()))
 }
 
 /// True when the caller (the dashboard) already asked the user and passed `--confirmed`.

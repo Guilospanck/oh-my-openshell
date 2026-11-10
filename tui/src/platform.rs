@@ -285,6 +285,8 @@ pub struct Facts {
     /// The `ssh` client: `openshell sandbox upload` spawns it on this machine.
     pub has_ssh: bool,
     pub has_gh: bool,
+    /// The secret scanner osh runs over files it copies into sandboxes.
+    pub has_gitleaks: bool,
     /// A tool that reads host clipboard images: pngpaste (macOS), wl-paste or xclip (Linux).
     pub has_clipboard: bool,
     /// Binary on PATH, whether or not its daemon answers.
@@ -496,6 +498,7 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
         has_tmux: h.which("tmux"),
         has_ssh: h.which("ssh"),
         has_gh: h.which("gh"),
+        has_gitleaks: h.which("gitleaks"),
         has_clipboard: match os {
             Os::MacOs => h.which("pngpaste"),
             Os::Linux => h.which("wl-paste") || h.which("xclip"),
@@ -560,6 +563,7 @@ pub mod testing {
             has_tmux: true,
             has_ssh: true,
             has_gh: true,
+            has_gitleaks: true,
             has_clipboard: true,
             runtimes_installed: vec![],
             runtimes_ready: vec![],
