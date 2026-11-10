@@ -79,6 +79,294 @@ pub struct Report {
     pub written: Vec<PathBuf>,
     /// Files the user changed since osh wrote them; left as they are.
     pub kept_user_edits: Vec<PathBuf>,
+    /// The part of `kept_user_edits` whose shipped default changed since the user's copy was
+    /// made: an upgrade brought a fix the user's copy does not have.
+    pub newer_defaults: Vec<PathBuf>,
+}
+
+impl Report {
+    /// What the dashboard tells the user about kept edits, or `None` when there is nothing to say.
+    /// The data directory itself is never the subject: the Data files screen is (palette).
+    pub fn notice(&self, dir: &Path) -> Option<String> {
+        if self.kept_user_edits.is_empty() {
+            return None;
+        }
+        let rel = |p: &PathBuf| {
+            p.strip_prefix(dir)
+                .unwrap_or(p)
+                .to_string_lossy()
+                .into_owned()
+        };
+        let mut text = format!(
+            "osh kept your edited copy of: {}.",
+            self.kept_user_edits
+                .iter()
+                .map(rel)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if !self.newer_defaults.is_empty() {
+            text.push_str(&format!(
+                "\nA newer shipped default exists for: {}. Your copy does not get its fixes.",
+                self.newer_defaults
+                    .iter()
+                    .map(rel)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        text.push_str(
+            "\nOpen \"Data files\" from the command palette (: or Ctrl-P) to compare a file with the shipped default, edit it or restore it.",
+        );
+        Some(text)
+    }
+}
+
+/// Where a data file stands against the copy compiled into this osh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileState {
+    /// Same as the shipped default.
+    Shipped,
+    /// Changed by the user; `newer`: the shipped default changed since, too.
+    Edited { newer: bool },
+    /// osh wrote an older default and nobody changed it: the next start updates it.
+    Outdated,
+    /// A shipped file that is not on disk (deleted).
+    Missing,
+    /// A file the user added (a profile or Dockerfile osh does not ship).
+    Own,
+}
+
+impl FileState {
+    pub fn label(self) -> &'static str {
+        match self {
+            FileState::Shipped => "shipped default",
+            FileState::Edited { newer: false } => "edited by you",
+            FileState::Edited { newer: true } => "edited by you; newer default available",
+            FileState::Outdated => "older default; updated at next start",
+            FileState::Missing => "deleted; shipped default available",
+            FileState::Own => "your own file",
+        }
+    }
+
+    /// The file differs from (or lacks) the shipped default, so restoring it changes something.
+    pub fn restorable(self) -> bool {
+        matches!(
+            self,
+            FileState::Edited { .. } | FileState::Outdated | FileState::Missing
+        )
+    }
+}
+
+/// Files osh needs to work, as opposed to profiles and Dockerfiles a user may drop on purpose.
+/// A required file that is gone is written again, so a deleted `sandbox-policy.yaml` cannot
+/// break every sandbox creation.
+pub fn required(rel: &str) -> bool {
+    !(rel.starts_with("providers/") || rel.starts_with("images/"))
+}
+
+fn load_manifest(dir: &Path) -> Map<String, Value> {
+    fs::read_to_string(dir.join(MANIFEST))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Where `rel` stands against the shipped copy.
+pub fn state(dir: &Path, rel: &str) -> FileState {
+    let on_disk = fs::read(dir.join(rel)).ok().map(|b| hash(&b));
+    let Some(body) = embedded(rel) else {
+        return if on_disk.is_some() {
+            FileState::Own
+        } else {
+            FileState::Missing
+        };
+    };
+    let new = hash(body.as_bytes());
+    let recorded = load_manifest(dir)
+        .get(rel)
+        .and_then(Value::as_str)
+        .map(String::from);
+    match on_disk {
+        None => FileState::Missing,
+        Some(d) if d == new => FileState::Shipped,
+        Some(d) if recorded.as_deref() == Some(d.as_str()) => FileState::Outdated,
+        Some(_) => FileState::Edited {
+            newer: recorded.is_some_and(|r| r != new),
+        },
+    }
+}
+
+/// Every data file: the shipped ones, then profiles (`providers/*.yaml|yml`) and Dockerfiles
+/// (`images/Dockerfile-*`) the user added, each with its state.
+pub fn files(dir: &Path) -> Vec<(String, FileState)> {
+    let mut out: Vec<(String, FileState)> = FILES
+        .iter()
+        .map(|(rel, _)| (rel.to_string(), state(dir, rel)))
+        .collect();
+    let mut own = Vec::new();
+    for (sub, keep) in [
+        (
+            "providers",
+            (|n: &str| n.ends_with(".yaml") || n.ends_with(".yml")) as fn(&str) -> bool,
+        ),
+        ("images", |n: &str| n.starts_with("Dockerfile-")),
+    ] {
+        if let Ok(rd) = fs::read_dir(dir.join(sub)) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let rel = format!("{sub}/{name}");
+                if keep(&name) && e.path().is_file() && embedded(&rel).is_none() {
+                    own.push((rel, FileState::Own));
+                }
+            }
+        }
+    }
+    own.sort_by(|a, b| a.0.cmp(&b.0));
+    out.extend(own);
+    out
+}
+
+/// Write the shipped default of `rel` back and record it, so later upgrades update it again.
+pub fn restore(dir: &Path, rel: &str) -> io::Result<()> {
+    let body = embedded(rel)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "osh ships no such file"))?;
+    let path = dir.join(rel);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(&path, body)?;
+    let mut manifest = load_manifest(dir);
+    manifest.insert(rel.into(), hash(body.as_bytes()).into());
+    fs::write(dir.join(MANIFEST), serde_json::to_string_pretty(&manifest)?)
+}
+
+/// Delete a data file. A shipped profile or Dockerfile stays deleted across upgrades (the
+/// manifest still names it); a required file comes back at the next start.
+pub fn remove(dir: &Path, rel: &str) -> io::Result<()> {
+    fs::remove_file(dir.join(rel))
+}
+
+/// The text parses as YAML (duplicate keys included, which OpenShell would reject or drop).
+pub fn check_yaml(text: &str) -> Result<(), String> {
+    yaml_rust2::YamlLoader::load_from_str(text)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// `sandbox-policy.yaml`: YAML, a mapping, with the `version` OpenShell requires.
+pub fn check_policy(text: &str) -> Result<(), String> {
+    let docs = yaml_rust2::YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
+    let doc = docs.first().ok_or("the policy is empty")?;
+    if doc.as_hash().is_none() {
+        return Err("the policy must be a mapping (version:, filesystem_policy:, ...)".into());
+    }
+    if doc["version"].is_badvalue() {
+        return Err("the policy needs a version: line (version: 1)".into());
+    }
+    if !doc["network_policies"].is_badvalue()
+        && !doc["network_policies"].is_null()
+        && doc["network_policies"].as_hash().is_none()
+    {
+        return Err("network_policies must map policy names to policies".into());
+    }
+    Ok(())
+}
+
+/// A Dockerfile has a `FROM` line before anything is built.
+pub fn check_dockerfile(text: &str) -> Result<(), String> {
+    let first = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with('#'));
+    match first {
+        Some(l)
+            if l.to_ascii_uppercase().starts_with("FROM ")
+                || l.to_ascii_uppercase().starts_with("ARG ") =>
+        {
+            Ok(())
+        }
+        _ => Err("a Dockerfile starts with a FROM line (ARG lines may come before it)".into()),
+    }
+}
+
+fn check_toml(text: &str) -> Result<(), String> {
+    text.parse::<toml::Table>()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// The check the editor runs before saving `rel`, so a broken file is never written.
+pub fn check_for(rel: &str) -> Option<crate::editor::Check> {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    Some(match rel {
+        "toolchains.toml" => crate::preload::check,
+        "sandbox-policy.yaml" => check_policy,
+        _ if rel.starts_with("providers/") => crate::cli::check_profile,
+        _ if rel.starts_with("images/") => check_dockerfile,
+        _ if name.ends_with(".toml") => check_toml,
+        _ if name.ends_with(".yaml") || name.ends_with(".yml") => check_yaml,
+        _ => return None,
+    })
+}
+
+/// A line diff of `old` (the shipped default) against `new` (the user's copy): `-` lines are only
+/// in the default, `+` lines only in the user's copy, with two lines of context around each change.
+pub fn diff(old: &str, new: &str) -> String {
+    let a: Vec<&str> = old.lines().collect();
+    let b: Vec<&str> = new.lines().collect();
+    // Longest common subsequence table, from the end.
+    let mut t = vec![vec![0u32; b.len() + 1]; a.len() + 1];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            t[i][j] = if a[i] == b[j] {
+                t[i + 1][j + 1] + 1
+            } else {
+                t[i + 1][j].max(t[i][j + 1])
+            };
+        }
+    }
+    let mut ops: Vec<(char, &str)> = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            ops.push((' ', a[i]));
+            i += 1;
+            j += 1;
+        } else if j < b.len() && (i == a.len() || t[i][j + 1] >= t[i + 1][j]) {
+            ops.push(('+', b[j]));
+            j += 1;
+        } else {
+            ops.push(('-', a[i]));
+            i += 1;
+        }
+    }
+    if ops.iter().all(|(k, _)| *k == ' ') {
+        return "No differences: the file is the shipped default.".into();
+    }
+    const CONTEXT: usize = 2;
+    let near = |k: usize| {
+        ops[k.saturating_sub(CONTEXT)..(k + CONTEXT + 1).min(ops.len())]
+            .iter()
+            .any(|(c, _)| *c != ' ')
+    };
+    let mut out = String::from("- only in the shipped default    + only in your copy\n\n");
+    let mut skipped = false;
+    for (k, (c, l)) in ops.iter().enumerate() {
+        if near(k) {
+            if skipped {
+                out.push_str("  ...\n");
+                skipped = false;
+            }
+            out.push_str(&format!("{c} {l}\n"));
+        } else {
+            skipped = true;
+        }
+    }
+    if skipped {
+        out.push_str("  ...\n");
+    }
+    out
 }
 
 /// The embedded copy of a data file, by its path relative to the data directory.
@@ -154,10 +442,7 @@ pub fn hash(bytes: &[u8]) -> String {
 pub fn materialize(dir: &Path) -> io::Result<Report> {
     fs::create_dir_all(dir)?;
     let manifest_path = dir.join(MANIFEST);
-    let mut manifest: Map<String, Value> = fs::read_to_string(&manifest_path)
-        .ok()
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default();
+    let mut manifest = load_manifest(dir);
     let mut report = Report::default();
     for (rel, body) in FILES {
         let path = dir.join(rel);
@@ -165,13 +450,17 @@ pub fn materialize(dir: &Path) -> io::Result<Report> {
         let on_disk = fs::read(&path).ok().map(|b| hash(&b));
         let recorded = manifest.get(*rel).and_then(Value::as_str).map(String::from);
         match on_disk {
-            // Recorded as written once and gone now: the user removed it on purpose.
-            None if recorded.is_some() => continue,
+            // Recorded as written once and gone now: a profile or Dockerfile the user removed on
+            // purpose. A file osh cannot work without comes back.
+            None if recorded.is_some() && !required(rel) => continue,
             Some(d) if d == new => {
                 manifest.insert((*rel).into(), new.into());
                 continue;
             }
             Some(d) if recorded.as_deref() != Some(d.as_str()) => {
+                if recorded.as_deref().is_some_and(|r| r != new) {
+                    report.newer_defaults.push(path.clone());
+                }
                 report.kept_user_edits.push(path);
                 continue;
             }
@@ -301,6 +590,67 @@ mod tests {
         assert!(!p.exists());
         assert!(r.written.is_empty());
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_deleted_required_file_comes_back_and_a_deleted_profile_does_not() {
+        let d = tmp("required");
+        materialize(&d).unwrap();
+        fs::remove_file(d.join("sandbox-policy.yaml")).unwrap();
+        fs::remove_file(d.join("providers/npm.yaml")).unwrap();
+        let r = materialize(&d).unwrap();
+        assert_eq!(r.written, vec![d.join("sandbox-policy.yaml")]);
+        assert!(!d.join("providers/npm.yaml").exists());
+        assert_eq!(state(&d, "providers/npm.yaml"), FileState::Missing);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn states_follow_edits_restores_and_newer_defaults() {
+        let d = tmp("states");
+        materialize(&d).unwrap();
+        assert_eq!(state(&d, "providers/npm.yaml"), FileState::Shipped);
+        fs::write(d.join("providers/npm.yaml"), "mine").unwrap();
+        assert_eq!(
+            state(&d, "providers/npm.yaml"),
+            FileState::Edited { newer: false }
+        );
+        // The copy osh wrote last time was an older default: the user's edit misses an upgrade.
+        let mut m = load_manifest(&d);
+        m.insert("providers/npm.yaml".into(), hash(b"older").into());
+        fs::write(d.join(MANIFEST), serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(
+            state(&d, "providers/npm.yaml"),
+            FileState::Edited { newer: true }
+        );
+        let r = materialize(&d).unwrap();
+        assert_eq!(r.newer_defaults, vec![d.join("providers/npm.yaml")]);
+        let n = r.notice(&d).unwrap();
+        assert!(n.contains("providers/npm.yaml") && n.contains("newer shipped default"));
+        assert!(n.contains("Data files"), "{n}");
+        restore(&d, "providers/npm.yaml").unwrap();
+        assert_eq!(state(&d, "providers/npm.yaml"), FileState::Shipped);
+        assert_eq!(materialize(&d).unwrap(), Report::default());
+        fs::write(d.join("providers/mine.yml"), "id: mine").unwrap();
+        let all = files(&d);
+        assert!(all.contains(&("providers/mine.yml".into(), FileState::Own)));
+        assert!(all.iter().any(|(r, _)| r == "sandbox-policy.yaml"));
+        remove(&d, "providers/mine.yml").unwrap();
+        assert!(!files(&d).iter().any(|(r, _)| r == "providers/mine.yml"));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_diff_marks_both_sides_and_says_when_there_is_none() {
+        let d = diff("a\nb\nc\n", "a\nB\nc\nd\n");
+        assert!(d.contains("- b\n+ B\n") || d.contains("+ B\n- b\n"), "{d}");
+        assert!(d.contains("+ d\n"), "{d}");
+        assert!(d.contains("  a\n"), "context is kept: {d}");
+        assert!(diff("x\n", "x\n").starts_with("No differences"));
+        let long_a: String = (0..20).map(|i| format!("{i}\n")).collect();
+        let long_b = long_a.replace("10\n", "ten\n");
+        let d = diff(&long_a, &long_b);
+        assert!(d.contains("  ...\n") && !d.contains("  0\n"), "{d}");
     }
 
     #[test]

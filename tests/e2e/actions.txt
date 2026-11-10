@@ -29,8 +29,12 @@ Providers | u | provider-update
 Providers | d | provider-delete
 Profiles | u | profile-import
 Profiles | Enter | profile-import
+Profiles | e | profile-file
+Profiles | n | profile-file
 Images | b | image-build
 Images | Enter | image-build
+Images | e | image-file
+Images | n | image-file
 Gateways | Enter | gateway-select
 Gateways | s | gateway-default
 Gateways | a | gateway-add
@@ -38,10 +42,12 @@ Gateways | d | gateway-wipe
 Gateways | x | gateway-remove
 shell | ctrl-] menu | shell-menu
 palette | Edit toolchains.toml | editor-toolchains
+palette | Data files | data-files
 palette | Editor: switch auto / your own / built-in | editor-external
 external-editor | $EDITOR with arguments runs inside osh | editor-external
 external-editor | Enter/r reopen after a failed check | editor-external
 external-editor | d discard after a failed check | SKIP: unit tests in app.rs drive the discard; editor-external covers the reopen path on the same screen
+palette | Sandbox policy | SKIP: opens the same file menu as Data files on sandbox-policy.yaml, which data-files drives end to end
 editor | Ctrl-S save | editor-toolchains
 editor | Esc close | editor-toolchains
 editor | Ctrl-F find | editor-toolchains

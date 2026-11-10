@@ -275,16 +275,69 @@ pub fn set_enabled(text: &str, want: &[(String, bool)]) -> String {
     joined
 }
 
-/// The creation policy: the filesystem policy as shipped plus the host list.
-pub fn creation_policy(base: &str, groups: &[Group]) -> String {
+/// The creation policy: the filesystem policy plus the host list. When the base already has a
+/// top-level `network_policies` block (the user added rules of their own), the list's entries go
+/// into that block at its indentation: a second top-level key would be a duplicate the gateway
+/// rejects or silently drops. Err when the base's block cannot take them (flow style, or a name
+/// osh uses already); the caller then creates the sandbox without the list and says why.
+pub fn creation_policy(base: &str, groups: &[Group]) -> Result<String, String> {
     let mut out = base.trim_end().to_string();
     out.push('\n');
     let net = network_policies(groups);
-    if !net.is_empty() {
+    if net.is_empty() {
+        return Ok(out);
+    }
+    let lines: Vec<&str> = out.lines().collect();
+    let Some(at) = lines
+        .iter()
+        .position(|l| l.starts_with("network_policies:"))
+    else {
         out.push('\n');
         out.push_str(&net);
+        return Ok(out);
+    };
+    let after = lines[at]["network_policies:".len()..]
+        .split(" #")
+        .next()
+        .unwrap_or_default()
+        .trim();
+    let child = lines[at + 1..]
+        .iter()
+        .find(|l| !l.trim().is_empty() && !l.trim_start().starts_with('#'))
+        .filter(|l| l.starts_with(' '));
+    let indent = match (after, child) {
+        ("" | "{}" | "~" | "null", None) => "  ".to_string(),
+        ("", Some(l)) if !l.trim_start().starts_with('-') => {
+            l[..l.len() - l.trim_start().len()].to_string()
+        }
+        _ => {
+            return Err(
+                "sandbox-policy.yaml writes network_policies in a form osh cannot add to (write it as a block: one policy name per line), so the toolchain hosts were left out".into(),
+            )
+        }
+    };
+    for name in ["osh_toolchains:", "osh_toolchains_git:"] {
+        if lines.iter().any(|l| l.trim_start() == name) {
+            return Err(format!(
+                "sandbox-policy.yaml already has a policy named {}, so the toolchain hosts were left out",
+                name.trim_end_matches(':')
+            ));
+        }
     }
-    out
+    let entries: Vec<String> = net
+        .lines()
+        .skip(1)
+        .map(|l| format!("{indent}{}", l.strip_prefix("  ").unwrap_or(l)))
+        .collect();
+    let mut merged: Vec<String> = lines[..at].iter().map(|s| s.to_string()).collect();
+    merged.push("network_policies:".into());
+    merged.extend(entries);
+    merged.extend(lines[at + 1..].iter().map(|s| s.to_string()));
+    let merged = merged.join("\n") + "\n";
+    crate::assets::check_yaml(&merged).map_err(|e| {
+        format!("adding the toolchain hosts to sandbox-policy.yaml would not parse ({e}), so they were left out")
+    })?;
+    Ok(merged)
 }
 
 /// Hosts in the list that are not used because they are not exact names (wildcards, addresses,
@@ -494,7 +547,7 @@ enabled = true"
     fn creation_policy_keeps_the_base_and_appends_the_block() {
         let groups =
             g("[a]\nenabled = true\nhosts = [\"x.example\"]\ngit_hosts = [\"git.example\"]\n");
-        let p = creation_policy("version: 1\nfilesystem_policy: {}\n", &groups);
+        let p = creation_policy("version: 1\nfilesystem_policy: {}\n", &groups).unwrap();
         assert!(p.starts_with("version: 1\nfilesystem_policy: {}\n\nnetwork_policies:\n"));
         assert!(p.contains("host: x.example, ports: [443]"));
         assert!(p.contains("- host: git.example\n"));
@@ -503,9 +556,40 @@ enabled = true"
             creation_policy(
                 "version: 1\n",
                 &g("[a]\nenabled = false\nhosts = [\"x.example\"]\n")
-            ),
+            )
+            .unwrap(),
             "version: 1\n"
         );
+    }
+
+    #[test]
+    fn the_hosts_join_a_network_policies_block_the_base_already_has() {
+        let groups = g("[a]\nenabled = true\nhosts = [\"x.example\"]\n");
+        let base =
+            "version: 1\nnetwork_policies:\n    mine:\n        endpoints: []\nlandlock: {}\n";
+        let p = creation_policy(base, &groups).unwrap();
+        assert_eq!(p.matches("network_policies:").count(), 1, "{p}");
+        assert!(
+            p.contains("\n    osh_toolchains:\n      endpoints:\n"),
+            "{p}"
+        );
+        assert!(
+            p.contains("\n    mine:\n        endpoints: []\nlandlock: {}\n"),
+            "{p}"
+        );
+        // An empty block, flow or not, takes the entries at the usual indent.
+        let p = creation_policy("network_policies: {}\nx: 1\n", &groups).unwrap();
+        assert!(
+            p.starts_with("network_policies:\n  osh_toolchains:\n"),
+            "{p}"
+        );
+        assert!(p.ends_with("x: 1\n"), "{p}");
+        // A one-line block cannot be added to: an error the caller shows.
+        let e = creation_policy("network_policies: { mine: {} }\n", &groups).unwrap_err();
+        assert!(e.contains("block"), "{e}");
+        let e = creation_policy("network_policies:\n  osh_toolchains:\n    x: 1\n", &groups)
+            .unwrap_err();
+        assert!(e.contains("osh_toolchains"), "{e}");
     }
 
     #[test]

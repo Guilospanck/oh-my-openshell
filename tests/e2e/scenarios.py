@@ -349,6 +349,82 @@ def image_build():
         finish_job(o, 1500)
         o.press("4"); o.wait("up to date", 30)
 
+@scenario("profile-file")
+def profile_file():
+    """e on a profile lists what can be done with its file (view, compare, restore); n starts a
+    new profile in the built-in editor from a template, written on Ctrl-S."""
+    path = os.path.join(data_dir(), "providers", "e2e-prof.yaml")
+    try:
+        with dashboard() as o:
+            o.press("3"); o.wait("npm", 15)
+            move_to(o, "npm")
+            o.press("e"); o.wait("providers/npm.yaml (", 10)
+            choose(o, "View"); o.wait("id: npm", 10)
+            o.press("esc"); o.wait("providers/npm.yaml (", 10)
+            o.press("esc"); o.wait_gone("providers/npm.yaml (", 5)
+            o.press("n"); o.wait("Name of the new provider profile", 10)
+            o.type("e2e-prof"); o.press("enter"); o.wait("Ctrl-S save", 10)
+            assert not os.path.exists(path), "nothing is written before the save"
+            o.press("ctrl-s"); o.wait("Saved providers/e2e-prof.yaml", 15)
+            assert "id: e2e-prof" in open(path).read()
+            o.press("esc"); o.wait("providers/e2e-prof.yaml (your own file)", 10)
+            choose(o, "Delete this file"); o.wait("Delete providers/e2e-prof.yaml?", 10)
+            o.press("y"); o.wait("Deleted providers/e2e-prof.yaml", 10)
+            assert not os.path.exists(path)
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+@scenario("image-file")
+def image_file():
+    """e on an image opens its Dockerfile's actions; n starts a new Dockerfile from pi's."""
+    path = os.path.join(data_dir(), "images", "Dockerfile-e2e")
+    try:
+        with dashboard() as o:
+            o.press("4"); o.wait("claude-code:latest", 15)
+            move_to(o, "claude-code:latest")
+            o.press("e"); o.wait("images/Dockerfile-claude_code (", 10)
+            choose(o, "View"); o.wait("FROM", 10)
+            o.press("esc"); o.press("esc")
+            o.press("n"); o.wait("Name of the new image", 10)
+            o.type("e2e"); o.press("enter"); o.wait("Ctrl-S save", 10)
+            o.press("ctrl-s"); o.wait("Saved images/Dockerfile-e2e", 15)
+            assert "FROM" in open(path).read()
+            o.press("esc"); o.wait("images/Dockerfile-e2e (your own file)", 10)
+            o.press("esc")
+            o.press("r"); o.wait("e2e:latest", 30)        # the Images tab lists the new image
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+
+@scenario("data-files")
+def data_files():
+    """The palette's Data files: an edited policy shows as edited, compares against the shipped
+    default and is restored from inside osh (the edit is kept as .osh-bak)."""
+    path = os.path.join(data_dir(), "sandbox-policy.yaml")
+    with open(path) as f:
+        before = f.read()
+    try:
+        with open(path, "a") as f:
+            f.write("# e2e edit\n")
+        with dashboard() as o:
+            o.press(":"); o.wait("Commands", 10)
+            o.type("data files"); o.wait("Data files:", 5); o.press("enter")
+            o.wait("Data files in", 10)
+            assert "sandbox-policy.yaml" in o.text() and "edited by you" in o.text(), o.text()
+            choose(o, "sandbox-policy.yaml", 25); o.wait("sandbox-policy.yaml (edited by you", 10)
+            choose(o, "Compare with the shipped default"); o.wait("+ # e2e edit", 10)
+            o.press("esc"); o.wait("sandbox-policy.yaml (edited by you", 10)
+            choose(o, "Restore the shipped default"); o.wait("Put the shipped default", 10)
+            o.press("y"); o.wait("Restored the shipped sandbox-policy.yaml", 10)
+        assert "# e2e edit" not in open(path).read()
+        assert "# e2e edit" in open(path + ".osh-bak").read()
+    finally:
+        with open(path, "w") as f:
+            f.write(before)
+        if os.path.exists(path + ".osh-bak"):
+            os.remove(path + ".osh-bak")
+
 def providers_out():
     return osc("provider list")[1]
 
@@ -722,6 +798,7 @@ def gateway_add():
 def gateway_wipe():
     """Last: wipes the main gateway (sandboxes, providers, profiles), which then restarts empty."""
     osc(f"provider profile import --file {DATA}/providers/npm.yaml")
+    osc("provider delete e2e-npm")  # an earlier scenario may have left it
     rc, out = osc("provider create --name e2e-npm --type npm")
     assert rc == 0, out
     with dashboard() as o:

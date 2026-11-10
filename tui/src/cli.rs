@@ -402,17 +402,83 @@ pub fn profile_ids(dir: &Path) -> Vec<String> {
             rd.flatten()
                 .filter_map(|e| {
                     let p = e.path();
-                    (p.extension()? == "yaml").then(|| p.file_stem()?.to_str().map(String::from))?
+                    let ext = p.extension()?;
+                    (ext == "yaml" || ext == "yml")
+                        .then(|| p.file_stem()?.to_str().map(String::from))?
                 })
                 .collect()
         })
         .unwrap_or_default();
     v.sort();
+    v.dedup();
     v
 }
 
+/// The profile file for `id`: `providers/ID.yaml`, or `ID.yml` when only that exists.
 pub fn profile_path(dir: &Path, id: &str) -> PathBuf {
-    dir.join("providers").join(format!("{id}.yaml"))
+    let yaml = dir.join("providers").join(format!("{id}.yaml"));
+    let yml = dir.join("providers").join(format!("{id}.yml"));
+    if !yaml.exists() && yml.exists() {
+        yml
+    } else {
+        yaml
+    }
+}
+
+/// The editor's check for a provider profile: valid YAML with an `id`, then OpenShell's own lint
+/// (read-only) when the CLI is there. "Already exists" is not a problem for a file being edited,
+/// and a lint that cannot reach the gateway does not block the save.
+pub fn check_profile(text: &str) -> Result<(), String> {
+    let docs = yaml_rust2::YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
+    let doc = docs.first().ok_or("the profile is empty")?;
+    if doc["id"].as_str().is_none_or(str::is_empty) {
+        return Err("a profile needs an id: line (the name it is imported under)".into());
+    }
+    if cfg!(test) || !have("openshell") {
+        return Ok(());
+    }
+    // OpenShell does not expand the template itself; lint what osh would import.
+    let body = text.replace("${FORGEJO_HOST}", "forgejo.example");
+    let tmp = std::env::temp_dir().join(format!("osh-lint-{}.yaml", std::process::id()));
+    if fs::write(&tmp, body).is_err() {
+        return Ok(());
+    }
+    let args = with_gateway(vec![
+        "profile".into(),
+        "lint".into(),
+        "-f".into(),
+        tmp.to_string_lossy().into(),
+    ]);
+    // The lint asks the gateway; a gateway that hangs must not freeze the editor's save.
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let out = run("openshell", &args, &[]);
+        let _ = fs::remove_file(&tmp);
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(Duration::from_secs(8)) {
+        Ok(Ok(_)) | Err(_) => Ok(()),
+        Ok(Err(e)) => lint_errors(&e).map_or(Ok(()), Err),
+    }
+}
+
+/// The lint's real problems (one per line), without "already exists"; `None` when the output has
+/// no diagnostics (the gateway could not be reached, say).
+pub fn lint_errors(out: &str) -> Option<String> {
+    let errs: Vec<String> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("error ") && !l.contains("already exists"))
+        .map(|l| {
+            // `error FILE profile=ID field=F message`: keep the field and the message.
+            let rest = l.splitn(3, ' ').nth(2).unwrap_or(l);
+            rest.split_once(' ')
+                .filter(|(p, _)| p.starts_with("profile="))
+                .map_or(rest, |(_, m)| m)
+                .to_string()
+        })
+        .collect();
+    (!errs.is_empty()).then(|| errs.join("\n"))
 }
 
 /// Repo profiles that need no credential and declare `host` as an endpoint: attaching one
@@ -848,10 +914,29 @@ pub fn allow_slashes(sandbox: &str, host: &str, port: u16, binary: &str) -> Resu
 /// `[GITHUB_TOKEN, GH_TOKEN]` only the first name is prompted for.
 /// `FORGEJO_HOST` is prepended when the profile is a template over it.
 pub fn profile_env_keys(dir: &Path, id: &str) -> Vec<String> {
-    let body = fs::read_to_string(profile_path(dir, id)).unwrap_or_default();
+    env_keys_of(&fs::read_to_string(profile_path(dir, id)).unwrap_or_default())
+}
+
+/// `profile_env_keys` for a profile's text. Read as YAML, so a block list (`env_vars:` then
+/// `- NAME` lines) counts as much as `[NAME]`; text that is not YAML falls back to line matching.
+pub fn env_keys_of(body: &str) -> Vec<String> {
     let mut keys = Vec::new();
     if body.contains("${FORGEJO_HOST}") {
         keys.push("FORGEJO_HOST".to_string());
+    }
+    if let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(body) {
+        if let Some(creds) = docs.first().and_then(|d| d["credentials"].as_vec()) {
+            for c in creds {
+                let first = match &c["env_vars"] {
+                    yaml_rust2::Yaml::Array(a) => a.first().and_then(|v| v.as_str()),
+                    v => v.as_str(),
+                };
+                if let Some(k) = first.filter(|k| !k.is_empty()) {
+                    keys.push(k.to_string());
+                }
+            }
+        }
+        return keys;
     }
     for line in body.lines() {
         if let Some(rest) = line.trim().strip_prefix("env_vars:") {
@@ -1109,8 +1194,32 @@ fn gateway_profile_version(id: &str) -> Option<u64> {
         .map(|p| p["resource_version"].as_u64().unwrap_or(0))
 }
 
+/// The gateway's copy of a profile as YAML, without the `resource_version` bookkeeping line, so it
+/// can be saved as a file or compared with one.
+pub fn export_profile(id: &str) -> Result<String, String> {
+    let text = os(&["profile", "export", id, "--output", "yaml"])?;
+    let mut out: String = text
+        .lines()
+        .filter(|l| !l.starts_with("resource_version:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
+    Ok(out)
+}
+
 /// Import the profile if the gateway lacks it, or replace it with the repo copy.
 pub fn sync_profile(dir: &Path, id: &str, host: Option<&str>) -> Result<String, String> {
+    // Lint first (read-only), so a broken file is explained, not half-imported.
+    let path = profile_path(dir, id);
+    if let Ok(text) = fs::read_to_string(&path) {
+        check_profile(&text).map_err(|e| {
+            format!(
+                "{} does not pass the profile check: {}",
+                path.display(),
+                e.lines().next().unwrap_or_default()
+            )
+        })?;
+    }
     if gateway_profile_version(id).is_none() {
         let tmp = stage_profile(dir, id, host, None)?;
         let r = os(&["profile", "import", "--file", &tmp.to_string_lossy()]);
@@ -1126,7 +1235,7 @@ pub fn sync_profile(dir: &Path, id: &str, host: Option<&str>) -> Result<String, 
     let tmp = stage_profile(dir, id, host, Some(version))?;
     let r = os(&["profile", "update", id, "--file", &tmp.to_string_lossy()]);
     let _ = fs::remove_file(&tmp);
-    r.map(|_| format!("Updated profile {id}. Running sandboxes may need a restart to pick it up."))
+    r.map(|_| format!("Updated profile {id}"))
 }
 
 /// Create a provider, importing its profile first when needed. Credentials are
@@ -1816,6 +1925,50 @@ pub fn sync_check(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn credential_keys_come_from_inline_and_block_lists_and_yml_files_count() {
+        let inline = "id: a\ncredentials:\n  - name: t\n    env_vars: [GITHUB_TOKEN, GH_TOKEN]\n";
+        assert_eq!(super::env_keys_of(inline), vec!["GITHUB_TOKEN"]);
+        let block = "id: a\ncredentials:\n  - name: t\n    env_vars:\n      - FOO_TOKEN\n      - FOO_ALT\n  - name: u\n    env_vars: BAR\n";
+        assert_eq!(super::env_keys_of(block), vec!["FOO_TOKEN", "BAR"]);
+        let tpl = "id: f\nendpoints:\n  - host: ${FORGEJO_HOST}\ncredentials:\n  - env_vars: [FORGEJO_TOKEN]\n";
+        assert_eq!(
+            super::env_keys_of(tpl),
+            vec!["FORGEJO_HOST", "FORGEJO_TOKEN"]
+        );
+        let d = std::env::temp_dir().join(format!("osh-yml-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("providers")).unwrap();
+        std::fs::write(d.join("providers/mine.yml"), block).unwrap();
+        std::fs::write(d.join("providers/x.yaml"), inline).unwrap();
+        assert_eq!(super::profile_ids(&d), vec!["mine", "x"]);
+        assert_eq!(
+            super::profile_path(&d, "mine"),
+            d.join("providers/mine.yml")
+        );
+        assert_eq!(
+            super::profile_env_keys(&d, "mine"),
+            vec!["FOO_TOKEN", "BAR"]
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_profile_check_wants_yaml_with_an_id_and_lint_output_is_reduced_to_its_errors() {
+        assert!(super::check_profile("id: x\nendpoints: []\n").is_ok());
+        assert!(super::check_profile("endpoints: []\n")
+            .unwrap_err()
+            .contains("id"));
+        let e = super::check_profile("id: x\nendpoints: [\n").unwrap_err();
+        assert!(e.contains("line"), "{e}");
+        let out = "Provider profile diagnostics:\n  error a.yaml profile=npm field=id custom provider profile 'npm' already exists\n  error a.yaml profile=npm field=endpoints host must not be empty\nError:   x provider profile lint failed";
+        assert_eq!(
+            super::lint_errors(out).as_deref(),
+            Some("field=endpoints host must not be empty")
+        );
+        assert_eq!(super::lint_errors("connection refused"), None);
+    }
+
     #[test]
     fn the_gateway_list_marks_the_cli_default() {
         let v: Value = serde_json::from_str(

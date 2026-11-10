@@ -17,6 +17,10 @@ pub enum Command {
     EditToolchains,
     /// Which editor the edit actions use: auto, always the user's, always the built-in one.
     EditorMode,
+    /// Every data file: view, edit, compare with or restore the shipped default, add, delete.
+    DataFiles,
+    /// The filesystem policy every new sandbox gets (`sandbox-policy.yaml`).
+    EditPolicy,
 }
 
 pub struct Action {
@@ -148,7 +152,31 @@ pub const ACTIONS: &[Action] = &[
         KeyCode::Char('u'),
         "Import or update the profile from providers/",
     ),
+    a(
+        T(Tab::Profiles),
+        "e",
+        KeyCode::Char('e'),
+        "Edit, view, compare or delete the profile file",
+    ),
+    a(
+        T(Tab::Profiles),
+        "n",
+        KeyCode::Char('n'),
+        "New provider profile (opens in your editor)",
+    ),
     a(T(Tab::Images), "b", KeyCode::Char('b'), "Build the image"),
+    a(
+        T(Tab::Images),
+        "e",
+        KeyCode::Char('e'),
+        "Edit, view, compare or restore the Dockerfile",
+    ),
+    a(
+        T(Tab::Images),
+        "n",
+        KeyCode::Char('n'),
+        "New Dockerfile (opens in your editor)",
+    ),
     a(
         T(Tab::Gateways),
         "Enter",
@@ -193,6 +221,16 @@ pub const ACTIONS: &[Action] = &[
         Global,
         "Editor: switch auto / your own ($VISUAL, $EDITOR) / built-in",
         Command::EditorMode,
+    ),
+    command(
+        Global,
+        "Data files: profiles, Dockerfiles, policy, configs (edit, compare, restore defaults)",
+        Command::DataFiles,
+    ),
+    command(
+        Global,
+        "Sandbox policy: the filesystem policy of new sandboxes (sandbox-policy.yaml)",
+        Command::EditPolicy,
     ),
 ];
 

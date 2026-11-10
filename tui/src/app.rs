@@ -67,6 +67,58 @@ pub const EDIT_TOOLCHAINS_ITEM: &str = "Edit toolchains.toml (add hosts or group
 const TOOLCHAINS_FILE: &str = "toolchains.toml";
 const GH_REPO_ITEM: &str = "Git repo, read/write (GitHub, GitLab, Bitbucket or Forgejo token)...";
 
+/// Data files list entries that start a new file.
+const NEW_PROFILE_ITEM: &str = "New provider profile...";
+const NEW_DOCKERFILE_ITEM: &str = "New Dockerfile...";
+/// Actions of one data file.
+const FA_EDIT: &str = "Edit (your editor, else osh's)";
+const FA_CREATE: &str = "Create it (your editor, else osh's)";
+const FA_VIEW: &str = "View";
+const FA_DIFF: &str = "Compare with the shipped default";
+const FA_RESTORE: &str = "Restore the shipped default";
+const FA_DELETE: &str = "Delete this file";
+const FA_GW_DIFF: &str = "Compare with the gateway's copy";
+const FA_GW_SAVE: &str = "Save the gateway's copy as this file";
+const FA_GW_DELETE: &str = "Delete the profile from this gateway";
+const FA_BACK: &str = "Back to the data files";
+
+/// The question after a profile update reached running sandboxes.
+fn profile_restart_text(profile: &str, sandboxes: &[String]) -> String {
+    let it = if sandboxes.len() == 1 { "it" } else { "them" };
+    format!(
+        "Profile {profile} is updated. {} {} a provider made from it and may keep the old rules until restarted.\n\nRestart {it} now? Running programs stop and /tmp is cleared; files in /sandbox are kept.",
+        sandboxes.join(", "),
+        if sandboxes.len() == 1 { "uses" } else { "use" }
+    )
+}
+
+/// What a restored file takes effect with.
+fn restore_hint(rel: &str) -> &'static str {
+    match rel {
+        "sandbox-policy.yaml" | "toolchains.toml" => "; new sandboxes use it",
+        r if r.starts_with("gateway") => {
+            "; it applies the next time osh installs the gateway config (Upgrade OpenShell in the command palette)"
+        }
+        r if r.starts_with("images/") => "; build the image again to use it (b on the Images tab)",
+        r if r.starts_with("providers/") => "; import it again to use it (u on the Profiles tab)",
+        _ => "",
+    }
+}
+
+/// A new provider profile: the narrowest grant, to widen on purpose.
+fn profile_template(id: &str) -> String {
+    format!(
+        "# {id}: what this profile allows, and what it does not. Grant the narrowest host, port,\n\
+         # method and binary needed. Save, then import it on the Profiles tab (u).\n\
+         id: {id}\n\
+         display_name: {id}\n\
+         description: Read-only access to example.com\n\
+         category: data\n\
+         endpoints:\n  - host: example.com\n    port: 443\n    protocol: rest\n    access: read-only\n    enforcement: enforce\n\
+         binaries: [/usr/bin/curl]\n"
+    )
+}
+
 #[derive(Clone, Default)]
 pub struct Plan {
     pub image: String,
@@ -213,12 +265,18 @@ pub enum SelKind {
     Review {
         sandbox: String,
     },
+    /// Every data file (paths relative to the data dir, in list order), plus "new" entries.
+    DataFiles(Vec<String>),
+    /// What to do with one data file (relative path).
+    DataFile(String),
 }
 
 /// Where to go once the editor closes: back to the picker that opened it, with the fresh file.
 #[derive(Clone)]
 pub enum EditThen {
     Nothing,
+    /// Back to the actions of this data file.
+    DataFile(String),
     NewSandbox(Box<Plan>),
     Running(String, String),
 }
@@ -242,6 +300,8 @@ pub enum InKind {
     RepoName,
     /// Name for a generated install-access provider.
     GenName(SyncPlan),
+    /// Name of a new data file: a provider profile (true) or a Dockerfile (false).
+    NewFile(bool),
     /// Prompt for each key in turn; `next` resumes a sandbox plan afterwards.
     Cred {
         provider: String,
@@ -288,6 +348,12 @@ pub enum ConfKind {
         sandbox: String,
         name: String,
     },
+    /// Put the shipped default of a data file back (the user's copy is kept as `.osh-bak`).
+    RestoreFile(String),
+    /// Delete a data file.
+    DeleteFile(String),
+    /// Delete a profile from the current gateway.
+    DeleteProfile(String),
 }
 
 /// Live state of a background job, shown in a progress popup while it runs. `total` 0 means the
@@ -490,6 +556,11 @@ pub enum GhStage {
         flow: Box<RepoFlow>,
         token: String,
         problem: Option<String>,
+    },
+    /// A profile was updated; these running sandboxes use a provider made from it.
+    ProfileUpdated {
+        profile: String,
+        sandboxes: Vec<String>,
     },
     /// A sandbox was deleted with its token providers; the tokens still live where they were
     /// made: GitHub token names, and (provider, token name, page) for the other providers.
@@ -1928,6 +1999,13 @@ impl App {
                 }
                 return;
             }
+            Some(GhStage::ProfileUpdated { profile, sandboxes }) => {
+                self.modal = Some(Modal::Confirm {
+                    text: profile_restart_text(&profile, &sandboxes),
+                    kind: ConfKind::Restart(sandboxes),
+                });
+                return;
+            }
             Some(GhStage::Leftover { github, other }) => {
                 let mut text = String::new();
                 if !github.is_empty() {
@@ -2541,7 +2619,10 @@ impl App {
             Some(picks) => preload::select(&groups, picks),
             None => groups,
         };
-        let policy = preload::creation_policy(&text, &groups);
+        let policy = preload::creation_policy(&text, &groups).unwrap_or_else(|e| {
+            note = Some(e);
+            preload::creation_policy(&text, &[]).unwrap_or_else(|_| text.clone())
+        });
         match std::fs::write(&generated, policy) {
             Ok(()) => (generated, note),
             Err(e) if base.is_file() => (
@@ -3112,6 +3193,20 @@ impl App {
                     self.bg_msg(move || cli::allow_slashes(&sandbox, &host, port, &binary));
                 }
             }
+            SelKind::DataFiles(rels) => match first.as_str() {
+                NEW_PROFILE_ITEM => self.new_file(true),
+                NEW_DOCKERFILE_ITEM => self.new_file(false),
+                _ => {
+                    if let Some(rel) = rels.into_iter().find(|r| {
+                        first
+                            .strip_prefix(r.as_str())
+                            .is_some_and(|rest| rest.starts_with("  "))
+                    }) {
+                        self.file_menu(rel);
+                    }
+                }
+            },
+            SelKind::DataFile(rel) => self.on_file_action(rel, &first),
             SelKind::Review { sandbox } => {
                 let seen: Vec<Denial> = self
                     .watch
@@ -3575,7 +3670,238 @@ impl App {
                     Err(e) => format!("Error: could not save the setting: {e}"),
                 }
             }
+            C::DataFiles => self.data_files(),
+            C::EditPolicy => self.file_menu("sandbox-policy.yaml".into()),
         }
+    }
+
+    /// Something to tell the user about the data files at start-up (kept edits, an earlier
+    /// install's data): an alert, so it survives the alternate screen and stays under `!`.
+    pub fn data_notice(&mut self, text: String) {
+        let title = text.lines().next().unwrap_or_default().to_string();
+        self.push_alert(crate::alerts::Alert {
+            sev: crate::alerts::Severity::Warn,
+            title,
+            detail: text,
+            sandbox: None,
+        });
+    }
+
+    /// The Data files list: every file osh ships or the user added, with how it stands against
+    /// the shipped default, and entries that start a new profile or Dockerfile.
+    fn data_files(&mut self) {
+        let files = crate::assets::files(&self.dir);
+        let width = files.iter().map(|(r, _)| r.len()).max().unwrap_or(0);
+        let mut items: Vec<String> = files
+            .iter()
+            .map(|(r, s)| format!("{r:<width$}  {}", s.label()))
+            .collect();
+        items.push(NEW_PROFILE_ITEM.into());
+        items.push(NEW_DOCKERFILE_ITEM.into());
+        let rels = files.into_iter().map(|(r, _)| r).collect();
+        self.select(
+            &format!("Data files in {}", self.dir.display()),
+            items,
+            false,
+            SelKind::DataFiles(rels),
+        );
+    }
+
+    /// The profile id a data file stands for (`providers/ID.yaml` or `.yml`).
+    fn profile_of(rel: &str) -> Option<&str> {
+        let name = rel.strip_prefix("providers/")?;
+        name.strip_suffix(".yaml")
+            .or_else(|| name.strip_suffix(".yml"))
+    }
+
+    /// What can be done with one data file: only the actions that change something are listed.
+    fn file_menu(&mut self, rel: String) {
+        use crate::assets::{self, FileState};
+        let state = assets::state(&self.dir, &rel);
+        let shipped = assets::embedded(&rel).is_some();
+        let exists = self.dir.join(&rel).is_file();
+        let mut items: Vec<&str> = Vec::new();
+        if exists {
+            items.extend([FA_EDIT, FA_VIEW]);
+        } else if !shipped {
+            items.push(FA_CREATE);
+        }
+        if shipped && exists && state != FileState::Shipped {
+            items.push(FA_DIFF);
+        }
+        if shipped && state.restorable() {
+            items.push(FA_RESTORE);
+        }
+        if exists && !assets::required(&rel) {
+            items.push(FA_DELETE);
+        }
+        let on_gateway =
+            Self::profile_of(&rel).is_some_and(|id| self.snap.profiles.iter().any(|p| p.id == id));
+        if on_gateway {
+            items.push(if exists { FA_GW_DIFF } else { FA_GW_SAVE });
+            items.push(FA_GW_DELETE);
+        }
+        items.push(FA_BACK);
+        let what = if !exists && !shipped {
+            if on_gateway {
+                "no file; the gateway has this profile".to_string()
+            } else {
+                "no file yet".to_string()
+            }
+        } else {
+            state.label().to_string()
+        };
+        self.select(
+            &format!("{rel} ({what})"),
+            items.into_iter().map(String::from).collect(),
+            false,
+            SelKind::DataFile(rel),
+        );
+    }
+
+    /// The file menu as a modal, to come back to after a viewer.
+    fn file_menu_modal(&mut self, rel: &str) -> Option<Modal> {
+        self.file_menu(rel.to_string());
+        self.modal.take()
+    }
+
+    fn on_file_action(&mut self, rel: String, action: &str) {
+        let path = self.dir.join(&rel);
+        match action {
+            FA_EDIT | FA_CREATE => self.edit_file(rel),
+            FA_VIEW => {
+                let text = std::fs::read_to_string(&path).unwrap_or_else(|e| format!("{e}"));
+                let back = self.file_menu_modal(&rel);
+                self.open_viewer(&rel, text, back);
+            }
+            FA_DIFF => {
+                let mine = std::fs::read_to_string(&path).unwrap_or_default();
+                let text =
+                    crate::assets::diff(crate::assets::embedded(&rel).unwrap_or_default(), &mine);
+                let back = self.file_menu_modal(&rel);
+                self.open_viewer(&format!("{rel}: shipped default vs your copy"), text, back);
+            }
+            FA_RESTORE => {
+                let keep = if path.is_file() {
+                    format!(" Your copy is kept as {rel}.osh-bak.")
+                } else {
+                    String::new()
+                };
+                self.modal = Some(Modal::Confirm {
+                    text: format!("Put the shipped default of {rel} back?{keep}"),
+                    kind: ConfKind::RestoreFile(rel),
+                });
+            }
+            FA_DELETE => {
+                let back = if crate::assets::embedded(&rel).is_some() {
+                    " The shipped default stays available under Data files (Restore)."
+                } else {
+                    " It cannot be brought back."
+                };
+                self.modal = Some(Modal::Confirm {
+                    text: format!("Delete {rel}?{back}"),
+                    kind: ConfKind::DeleteFile(rel),
+                });
+            }
+            FA_GW_DIFF => {
+                let Some(id) = Self::profile_of(&rel).map(String::from) else {
+                    return;
+                };
+                self.status = format!("Comparing {id} with the gateway's copy...");
+                self.bg_msg(move || {
+                    let theirs = cli::export_profile(&id)?;
+                    let mine = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+                    Ok(format!(
+                        "{id}: the gateway's copy (-) against {rel} (+)\n\n{}",
+                        crate::assets::diff(&theirs, &mine)
+                    ))
+                });
+            }
+            FA_GW_SAVE => {
+                let Some(id) = Self::profile_of(&rel).map(String::from) else {
+                    return;
+                };
+                self.status = format!("Saving the gateway's {id} to {rel}...");
+                self.bg_msg(move || {
+                    let text = cli::export_profile(&id)?;
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                    }
+                    std::fs::write(&path, text).map_err(|e| e.to_string())?;
+                    Ok(format!("Saved the gateway's {id} as {rel}"))
+                });
+            }
+            FA_GW_DELETE => {
+                let Some(id) = Self::profile_of(&rel).map(String::from) else {
+                    return;
+                };
+                self.modal = Some(Modal::Confirm {
+                    text: format!(
+                        "Delete the profile {id} from gateway {}? Providers made from it stop working until it is imported again. The file stays.",
+                        cli::gateway()
+                    ),
+                    kind: ConfKind::DeleteProfile(id),
+                });
+            }
+            _ => self.data_files(),
+        }
+    }
+
+    /// Open a data file in the editor with the check that fits it; back to its menu after.
+    fn edit_file(&mut self, rel: String) {
+        let check = crate::assets::check_for(&rel);
+        let path = self.dir.join(&rel);
+        self.open_editor(&rel.clone(), path, None, check, EditThen::DataFile(rel));
+    }
+
+    /// Ask for the name of a new provider profile (`profile`) or Dockerfile.
+    fn new_file(&mut self, profile: bool) {
+        let title = if profile {
+            "Name of the new provider profile (letters, digits, - and _)"
+        } else {
+            "Name of the new image (letters, digits, - and _); its Dockerfile starts as a copy of pi's"
+        };
+        self.input(title, false, InKind::NewFile(profile));
+    }
+
+    /// Start the new file in the editor from a template; it is written on the first save.
+    fn create_file(&mut self, profile: bool, name: &str) {
+        let name = name.trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            self.modal = Some(Modal::Info(format!(
+                "{name:?} cannot be a file name here: use letters, digits, - and _ only."
+            )));
+            return;
+        }
+        let rel = if profile {
+            format!("providers/{name}.yaml")
+        } else {
+            format!("images/Dockerfile-{name}")
+        };
+        if self.dir.join(&rel).exists() || (profile && cli::profile_path(&self.dir, name).exists())
+        {
+            return self.file_menu(rel);
+        }
+        let template = if profile {
+            profile_template(name)
+        } else {
+            format!(
+                "# The {name} image, started as a copy of Dockerfile-pi. Build it on the Images tab (b).\n{}",
+                crate::assets::embedded("images/Dockerfile-pi").unwrap_or("FROM debian:stable-slim\n")
+            )
+        };
+        let (path, check) = (self.dir.join(&rel), crate::assets::check_for(&rel));
+        self.open_editor(
+            &rel.clone(),
+            path,
+            Some(template),
+            check,
+            EditThen::DataFile(rel),
+        );
     }
 
     /// The editor is open (it takes every key and paste).
@@ -3627,6 +3953,7 @@ impl App {
     fn edit_closed(&mut self, then: EditThen, _saved: bool) {
         match then {
             EditThen::Nothing => {}
+            EditThen::DataFile(rel) => self.file_menu(rel),
             EditThen::NewSandbox(plan) => self.pick_toolchains(*plan),
             EditThen::Running(name, gateway) => self.pick_toolchains_running(name, gateway),
         }
@@ -3849,6 +4176,7 @@ impl App {
 
     fn on_input(&mut self, kind: InKind, text: String) {
         match kind {
+            InKind::NewFile(profile) => self.create_file(profile, &text),
             InKind::OtherImage => {
                 if !text.trim().is_empty() {
                     self.pick_providers(Plan {
@@ -4238,6 +4566,33 @@ impl App {
                     })
                 });
             }
+            ConfKind::RestoreFile(rel) => {
+                let path = self.dir.join(&rel);
+                let backup = path.with_file_name(format!(
+                    "{}.osh-bak",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ));
+                let kept = match std::fs::copy(&path, &backup) {
+                    Ok(_) => format!(" (your copy: {rel}.osh-bak)"),
+                    Err(_) => String::new(),
+                };
+                self.status = match crate::assets::restore(&self.dir, &rel) {
+                    Ok(()) => format!("Restored the shipped {rel}{kept}{}", restore_hint(&rel)),
+                    Err(e) => format!("Error: could not restore {rel}: {e}"),
+                };
+            }
+            ConfKind::DeleteFile(rel) => {
+                self.status = match crate::assets::remove(&self.dir, &rel) {
+                    Ok(()) => format!("Deleted {rel}"),
+                    Err(e) => format!("Error: could not delete {rel}: {e}"),
+                };
+            }
+            ConfKind::DeleteProfile(id) => {
+                self.status = format!("Deleting profile {id}...");
+                self.bg_msg(move || {
+                    cli::os(&["profile", "delete", &id]).map(|_| format!("Deleted profile {id}"))
+                });
+            }
             ConfKind::DropAccess { sandbox, name } => {
                 self.bg_msg(move || cli::drop_generated(&sandbox, &name))
             }
@@ -4451,6 +4806,21 @@ impl App {
             Tab::Profiles => self.profile_key(code),
             Tab::Gateways => self.gateway_key(code),
             Tab::Images => {
+                if code == KeyCode::Char('n') {
+                    return self.new_file(false);
+                }
+                if code == KeyCode::Char('e') {
+                    if let Some(img) = self.snap.images.get(self.current()) {
+                        let rel = img
+                            .file
+                            .strip_prefix(&self.dir)
+                            .unwrap_or(&img.file)
+                            .to_string_lossy()
+                            .into_owned();
+                        self.file_menu(rel);
+                    }
+                    return;
+                }
                 if code == KeyCode::Char('b') || code == KeyCode::Enter {
                     if cli::runtime().is_none() {
                         self.status = "No running container runtime: start Docker or Podman, or run `osh setup --runtime docker|podman`".into();
@@ -4708,17 +5078,23 @@ impl App {
     }
 
     fn profile_key(&mut self, code: KeyCode) {
-        if !matches!(code, KeyCode::Char('u') | KeyCode::Enter) {
+        if code == KeyCode::Char('n') {
+            return self.new_file(true);
+        }
+        if !matches!(code, KeyCode::Char('u' | 'e') | KeyCode::Enter) {
             return;
         }
         let rows = self.profile_rows();
         let Some(row) = rows.get(self.current()) else {
             return;
         };
+        let rel = self.profile_rel(&row.id);
+        if code == KeyCode::Char('e') {
+            return self.file_menu(rel);
+        }
         if !row.in_repo {
             self.modal = Some(Modal::Info(format!(
-                "No {}.yaml in providers/ to sync from.",
-                row.id
+                "There is no {rel} to import from: the gateway has this profile but osh has no file for it.\nPress e to save the gateway's copy as that file, or to delete the profile from the gateway."
             )));
             return;
         }
@@ -4734,7 +5110,46 @@ impl App {
         }
         let (dir, id) = (self.dir.clone(), row.id.clone());
         self.status = format!("Syncing profile {id}...");
-        self.bg_msg(move || cli::sync_profile(&dir, &id, None));
+        // Providers made from this profile, to find the running sandboxes an update reaches.
+        let providers: Vec<String> = self
+            .snap
+            .providers
+            .iter()
+            .filter(|p| p.ty == id)
+            .map(|p| p.name.clone())
+            .collect();
+        let sandboxes = self.snap.sandboxes.clone();
+        self.bg(move || {
+            let msg = cli::sync_profile(&dir, &id, None)?;
+            let mut running: Vec<String> = Vec::new();
+            if msg.starts_with("Updated") {
+                for p in &providers {
+                    for s in cli::running_with(p, &sandboxes) {
+                        if !running.contains(&s) {
+                            running.push(s);
+                        }
+                    }
+                }
+            }
+            Ok(Done {
+                msg,
+                next: None,
+                sync: None,
+                gh: (!running.is_empty()).then_some(GhStage::ProfileUpdated {
+                    profile: id,
+                    sandboxes: running,
+                }),
+            })
+        });
+    }
+
+    /// The data-dir path of a profile's file, relative: the one that exists, else `ID.yaml`.
+    fn profile_rel(&self, id: &str) -> String {
+        let p = cli::profile_path(&self.dir, id);
+        format!(
+            "providers/{}",
+            p.file_name().unwrap_or_default().to_string_lossy()
+        )
     }
 
     fn open_viewer(&mut self, title: &str, text: String, back: Option<Modal>) {
@@ -6094,6 +6509,216 @@ mod tests {
         let text = std::fs::read_to_string(app.creation_policy(&plan).0).unwrap();
         assert!(text.contains("b.example") && !text.contains("a.example"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn data_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("osh-df-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        crate::assets::materialize(&dir).unwrap();
+        dir
+    }
+
+    fn items(app: &App) -> Vec<String> {
+        match &app.modal {
+            Some(Modal::Select { items, .. }) => items.clone(),
+            _ => panic!("a list is open"),
+        }
+    }
+
+    #[test]
+    fn data_files_compare_and_restore_an_edited_policy_inside_osh() {
+        let dir = data_dir("policy");
+        let policy = dir.join("sandbox-policy.yaml");
+        let shipped = std::fs::read_to_string(&policy).unwrap();
+        std::fs::write(&policy, format!("{shipped}# mine\n")).unwrap();
+        let mut a = app();
+        a.dir = dir.clone();
+        a.run_command(crate::palette::Command::DataFiles);
+        let list = items(&a);
+        let line = list
+            .iter()
+            .find(|l| l.starts_with("sandbox-policy.yaml "))
+            .unwrap();
+        assert!(line.ends_with("edited by you"), "{line}");
+        assert!(list.contains(&NEW_PROFILE_ITEM.to_string()));
+        a.modal = None;
+        a.on_select(
+            SelKind::DataFiles(vec!["sandbox-policy.yaml".into()]),
+            vec![line.clone()],
+        );
+        let menu = items(&a);
+        assert!(menu.contains(&FA_DIFF.into()) && menu.contains(&FA_RESTORE.into()));
+        assert!(
+            !menu.contains(&FA_DELETE.into()),
+            "a file osh needs is not deleted"
+        );
+        a.modal = None;
+        a.on_select(
+            SelKind::DataFile("sandbox-policy.yaml".into()),
+            vec![FA_DIFF.into()],
+        );
+        let Some(Modal::Viewer { text, back, .. }) = &a.modal else {
+            panic!("the diff is shown");
+        };
+        assert!(text.contains("+ # mine"), "{text}");
+        assert!(back.is_some(), "closing it goes back to the file's menu");
+        a.modal = None;
+        a.on_select(
+            SelKind::DataFile("sandbox-policy.yaml".into()),
+            vec![FA_RESTORE.into()],
+        );
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Confirm {
+                kind: ConfKind::RestoreFile(_),
+                ..
+            })
+        ));
+        press(&mut a, KeyCode::Char('y'));
+        assert_eq!(std::fs::read_to_string(&policy).unwrap(), shipped);
+        assert!(
+            std::fs::read_to_string(dir.join("sandbox-policy.yaml.osh-bak"))
+                .unwrap()
+                .ends_with("# mine\n")
+        );
+        assert!(a
+            .status
+            .starts_with("Restored the shipped sandbox-policy.yaml"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_profile_starts_from_a_template_in_the_editor_and_bad_names_are_refused() {
+        let dir = data_dir("newprof");
+        let mut a = app();
+        a.dir = dir.clone();
+        a.tab = Tab::Profiles;
+        press(&mut a, KeyCode::Char('n'));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Input {
+                kind: InKind::NewFile(true),
+                ..
+            })
+        ));
+        a.modal = None;
+        a.on_input(InKind::NewFile(true), "a/b".into());
+        assert!(matches!(&a.modal, Some(Modal::Info(t)) if t.contains("letters, digits")));
+        a.on_input(InKind::NewFile(true), "mine".into());
+        let Some(Modal::Editor { ed, .. }) = &mut a.modal else {
+            panic!("the editor opens");
+        };
+        assert!(ed.text().contains("id: mine") && ed.modified());
+        assert!(!dir.join("providers/mine.yaml").exists());
+        ed.save().unwrap();
+        assert!(dir.join("providers/mine.yaml").is_file());
+        // Closing it shows the new file's own actions.
+        press(&mut a, KeyCode::Esc);
+        assert!(items(&a).contains(&FA_DELETE.to_string()));
+        a.modal = None;
+        a.on_select(
+            SelKind::DataFile("providers/mine.yaml".into()),
+            vec![FA_DELETE.into()],
+        );
+        press(&mut a, KeyCode::Char('y'));
+        assert!(!dir.join("providers/mine.yaml").exists());
+        // A Dockerfile starts from pi's and is checked for a FROM line.
+        a.on_input(InKind::NewFile(false), "x".into());
+        let Some(Modal::Editor { ed, .. }) = &a.modal else {
+            panic!("the editor opens");
+        };
+        assert!(ed.text().contains("FROM ") && ed.path.ends_with("images/Dockerfile-x"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_profile_only_on_the_gateway_can_be_saved_as_a_file_or_deleted_from_it() {
+        let dir = data_dir("gwonly");
+        let mut a = app();
+        a.dir = dir.clone();
+        a.tab = Tab::Profiles;
+        a.snap.profiles = vec![cli::Profile {
+            id: "zz-only".into(),
+            version: 1,
+        }];
+        a.cursor[2] = a
+            .profile_rows()
+            .iter()
+            .position(|r| r.id == "zz-only")
+            .unwrap();
+        press(&mut a, KeyCode::Char('u'));
+        assert!(matches!(&a.modal, Some(Modal::Info(t)) if t.contains("Press e")));
+        a.modal = None;
+        press(&mut a, KeyCode::Char('e'));
+        let menu = items(&a);
+        assert!(menu.contains(&FA_GW_SAVE.into()) && menu.contains(&FA_GW_DELETE.into()));
+        assert!(!menu.contains(&FA_VIEW.into()), "no file to view yet");
+        a.modal = None;
+        a.on_select(
+            SelKind::DataFile("providers/zz-only.yaml".into()),
+            vec![FA_GW_DELETE.into()],
+        );
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Confirm {
+                kind: ConfKind::DeleteProfile(_),
+                ..
+            })
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_policy_falls_back_to_the_shipped_one_and_a_bad_block_is_explained() {
+        let dir = std::env::temp_dir().join(format!("osh-tpm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("toolchains.toml"),
+            "[a]\nenabled = true\nhosts = [\"a.example\"]\n",
+        )
+        .unwrap();
+        let mut a = app();
+        a.dir = dir.clone();
+        let (path, note) = a.creation_policy(&Plan::default());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("/dev") && text.contains("a.example"),
+            "{text}"
+        );
+        assert!(note.unwrap().contains("sandbox-policy.yaml is missing"));
+        std::fs::write(
+            dir.join("sandbox-policy.yaml"),
+            "version: 1\nnetwork_policies: { mine: {} }\n",
+        )
+        .unwrap();
+        let (path, note) = a.creation_policy(&Plan::default());
+        assert!(!std::fs::read_to_string(path).unwrap().contains("a.example"));
+        assert!(note.unwrap().contains("block"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_profile_update_that_reaches_running_sandboxes_offers_their_restart() {
+        let mut a = app();
+        a.on_done(Done {
+            msg: "Updated profile npm".into(),
+            next: None,
+            sync: None,
+            gh: Some(GhStage::ProfileUpdated {
+                profile: "npm".into(),
+                sandboxes: vec!["box".into()],
+            }),
+        });
+        let Some(Modal::Confirm {
+            text,
+            kind: ConfKind::Restart(names),
+        }) = &a.modal
+        else {
+            panic!("the restart is offered");
+        };
+        assert!(text.starts_with("Profile npm is updated. box uses a provider"));
+        assert_eq!(names, &["box"]);
     }
 
     #[test]

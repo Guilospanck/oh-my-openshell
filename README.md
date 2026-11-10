@@ -46,8 +46,12 @@ and `OSH_NO_SETUP=1` (binary only). Linux archives are built on Ubuntu 24.04 and
 
 `osh` is a single binary. The provider profiles, sandbox Dockerfiles and gateway
 configs are embedded in it and written to `~/.local/share/osh` on first run
-(your edits to those files are kept on upgrade, and a file you delete stays deleted; remove `.osh-manifest.json` there to restore the defaults; add your own `images/Dockerfile-*`
-and `providers/*.yaml` there). The first time you run `osh` (and with `osh setup`) a guided screen walks you
+(your edits to those files are kept on upgrade, and the dashboard says so in an alert, naming the files whose
+shipped default has changed since; a profile or Dockerfile you delete stays deleted, while a file osh needs, such as
+`sandbox-policy.yaml` or a gateway config, is written again). `Data files` in the command palette lists every one
+of them with its state (shipped default, edited by you, deleted, your own) and views, edits, compares with the
+shipped default, restores it (your copy is kept as `.osh-bak`) or deletes it; `n` on the Profiles and Images tabs
+starts a new profile or Dockerfile in your editor (or the built-in one when none is found; see [Editing files](#editing-files)). The first time you run `osh` (and with `osh setup`) a guided screen walks you
 through it: **Machine** (what was found), **Gateways** (tick the types you want;
 each says what it needs and what osh will install for it), **Review** (every
 step, with `sudo` marked), **Install** (live progress; `Esc` stops after the step that is running, and the rest are left for the next `osh setup`) and **Done**. Setup
@@ -99,12 +103,14 @@ A few actions have no key and live only in the palette:
 | --- | --- |
 | `Edit toolchains.toml` | opens the list of toolchain hosts in your editor, or the built-in one (below) |
 | `Editor: switch auto / your own / built-in` | which editor the edit actions use: `auto` (yours when one is found, else the built-in one), always yours, or always the built-in one (kept across runs in `editor-mode` in the data folder) |
+| `Data files` | every file osh keeps in its data folder: view, edit, compare with the shipped default, restore it, delete; new profile or Dockerfile |
+| `Sandbox policy` | the same actions for `sandbox-policy.yaml`, the filesystem policy every new sandbox gets (checked as YAML with a `version` on save) |
 
 | Tab | What you can do |
 | --- | --- |
 | Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a repo token (`t`), install skills and plugins (`K`, below), transfer state to another sandbox (`T`: copies the home directory, workspace and tool caches through a temp folder on the host; same-path files are overwritten; system packages cannot move, so put those in the image) |
 | Providers | create from a `providers/*.yaml` profile or a read/write repo token for GitHub, GitLab, Bitbucket or Forgejo (`n`), update credentials (`u`), delete (`d`) |
-| Profiles | import or refresh a profile on the gateway (`u`) |
+| Profiles | import or refresh a profile on the gateway (`u`; the file is linted first, and an update that reaches running sandboxes offers to restart them), the file's actions (`e`: view, edit, compare with the shipped default or the gateway's copy, restore, delete; save the gateway's copy as a file; delete the profile from the gateway), a new profile from a template (`n`). `.yml` files count too |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from) |
 | Gateways | switch (`g` / `Enter`), make one the OpenShell CLI default (`s`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
 

@@ -534,33 +534,40 @@ fn confirmed(word: &str) -> bool {
     }
 }
 
-/// Writes the embedded providers, Dockerfiles and configs to the data dir, and returns it.
+/// Writes the embedded providers, Dockerfiles and configs to the data dir, for a subcommand:
+/// what there is to say goes to stderr.
 fn materialize_data() -> PathBuf {
+    let (dir, notes) = materialize_notes();
+    for n in notes {
+        eprintln!("osh: {}", n.replace('\n', " "));
+    }
+    dir
+}
+
+/// Writes the embedded files to the data dir, and returns it with what the user should be told
+/// (data left by an earlier install, edited files kept). The dashboard shows these as alerts:
+/// printed before it opens, the alternate screen would hide them at once.
+fn materialize_notes() -> (PathBuf, Vec<String>) {
     let dir = assets::data_dir();
+    let mut notes = Vec::new();
     // OSH_DIR is a checkout in development: its files are the source, not a copy to refresh.
     if std::env::var_os("OSH_DIR").is_none() {
         if assets::leftover_from_earlier_install(&dir, &assets::exe_id()) {
             let n = gwmodel::Registry::load(&dir).gateways.len();
-            eprintln!(
-                "osh: found data from an earlier install in {} ({n} gateway(s) of osh's). \
-                 Using it. For a clean start, run `osh uninstall` (sandboxes are lost).",
+            notes.push(format!(
+                "Found data from an earlier install in {} ({n} gateway(s) of osh's), and using it.\nFor a clean start, choose \"Uninstall osh and OpenShell\" in the command palette (: or Ctrl-P); sandboxes are lost.",
                 dir.display()
-            );
-            if io::stdin().is_terminal() {
-                eprint!("Press Enter to continue.");
-                let _ = io::stdin().read_line(&mut String::new());
-            }
+            ));
         }
         match assets::materialize(&dir) {
-            Ok(r) => {
-                for p in r.kept_user_edits {
-                    eprintln!("osh: keeping your edited {}", p.display());
-                }
-            }
-            Err(e) => eprintln!("osh: cannot write {}: {e}", dir.display()),
+            Ok(r) => notes.extend(r.notice(&dir)),
+            Err(e) => notes.push(format!(
+                "Cannot write the data files to {}: {e}",
+                dir.display()
+            )),
         }
     }
-    dir
+    (dir, notes)
 }
 
 fn main() -> io::Result<()> {
@@ -572,7 +579,7 @@ fn main() -> io::Result<()> {
     if let Some(code) = subcommand(&args) {
         std::process::exit(code);
     }
-    let dir = materialize_data();
+    let (dir, notes) = materialize_notes();
     if !first_run(&dir) {
         return Ok(());
     }
@@ -586,6 +593,9 @@ fn main() -> io::Result<()> {
     alerts::spawn_watch(dir.clone(), alert_tx, Duration::from_secs(4));
 
     let mut app = App::new(dir, selected, wake_tx, done_tx);
+    for n in notes {
+        app.data_notice(n);
+    }
     if !std::env::args().any(|a| a == "--ui") {
         app.jump_to(cli::find_shared());
     }
