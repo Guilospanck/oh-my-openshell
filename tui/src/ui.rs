@@ -643,7 +643,7 @@ pub fn footer_help(tab: Tab) -> &'static str {
         Tab::Providers => "n create  u update credentials  d delete",
         Tab::Profiles => "u / Enter import or update from providers/  e file  n new",
         Tab::Images => "b / Enter build  e Dockerfile  n new",
-        Tab::Gateways => "Enter select  s make default  a add  d wipe (delete all data)  x remove",
+        Tab::Gateways => "Enter select  s make default  a add  R start/restart  l log  e config  V VM size  d wipe (delete all data)  x remove",
     }
 }
 

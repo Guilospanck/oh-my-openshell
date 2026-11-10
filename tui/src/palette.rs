@@ -192,6 +192,30 @@ pub const ACTIONS: &[Action] = &[
     a(T(Tab::Gateways), "a", KeyCode::Char('a'), "Add a gateway"),
     a(
         T(Tab::Gateways),
+        "R",
+        KeyCode::Char('R'),
+        "Start or restart the gateway (applies its config)",
+    ),
+    a(
+        T(Tab::Gateways),
+        "l",
+        KeyCode::Char('l'),
+        "Show the gateway's service log",
+    ),
+    a(
+        T(Tab::Gateways),
+        "e",
+        KeyCode::Char('e'),
+        "Edit the gateway's config",
+    ),
+    a(
+        T(Tab::Gateways),
+        "V",
+        KeyCode::Char('V'),
+        "Set the VM size (vCPUs, memory) of a VM gateway",
+    ),
+    a(
+        T(Tab::Gateways),
         "d",
         KeyCode::Char('d'),
         "Wipe the gateway (delete all its data)",

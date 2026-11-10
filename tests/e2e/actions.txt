@@ -40,6 +40,10 @@ Gateways | s | gateway-default
 Gateways | a | gateway-add
 Gateways | d | gateway-wipe
 Gateways | x | gateway-remove
+Gateways | R | gateway-restart
+Gateways | l | gateway-log
+Gateways | e | gateway-config
+Gateways | V | gateway-vm-size
 shell | ctrl-] menu | shell-menu
 palette | Edit toolchains.toml | editor-toolchains
 palette | Data files | data-files

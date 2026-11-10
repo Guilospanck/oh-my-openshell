@@ -24,6 +24,194 @@ pub(crate) fn packaged(spec: &GatewaySpec, os: Os) -> bool {
     spec.main && !(os == Os::MacOs && spec.kind != GwKind::Vm)
 }
 
+/// The size every VM sandbox gets, chosen in the dashboard (`V` on the Gateways tab), in the osh
+/// data dir. The VM driver has no per-sandbox limits; `vcpus` and `mem_mib` under
+/// `[openshell.drivers.vm]` set the size of every microVM the gateway starts.
+pub const VM_SIZE_FILE: &str = "vm-size.toml";
+
+/// What the VM driver uses when the config says nothing (`openshell-driver-vm --help`).
+pub const VM_DEFAULT_SIZE: (u32, u32) = (2, 2048);
+
+/// The chosen VM size, `(vcpus, mem_mib)`, when one was set.
+pub fn vm_size(h: &dyn Host, p: &Paths) -> Option<(u32, u32)> {
+    let t: toml::Table = h.read(&p.data.join(VM_SIZE_FILE))?.parse().ok()?;
+    let n = |k: &str| t.get(k)?.as_integer().and_then(|v| u32::try_from(v).ok());
+    Some((n("vcpus")?, n("mem_mib")?))
+}
+
+/// `config` with the VM size set in its `[openshell.drivers.vm]` section (replacing earlier
+/// `vcpus` / `mem_mib` lines). A config for another driver, or no size, is returned as it is.
+pub fn with_vm_size(config: &str, size: Option<(u32, u32)>) -> String {
+    let Some((vcpus, mem)) = size else {
+        return config.to_string();
+    };
+    const HEAD: &str = "[openshell.drivers.vm]";
+    let is_key = |l: &str, k: &str| {
+        l.trim_start()
+            .strip_prefix(k)
+            .is_some_and(|r| r.trim_start().starts_with('='))
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut in_vm = false;
+    let mut found = false;
+    for line in config.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_vm = t == HEAD;
+            out.push(line.to_string());
+            if in_vm {
+                found = true;
+                out.push(format!("vcpus = {vcpus}"));
+                out.push(format!("mem_mib = {mem}"));
+            }
+            continue;
+        }
+        if in_vm && (is_key(line, "vcpus") || is_key(line, "mem_mib")) {
+            continue;
+        }
+        out.push(line.to_string());
+    }
+    let vm_driver = config
+        .lines()
+        .any(|l| is_key(l, "compute_driver") && l.contains("\"vm\""));
+    if !found && vm_driver {
+        out.push(String::new());
+        out.push(HEAD.into());
+        out.push(format!("vcpus = {vcpus}"));
+        out.push(format!("mem_mib = {mem}"));
+    }
+    let mut t = out.join("\n");
+    if config.ends_with('\n') || !found {
+        t.push('\n');
+    }
+    t
+}
+
+/// The registry entry for `name`, or the shape of a gateway osh did not create but knows
+/// (`gateway::legacy_spec`), so restart, logs and the VM size work for those too.
+pub fn spec_for(
+    f: &Facts,
+    p: &Paths,
+    h: &dyn Host,
+    reg: &Registry,
+    name: &str,
+) -> Result<GatewaySpec, String> {
+    if let Some(s) = reg.get(name) {
+        return Ok(s.clone());
+    }
+    let driver = h
+        .read(&p.config_home.join("gateway.toml"))
+        .and_then(|t| gateway::driver_runtime(&t));
+    gateway::legacy_spec(f.os, name, driver.or(f.runtime()))
+}
+
+/// Start or restart a gateway so it runs its current config: the main is set up again the way
+/// `osh setup` would (config installed when it changed, service restarted, wait), an extra's own
+/// service is restarted (it reads its config at start).
+pub fn apply_and_restart_steps(
+    f: &Facts,
+    p: &Paths,
+    h: &dyn Host,
+    reg: &Registry,
+    spec: &GatewaySpec,
+) -> Vec<Step> {
+    match reg.get(&spec.name) {
+        Some(s) if s.main => main_gateway_steps_forced(f, p, h, reg, s),
+        Some(s) => restart_gateway_steps(f, s),
+        // A main osh's wizard did not make: its config comes from the data dir (`gateway::plan`).
+        None if spec.main => gateway::plan(f, &crate::setup::Options::default(), h, p, true),
+        None => restart_gateway_steps(f, spec),
+    }
+}
+
+/// Set the size of every VM sandbox of `spec` (a VM gateway): remember it, write it into the
+/// gateway's config, restart the gateway. Sandboxes running on it stop with the restart.
+pub fn vm_size_steps(
+    f: &Facts,
+    p: &Paths,
+    h: &dyn Host,
+    spec: &GatewaySpec,
+    (vcpus, mem): (u32, u32),
+) -> Result<Vec<Step>, String> {
+    if spec.kind != GwKind::Vm {
+        return Err(format!(
+            "{} is not a VM gateway: its sandboxes take CPU and memory limits one by one when they are created",
+            spec.name
+        ));
+    }
+    if !(1..=64).contains(&vcpus) || !(512..=262_144).contains(&mem) {
+        return Err("give 1 to 64 vCPUs and 512 to 262144 MiB of memory".into());
+    }
+    let size = Some((vcpus, mem));
+    let target = if packaged(spec, f.os) {
+        p.config_home.join("gateway.toml")
+    } else {
+        config_path(p, &spec.name)
+    };
+    let base = h.read(&target).unwrap_or_else(|| gateway_toml(spec, f.os));
+    let mut steps = vec![
+        st(
+            spec,
+            "vm-size",
+            "Remember the VM size",
+            StepKind::Write {
+                path: p.data.join(VM_SIZE_FILE),
+                content: format!("vcpus = {vcpus}\nmem_mib = {mem}\n"),
+            },
+        ),
+        st(
+            spec,
+            "vm-size-config",
+            &format!("Set {vcpus} vCPUs and {mem} MiB in the gateway config"),
+            StepKind::Write {
+                path: target,
+                content: with_vm_size(&base, size),
+            },
+        ),
+    ];
+    steps.extend(restart_gateway_steps(f, spec));
+    Ok(chain(steps, None))
+}
+
+/// The command that follows a gateway's own service log: the systemd journal on Linux; on macOS
+/// the launchd agent's files, or Homebrew's for the packaged service.
+pub fn log_command(os: Os, spec: &GatewaySpec, p: &Paths) -> (String, Vec<String>) {
+    let follow = |files: Vec<String>| {
+        let mut a = vec!["-n".to_string(), "2000".into(), "-F".into()];
+        a.extend(files);
+        ("tail".to_string(), a)
+    };
+    match (os, packaged(spec, os)) {
+        (Os::Linux, packaged) => {
+            let unit = if packaged {
+                "openshell-gateway".to_string()
+            } else {
+                unit_name(&spec.name)
+            };
+            (
+                "journalctl".into(),
+                ["--user", "-u", &unit, "-n", "2000", "-f", "--no-pager"]
+                    .map(String::from)
+                    .to_vec(),
+            )
+        }
+        (Os::MacOs, true) => (
+            "sh".into(),
+            vec![
+                "-c".into(),
+                r#"d="$(brew --prefix)/var/log/openshell"; exec tail -n 2000 -F "$d/openshell-gateway.err.log" "$d/openshell-gateway.out.log""#.into(),
+            ],
+        ),
+        (Os::MacOs, false) => {
+            let logs = db_dir_for(p, os, spec);
+            follow(vec![
+                logs.join("gateway.err.log").to_string_lossy().into(),
+                logs.join("gateway.out.log").to_string_lossy().into(),
+            ])
+        }
+    }
+}
+
 /// The osh data dir's generated config for a gateway.
 pub fn config_path(p: &Paths, name: &str) -> PathBuf {
     p.data.join("gateways").join(format!("{name}.toml"))
@@ -545,7 +733,7 @@ fn own_service_steps(
             &format!("Write the {} gateway config", spec.kind.label()),
             StepKind::Write {
                 path: cfg,
-                content: gateway_toml(spec, f.os),
+                content: with_vm_size(&gateway_toml(spec, f.os), vm_size(h, p)),
             },
         ));
     }
@@ -792,7 +980,8 @@ fn main_steps(
         own_service_steps(f, p, h, spec, register, vec![stop])
     } else {
         let target = p.config_home.join("gateway.toml");
-        let wanted = gateway_toml(spec, f.os);
+        // The VM size chosen in the dashboard is part of the config, so it is not "drift".
+        let wanted = with_vm_size(&gateway_toml(spec, f.os), vm_size(h, p));
         let installed = h.read(&target);
         let current = installed.as_deref().map(without_header) == Some(without_header(&wanted));
         if !force && !installing && current && gateway::service_running(f.os, h) {
@@ -1206,6 +1395,99 @@ mod tests {
             port,
             main,
         }
+    }
+
+    #[test]
+    fn the_vm_size_goes_into_the_vm_section_and_nowhere_else() {
+        let vm = gateway_toml(&spec(GwKind::Vm, 17670, true), Os::MacOs);
+        let sized = with_vm_size(&vm, Some((4, 8192)));
+        let at = sized.find("[openshell.drivers.vm]\nvcpus = 4\nmem_mib = 8192\n");
+        assert!(at.is_some(), "{sized}");
+        // Setting it again replaces the lines instead of adding more.
+        let again = with_vm_size(&sized, Some((2, 4096)));
+        assert_eq!(again.matches("vcpus =").count(), 1, "{again}");
+        assert!(again.contains("vcpus = 2\nmem_mib = 4096"));
+        assert_eq!(with_vm_size(&vm, None), vm);
+        let docker = gateway_toml(&spec(GwKind::Docker, 17671, false), Os::Linux);
+        assert_eq!(with_vm_size(&docker, Some((4, 8192))), docker);
+        // The shipped vm config has the section; a vm config without one gets it.
+        let bare = "[openshell.gateway]\ncompute_driver = \"vm\"\n";
+        assert!(with_vm_size(bare, Some((3, 3072)))
+            .ends_with("[openshell.drivers.vm]\nvcpus = 3\nmem_mib = 3072\n"));
+    }
+
+    #[test]
+    fn setting_the_vm_size_remembers_it_writes_the_config_and_restarts() {
+        let f = facts(Os::MacOs);
+        let p = paths();
+        let h = FakeHost::default();
+        let s = spec(GwKind::Vm, 17670, true);
+        let steps = vm_size_steps(&f, &p, &h, &s, (4, 8192)).unwrap();
+        let StepKind::Write { path, content } = &steps[0].kind else {
+            panic!("first it is remembered");
+        };
+        assert_eq!(path, &p.data.join(VM_SIZE_FILE));
+        assert_eq!(content, "vcpus = 4\nmem_mib = 8192\n");
+        let StepKind::Write { path, content } = &steps[1].kind else {
+            panic!("then written into the config");
+        };
+        assert_eq!(path, &p.config_home.join("gateway.toml"));
+        assert!(content.contains("vcpus = 4\nmem_mib = 8192"));
+        assert!(steps
+            .iter()
+            .any(|x| x.command_line() == "brew services restart openshell"));
+        assert!(vm_size_steps(&f, &p, &h, &spec(GwKind::Docker, 17671, false), (4, 8192)).is_err());
+        assert!(vm_size_steps(&f, &p, &h, &s, (0, 8192)).is_err());
+        // Once remembered, the main's wanted config carries it: no drift, no rewrite.
+        let mut h = FakeHost::default();
+        h.files.insert(
+            p.data.join(VM_SIZE_FILE).to_string_lossy().into_owned(),
+            "vcpus = 4\nmem_mib = 8192\n".into(),
+        );
+        assert_eq!(vm_size(&h, &p), Some((4, 8192)));
+    }
+
+    #[test]
+    fn a_gateways_service_log_is_its_journal_or_its_log_files() {
+        let p = paths();
+        let (prog, args) = log_command(Os::Linux, &spec(GwKind::Docker, 17670, true), &p);
+        assert_eq!(prog, "journalctl");
+        assert!(args.contains(&"openshell-gateway".to_string()) && args.contains(&"-f".into()));
+        let (_, args) = log_command(Os::Linux, &spec(GwKind::Podman, 17671, false), &p);
+        assert!(args.contains(&unit_name("openshell-podman")));
+        let (prog, args) = log_command(Os::MacOs, &spec(GwKind::Docker, 17671, false), &p);
+        assert_eq!(prog, "tail");
+        assert!(args
+            .iter()
+            .any(|a| a.ends_with("gateway-docker/gateway.err.log")));
+        let (prog, args) = log_command(Os::MacOs, &spec(GwKind::Vm, 17670, true), &p);
+        assert_eq!(prog, "sh");
+        assert!(args[1].contains("var/log/openshell"));
+    }
+
+    #[test]
+    fn a_restart_sets_a_main_up_again_and_only_restarts_an_extra() {
+        let f = facts(Os::Linux);
+        let p = paths();
+        let h = FakeHost::default();
+        let mut reg = Registry::default();
+        let main = spec(GwKind::Docker, 17670, true);
+        let extra = spec(GwKind::Podman, 17671, false);
+        reg.add(main.clone());
+        reg.add(extra.clone());
+        let m = apply_and_restart_steps(&f, &p, &h, &reg, &main);
+        assert!(m
+            .iter()
+            .any(|s| s.command_line() == "systemctl --user restart openshell-gateway"));
+        let e = apply_and_restart_steps(&f, &p, &h, &reg, &extra);
+        assert_eq!(
+            e[0].command_line(),
+            format!("systemctl --user restart {}", unit_name("openshell-podman"))
+        );
+        // A main osh did not create installs the data dir's config, as `osh setup` does.
+        let legacy = gateway::legacy_spec(Os::Linux, "openshell", None).unwrap();
+        let l = apply_and_restart_steps(&f, &p, &h, &Registry::default(), &legacy);
+        assert!(l.iter().any(|s| s.id == "gateway-config"));
     }
 
     fn texts(steps: &[Step]) -> String {

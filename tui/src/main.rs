@@ -452,8 +452,46 @@ fn gateway_command(args: &[String]) -> i32 {
 /// `osh gateway add <vm|docker|podman> [--yes] [--dry-run]` and
 /// `osh gateway remove <name> [--delete-data]`.
 fn gateway_add_remove(args: &[String]) -> i32 {
-    let usage = "usage: osh gateway add <vm|docker|podman> [--yes] [--dry-run] | osh gateway remove <name> [--delete-data]";
+    let usage = "usage: osh gateway add <vm|docker|podman> [--yes] [--dry-run] | osh gateway remove <name> [--delete-data] | osh gateway restart <name> | osh gateway vm-size <name> <vcpus> <mem-mib>";
     match args.first().map(String::as_str) {
+        Some(verb @ ("restart" | "vm-size")) => {
+            let Some(name) = args.get(1).filter(|n| !n.starts_with("--")) else {
+                eprintln!("{usage}");
+                return 2;
+            };
+            let h = platform::RealHost;
+            let f = platform::gather(&h);
+            let p = gateway::Paths::detect();
+            let reg = gwmodel::Registry::load(&p.data);
+            let spec = match gwops::spec_for(&f, &p, &h, &reg, name) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("osh: {e}");
+                    return 2;
+                }
+            };
+            let steps = if verb == "restart" {
+                gwops::apply_and_restart_steps(&f, &p, &h, &reg, &spec)
+            } else {
+                let num = |i: usize| args.get(i).and_then(|v| v.parse::<u32>().ok());
+                let (Some(vcpus), Some(mem)) = (num(2), num(3)) else {
+                    eprintln!("{usage}");
+                    return 2;
+                };
+                match gwops::vm_size_steps(&f, &p, &h, &spec, (vcpus, mem)) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("osh: {e}");
+                        return 2;
+                    }
+                }
+            };
+            let o = setup::Options {
+                yes: pre_confirmed(args),
+                ..Default::default()
+            };
+            i32::from(!setup::run_steps(&h, steps, &o, io::stdin().is_terminal()))
+        }
         Some("add") => {
             let Some(kind) = args.get(1).and_then(|k| gwmodel::GwKind::parse(k)) else {
                 eprintln!("{usage}");

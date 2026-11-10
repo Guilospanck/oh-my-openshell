@@ -277,6 +277,8 @@ pub enum EditThen {
     Nothing,
     /// Back to the actions of this data file.
     DataFile(String),
+    /// A gateway's config was edited: offer the restart that applies it.
+    Gateway(String),
     NewSandbox(Box<Plan>),
     Running(String, String),
 }
@@ -302,6 +304,9 @@ pub enum InKind {
     GenName(SyncPlan),
     /// Name of a new data file: a provider profile (true) or a Dockerfile (false).
     NewFile(bool),
+    /// vCPUs, then memory, for every sandbox of a VM gateway.
+    VmCpus(String),
+    VmMemory(String, u32),
     /// Prompt for each key in turn; `next` resumes a sandbox plan afterwards.
     Cred {
         provider: String,
@@ -354,6 +359,11 @@ pub enum ConfKind {
     DeleteFile(String),
     /// Delete a profile from the current gateway.
     DeleteProfile(String),
+    /// Run `osh ARGS` with the terminal handed over: the subcommand's own code and step list,
+    /// after this confirmation (`--confirmed` in ARGS skips its per-step questions).
+    OshJob(Vec<String>),
+    /// The VM size of every sandbox on a VM gateway: (gateway, vcpus, mem_mib).
+    VmSize(String, u32, u32),
 }
 
 /// Live state of a background job, shown in a progress popup while it runs. `total` 0 means the
@@ -903,11 +913,13 @@ fn config_stale(reg: &crate::gwmodel::Registry) -> bool {
         crate::platform::Os::Linux
     };
     let name = crate::gateway::config_name_for(os, cli::runtime());
-    let differs = crate::gateway::stale(
-        name,
-        &crate::platform::RealHost,
-        &crate::gateway::Paths::detect(),
-    );
+    let paths = crate::gateway::Paths::detect();
+    // The stub osh writes for the Homebrew service is deliberately not the built-in config: the
+    // main gateway is one osh runs itself. Without this, a run whose data dir has no registry
+    // (the dev launcher points it at the checkout) would call the stub out of date.
+    let is_stub = std::fs::read_to_string(paths.config_home.join("gateway.toml"))
+        .is_ok_and(|t| t == crate::gwops::BREW_SERVICE_TOML);
+    let differs = !is_stub && crate::gateway::stale(name, &crate::platform::RealHost, &paths);
     config_stale_with(reg, differs)
 }
 
@@ -1122,10 +1134,8 @@ impl App {
             e.clone()
         } else if s.gateway_ok {
             "Ready".into()
-        } else if cfg!(target_os = "macos") {
-            "Gateway unreachable: brew services start openshell (vm) or osh gateway-docker".into()
         } else {
-            "Gateway unreachable: systemctl --user start openshell-gateway".into()
+            "Gateway unreachable: on the Gateways tab (5), R starts it and l shows its log".into()
         }
     }
 
@@ -2565,10 +2575,13 @@ impl App {
                 g.repo.shown(),
             )
         });
-        let note = self
+        let mut note = self
             .creation_policy(&plan)
             .1
             .map_or(String::new(), |n| format!("Note: {n}.\n\n"));
+        if !self.limits_supported() {
+            note.push_str(&format!("{}.\n\n", self.no_limits_note()));
+        }
         self.modal = Some(Modal::Confirm {
             text: format!("{extra}{note}Run:\n{summary}\n\nContinue?"),
             kind: ConfKind::CreateSandbox(plan),
@@ -3950,10 +3963,25 @@ impl App {
     }
 
     /// After an edit, in either editor: back to where it was opened from, with what comes next.
-    fn edit_closed(&mut self, then: EditThen, _saved: bool) {
+    fn edit_closed(&mut self, then: EditThen, saved: bool) {
         match then {
             EditThen::Nothing => {}
             EditThen::DataFile(rel) => self.file_menu(rel),
+            EditThen::Gateway(name) => {
+                if saved {
+                    self.modal = Some(Modal::Confirm {
+                        text: format!(
+                            "Restart {name} now so it uses the saved config? Sandboxes on it lose their connections for a moment."
+                        ),
+                        kind: ConfKind::OshJob(vec![
+                            "gateway".into(),
+                            "restart".into(),
+                            name,
+                            "--confirmed".into(),
+                        ]),
+                    });
+                }
+            }
             EditThen::NewSandbox(plan) => self.pick_toolchains(*plan),
             EditThen::Running(name, gateway) => self.pick_toolchains_running(name, gateway),
         }
@@ -4177,6 +4205,28 @@ impl App {
     fn on_input(&mut self, kind: InKind, text: String) {
         match kind {
             InKind::NewFile(profile) => self.create_file(profile, &text),
+            InKind::VmCpus(name) => match text.trim().parse::<u32>() {
+                Ok(n) if (1..=64).contains(&n) => {
+                    let (_, mem) = self.vm_size_now();
+                    self.input(
+                        &format!("Memory in MiB for every sandbox on {name} (now {mem})"),
+                        false,
+                        InKind::VmMemory(name, n),
+                    );
+                }
+                _ => self.status = "Not changed: give a number of vCPUs from 1 to 64".into(),
+            },
+            InKind::VmMemory(name, vcpus) => match text.trim().parse::<u32>() {
+                Ok(mem) if (512..=262_144).contains(&mem) => {
+                    self.modal = Some(Modal::Confirm {
+                        text: format!(
+                            "Give every sandbox on {name} {vcpus} vCPUs and {mem} MiB?\n\nosh writes this into the gateway's config and restarts the gateway: running sandboxes on it stop, and new ones start at this size."
+                        ),
+                        kind: ConfKind::VmSize(name, vcpus, mem),
+                    })
+                }
+                _ => self.status = "Not changed: give the memory in MiB, 512 to 262144".into(),
+            },
             InKind::OtherImage => {
                 if !text.trim().is_empty() {
                     self.pick_providers(Plan {
@@ -4232,6 +4282,7 @@ impl App {
                         InKind::Cpu(plan),
                     );
                 } else {
+                    self.status = self.no_limits_note();
                     self.ask_share(plan);
                 }
             }
@@ -4352,6 +4403,18 @@ impl App {
                     next,
                 });
             }
+        }
+    }
+
+    /// Why the create flow did not ask for CPU and memory limits.
+    fn no_limits_note(&self) -> String {
+        if self.snap.driver == "vm" {
+            let (cpus, mem) = self.vm_size_now();
+            format!(
+                "No CPU or memory question: every VM sandbox gets the gateway's size, {cpus} vCPUs and {mem} MiB (V on the Gateways tab changes it)"
+            )
+        } else {
+            "No CPU or memory question: the gateway has not said which driver it runs yet, so limits are left to its defaults".into()
         }
     }
 
@@ -4587,6 +4650,15 @@ impl App {
                     Err(e) => format!("Error: could not delete {rel}: {e}"),
                 };
             }
+            ConfKind::OshJob(args) => self.osh_job(args),
+            ConfKind::VmSize(name, vcpus, mem) => self.osh_job(vec![
+                "gateway".into(),
+                "vm-size".into(),
+                name,
+                vcpus.to_string(),
+                mem.to_string(),
+                "--confirmed".into(),
+            ]),
             ConfKind::DeleteProfile(id) => {
                 self.status = format!("Deleting profile {id}...");
                 self.bg_msg(move || {
@@ -5017,11 +5089,52 @@ impl App {
                         "Remove gateway {name}?\n\nIts service is stopped and disabled and it is\n\
                          forgotten by osh and the OpenShell CLI.\n\
                          Its sandboxes' data stays on disk (osh keeps the database).\n\
-                         To delete the data too, run: osh gateway remove {name} --delete-data",
+                         y removes it and keeps the data; D removes it and DELETES the data too.",
                         name = g.name
                     ),
                     kind: ConfKind::RemoveGateway(g.name.clone()),
                 });
+            }
+            KeyCode::Char('R') => {
+                let up = g.name == self.snap.gateway && self.snap.gateway_ok;
+                self.modal = Some(Modal::Confirm {
+                    text: format!(
+                        "{} gateway {}?\n\nosh installs its config if that changed, restarts its service and waits for it to answer.{}",
+                        if up { "Restart" } else { "Start" },
+                        g.name,
+                        if up {
+                            " Sandboxes on it lose their connections for a moment."
+                        } else {
+                            ""
+                        }
+                    ),
+                    kind: ConfKind::OshJob(vec![
+                        "gateway".into(),
+                        "restart".into(),
+                        g.name.clone(),
+                        "--confirmed".into(),
+                    ]),
+                });
+            }
+            KeyCode::Char('l') => self.gateway_log(&g.name),
+            KeyCode::Char('e') => self.edit_gateway_config(&g.name),
+            KeyCode::Char('V') => {
+                if info.kind != "VM" {
+                    self.modal = Some(Modal::Info(format!(
+                        "{} is not a VM gateway. Its sandboxes take CPU and memory limits one by one, asked when a sandbox is created (n on the Sandboxes tab).",
+                        g.name
+                    )));
+                    return;
+                }
+                let (cpus, _) = self.vm_size_now();
+                self.input(
+                    &format!(
+                        "vCPUs for every sandbox on {} (now {cpus}; the VM driver has no per-sandbox size)",
+                        g.name
+                    ),
+                    false,
+                    InKind::VmCpus(g.name.clone()),
+                );
             }
             KeyCode::Enter => {
                 let name = g.name.clone();
@@ -5141,6 +5254,90 @@ impl App {
                 }),
             })
         });
+    }
+
+    /// Run `osh ARGS` with the terminal handed over (see `ConfKind::OshJob`).
+    fn osh_job(&mut self, args: Vec<String>) {
+        let exe = std::env::current_exe().unwrap_or_else(|_| "osh".into());
+        self.job = Some(vec![Step {
+            prog: exe.to_string_lossy().into(),
+            args,
+        }]);
+    }
+
+    /// The VM size the gateways start microVMs with: the one set here, else the driver's default.
+    fn vm_size_now(&self) -> (u32, u32) {
+        if cfg!(test) {
+            return crate::gwops::VM_DEFAULT_SIZE;
+        }
+        let p = crate::gateway::Paths::detect();
+        crate::gwops::vm_size(&crate::platform::RealHost, &p)
+            .unwrap_or(crate::gwops::VM_DEFAULT_SIZE)
+    }
+
+    /// Follow a gateway's own service log (journal or launchd/Homebrew log files) in the log view,
+    /// which works while the gateway is down, when there is no sandbox to read logs from.
+    fn gateway_log(&mut self, name: &str) {
+        use crate::platform::Host as _;
+        let h = crate::platform::RealHost;
+        let p = crate::gateway::Paths::detect();
+        let os = if cfg!(target_os = "macos") {
+            crate::platform::Os::MacOs
+        } else {
+            crate::platform::Os::Linux
+        };
+        let driver = h
+            .read(&p.config_home.join("gateway.toml"))
+            .and_then(|t| crate::gateway::driver_runtime(&t));
+        let spec = match self.registry.get(name) {
+            Some(s) => Ok(s.clone()),
+            None => crate::gateway::legacy_spec(os, name, driver.or(cli::runtime())),
+        };
+        match spec {
+            Ok(spec) => {
+                let (prog, args) = crate::gwops::log_command(os, &spec, &p);
+                match LogView::open_command(format!("{name} service"), &prog, args) {
+                    Ok(lv) => self.logview = Some(lv),
+                    Err(e) => self.status = format!("Error: {e}"),
+                }
+            }
+            Err(_) => {
+                self.modal = Some(Modal::Info(format!(
+                    "osh does not know how {name} runs (osh did not create it), so it cannot show its service log."
+                )))
+            }
+        }
+    }
+
+    /// Open the config osh keeps for a gateway in the editor; on close, offer the restart that
+    /// applies it.
+    fn edit_gateway_config(&mut self, name: &str) {
+        let os = if cfg!(target_os = "macos") {
+            crate::platform::Os::MacOs
+        } else {
+            crate::platform::Os::Linux
+        };
+        let rel = match self.registry.get(name) {
+            Some(spec) if crate::gwops::packaged(spec, os) => {
+                self.modal = Some(Modal::Info(format!(
+                    "osh writes the config of {name} itself (OpenShell's own gateway.toml) and puts it back when it differs, so an edit would not last. What osh lets you change: the VM size of a VM gateway (V)."
+                )));
+                return;
+            }
+            Some(_) => format!("gateways/{name}.toml"),
+            None if name == "openshell" => {
+                crate::gateway::config_name_for(os, cli::runtime()).to_string()
+            }
+            None if name == "openshell-docker" => "gateway-docker.toml".to_string(),
+            None => {
+                self.modal = Some(Modal::Info(format!(
+                    "osh did not create {name}, so it has no config of it to edit."
+                )));
+                return;
+            }
+        };
+        let (path, check) = (self.dir.join(&rel), crate::assets::check_for(&rel));
+        self.open_editor(&rel, path, None, check, EditThen::Gateway(name.to_string()));
     }
 
     /// The data-dir path of a profile's file, relative: the one that exists, else `ID.yaml`.
@@ -5298,6 +5495,23 @@ impl App {
             }
             Modal::Confirm { text, kind } => match key.code {
                 KeyCode::Char('y') | KeyCode::Enter => self.on_confirm(kind),
+                KeyCode::Char('D') if matches!(kind, ConfKind::RemoveGateway(_)) => {
+                    let ConfKind::RemoveGateway(name) = kind else {
+                        return;
+                    };
+                    self.modal = Some(Modal::Confirm {
+                        text: format!(
+                            "Remove gateway {name} AND DELETE its data?\n\nEvery sandbox on it, with its files, and its stored provider credentials are deleted for good. This cannot be undone."
+                        ),
+                        kind: ConfKind::OshJob(vec![
+                            "gateway".into(),
+                            "remove".into(),
+                            name,
+                            "--delete-data".into(),
+                            "--confirmed".into(),
+                        ]),
+                    });
+                }
                 KeyCode::Char('v') => {
                     let full = match &kind {
                         ConfKind::SyncGen { yaml, .. } => yaml.clone(),
@@ -6389,6 +6603,89 @@ mod tests {
     }
 
     #[test]
+    fn every_edit_action_goes_through_the_one_route() {
+        // In the source: only `open_editor` starts either editor.
+        let src = include_str!("app.rs");
+        let code = &src[..src.find("#[cfg(test)]\nmod tests").unwrap()];
+        let start = code.find("    fn open_editor(").unwrap();
+        let end = start + 1 + code[start + 1..].find("\n    fn ").unwrap();
+        for needle in [
+            "editor::Editor::open(",
+            "editor::Editor::create(",
+            "editor::Editor::new(",
+            "exted::Run::start(",
+            "Modal::Editor {\n",
+            "Modal::ExtEdit {\n",
+        ] {
+            for (at, _) in code.match_indices(needle) {
+                assert!(
+                    (start..end).contains(&at),
+                    "{needle} outside open_editor at byte {at}"
+                );
+            }
+        }
+        // In behaviour: each action opens the user's editor on its file.
+        let dir = toolchain_dir("extall", "[a]\n");
+        std::fs::write(
+            dir.join("gateway-docker.toml"),
+            crate::assets::embedded("gateway-docker.toml").unwrap(),
+        )
+        .unwrap();
+        let mut app = app();
+        app.dir = dir.clone();
+        sh_editor("true");
+        let mut opened = Vec::new();
+        let mut check = |app: &mut App| {
+            opened.push(
+                ext_run(app)
+                    .scratch
+                    .file
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            wait_editor(app);
+            app.modal = None;
+        };
+        app.edit_toolchains(EditThen::Nothing);
+        check(&mut app);
+        app.edit_file("sandbox-policy.yaml".into());
+        check(&mut app);
+        app.create_file(true, "e2e-prof");
+        check(&mut app);
+        app.create_file(false, "foo");
+        check(&mut app);
+        app.edit_gateway_config("openshell-docker");
+        check(&mut app);
+        assert_eq!(
+            opened,
+            [
+                "toolchains.toml",
+                "sandbox-policy.yaml",
+                "e2e-prof.yaml",
+                "Dockerfile-foo",
+                "gateway-docker.toml"
+            ]
+        );
+        assert!(
+            !dir.join("providers/e2e-prof.yaml").exists(),
+            "an untouched template is not written"
+        );
+        // A saved gateway config offers the restart, as the built-in editor's save does.
+        sh_editor(r#"printf '\n# edited\n' >> "$1""#);
+        app.edit_gateway_config("openshell-docker");
+        wait_editor(&mut app);
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm { text, .. }) if text.starts_with("Restart openshell-docker")),
+            "{}",
+            app.status
+        );
+        fake_editor(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_broken_list_offers_the_editor_or_going_on_without_it() {
         let dir = toolchain_dir("fix", "[a\n");
         let mut app = app();
@@ -6699,6 +6996,97 @@ mod tests {
     }
 
     #[test]
+    fn gateways_start_restart_and_resize_through_osh_with_a_confirmation() {
+        let mut a = app();
+        on_gateways(&mut a, vec![gw("openshell-docker", 17671)]);
+        press(&mut a, KeyCode::Char('R'));
+        let Some(Modal::Confirm {
+            kind: ConfKind::OshJob(args),
+            text,
+        }) = &a.modal
+        else {
+            panic!("R asks first");
+        };
+        assert!(
+            text.starts_with("Start gateway openshell-docker?"),
+            "{text}"
+        );
+        assert_eq!(
+            args,
+            &["gateway", "restart", "openshell-docker", "--confirmed"]
+        );
+        press(&mut a, KeyCode::Char('y'));
+        let job = a.job.take().expect("runs osh itself");
+        assert_eq!(job[0].args[..2], ["gateway".to_string(), "restart".into()]);
+        press(&mut a, KeyCode::Char('V'));
+        assert!(matches!(&a.modal, Some(Modal::Info(t)) if t.contains("is not a VM gateway")));
+        a.modal = None;
+        on_gateways(&mut a, vec![gw("openshell-vm", 17672)]);
+        press(&mut a, KeyCode::Char('V'));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Input {
+                kind: InKind::VmCpus(_),
+                ..
+            })
+        ));
+        a.modal = None;
+        a.on_input(InKind::VmCpus("openshell-vm".into()), "99".into());
+        assert!(a.status.starts_with("Not changed"));
+        a.on_input(InKind::VmCpus("openshell-vm".into()), "4".into());
+        a.modal = None;
+        a.on_input(InKind::VmMemory("openshell-vm".into(), 4), "4096".into());
+        press(&mut a, KeyCode::Char('y'));
+        let job = a.job.take().unwrap();
+        assert_eq!(
+            job[0].args,
+            [
+                "gateway",
+                "vm-size",
+                "openshell-vm",
+                "4",
+                "4096",
+                "--confirmed"
+            ]
+        );
+    }
+
+    #[test]
+    fn removing_a_gateway_can_delete_its_data_from_the_same_question() {
+        let mut a = app();
+        a.registry.add(crate::gwmodel::GatewaySpec {
+            name: "openshell-podman".into(),
+            kind: crate::gwmodel::GwKind::Podman,
+            port: 17671,
+            main: false,
+        });
+        on_gateways(&mut a, vec![gw("openshell-podman", 17671)]);
+        press(&mut a, KeyCode::Char('x'));
+        assert!(
+            matches!(&a.modal, Some(Modal::Confirm { text, .. }) if text.contains("D removes it and DELETES"))
+        );
+        press(&mut a, KeyCode::Char('D'));
+        let Some(Modal::Confirm {
+            kind: ConfKind::OshJob(args),
+            ..
+        }) = &a.modal
+        else {
+            panic!("a second, stronger question");
+        };
+        assert!(args.contains(&"--delete-data".to_string()));
+    }
+
+    #[test]
+    fn start_up_notices_become_alerts_and_an_unreachable_gateway_names_keys() {
+        let mut a = app();
+        a.data_notice("osh kept your edited copy of: x.\nmore".into());
+        assert_eq!(a.alerts[0].title, "osh kept your edited copy of: x.");
+        assert!(a.alerts[0].detail.contains("more"));
+        let s = App::snapshot_status(&Snapshot::default());
+        assert!(s.contains("R starts it") && !s.contains("brew") && !s.contains("systemctl"));
+    }
+
+    #[test]
     fn a_profile_update_that_reaches_running_sandboxes_offers_their_restart() {
         let mut a = app();
         a.on_done(Done {
@@ -6719,6 +7107,20 @@ mod tests {
         };
         assert!(text.starts_with("Profile npm is updated. box uses a provider"));
         assert_eq!(names, &["box"]);
+    }
+
+    #[test]
+    fn a_vm_gateway_says_why_the_create_flow_asks_no_limits() {
+        let mut a = app();
+        a.snap.driver = "vm".into();
+        a.on_input(InKind::Name(Plan::default()), "x".into());
+        assert!(
+            a.status
+                .contains("every VM sandbox gets the gateway's size"),
+            "{}",
+            a.status
+        );
+        assert!(a.status.contains("V on the Gateways tab"));
     }
 
     #[test]

@@ -794,6 +794,59 @@ def gateway_add():
         assert len(gateway_rows(o)) == before + 1, gateway_rows(o)
         wait_cli(lambda: "Connected" in sh(f"openshell -g openshell-{ready_type.lower()} status")[1], "it answers", 180)
 
+@scenario("gateway-log")
+def gateway_log():
+    """l follows the gateway's own service log (the journal here), which works with it down."""
+    with dashboard() as o:
+        o.press("5"); o.wait("GATEWAY", 10)
+        move_to(o, gateway_rows(o)[0].split()[0])
+        o.press("l"); o.wait("service", 15)
+        o.wait(("openshell", "gateway", "Started", "listening"), 30)
+        o.press("q"); o.wait("GATEWAY", 10)
+
+@scenario("gateway-config")
+def gateway_config():
+    """e: the main's config is osh's own (explained); an extra's opens in the editor."""
+    with dashboard() as o:
+        o.press("5"); o.wait("GATEWAY", 10)
+        rows = gateway_rows(o)
+        move_to(o, rows[0].split()[0])
+        o.press("e"); o.wait(("osh writes the config", "Ctrl-S save"), 10)
+        o.press("esc")
+        extra = next((r for r in rows if " main" not in r), None)
+        if extra:
+            move_to(o, extra.split()[0])
+            o.press("e"); o.wait("Ctrl-S save", 10)
+            o.press("esc"); o.wait("GATEWAY", 10)
+
+@scenario("gateway-vm-size")
+def gateway_vm_size():
+    """V sets the size of VM sandboxes; a container gateway says its sandboxes take limits one by one."""
+    with dashboard() as o:
+        o.press("5"); o.wait("GATEWAY", 10)
+        rows = gateway_rows(o)
+        vm = next((r for r in rows if " VM " in f" {r} "), None)
+        if vm is None:
+            move_to(o, rows[0].split()[0])
+            o.press("V"); o.wait("is not a VM gateway", 10)
+            o.press("esc")
+            return
+        move_to(o, vm.split()[0])
+        o.press("V"); o.wait("vCPUs for every sandbox", 10)
+        o.press("esc")
+
+@scenario("gateway-restart")
+def gateway_restart():
+    """R restarts the main gateway through osh's own steps; it answers again afterwards."""
+    with dashboard() as o:
+        o.press("5"); o.wait("GATEWAY", 10)
+        move_to(o, gateway_rows(o)[0].split()[0])
+        o.press("R"); o.wait(("Restart gateway", "Start gateway"), 10)
+        o.press("n"); o.wait_gone("gateway?", 5)
+        o.press("R"); o.wait(("Restart gateway", "Start gateway"), 10); o.press("y")
+        finish_job(o, 600)
+        o.wait("connected", 180)
+
 @scenario("gateway-wipe")
 def gateway_wipe():
     """Last: wipes the main gateway (sandboxes, providers, profiles), which then restarts empty."""

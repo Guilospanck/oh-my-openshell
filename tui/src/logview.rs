@@ -25,6 +25,9 @@ const SOURCES: [&str; 3] = ["all", "gateway", "sandbox"];
 
 pub struct LogView {
     pub name: String,
+    /// A fixed command to follow instead of `openshell logs` (a gateway's service log); it has
+    /// one source, so `s` does nothing.
+    cmd: Option<(String, Vec<String>)>,
     /// Index into `SOURCES`.
     pub source: usize,
     pub buf: Arc<Mutex<Buf>>,
@@ -121,6 +124,7 @@ impl LogView {
         let child = Self::spawn(&name, SOURCES[0], &buf)?;
         Ok(LogView {
             name,
+            cmd: None,
             source: 0,
             buf,
             child: Some(child),
@@ -133,6 +137,44 @@ impl LogView {
             height: Cell::new(20),
             seen_dropped: 0,
         })
+    }
+
+    /// Follow `prog ARGS` (a gateway's journal or log files) under the title `name`.
+    pub fn open_command(name: String, prog: &str, args: Vec<String>) -> Result<Self, String> {
+        let buf = Arc::new(Mutex::new(Buf::default()));
+        let child = Self::spawn_cmd(prog, &args, &buf)?;
+        Ok(LogView {
+            name,
+            cmd: Some((prog.to_string(), args)),
+            source: 0,
+            buf,
+            child: Some(child),
+            top: 0,
+            left: 0,
+            follow: true,
+            typing: None,
+            query: String::new(),
+            current: None,
+            height: Cell::new(20),
+            seen_dropped: 0,
+        })
+    }
+
+    fn spawn_cmd(prog: &str, args: &[String], buf: &Arc<Mutex<Buf>>) -> Result<Child, String> {
+        let mut child = Command::new(prog)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("{prog}: {e}"))?;
+        if let Some(o) = child.stdout.take() {
+            pump(o, buf.clone());
+        }
+        if let Some(e) = child.stderr.take() {
+            pump(e, buf.clone());
+        }
+        Ok(child)
     }
 
     fn spawn(name: &str, source: &str, buf: &Arc<Mutex<Buf>>) -> Result<Child, String> {
@@ -163,11 +205,17 @@ impl LogView {
     }
 
     pub fn source_name(&self) -> &'static str {
+        if self.cmd.is_some() {
+            return "service";
+        }
         SOURCES[self.source]
     }
 
     /// Switch to the next log source: restart the stream with a fresh buffer.
     fn cycle_source(&mut self) {
+        if self.cmd.is_some() {
+            return;
+        }
         if let Some(mut c) = self.child.take() {
             let _ = c.kill();
             let _ = c.wait();
@@ -331,6 +379,7 @@ mod tests {
         };
         LogView {
             name: "a".into(),
+            cmd: None,
             source: 0,
             buf: Arc::new(Mutex::new(buf)),
             child: None,
@@ -343,6 +392,27 @@ mod tests {
             height: Cell::new(10),
             seen_dropped: 0,
         }
+    }
+
+    #[test]
+    fn a_service_log_follows_its_command_and_has_one_source() {
+        let mut lv =
+            LogView::open_command("gw service".into(), "printf", vec!["a\\nb\\n".into()]).unwrap();
+        assert_eq!(lv.source_name(), "service");
+        for _ in 0..100 {
+            if lv.len() >= 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(lv.buf.lock().unwrap().lines, vec!["a", "b"]);
+        lv.cycle_source();
+        assert_eq!(
+            lv.source_name(),
+            "service",
+            "s does not switch a service log"
+        );
+        assert!(LogView::open_command("x".into(), "/no/such/prog", vec![]).is_err());
     }
 
     #[test]

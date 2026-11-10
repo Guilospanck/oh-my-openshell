@@ -172,8 +172,11 @@ pub fn config_name_for(os: Os, rt: Option<Runtime>) -> &'static str {
 
 /// The config to install: the data dir's copy (so edits there apply), else the embedded one.
 fn wanted_config(name: &str, h: &dyn Host, p: &Paths) -> String {
-    h.read(&p.data.join(name))
-        .unwrap_or_else(|| assets::embedded(name).unwrap_or_default().to_string())
+    let text = h
+        .read(&p.data.join(name))
+        .unwrap_or_else(|| assets::embedded(name).unwrap_or_default().to_string());
+    // The VM size set in the dashboard applies to a vm config only (`with_vm_size` checks).
+    crate::gwops::with_vm_size(&text, crate::gwops::vm_size(h, p))
 }
 
 pub(crate) fn service_running(os: Os, h: &dyn Host) -> bool {

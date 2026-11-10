@@ -19,6 +19,8 @@ osh setup      # the guided screen again (needs a terminal); or, without one:
 osh setup --gateways docker,podman --yes   # the first listed is the main gateway; --dry-run only prints the steps
 osh gateway add vm|docker|podman [--yes] [--dry-run]   # one more gateway
 osh gateway remove NAME [--delete-data]    # remove a gateway osh created (typed confirmation)
+osh gateway restart NAME    # start or restart a gateway with its current config (Gateways tab: R)
+osh gateway vm-size NAME VCPUS MEM_MIB     # the size of every sandbox on a VM gateway (Gateways tab: V)
 osh upgrade    # reinstall OpenShell, refresh the gateway config, restart the main gateway and its extras
 osh gateway-docker          # same as: osh gateway add docker
 osh uninstall  # remove OpenShell, its services and folders, osh's own data and the osh program (asks first; sandboxes are lost)
@@ -112,7 +114,7 @@ A few actions have no key and live only in the palette:
 | Providers | create from a `providers/*.yaml` profile or a read/write repo token for GitHub, GitLab, Bitbucket or Forgejo (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`; the file is linted first, and an update that reaches running sandboxes offers to restart them), the file's actions (`e`: view, edit, compare with the shipped default or the gateway's copy, restore, delete; save the gateway's copy as a file; delete the profile from the gateway), a new profile from a template (`n`). `.yml` files count too |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from) |
-| Gateways | switch (`g` / `Enter`), make one the OpenShell CLI default (`s`), add a gateway (`a`), remove one osh created (`x`), wipe and restart empty (`d`) |
+| Gateways | switch (`g` / `Enter`), make one the OpenShell CLI default (`s`), add a gateway (`a`), start or restart it with its current config (`R`), follow its service log (`l`: the journal on Linux, the launchd or Homebrew log files on macOS; works while it is down), edit the config osh keeps for it (`e`; a restart is offered after saving), set the size of every sandbox on a VM gateway (`V`), remove one osh created (`x`), with its data too (`D` in that question), wipe and restart empty (`d`) |
 
 Credentials are read from the environment when exported, else prompted hidden;
 they never go through argv. The footer shows the keys for the current tab.
@@ -307,15 +309,19 @@ older `just gateway-docker` set up runs a script osh no longer ships, so `osh se
 and `osh gateway-docker` point it at `osh gateway-service docker` (same config, database and
 logs) and start it again; any osh launchd agent whose program is gone is repaired the same way.
 
-osh keeps each gateway's config in `~/.local/share/osh/gateways/NAME.toml` (edit it; your
-changes are kept). The main gateway on Linux, and the VM main on macOS, use OpenShell's own
+osh keeps each gateway's config in `~/.local/share/osh/gateways/NAME.toml` (edit it with `e` on
+the Gateways tab; your changes are kept, and `R` restarts the gateway with them). The main gateway on Linux, and the VM main on macOS, use OpenShell's own
 `gateway.toml` instead: osh rewrites it when it differs from what it would write and keeps the
 previous copy next to it as `gateway.toml.osh-bak` (then `.osh-bak.1`, `.2`, never overwriting
 an earlier one). osh remembers the ones it made in `gateways.json` there. Extras run as
 a systemd user unit `osh-gateway-NAME` (Linux) or a launchd agent (macOS); the main runs as
 OpenShell's own service (on macOS a Docker or Podman main runs as its own launchd agent
-instead of the Homebrew service). Logs on Linux:
-`journalctl --user -u openshell-gateway` or `-u osh-gateway-NAME`. Providers and
+instead of the Homebrew service). `l` on the Gateways tab follows a gateway's service log inside
+osh (the journal of `openshell-gateway` or `osh-gateway-NAME` on Linux; the launchd agent's or
+Homebrew's log files on macOS), also while the gateway is down; the status line then names `R`
+to start it. A VM gateway has no per-sandbox CPU or memory limits (the create flow says so instead
+of asking): `V` sets the size of every microVM it starts (`vcpus` and `mem_mib` in its config,
+default 2 vCPUs and 2048 MiB; kept in `vm-size.toml` in the data folder) and restarts it. Providers and
 profiles are per gateway. The Podman and VM gateways have only been tested up to a
 connected gateway on Linux, never booting a real microVM, and nothing here has run
 on a real Linux desktop.
