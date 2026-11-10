@@ -268,7 +268,40 @@ pub enum ConfKind {
     },
 }
 
+/// Live state of a background job, shown in a progress popup while it runs. `total` 0 means the
+/// job cannot say how far it is: the popup then shows a moving bar and the elapsed time.
+pub struct Task {
+    pub title: String,
+    pub total: usize,
+    pub done: usize,
+    pub current: String,
+    pub started: Instant,
+}
+
+impl Task {
+    pub fn new(title: impl Into<String>, total: usize) -> Self {
+        Task {
+            title: title.into(),
+            total,
+            done: 0,
+            current: String::new(),
+            started: Instant::now(),
+        }
+    }
+}
+
 pub enum Modal {
+    /// The key reference for the current tab; scrollable, read-only.
+    Help {
+        scroll: u16,
+    },
+    /// Type to filter every action, Enter runs the chosen one.
+    Palette {
+        query: String,
+        cursor: usize,
+    },
+    /// A running job; Esc hides the popup, the job goes on.
+    Task(std::sync::Arc<std::sync::Mutex<Task>>),
     Select {
         title: String,
         items: Vec<String>,
@@ -306,13 +339,21 @@ pub enum Modal {
 /// Rows a scrolling modal can show: the terminal minus border and margin. Fixed under test so a unit test
 /// does not depend on the height of the terminal that runs `cargo test`.
 fn modal_rows() -> u16 {
+    modal_screen().1.saturating_sub(4)
+}
+
+/// Terminal size, fixed under test.
+fn modal_screen() -> (u16, u16) {
     if cfg!(test) {
-        return 20;
+        return (100, 24);
     }
-    ratatui::crossterm::terminal::size()
-        .map(|(_, h)| h)
-        .unwrap_or(24)
-        .saturating_sub(4)
+    ratatui::crossterm::terminal::size().unwrap_or((80, 24))
+}
+
+/// Rows the scrolling popups produce for `rows` wrapped at the current width, minus the rows
+/// that fit on screen: the furthest the popup can scroll.
+fn modal_last(rows: usize) -> u16 {
+    (rows as u16).saturating_sub(modal_rows())
 }
 
 /// A command run with the terminal handed back to it (build, create, setup-token).
@@ -1706,10 +1747,19 @@ impl App {
         }
     }
 
-    fn bg<F>(&self, f: F)
+    fn bg<F>(&mut self, f: F)
     where
         F: FnOnce() -> Result<Done, String> + Send + 'static,
     {
+        // Work the user started from the dashboard shows a progress popup, named by the status
+        // ("Creating provider x"). A shell is never covered, and a popup that is already open
+        // (a job with real progress opens its own) stays.
+        if self.active.is_none() && self.modal.is_none() && self.busy() {
+            let title = self.status.trim_end_matches("...").to_string();
+            self.modal = Some(Modal::Task(std::sync::Arc::new(std::sync::Mutex::new(
+                Task::new(title, 0),
+            ))));
+        }
         let tx = self.done_tx.clone();
         thread::spawn(move || {
             // A panic must still end the spinner the status shows while this runs.
@@ -1725,7 +1775,7 @@ impl App {
         });
     }
 
-    fn bg_msg<F>(&self, f: F)
+    fn bg_msg<F>(&mut self, f: F)
     where
         F: FnOnce() -> Result<String, String> + Send + 'static,
     {
@@ -1740,7 +1790,14 @@ impl App {
     }
 
     pub fn on_done(&mut self, d: Done) {
-        self.status = d.msg;
+        if matches!(self.modal, Some(Modal::Task(_))) {
+            self.modal = None;
+        }
+        // A multi-line result is too long for the status line: show it whole in a popup.
+        if d.msg.contains('\n') && self.modal.is_none() {
+            self.modal = Some(Modal::Info(d.msg.clone()));
+        }
+        self.status = d.msg.lines().next().unwrap_or_default().to_string();
         self.tracked = ghrepo::load_tracked(ghrepo::tracked_path().as_deref());
         if self.status.starts_with("Error") {
             self.temp_access = None;
@@ -3724,6 +3781,17 @@ impl App {
             self.quit = true;
             return;
         }
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && key.code == KeyCode::Char('p')
+            && self.logview.is_none()
+            && self.modal.is_none()
+        {
+            self.modal = Some(Modal::Palette {
+                query: String::new(),
+                cursor: 0,
+            });
+            return;
+        }
         if let Some(lv) = &mut self.logview {
             if !lv.on_key(key) {
                 self.logview = None;
@@ -3739,6 +3807,13 @@ impl App {
                 self.dismiss_toast();
             }
             KeyCode::Char('!') => self.show_alerts(None),
+            KeyCode::Char('?') => self.modal = Some(Modal::Help { scroll: 0 }),
+            KeyCode::Char(':') => {
+                self.modal = Some(Modal::Palette {
+                    query: String::new(),
+                    cursor: 0,
+                })
+            }
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Tab => self.switch((self.idx() + 1) % TABS.len()),
             KeyCode::BackTab => self.switch((self.idx() + TABS.len() - 1) % TABS.len()),
@@ -4173,6 +4248,56 @@ impl App {
             return;
         }
         match modal {
+            Modal::Help { mut scroll } => {
+                let cols = crate::ui::tall_cols(modal_screen().0);
+                let last =
+                    modal_last(crate::ui::wrap_lines(&crate::ui::help_lines(self.tab), cols).len());
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q' | '?') | KeyCode::Enter => return,
+                    KeyCode::Char('j') | KeyCode::Down => scroll = (scroll + 1).min(last),
+                    KeyCode::Char('k') | KeyCode::Up => scroll = scroll.saturating_sub(1),
+                    KeyCode::PageDown | KeyCode::Char(' ') => scroll = (scroll + 10).min(last),
+                    KeyCode::PageUp => scroll = scroll.saturating_sub(10),
+                    KeyCode::Char('g') | KeyCode::Home => scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => scroll = last,
+                    _ => {}
+                }
+                self.modal = Some(Modal::Help { scroll });
+            }
+            Modal::Palette {
+                mut query,
+                mut cursor,
+            } => {
+                let hits = crate::palette::filter(self.tab, &query);
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Enter => {
+                        if let Some((action, _)) = hits.get(cursor) {
+                            self.on_key(KeyEvent::from(action.code));
+                        }
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Tab => {
+                        cursor = (cursor + 1).min(hits.len().saturating_sub(1))
+                    }
+                    KeyCode::Up | KeyCode::BackTab => cursor = cursor.saturating_sub(1),
+                    KeyCode::Backspace => {
+                        query.pop();
+                        cursor = 0;
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(c);
+                        cursor = 0;
+                    }
+                    _ => {}
+                }
+                self.modal = Some(Modal::Palette { query, cursor });
+            }
+            Modal::Task(t) => {
+                if key.code != KeyCode::Esc {
+                    self.modal = Some(Modal::Task(t));
+                }
+            }
             Modal::Info(text) => {
                 if key.code == KeyCode::Char('v') {
                     self.open_viewer("Details", text.clone(), Some(Modal::Info(text)));
@@ -4183,8 +4308,9 @@ impl App {
                 perms,
                 mut scroll,
             } => {
-                let rows = modal_rows();
-                let last = (crate::ui::perm_lines(&perms).len() as u16).saturating_sub(rows);
+                let cols = crate::ui::tall_cols(modal_screen().0);
+                let last =
+                    modal_last(crate::ui::wrap_lines(&crate::ui::perm_lines(&perms), cols).len());
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => return,
                     KeyCode::Char('j') | KeyCode::Down => scroll = (scroll + 1).min(last),
@@ -4208,8 +4334,8 @@ impl App {
                 back,
             } => {
                 // The viewer fills the screen minus its border and margin; stop when the last line is at the bottom.
-                let rows = modal_rows();
-                let last = (text.lines().count() as u16).saturating_sub(rows);
+                let cols = crate::ui::tall_cols(modal_screen().0);
+                let last = modal_last(crate::ui::wrap_text(&text, cols).len());
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
                         self.modal = back.map(|b| *b);
@@ -4583,10 +4709,14 @@ mod tests {
         }
     }
 
+    /// A dashboard whose data dir is an empty temporary folder, so nothing a test does writes
+    /// into the checkout.
     fn app() -> App {
         let (wake, _w) = mpsc::channel();
         let (done, _d) = mpsc::channel();
-        App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done)
+        let dir = std::env::temp_dir().join(format!("osh-app-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        App::new(dir, Arc::new(Mutex::new(None)), wake, done)
     }
 
     fn alert(title: &str) -> crate::alerts::Alert {
@@ -5015,7 +5145,7 @@ mod tests {
     fn a_panicking_background_task_still_ends_the_status() {
         let (wake, _w) = mpsc::channel();
         let (done, rx) = mpsc::channel();
-        let a = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let mut a = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
         a.bg(|| -> Result<Done, String> { panic!("boom") });
         let d = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(d.msg.starts_with("Error"), "{}", d.msg);
@@ -5617,5 +5747,30 @@ mod tests {
             });
         }
         assert_eq!(a.free_name("app"), "app-3");
+    }
+
+    #[test]
+    fn background_work_from_the_dashboard_shows_a_progress_popup_until_it_is_done() {
+        let mut a = app();
+        a.status = "Creating provider x...".into();
+        a.bg_msg(|| Ok("Created provider x".into()));
+        let Some(Modal::Task(t)) = &a.modal else {
+            panic!("no progress popup")
+        };
+        assert_eq!(t.lock().unwrap().title, "Creating provider x");
+        // Esc hides it, any other key is ignored while it shows.
+        a.on_key(KeyEvent::from(KeyCode::Char('j')));
+        assert!(matches!(a.modal, Some(Modal::Task(_))));
+        a.on_done(Done {
+            msg: "Created provider x".into(),
+            next: None,
+            sync: None,
+            gh: None,
+        });
+        assert!(a.modal.is_none());
+        // Work that sets no "..." status (a quick toggle) opens nothing.
+        a.status = "Ready".into();
+        a.bg_msg(|| Ok("ok".into()));
+        assert!(a.modal.is_none());
     }
 }

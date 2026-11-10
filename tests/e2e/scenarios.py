@@ -2,9 +2,10 @@
 """End-to-end scenarios for the osh dashboard. Each @scenario id appears in tests/e2e/actions.txt,
 which lists every key and command the dashboard has; a unit test keeps the two in step.
 usage: scenarios.py [id ...]   (no ids = all)"""
-import os, subprocess, sys, time, traceback
+import os, shutil, subprocess, sys, tempfile, time, traceback
 sys.path.insert(0, os.path.dirname(__file__))
 from driver import Osh, Timeout
+import pyte.graphics
 
 SCENARIOS = {}
 
@@ -19,7 +20,7 @@ def sh(cmd, timeout=120):
     return r.returncode, (r.stdout + r.stderr)
 
 GW = os.environ.get("OSH_GATEWAY", "")
-TABS = {"1": "Sandboxes (live)", "2": "Providers", "3": "Profiles (u:", "4": "Images (b:", "5": "Gateways (a:"}
+TABS = {"1": "PHASE", "2": "CREDENTIAL KEYS", "3": "ON GATEWAY", "4": "DOCKERFILE", "5": "GATEWAY"}
 
 def osc(args, timeout=120):
     return sh(f"openshell {'-g ' + GW if GW else ''} {args}", timeout)
@@ -45,24 +46,50 @@ def clean(*names):
     for n in names:
         osc(f"sandbox delete {n}")
 
-def dashboard():
-    o = Osh()
+def editor_mode(mode):
+    """Set osh's editor setting (the palette's `Editor: switch`): "builtin", "external" or "auto".
+    Scenarios that type into the built-in editor force it, so an editor on PATH does not open."""
+    path = os.path.join(data_dir(), "editor-mode")
+    if mode == "auto":
+        if os.path.exists(path):
+            os.remove(path)
+    else:
+        with open(path, "w") as f:
+            f.write(mode + "\n")
+
+def dashboard(env=None, editor="builtin"):
+    editor_mode(editor)
+    o = Osh(env=env)
     # After osh is replaced it says once that it found data of an earlier install.
-    o.wait(("Sandboxes (live)", "Press Enter to continue"), 60)
+    o.wait(("PHASE", "Press Enter to continue"), 60)
     if "Press Enter to continue" in o.text():
         o.press("enter")
-        o.wait("Sandboxes (live)", 60)
+        o.wait("PHASE", 60)
     return o
 
+# osh's accent (ratatui Color::Cyan) as pyte reports it: crossterm sends it as 256-colour index 6
+# (38;5;6), which pyte stores as that palette entry's hex; plain SGR 36 would read "cyan".
+ACCENT = ("cyan", pyte.graphics.FG_BG_256[6])
+
 def highlighted(o):
-    """Text of the lowest row drawn in reverse video: a modal's cursor sits below the table's
-    behind it. The tab bar (row 0) is reversed for the active tab, so it is skipped."""
+    """Text of the row under the cursor. A modal's cursor is drawn in reverse video (the lowest
+    such row: the tab bar, row 0, is reversed for the active tab, so it is skipped); with no modal
+    it is the table's cursor row, drawn bold in the accent colour (cyan) from its first cell, and
+    only that panel's part of the line is returned (the Sandboxes tab has details beside it)."""
     found = ""
     for y in range(1, o.rows):
         row = o.screen.buffer[y]
         if any(row[x].reverse for x in range(o.cols) if x in row):
             found = o.screen.display[y]
-    return found.strip(" \u2502")
+    if found:
+        return found.strip(" \u2502")
+    for y in range(1, o.rows):
+        row, line = o.screen.buffer[y], o.screen.display[y]
+        x = next((x for x in range(o.cols) if line[x] not in " \u2502"), None)
+        if x is not None and row[x].bold and row[x].fg in ACCENT:
+            end = line.find("\u2502", x)
+            return line[x:end if end >= 0 else None].strip()
+    return ""
 
 def choose(o, text, limit=12):
     """Move the cursor down to the row containing `text`, then press Enter."""
@@ -80,6 +107,7 @@ def create_sandbox(o, name, share=None, rw=False):
     choose(o, "Custom...")
     o.wait("Image"); choose(o, "claude-code:latest")
     o.wait("Providers (space"); o.press("enter")
+    o.wait("Toolchain hosts this sandbox"); o.press("enter")
     o.wait("Sandbox name"); o.type(name); o.press("enter")
     o.wait("CPU limit"); o.press("enter")
     o.wait("Memory limit"); o.press("enter")
@@ -135,6 +163,30 @@ def nav_alerts():
     with dashboard() as o:
         o.press("!"); o.wait("Nothing suspicious", 10)
         o.press("esc"); o.wait_gone("Nothing suspicious", 5)
+
+@scenario("nav-help")
+def nav_help():
+    with dashboard() as o:
+        o.press("?"); o.wait("Everywhere on the dashboard", 10)
+        o.press("esc"); o.wait_gone("Everywhere on the dashboard", 5)
+
+@scenario("nav-palette")
+def nav_palette():
+    with dashboard() as o:
+        o.press(":"); o.wait("Commands", 10)
+        o.type("go to g"); o.wait("Go to Gateways", 5)
+        o.press("enter"); o.wait(TABS["5"], 10)
+        o.press(":"); o.wait("Commands", 10)
+        o.press("esc"); o.wait_gone("Commands", 5)
+
+def data_dir():
+    """osh's data directory, found the way osh finds it (assets::data_dir)."""
+    if os.environ.get("OSH_DIR"):
+        return os.environ["OSH_DIR"]
+    xdg = os.environ.get("XDG_DATA_HOME", "")
+    if os.path.isabs(xdg):
+        return os.path.join(xdg, "osh")
+    return os.path.expanduser("~/.local/share/osh")
 
 @scenario("nav-quit")
 def nav_quit():
@@ -287,11 +339,11 @@ def sandbox_shell():
         o.wait("IN-TMUX", 15); assert "hello-42" in o.text()
         o.press("ctrl-]"); o.wait("Shell in e2e-sb", 10)
         choose(o, "Close the session")
-        o.wait("Sandboxes (live)", 15)
+        o.wait("PHASE", 15)
         select_sandbox(o)
         o.press("enter"); o.wait("hello-42", 60)   # tmux -A reattached to the same session
         o.press("ctrl-]"); o.wait("Shell in e2e-sb", 10); choose(o, "Close the session")
-        o.wait("Sandboxes (live)", 15)
+        o.wait("PHASE", 15)
 
 @scenario("shell-menu")
 def shell_menu():
@@ -309,11 +361,12 @@ def shell_menu():
         o.wait(("blocked", "Blocked", "No blocked"), 15); o.press("esc")
         menu(); choose(o, "Alerts (0)"); o.wait("Nothing suspicious", 10); o.press("esc")
         menu(); choose(o, "Dashboard (keep the session running)")
-        o.wait("Sandboxes (live)", 15)
-        assert "\u25cf" in row(o, SB), f"a running shell is marked: {row(o, SB)!r}"
+        o.wait("PHASE", 15)
+        # A running shell is marked after the name (the phase has a dot of its own).
+        assert row(o, SB).startswith(SB + " \u25b8"), f"a running shell is marked: {row(o, SB)!r}"
         o.press("enter"); o.wait("node@", 30)                  # back into the kept shell
-        menu(); choose(o, "Close the session"); o.wait("Sandboxes (live)", 15)
-        assert "\u25cf" not in row(o, SB)
+        menu(); choose(o, "Close the session"); o.wait("PHASE", 15)
+        assert "\u25b8" not in row(o, SB), row(o, SB)
 
 @scenario("sandbox-logs")
 def sandbox_logs():
@@ -321,8 +374,8 @@ def sandbox_logs():
     with dashboard() as o:
         select_sandbox(o)
         o.press("l"); o.settle(2)
-        assert "Sandboxes (live)" not in o.text().splitlines()[0], "the log view takes the screen"
-        o.press("q"); o.wait("Sandboxes (live)", 10)
+        assert "PHASE" not in o.text().splitlines()[0], "the log view takes the screen"
+        o.press("q"); o.wait("PHASE", 10)
 
 @scenario("sandbox-blocked")
 def sandbox_blocked():
@@ -411,14 +464,17 @@ def alerts_toast():
         # A risky folder is flagged in the access question, and as an alert.
         o.press("n"); o.wait("New sandbox"); choose(o, "Custom..."); o.wait("Image")
         choose(o, "claude-code:latest"); o.wait("Providers (space"); o.press("enter")
+        o.wait("Toolchain hosts this sandbox"); o.press("enter")
         for _ in range(3):
             o.wait(("Sandbox name", "CPU limit", "Memory limit")); o.press("enter")
         o.wait("Share a host folder?"); choose(o, "Other folder...")
         o.wait("Host folder to share"); o.type(os.path.expanduser("~")); o.press("enter")
         o.wait("RISKY", 10)
         assert "whole disk" not in o.text() and "home folder" in o.text(), o.text()
-        box = next(i for i, l in enumerate(o.text().splitlines()) if "alert" in l and "Esc dismisses" in l)
+        lines = o.text().splitlines()
+        box = next(i for i, l in enumerate(lines) if "\u256d Alert " in l)
         assert box <= 3, "the alert is at the top"
+        assert any("Esc dismiss \u00b7 ! list" in l for l in lines[box:]), "the toast says how to close it"
         o.press("esc"); o.settle(0.5)
         o.press("esc"); o.settle(0.5)
         # Now a real read-write share of a project folder.
@@ -436,11 +492,17 @@ def alerts_toast():
         open(f"{share}/.git/hooks/pre-commit", "w").write("#!/bin/sh\ntrue\n")
         o.wait("pre-commit appeared in e2e-share", 30)
         o.press("esc"); o.wait_gone("pre-commit appeared", 3)       # Esc dismisses it at once
+        # Alerts about shared files list each file to read, then "Read all" shows every alert.
         o.press("!"); o.wait("Alerts (", 5)
         t = o.text()
-        assert ".git/hooks/pre-commit" in t and ".envrc" in t and "[HIGH]" in t, t
+        assert "View " + f"{share}/.git/hooks/pre-commit" in t and f"View {share}/.envrc" in t, t
+        choose(o, "Read all"); o.wait("[HIGH]", 5)
+        t = o.text()
+        assert ".git/hooks/pre-commit" in t and ".envrc" in t, t
+        o.press("esc"); o.wait("Read all", 5)                       # Esc goes back to the list
         o.press("esc"); o.wait_gone("Alerts (", 5)
-        assert not any("alert (Esc" in l for l in o.text().splitlines()), "closing the list leaves nothing behind"
+        assert not any("\u256d Alert " in l or "Esc dismiss \u00b7" in l for l in o.text().splitlines()), \
+            "closing the list leaves nothing behind"
     clean(name); sh(f"rm -rf {share}")
 
 @scenario("cmd-doctor")
@@ -467,7 +529,7 @@ def gateway_rows(o):
 @scenario("gateway-select")
 def gateway_select():
     with dashboard() as o:
-        o.press("5"); o.wait("Gateways (a:", 10)
+        o.press("5"); o.wait("GATEWAY", 10)
         rows = gateway_rows(o)
         assert rows and "selected" in rows[0], rows
         if len(rows) == 1:
@@ -485,7 +547,7 @@ def gateway_select():
 def gateway_default():
     """`s` makes the highlighted gateway the OpenShell CLI default and marks its row."""
     with dashboard() as o:
-        o.press("5"); o.wait("Gateways (a:", 10)
+        o.press("5"); o.wait("GATEWAY", 10)
         rows = gateway_rows(o)
         assert sum("default" in r for r in rows) == 1, rows
         if len(rows) == 1:
@@ -501,7 +563,7 @@ def gateway_default():
 @scenario("gateway-remove")
 def gateway_remove():
     with dashboard() as o:
-        o.press("5"); o.wait("Gateways (a:", 10)
+        o.press("5"); o.wait("GATEWAY", 10)
         rows = gateway_rows(o)
         extra = next((r for r in rows if " main" not in r), None)
         if extra is None:                             # only the main gateway: it is kept
@@ -517,7 +579,7 @@ def gateway_remove():
         assert any(target in r for r in gateway_rows(o)), "n keeps it"
         o.press("x"); o.wait(f"Remove gateway {target}?", 10); o.press("y")
         finish_job(o, 300)
-        o.press("5"); o.wait("Gateways (a:", 10)
+        o.press("5"); o.wait("GATEWAY", 10)
         assert not any(target in r for r in gateway_rows(o)), gateway_rows(o)
         assert target not in sh("openshell gateway list")[1], "the OpenShell CLI forgot it too"
         main = rows[0].split()[0]
@@ -528,7 +590,7 @@ def gateway_add():
     """Opens the wizard; where a type is ready to add (the docker machine, after the removal
     above), adds it for real and waits for it to answer."""
     with dashboard() as o:
-        o.press("5"); o.wait("Gateways (a:", 10)
+        o.press("5"); o.wait("GATEWAY", 10)
         before = len(gateway_rows(o))
         o.press("a"); o.wait("Pick the gateways to add.", 20)
         t = o.text()
@@ -537,7 +599,7 @@ def gateway_add():
         ready_type = next((n for n in ("Docker", "Podman")
                            if any(l.count(n) and "[ ]" in l and "ready" in l for l in t.splitlines())), None)
         if ready_type is None:
-            o.press("esc"); o.wait("Gateways (a:", 10)
+            o.press("esc"); o.wait("GATEWAY", 10)
             return
         for _ in range(4):
             if f"\u250c {ready_type} " in o.text():      # the detail pane is titled with the cursor's type
@@ -546,7 +608,7 @@ def gateway_add():
         o.press("space")
         o.press("enter"); o.wait("I will run", 20)
         o.press("enter"); o.wait("All set.", 600)
-        o.press("enter"); o.wait("Gateways (a:", 30)
+        o.press("enter"); o.wait("GATEWAY", 30)
         assert len(gateway_rows(o)) == before + 1, gateway_rows(o)
         wait_cli(lambda: "Connected" in sh(f"openshell -g openshell-{ready_type.lower()} status")[1], "it answers", 180)
 
@@ -557,7 +619,7 @@ def gateway_wipe():
     rc, out = osc("provider create --name e2e-npm --type npm")
     assert rc == 0, out
     with dashboard() as o:
-        o.press("5"); o.wait("Gateways (a:", 10)
+        o.press("5"); o.wait("GATEWAY", 10)
         move_to(o, gateway_rows(o)[0].split()[0])
         o.press("d"); o.wait("WIPE gateway", 10)
         o.press("n"); o.wait_gone("WIPE gateway", 5)

@@ -9,6 +9,8 @@ global | k | nav-move
 global | g | nav-gateway
 global | r | nav-refresh
 global | ! | nav-alerts
+global | ? | nav-help
+global | : | nav-palette
 global | q | nav-quit
 Sandboxes | Enter | sandbox-shell
 Sandboxes | l | sandbox-logs

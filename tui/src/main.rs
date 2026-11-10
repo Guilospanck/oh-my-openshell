@@ -11,6 +11,7 @@ mod ghrepo;
 mod gwmodel;
 mod gwops;
 mod logview;
+mod palette;
 mod platform;
 mod ports;
 mod preload;
@@ -1332,5 +1333,81 @@ mod tests {
         app.on_key(KeyEvent::from(KeyCode::Esc));
         assert!(matches!(app.modal, Some(app::Modal::Confirm { .. })));
         term.draw(|f| ui::draw(f, &app)).unwrap();
+    }
+
+    #[test]
+    fn the_palette_runs_an_action_by_its_key_and_help_opens_and_closes() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        app.on_key(KeyEvent::from(KeyCode::Char(':')));
+        for c in "go to g".chars() {
+            app.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let shot: String = (0..30)
+            .map(|y| {
+                (0..100)
+                    .map(|x| term.backend().buffer()[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+                    + "\n"
+            })
+            .collect();
+        assert!(shot.contains("Go to Gateways"));
+        app.on_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.modal.is_none());
+        assert!(matches!(app.tab, app::Tab::Gateways));
+        app.on_key(KeyEvent::from(KeyCode::Char('?')));
+        assert!(matches!(app.modal, Some(app::Modal::Help { .. })));
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        let all: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(all.contains("Gateways tab") && all.contains("Everywhere"));
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.modal.is_none());
+        app.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(app.modal, Some(app::Modal::Palette { .. })));
+    }
+}
+#[cfg(test)]
+mod shell_bar_colours {
+    use super::*;
+    #[test]
+    fn the_shell_bar_colours_the_name_the_branch_and_the_hint_separately() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let s = term::Session::spawn(
+            "sb".into(),
+            app.snap.gateway.clone(),
+            "sh",
+            &[
+                "-c".to_string(),
+                "printf '\\033]0;osh-status:ok|zebra\\007'; sleep 5".to_string(),
+            ],
+            60,
+            19,
+        )
+        .unwrap();
+        app.sessions.push(s);
+        app.active = Some(0);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        app.sessions[0].pump();
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        t.draw(|f| ui::draw(f, &app)).unwrap();
+        let b = t.backend().buffer();
+        let fg = |x: u16| b[(x, 19)].fg;
+        assert_eq!(fg(1), ratatui::style::Color::Cyan, "sandbox name");
+        let branch = (0..60).find(|x| b[(*x, 19)].symbol() == "z").map(fg);
+        assert_eq!(branch, Some(ratatui::style::Color::Indexed(176)), "branch");
+        assert_eq!(fg(59), ratatui::style::Color::Indexed(244), "menu hint");
     }
 }

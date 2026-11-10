@@ -90,6 +90,10 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 `zig@0.15` on PATH for the build; building by hand needs
 `PATH="$(brew --prefix zig@0.15)/bin:$PATH" LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast cargo build --release`.
 
+Two keys help you find your way on any tab: `?` opens the key reference for the tab you are on, and
+`:` (or `Ctrl-P`) opens the command palette, where you type a few letters of any action (`del`, `go to g`) and
+press `Enter` to run it. The palette sends the action's own key, so it does exactly what the key does.
+
 | Tab | What you can do |
 | --- | --- |
 | Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a repo token (`t`), install skills and plugins (`K`, below), transfer state to another sandbox (`T`: copies the home directory, workspace and tool caches through a temp folder on the host; same-path files are overwritten; system packages cannot move, so put those in the image) |
