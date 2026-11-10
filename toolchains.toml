@@ -11,8 +11,9 @@
 # releases cannot be fetched without them. Turn a group off to drop its hosts.
 #
 # Groups apply to sandboxes created afterwards. For a running sandbox use the Ctrl-] menu.
-# A file that is not valid TOML is ignored: new sandboxes start without the list, and the Ctrl-]
-# entry that opens the hosts in a running sandbox says what is wrong.
+# Edit it inside osh: "Edit toolchains.toml" in the command palette (:) or in the toolchain
+# pickers; saving there refuses a file that is not valid TOML. A broken file is otherwise ignored:
+# the pickers say what is wrong and offer the editor.
 
 [github]
 enabled = true

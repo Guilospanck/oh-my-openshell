@@ -349,14 +349,23 @@ database), `js` (npm, pnpm, yarn, bun; same registry shape as `npm`, so both att
 together). A blocked-request prompt offers
 `rust` or `go` when the blocked host is one of theirs and no ordinary profile covers it.
 
-Toolchain hosts: `toolchains.toml` in the data directory lists exact hosts, in groups, that every
+Toolchain hosts: `toolchains.toml` in the data directory (edit it inside osh: `Edit toolchains.toml`
+in the palette or in either toolchain picker, see [Editing files](#editing-files)) lists exact hosts, in groups, that every
 new sandbox may read from its first command (GET/HEAD/OPTIONS by any program, so installs do not
 fail once per host). `github`, `go`, `rust`, `zig`, `node` and `python` are on; `gitlab-codeberg`,
 `java`, `ruby`, `php`, `dotnet`, `elixir` and `playwright` are off. Edit the file to switch a group
 (`[java]` then `enabled = true`), add hosts, or move a git host to `git_hosts` (adds the `POST /**/git-upload-pack` that
 clone and fetch need; pushes stay denied). osh keeps your edits. The list goes into the
-`--policy` file given to `sandbox create`; for a running sandbox use `Open the toolchain hosts`
-in the `Ctrl-]` menu, which adds the rules with `policy update` (never `policy set`, which would
+`--policy` file given to `sandbox create`, inside the `network_policies` block of `sandbox-policy.yaml`
+when you added one there (a one-line block cannot be added to: the create question says the hosts were
+left out, and why). Creating a sandbox asks which groups it may read from
+(marks start at the file; the last line, `Save this choice as the default`, writes them back to the
+file, so groups can be switched without leaving `osh`; the line after it, `Edit toolchains.toml`, opens the
+file in your editor (or the built-in one) and brings the picker back with the saved groups). Hosts that are not exact
+names (wildcards, addresses) are refused by the file's check and named in the status line. When the file is not
+valid TOML or has no group, both pickers say why and offer the editor (a new sandbox can also go on
+without the list). For a running sandbox use `Open the toolchain
+hosts` in the `Ctrl-]` menu: it asks which groups, and adds the rules with `policy update` (never `policy set`, which would
 drop rules you allowed since). Some entries are wide on purpose: `storage.googleapis.com` reaches
 any Google Cloud Storage bucket and the `githubusercontent.com` hosts serve anyone's files, but
 Go modules and GitHub releases cannot be fetched without them. Where a provider profile defines

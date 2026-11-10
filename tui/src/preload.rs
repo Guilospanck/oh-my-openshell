@@ -105,9 +105,12 @@ pub fn network_policies(groups: &[Group]) -> String {
 }
 
 /// The `openshell policy update` argument lists that give a running sandbox the same hosts, to
-/// run in order, each with `--wait`. They only add rules (`policy set` would replace the whole
-/// policy and drop rules added since). The git POST is a separate update because OpenShell does
-/// not take `--add-allow` and `--add-endpoint` together; it needs the endpoint to exist first.
+/// run in order. They only add rules (`policy set` would replace the whole policy and drop rules
+/// added since). Each host is its own update: OpenShell rejects a whole update when one host
+/// clashes with a rule already on the sandbox (a provider's, say), and one clash must not block
+/// the other hosts. Only the last waits for the sandbox to load the policy. The git POST is a
+/// separate update after the endpoints because OpenShell does not take `--add-allow` and
+/// `--add-endpoint` together; it needs the endpoint to exist first.
 pub fn update_commands(gateway: &str, sandbox: &str, groups: &[Group]) -> Vec<Vec<String>> {
     // The command line cannot set `allow_encoded_slash`, and a rule without it would clash with the
     // npm provider's for the same host, so those hosts are left out here (the creation policy
@@ -124,22 +127,17 @@ pub fn update_commands(gateway: &str, sandbox: &str, groups: &[Group]) -> Vec<Ve
         }
         a.extend(["policy".into(), "update".into(), sandbox.into()]);
         a.extend(extra);
-        a.extend(["--wait".into(), "--timeout".into(), "60".into()]);
         a
     };
-    let mut out = Vec::new();
-    let mut add: Vec<String> = Vec::new();
+    let mut out: Vec<Vec<String>> = Vec::new();
     for h in plain.iter().chain(&git) {
-        add.extend([
+        out.push(base(vec![
             "--add-endpoint".into(),
             format!("{h}:443:read-only:rest:enforce"),
-        ]);
+            "--binary".into(),
+            "/**".into(),
+        ]));
     }
-    if add.is_empty() {
-        return out;
-    }
-    add.extend(["--binary".into(), "/**".into()]);
-    out.push(base(add));
     for h in &git {
         out.push(base(vec![
             "--rule-name".into(),
@@ -150,7 +148,131 @@ pub fn update_commands(gateway: &str, sandbox: &str, groups: &[Group]) -> Vec<Ve
             format!("{h}:443:POST:/**/git-upload-pack"),
         ]));
     }
+    if let Some(last) = out.last_mut() {
+        last.extend(["--wait".into(), "--timeout".into(), "60".into()]);
+    }
     out
+}
+
+/// The host an `update_commands` list entry is about, for progress and reports.
+pub fn command_host(args: &[String]) -> String {
+    args.iter()
+        .find_map(|a| a.split_once(":443:").map(|(h, _)| h.to_string()))
+        .unwrap_or_default()
+}
+
+/// What a refused update means in plain words. OpenShell's own text is a wall of internals; the
+/// usual cause (another rule, often a provider's, already covers the host) gets a short name.
+fn refusal(err: &str) -> Option<String> {
+    if err.contains("undeclared authorization") || err.contains("would grant binary") {
+        return None;
+    }
+    let first = err.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let clean = first
+        .trim_start_matches("Error:")
+        .trim_start_matches('\u{d7}')
+        .trim();
+    Some(clean.chars().take(120).collect())
+}
+
+/// The popup text after the hosts were sent: what opened, what a rule already covered, and what
+/// failed for another reason. `results` holds one entry per update, host first.
+pub fn report(sandbox: &str, results: &[(String, Result<(), String>)]) -> String {
+    let mut ok: Vec<&str> = Vec::new();
+    let mut covered: Vec<&str> = Vec::new();
+    let mut failed: Vec<(&str, String)> = Vec::new();
+    for (host, r) in results {
+        match r {
+            Ok(()) => {
+                if !ok.contains(&host.as_str()) {
+                    ok.push(host);
+                }
+            }
+            Err(e) => match refusal(e) {
+                None => covered.push(host),
+                Some(why) => failed.push((host, why)),
+            },
+        }
+    }
+    let mut out = format!("\u{2713} {} hosts are open in {sandbox}.", ok.len());
+    if !covered.is_empty() {
+        out.push_str(&format!(
+            "\n\n\u{2022} {} were already allowed by another rule (a provider's, usually), so nothing changed for them:\n  {}",
+            covered.len(),
+            covered.join(", ")
+        ));
+    }
+    if !failed.is_empty() {
+        out.push_str(&format!("\n\n\u{2717} {} failed:", failed.len()));
+        for (h, why) in failed {
+            out.push_str(&format!("\n  {h}  {why}"));
+        }
+    }
+    out
+}
+
+/// The picker line of a group: its name first, so `group_of` can read the pick back.
+pub fn label(g: &Group) -> String {
+    let n = g.hosts.len();
+    format!("{}  ({n} host{})", g.name, if n == 1 { "" } else { "s" })
+}
+
+/// The group a picker line (`label`) stands for.
+pub fn group_of(line: &str) -> &str {
+    line.split_whitespace().next().unwrap_or_default()
+}
+
+/// The groups with exactly the named ones switched on, for one sandbox's choice.
+pub fn select(groups: &[Group], picks: &[String]) -> Vec<Group> {
+    groups
+        .iter()
+        .map(|g| Group {
+            on: picks.iter().any(|p| p == &g.name),
+            ..g.clone()
+        })
+        .collect()
+}
+
+/// `text` with each group's `enabled` line set to `want`, so a default chosen in the TUI lands in
+/// the file without losing its comments, hosts or order. A group without the line gets one under
+/// its header. Groups not named stay as they are.
+pub fn set_enabled(text: &str, want: &[(String, bool)]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut section: Option<&(String, bool)> = None;
+    let mut seen = false;
+    let finish = |out: &mut Vec<String>, section: Option<&(String, bool)>, seen: bool| {
+        // A section that never had `enabled` gets it right after its header.
+        if let (Some((_, on)), false) = (section, seen) {
+            let at = out
+                .iter()
+                .rposition(|l| l.trim_start().starts_with('['))
+                .map_or(out.len(), |i| i + 1);
+            out.insert(at, format!("enabled = {on}"));
+        }
+    };
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            finish(&mut out, section, seen);
+            let name = t.trim_matches(|c| c == '[' || c == ']').trim();
+            section = want.iter().find(|(n, _)| n == name);
+            seen = false;
+        } else if let (Some((_, on)), true) = (section, t.starts_with("enabled")) {
+            if t.trim_start_matches("enabled")
+                .trim_start()
+                .starts_with('=')
+            {
+                out.push(format!("enabled = {on}"));
+                seen = true;
+                continue;
+            }
+        }
+        out.push(line.to_string());
+    }
+    finish(&mut out, section, seen);
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    joined
 }
 
 /// The creation policy: the filesystem policy as shipped plus the host list.
@@ -307,27 +429,32 @@ enabled = true"
     }
 
     #[test]
-    fn a_running_sandbox_gets_one_endpoint_update_then_one_git_allow_per_git_host() {
+    fn a_running_sandbox_gets_one_update_per_host_then_one_git_allow_per_git_host() {
         let groups = g("[a]\nenabled = true\nhosts = [\"x.example\"]\ngit_hosts = [\"git-host.example\"]\n[b]\nenabled = false\nhosts = [\"z.example\"]\n");
         let cmds = update_commands("gw", "sb", &groups);
-        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds.len(), 3);
         let first = cmds[0].join(" ");
-        assert!(
-            first.starts_with("-g gw policy update sb --add-endpoint "),
-            "{first}"
+        assert_eq!(
+            first,
+            "-g gw policy update sb --add-endpoint x.example:443:read-only:rest:enforce --binary /**"
         );
-        assert!(first.contains("--add-endpoint x.example:443:read-only:rest:enforce"));
-        assert!(first.contains("--add-endpoint git-host.example:443:read-only:rest:enforce"));
-        assert!(first.contains("--binary /** --wait"));
+        assert!(cmds[1]
+            .join(" ")
+            .contains("--add-endpoint git-host.example:443:read-only:rest:enforce"));
         assert!(
-            !first.contains("z.example"),
+            !cmds.concat().join(" ").contains("z.example"),
             "groups that are off are skipped"
         );
         assert!(
-            !first.contains("--add-allow"),
+            !cmds[..2].concat().join(" ").contains("--add-allow"),
             "OpenShell refuses both in one update"
         );
-        let second = cmds[1].join(" ");
+        let second = cmds[2].join(" ");
+        assert!(
+            second.ends_with("--wait --timeout 60"),
+            "only the last waits"
+        );
+        assert!(!first.contains("--wait") && !cmds[1].join(" ").contains("--wait"));
         assert!(
             second.contains("--rule-name allow_git_host_example_443"),
             "{second}"
@@ -339,6 +466,28 @@ enabled = true"
             &g("[a]\nenabled = false\nhosts = [\"x.example\"]\n")
         )
         .is_empty());
+    }
+
+    #[test]
+    fn the_report_names_what_opened_was_covered_and_failed() {
+        let r = vec![
+            ("a.example".to_string(), Ok(())),
+            (
+                "b.example".to_string(),
+                Err("Error:   \u{d7} merge operation 0 add-rule 'x' would grant binary '/**' undeclared authorization".to_string()),
+            ),
+            ("c.example".to_string(), Err("Error: boom\nmore".to_string())),
+        ];
+        let t = report("sb", &r);
+        assert!(t.starts_with("\u{2713} 1 hosts are open in sb."), "{t}");
+        assert!(t.contains("1 were already allowed by another rule"), "{t}");
+        assert!(t.contains("  b.example"), "{t}");
+        assert!(t.contains("\u{2717} 1 failed:\n  c.example  boom"), "{t}");
+        assert!(!t.contains("merge operation"), "{t}");
+        assert_eq!(
+            command_host(&["x".into(), "h.example:443:read-only:rest:enforce".into()]),
+            "h.example"
+        );
     }
 
     #[test]
@@ -367,5 +516,28 @@ enabled = true"
         assert!(e.contains("*.bad") && e.contains("line 2"), "{e}");
         assert!(check("[a]\nhosts = [\"ok.example\"]\n").is_ok());
         assert!(check("not toml [").is_err());
+    }
+    #[test]
+    fn select_switches_exactly_the_named_groups_on() {
+        let groups = select(&g(SAMPLE), &["b".to_string()]);
+        assert!(!groups[0].on && groups[1].on && !groups[2].on);
+        assert_eq!(group_of(&label(&groups[0])), "a");
+        assert_eq!(label(&groups[2]), "c  (1 host)");
+    }
+
+    #[test]
+    fn set_enabled_rewrites_the_flag_and_keeps_everything_else() {
+        let out = set_enabled(
+            SAMPLE,
+            &[("a".into(), false), ("b".into(), true), ("c".into(), true)],
+        );
+        let groups = g(&out);
+        assert!(!groups[0].on && groups[1].on && groups[2].on);
+        assert!(out.contains("# c\n"), "comments stay");
+        assert!(
+            out.contains("hosts = [\"x.example\", \"*.bad\""),
+            "hosts stay"
+        );
+        assert_eq!(set_enabled(&out, &[("a".into(), false)]), out, "idempotent");
     }
 }
