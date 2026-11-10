@@ -698,6 +698,10 @@ pub struct App {
     pub ports: Ports,
     /// One listener poller per open shell, feeding `ports`.
     scans: Vec<Scan>,
+    /// Resource meter of the sandbox in view (`meter_target`); at most one runs.
+    meter: Option<crate::usage::Meter>,
+    /// The newest reading of the metered sandbox: `(sandbox, gateway, usage)`.
+    pub usage: Option<(String, String, crate::usage::Usage)>,
     /// When the last watcher prompt opened; keys typed just before it are not answers.
     pub prompt_at: Option<Instant>,
     /// An automatic-allow batch is running: `policy update` calls must not overlap.
@@ -1039,6 +1043,8 @@ impl App {
             follows: Vec::new(),
             ports: Ports::default(),
             scans: Vec::new(),
+            meter: None,
+            usage: None,
             prompt_at: None,
             auto_running: Arc::new(AtomicBool::new(false)),
             token_flow: None,
@@ -1534,9 +1540,59 @@ impl App {
         self.status = format!("{what} {} chars", text.chars().count());
     }
 
+    /// The sandbox whose CPU, memory and disk use is on screen: the focused shell's, else the
+    /// selected sandbox on the Sandboxes tab while it is Ready. Nothing is read otherwise (another
+    /// tab, the log viewer, a sandbox that is not running).
+    pub fn meter_target(&self) -> Option<(String, String)> {
+        if let Some(s) = self.session() {
+            return Some((s.sandbox.clone(), s.gateway.clone()));
+        }
+        if self.tab != Tab::Sandboxes || self.logview.is_some() {
+            return None;
+        }
+        self.selected_sandbox()
+            .filter(|s| s.phase == "Ready")
+            .map(|s| (s.name.clone(), self.snap.gateway.clone()))
+    }
+
+    /// The reading for `sandbox` on `gateway`, if it is the one metered.
+    pub fn usage_of(&self, sandbox: &str, gateway: &str) -> Option<&crate::usage::Usage> {
+        self.usage
+            .as_ref()
+            .filter(|(s, g, _)| s == sandbox && g == gateway)
+            .map(|(_, _, u)| u)
+    }
+
+    /// Start, replace or stop the meter to follow `meter_target`, and take its newest reading.
+    fn pump_meter(&mut self) {
+        let want = self.meter_target();
+        let have = self
+            .meter
+            .as_ref()
+            .map(|m| (m.sandbox.clone(), m.gateway.clone()));
+        if want != have {
+            self.meter = want.clone().map(|(s, g)| crate::usage::Meter::spawn(s, g));
+        }
+        if self
+            .usage
+            .as_ref()
+            .is_some_and(|(s, g, _)| want.as_ref() != Some(&(s.clone(), g.clone())))
+        {
+            self.usage = None;
+        }
+        if let Some(m) = self.meter.as_mut() {
+            match m.latest() {
+                Some(Some(u)) => self.usage = Some((m.sandbox.clone(), m.gateway.clone(), u)),
+                Some(None) => self.usage = None,
+                None => {}
+            }
+        }
+    }
+
     /// Read new log lines of every open shell's sandbox, then show the next prompt when
     /// nothing else holds the screen.
     pub fn pump_watch(&mut self) {
+        self.pump_meter();
         let mut stopped = Vec::new();
         for (i, f) in self.follows.iter_mut().enumerate() {
             match f.drain() {
@@ -7536,6 +7592,41 @@ mod tests {
             "u prompts for the new value"
         );
         std::env::remove_var("OSH_TEST_RENEW_TOKEN");
+    }
+
+    #[test]
+    fn the_meter_follows_the_selected_ready_sandbox_and_pauses_elsewhere() {
+        let mut a = app();
+        a.snap.gateway = "gw".into();
+        a.snap.sandboxes = vec![
+            cli::Sandbox {
+                name: "up".into(),
+                phase: "Ready".into(),
+                ..Default::default()
+            },
+            cli::Sandbox {
+                name: "down".into(),
+                phase: "Provisioning".into(),
+                ..Default::default()
+            },
+        ];
+        a.tab = Tab::Sandboxes;
+        a.cursor[0] = 0;
+        assert_eq!(a.meter_target(), Some(("up".into(), "gw".into())));
+        a.cursor[0] = 1;
+        assert_eq!(a.meter_target(), None, "not Ready: nothing is read");
+        a.cursor[0] = 0;
+        a.tab = Tab::Providers;
+        assert_eq!(a.meter_target(), None, "another tab pauses the meter");
+        // A reading of another sandbox is not shown for this one, and is dropped once the
+        // target moves on.
+        a.tab = Tab::Sandboxes;
+        a.usage = Some(("up".into(), "gw".into(), crate::usage::Usage::default()));
+        assert!(a.usage_of("up", "gw").is_some());
+        assert!(a.usage_of("up", "other").is_none() && a.usage_of("down", "gw").is_none());
+        a.tab = Tab::Images;
+        a.pump_meter();
+        assert!(a.usage.is_none() && a.meter.is_none());
     }
 
     #[test]

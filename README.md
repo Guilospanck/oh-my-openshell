@@ -268,6 +268,23 @@ now listening there that are not forwarded (`Forward port N`), and `Forward anot
 which asks for a port number.
 Prompts follow the same rule as blocked requests: a sandbox's offers wait until its shell has focus.
 
+### CPU, memory and disk use
+
+The status bar of a shell shows the sandbox's current use before `Ctrl-] menu`, as
+`cpu 12%  mem 1.1/2.0 GiB  disk 3.2/20 GiB`; the `usage` line in the Sandboxes tab's details
+shows the same for the selected sandbox while it is Ready. A figure turns yellow from 80% and
+red from 95%. On a narrow screen the figures shrink to percentages, then the last ones are left
+out. Nothing has to be installed in the sandbox: every 5 seconds osh runs one read-only
+`sh -c` through `openshell sandbox exec` that reads `/proc/stat`, `/proc/meminfo` and
+`df -Pk /sandbox /` (busybox images work too); whatever cannot be read is left out, and after
+two failed reads the figures disappear and osh asks less often. Only the sandbox in view is
+read, one read at a time, and nothing is read on the other tabs, in the log viewer, or for a
+sandbox that is not Ready.
+
+The totals are what the sandbox's kernel reports, not limits of that sandbox: on the vm gateway
+every sandbox is a microVM of the gateway's one size (`V` on the Gateways tab); on docker and
+podman they are the machine's (or its VM's), shared by all sandboxes. The details say which.
+
 ### Selection and copy
 
 Drag with the left button to select text in a shell (hold `Shift` when the

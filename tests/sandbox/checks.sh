@@ -107,5 +107,17 @@ sandbox_checks() {
   [[ "$out" == 200 ]] && pass "the forwarded port answers on the host" || fail "the forwarded port answers on the host" "$out"
   openshell -g "$main" forward stop 18765 "$name" >/dev/null 2>&1 && pass "forward stop ends it" || fail "forward stop ends it"
 
+  # The resource meter (usage.rs): the exact script osh runs (usage::script(true); a unit test
+  # keeps this copy equal to it) reads /proc/stat twice, /proc/meminfo and df under the shipped
+  # policy, with the same exec flags.
+  local meter='{ read -r l < /proc/stat && echo "$l"; } 2>/dev/null; sleep 1; { read -r l < /proc/stat && echo "$l"; } 2>/dev/null; cat /proc/meminfo 2>/dev/null; df -Pk /sandbox / 2>/dev/null; true'
+  out="$(openshell -g "$main" sandbox exec --name "$name" --timeout 10 --no-tty -- sh -c "$meter" 2>/dev/null)"
+  [[ "$(grep -c '^cpu ' <<<"$out")" == 2 ]] && pass "the meter reads two CPU samples from /proc/stat" \
+    || fail "the meter reads two CPU samples from /proc/stat" "$out"
+  grep -q '^MemTotal:' <<<"$out" && grep -q '^MemAvailable:' <<<"$out" \
+    && pass "the meter reads MemTotal and MemAvailable" || fail "the meter reads MemTotal and MemAvailable" "$out"
+  grep -Eq '^.* [0-9]+ +[0-9]+ +[0-9]+ +[0-9]+% +/(sandbox)?$' <<<"$out" \
+    && pass "the meter reads df for /sandbox or /" || fail "the meter reads df for /sandbox or /" "$out"
+
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
 }

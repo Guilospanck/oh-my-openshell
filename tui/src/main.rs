@@ -21,6 +21,7 @@ mod setup;
 mod term;
 mod tmuxpass;
 mod ui;
+mod usage;
 mod watch;
 mod wizard;
 
@@ -1524,6 +1525,60 @@ mod tests {
 #[cfg(test)]
 mod shell_bar_colours {
     use super::*;
+    #[test]
+    fn the_shell_bar_shows_the_sandboxs_usage_before_the_hint_and_hides_it_when_tight() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let s = term::Session::spawn(
+            "sb".into(),
+            app.snap.gateway.clone(),
+            "sh",
+            &["-c".to_string(), "sleep 5".to_string()],
+            80,
+            19,
+        )
+        .unwrap();
+        let gw = s.gateway.clone();
+        app.sessions.push(s);
+        app.active = Some(0);
+        app.usage = Some((
+            "sb".into(),
+            gw,
+            usage::Usage {
+                cpu: Some(97.0),
+                mem: Some(usage::Mem {
+                    total_kb: 2 << 20,
+                    avail_kb: 1 << 20,
+                }),
+                disks: vec![],
+            },
+        ));
+        let row = |w: u16| {
+            let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 20)).unwrap();
+            t.draw(|f| ui::draw(f, &app)).unwrap();
+            let b = t.backend().buffer().clone();
+            let text: String = (0..w).map(|x| b[(x, 19)].symbol().to_string()).collect();
+            (text, b)
+        };
+        let (text, b) = row(80);
+        assert!(
+            text.contains("cpu 97%  mem 1.0/2.0 GiB Ctrl-] menu"),
+            "{text}"
+        );
+        let c = text.find("cpu").unwrap() as u16;
+        assert_eq!(b[(c, 19)].fg, ratatui::style::Color::Red, "97% is alarming");
+        assert_eq!(
+            b[(c, 19)].bg,
+            ratatui::style::Color::Indexed(236),
+            "on the bar"
+        );
+        let (text, _) = row(32);
+        assert!(text.contains("cpu 97%") && !text.contains("GiB"), "{text}");
+        assert!(text.ends_with("Ctrl-] menu "), "{text}");
+        let (text, _) = row(18);
+        assert!(!text.contains("cpu"), "{text}");
+    }
     #[test]
     fn the_shell_bar_colours_the_name_the_branch_and_the_hint_separately() {
         let (wake, _w) = mpsc::channel();

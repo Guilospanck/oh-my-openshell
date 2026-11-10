@@ -406,6 +406,17 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
     match app.selected_sandbox() {
         Some(s) => {
             detail.push(kv("phase", dot(&s.phase, phase_style(&s.phase)).spans));
+            if s.phase == "Ready" {
+                match app.usage_of(&s.name, &app.snap.gateway) {
+                    Some(u) => {
+                        detail.push(kv("usage", usage_spans(u, dcols, Style::default())));
+                        for l in wrap_text(totals_note(&app.snap.driver), dcols.max(8)) {
+                            detail.push(prefix(l.style(role::dim()), &" ".repeat(12)));
+                        }
+                    }
+                    None => detail.push(kv("usage", vec![Span::styled("reading…", role::dim())])),
+                }
+            }
             if let Some((_, l)) = app.snap.limits.as_ref().filter(|(n, _)| n == &s.name) {
                 detail.push(kv("limits", vec![Span::raw(l.clone())]));
             }
@@ -460,6 +471,34 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
         ),
         right[1],
     );
+}
+
+/// What the meter's totals are, since none of them is a limit of this one sandbox.
+fn totals_note(driver: &str) -> &'static str {
+    if driver == "vm" {
+        "totals are the gateway's VM size, the same for every sandbox"
+    } else {
+        "totals are the machine's, shared by all sandboxes"
+    }
+}
+
+/// The meter's figures that fit in `width` columns: `ok` for the normal ones, yellow from 80%,
+/// red from 95%.
+fn usage_spans(u: &crate::usage::Usage, width: usize, ok: Style) -> Vec<Span<'static>> {
+    use crate::usage::{fit, parts, Level, GAP};
+    let mut out = Vec::new();
+    for (i, (text, level)) in fit(&parts(u), width).into_iter().enumerate() {
+        if i > 0 {
+            out.push(Span::styled(GAP, ok));
+        }
+        let style = match level {
+            Level::Ok => ok,
+            Level::Warn => ok.fg(role::WARN),
+            Level::High => ok.fg(role::ERR).add_modifier(Modifier::BOLD),
+        };
+        out.push(Span::styled(text, style));
+    }
+    out
 }
 
 fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
@@ -1445,6 +1484,20 @@ fn draw_session(f: &mut Frame, app: &App, s: &Session) {
         Paragraph::new(hint).style(base.fg(Color::Indexed(244))),
         Rect::new(bar.right() - w, bar.y, w, bar.height),
     );
+    // The sandbox's CPU, memory and disk use, right-aligned before the hint, in what the left
+    // side leaves free (a long status hides it rather than being overwritten).
+    if let Some(u) = app.usage_of(&s.sandbox, &s.gateway) {
+        let left: usize = spans.iter().map(|x| x.width()).sum();
+        let free = usize::from(bar.width).saturating_sub(left + usize::from(w) + 2);
+        let shown = usage_spans(u, free, base);
+        let uw: u16 = shown.iter().map(|x| x.width() as u16).sum();
+        if uw > 0 {
+            f.render_widget(
+                Paragraph::new(Line::from(shown)),
+                Rect::new(bar.right() - w - uw - 1, bar.y, uw, bar.height),
+            );
+        }
+    }
 }
 
 /// A log line with its classes coloured: the time dim, the source tag by who wrote it (sandbox
@@ -1672,12 +1725,59 @@ mod tests {
         app
     }
 
+    fn reading(mem_avail_kb: u64) -> crate::usage::Usage {
+        crate::usage::Usage {
+            cpu: Some(12.0),
+            mem: Some(crate::usage::Mem {
+                total_kb: 2 * 1024 * 1024,
+                avail_kb: mem_avail_kb,
+            }),
+            disks: vec![],
+        }
+    }
+
     fn screen(app: &App, w: u16, h: u16) -> (String, ratatui::buffer::Buffer) {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
         let buf = term.backend().buffer().clone();
         let all = buf.content().iter().map(|c| c.symbol()).collect();
         (all, buf)
+    }
+
+    #[test]
+    fn the_details_show_the_selected_sandboxs_usage_and_what_the_totals_are() {
+        let mut app = usage_app("vm");
+        let (all, _) = screen(&app, 120, 30);
+        assert!(all.contains("reading…"), "before the first reading");
+        // 1.8 of 2.0 GiB used: 90%, warned in yellow.
+        app.usage = Some(("sb".into(), "gw".into(), reading(200 * 1024)));
+        let (all, buf) = screen(&app, 120, 30);
+        assert!(
+            all.contains("cpu 12%") && all.contains("mem 1.8/2.0 GiB"),
+            "{all}"
+        );
+        assert!(all.contains("gateway's VM size"));
+        let m = (0..buf.area.height)
+            .flat_map(|y| (0..buf.area.width - 4).map(move |x| (x, y)))
+            .find(|&(x, y)| {
+                buf[(x, y)].symbol() == "m"
+                    && buf[(x + 1, y)].symbol() == "e"
+                    && buf[(x + 4, y)].symbol() == "1"
+            })
+            .unwrap();
+        assert_eq!(buf[m].fg, role::WARN);
+        // Another gateway's sandbox of the same name shows no figures.
+        app.usage = Some(("sb".into(), "other".into(), reading(0)));
+        assert!(!screen(&app, 120, 30).0.contains("cpu 12%"));
+        // Tiny screens draw without panicking.
+        app.usage = Some(("sb".into(), "gw".into(), reading(0)));
+        for (w, h) in [(20, 8), (40, 10), (1, 1)] {
+            screen(&app, w, h);
+        }
+        let docker = usage_app("docker");
+        let mut d = docker;
+        d.usage = Some(("sb".into(), "gw".into(), reading(0)));
+        assert!(screen(&d, 120, 30).0.contains("shared by all sandboxes"));
     }
 
     #[test]
@@ -1709,6 +1809,21 @@ mod tests {
         // Small screens draw without panicking.
         for (w, h) in [(20, 8), (1, 1)] {
             screen(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn usage_spans_colour_by_level_and_never_exceed_the_width() {
+        let u = reading(0);
+        let s = usage_spans(&u, 80, Style::default());
+        let red = s.iter().find(|x| x.content.starts_with("mem")).unwrap();
+        assert_eq!(red.style.fg, Some(role::ERR));
+        for w in 0..40 {
+            let n: usize = usage_spans(&u, w, Style::default())
+                .iter()
+                .map(|x| x.width())
+                .sum();
+            assert!(n <= w);
         }
     }
 
