@@ -755,6 +755,29 @@ pub fn expiry_ms(now: u64, days: u32) -> u64 {
     (now + u64::from(days) * 86_400) * 1000
 }
 
+/// Epoch seconds of a GitHub `github-authentication-token-expiration` header value, such as
+/// `2026-12-05 12:00:00 UTC`. The token's real expiry: the user picks it on GitHub's page, so osh
+/// must not assume the 30 days it pre-fills.
+pub fn parse_token_expiry(v: &str) -> Option<u64> {
+    let v = v.trim().trim_end_matches("UTC").trim();
+    let (date, time) = v.split_once(' ')?;
+    let mut d = date.split('-').map(|n| n.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let mut t = time.split(':').map(|n| n.parse::<i64>().ok());
+    let (hh, mm, ss) = (t.next()??, t.next()??, t.next()??);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's civil-date algorithm).
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
 /// Whole days left before `expiry_ms`; zero once it has passed.
 pub fn days_left(now: u64, expiry_ms: u64) -> u64 {
     (expiry_ms / 1000).saturating_sub(now) / 86_400
@@ -1171,6 +1194,21 @@ mod tests {
         assert!(y.ends_with(
             "binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n"
         ));
+    }
+
+    #[test]
+    fn the_github_expiry_header_is_read_as_utc_epoch_seconds() {
+        assert_eq!(parse_token_expiry("1970-01-02 00:00:01 UTC"), Some(86_401));
+        assert_eq!(
+            parse_token_expiry("2026-11-10 12:00:00 UTC"),
+            Some(1_794_312_000)
+        );
+        assert_eq!(
+            parse_token_expiry("2024-02-29 00:00:00 UTC"),
+            Some(1_709_164_800)
+        );
+        assert_eq!(parse_token_expiry("never"), None);
+        assert_eq!(parse_token_expiry("2026-13-01 00:00:00 UTC"), None);
     }
 
     #[test]

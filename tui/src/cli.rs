@@ -493,9 +493,11 @@ pub fn open_url(url: &str) -> bool {
         .is_ok()
 }
 
-/// HTTP status of a read-only GET of the repo on its provider (`ghrepo::check_request`) with
-/// `token`. The token reaches curl in a private header file, so it never appears in argv.
-pub fn repo_status(repo: &GhRepo, token: &str) -> Result<u16, String> {
+/// What a read-only GET of the repo on its provider (`ghrepo::check_request`) with `token` says:
+/// the HTTP status, and for GitHub the token's real expiry (epoch seconds) from the
+/// `github-authentication-token-expiration` header. The token reaches curl in a private header
+/// file, so it never appears in argv.
+pub fn repo_probe(repo: &GhRepo, token: &str) -> Result<(u16, Option<u64>), String> {
     use std::{io::Write, os::unix::fs::OpenOptionsExt};
     let (auth, accept, url) = ghrepo::check_request(repo);
     let file = std::env::temp_dir().join(format!(
@@ -518,8 +520,8 @@ pub fn repo_status(repo: &GhRepo, token: &str) -> Result<u16, String> {
             "15".into(),
             "-o".into(),
             "/dev/null".into(),
-            "-w".into(),
-            "%{http_code}".into(),
+            "-D".into(),
+            "-".into(),
             "-H".into(),
             format!("@{}", file.display()),
             "-H".into(),
@@ -531,9 +533,28 @@ pub fn repo_status(repo: &GhRepo, token: &str) -> Result<u16, String> {
         run("curl", &args, &[])
     });
     let _ = fs::remove_file(&file);
-    out?.trim()
-        .parse()
-        .map_err(|_| format!("{} gave no HTTP status", host_name(repo)))
+    let headers = out?;
+    let status = headers
+        .lines()
+        .rev()
+        .find_map(|l| {
+            l.strip_prefix("HTTP/")
+                .and_then(|r| r.split_whitespace().nth(1))
+        })
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| format!("{} gave no HTTP status", host_name(repo)))?;
+    let expires = headers.lines().find_map(|l| {
+        let (k, v) = l.split_once(':')?;
+        k.eq_ignore_ascii_case("github-authentication-token-expiration")
+            .then(|| ghrepo::parse_token_expiry(v))
+            .flatten()
+    });
+    Ok((status, expires))
+}
+
+/// HTTP status of the check (see `repo_probe`).
+pub fn repo_status(repo: &GhRepo, token: &str) -> Result<u16, String> {
+    repo_probe(repo, token).map(|(s, _)| s)
 }
 
 /// How the repo's host is named in messages: the provider for the fixed cloud hosts, the
@@ -589,17 +610,22 @@ pub fn repo_status_problem(status: u16, repo: &GhRepo) -> Option<String> {
     Some(msg)
 }
 
-fn track_repo(provider: &str, repo: &GhRepo) {
+fn track_repo(provider: &str, repo: &GhRepo, token: &str) {
+    // The user picks the lifetime on the provider's page, so ask GitHub when the token really
+    // expires; the pre-filled default is only the fallback when the answer has none.
+    let real = (repo.forge == ghrepo::Forge::GitHub)
+        .then(|| repo_probe(repo, token).ok().and_then(|(_, e)| e))
+        .flatten();
+    let expiry = real.map_or_else(
+        || ghrepo::expiry_ms(ghrepo::now_secs(), ghrepo::TOKEN_DAYS),
+        |s| s * 1000,
+    );
     let args = [
         "provider".to_string(),
         "update".into(),
         provider.into(),
         "--credential-expires-at".into(),
-        format!(
-            "{}={}",
-            ghrepo::token_env(repo),
-            ghrepo::expiry_ms(ghrepo::now_secs(), ghrepo::TOKEN_DAYS)
-        ),
+        format!("{}={}", ghrepo::token_env(repo), expiry),
     ];
     let _ = exec("openshell", &args, &[]);
     ghrepo::track(
@@ -607,7 +633,7 @@ fn track_repo(provider: &str, repo: &GhRepo) {
         Tracked {
             gateway: gateway(),
             provider: provider.into(),
-            expiry_ms: ghrepo::expiry_ms(ghrepo::now_secs(), ghrepo::TOKEN_DAYS),
+            expiry_ms: expiry,
             repo: repo.spec(),
         },
     );
@@ -647,7 +673,7 @@ pub fn create_repo_provider(repo: &GhRepo, provider: &str, token: &str) -> Resul
     }
     // Forgejo tokens never expire: nothing to track or warn about.
     if repo.forge.expires() {
-        track_repo(provider, repo);
+        track_repo(provider, repo, token);
     }
     Ok(format!("Created provider {provider} for {}", repo.shown()))
 }
@@ -655,7 +681,7 @@ pub fn create_repo_provider(repo: &GhRepo, provider: &str, token: &str) -> Resul
 /// Swap in a new token for a repo provider and restart its 30 day clock.
 pub fn renew_repo_token(repo: &GhRepo, provider: &str, token: &str) -> Result<String, String> {
     update_credentials(provider, &[(ghrepo::token_env(repo).into(), token.into())])?;
-    track_repo(provider, repo);
+    track_repo(provider, repo, token);
     Ok(format!(
         "Renewed the token of {provider} ({})",
         repo.shown()
