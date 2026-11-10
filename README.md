@@ -301,7 +301,7 @@ in the `Ctrl-]` menu, which adds the rules with `policy update` (never `policy s
 drop rules you allowed since). Some entries are wide on purpose: `storage.googleapis.com` reaches
 any Google Cloud Storage bucket and the `githubusercontent.com` hosts serve anyone's files, but
 Go modules and GitHub releases cannot be fetched without them. Where a provider profile defines
-the same host, the list narrows it to read-only for that host.
+the same host, the list narrows it to read-only for that host. `registry.npmjs.org` carries the npm profile's `allow_encoded_slash` setting in the creation policy (a mismatch makes OpenShell reject the provider attach); `policy update` cannot set it, so `Open the toolchain hosts` skips that host: attach the `npm` or `js` profile, or answer the prompt.
 
 For open-ended research ("any website") there is no profile, because OpenShell refuses `*`
 hosts. Instead, when `curl` or Claude Code is blocked on a web host (ports 80/443), the prompt

@@ -3,6 +3,11 @@
 //! host", so the list is exact hosts, grouped so a group can be switched off.
 use std::collections::BTreeSet;
 
+/// Hosts that a provider profile (`npm`, `js`) also defines with `allow_encoded_slash: true`.
+/// OpenShell rejects two endpoints for one host that differ in a setting, so the same value has
+/// to go into the list or attaching that provider to a sandbox with the list would time out.
+const ENCODED_SLASH_HOSTS: &[&str] = &["registry.npmjs.org"];
+
 /// One `[group] on|off` section of the list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group {
@@ -76,8 +81,13 @@ pub fn network_policies(groups: &[Group]) -> String {
     if !plain.is_empty() {
         out.push_str("  osh_toolchains:\n    endpoints:\n");
         for h in &plain {
+            let slash = if ENCODED_SLASH_HOSTS.contains(&h.as_str()) {
+                ", allow_encoded_slash: true"
+            } else {
+                ""
+            };
             out.push_str(&format!(
-                "      - {{ host: {h}, ports: [443], protocol: rest, enforcement: enforce, access: read-only }}\n"
+                "      - {{ host: {h}, ports: [443], protocol: rest, enforcement: enforce, access: read-only{slash} }}\n"
             ));
         }
         out.push_str("    binaries:\n      - { path: \"/**\" }\n");
@@ -99,7 +109,14 @@ pub fn network_policies(groups: &[Group]) -> String {
 /// policy and drop rules added since). The git POST is a separate update because OpenShell does
 /// not take `--add-allow` and `--add-endpoint` together; it needs the endpoint to exist first.
 pub fn update_commands(gateway: &str, sandbox: &str, groups: &[Group]) -> Vec<Vec<String>> {
+    // The command line cannot set `allow_encoded_slash`, and a rule without it would clash with the
+    // npm provider's for the same host, so those hosts are left out here (the creation policy
+    // sets it). Attach the `npm` or `js` profile, or answer the prompt, for them.
     let (plain, git) = hosts(groups);
+    let plain: Vec<String> = plain
+        .into_iter()
+        .filter(|h| !ENCODED_SLASH_HOSTS.contains(&h.as_str()))
+        .collect();
     let base = |extra: Vec<String>| {
         let mut a: Vec<String> = Vec::new();
         if !gateway.is_empty() {
@@ -231,6 +248,20 @@ enabled = true"
         assert!(groups.iter().any(|g| !g.on), "optional groups ship off");
         let (_, git) = hosts(&groups);
         assert_eq!(git, vec!["github.com".to_string()]);
+    }
+
+    #[test]
+    fn the_npm_registry_carries_the_encoded_slash_setting_at_creation_and_is_skipped_live() {
+        let groups = g("[n]\nenabled = true\nhosts = [\"registry.npmjs.org\", \"x.example\"]\n");
+        assert!(network_policies(&groups).contains(
+            "host: registry.npmjs.org, ports: [443], protocol: rest, enforcement: enforce, access: read-only, allow_encoded_slash: true"
+        ));
+        assert!(!network_policies(&groups).contains("x.example, ports: [443], protocol: rest, enforcement: enforce, access: read-only, allow"));
+        let cmds = update_commands("", "sb", &groups).concat().join(" ");
+        assert!(
+            cmds.contains("x.example") && !cmds.contains("registry.npmjs.org"),
+            "{cmds}"
+        );
     }
 
     #[test]
