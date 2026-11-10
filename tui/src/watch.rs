@@ -41,7 +41,7 @@ impl Blocked {
     }
 }
 
-fn is_ip(h: &str) -> bool {
+pub fn is_ip(h: &str) -> bool {
     h.parse::<std::net::IpAddr>().is_ok() || h.starts_with('[')
 }
 
@@ -132,6 +132,12 @@ pub fn is_web_read(b: &Blocked) -> bool {
         && !is_ip(&b.host)
 }
 
+/// A read of a web host (HTTP ports, a plain name) by any program. What the persistent
+/// "any program" setting covers; `allow` still needs an exact binary path.
+pub fn is_any_read(b: &Blocked) -> bool {
+    matches!(b.port, 80 | 443) && cli::valid_host(&b.host) && !is_ip(&b.host)
+}
+
 /// `(sandbox, binary, host, port)`: what a decision applies to.
 pub type Key = (String, String, String, u16);
 
@@ -193,6 +199,10 @@ pub struct Watch {
     /// session. OpenShell refuses wildcard hosts, so this is how "any website" is done: each
     /// denial is answered with the same read-only allow a person would have picked.
     auto_web: HashSet<String>,
+    /// Sandboxes where web reads by any program are allowed without asking. Unlike `auto_web`
+    /// it outlives the session: kept in `auto_any_file`, one sandbox name per line.
+    auto_any: HashSet<String>,
+    auto_any_file: Option<PathBuf>,
     /// Allows decided without a prompt, waiting for the app to apply them.
     auto: Vec<(String, String, Blocked)>,
 }
@@ -216,7 +226,39 @@ pub fn never_path() -> Option<PathBuf> {
     Some(base.join("osh/never"))
 }
 
+/// Where the "any program" sandboxes are listed: next to `never`, in `osh/auto_any`.
+pub fn auto_any_path() -> Option<PathBuf> {
+    never_path().map(|p| p.with_file_name("auto_any"))
+}
+
 impl Watch {
+    /// Read the "any program" sandboxes from, and save them to, `file`.
+    pub fn with_auto_any_file(mut self, file: Option<PathBuf>) -> Self {
+        self.auto_any = file
+            .as_ref()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .map(|t| {
+                t.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.auto_any_file = file;
+        self
+    }
+
+    fn save_auto_any(&self) {
+        let Some(f) = &self.auto_any_file else { return };
+        let mut lines: Vec<&str> = self.auto_any.iter().map(String::as_str).collect();
+        lines.sort();
+        if let Some(dir) = f.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(f, lines.join("\n") + "\n");
+    }
+
     /// A watcher whose never-allow list is read from, and saved to, `file`.
     pub fn with_never_file(file: Option<PathBuf>) -> Self {
         let never = file
@@ -309,7 +351,9 @@ impl Watch {
                         }
                     }
                 }
-                if self.auto_web.contains(sandbox) && is_web_read(&b) {
+                if (self.auto_web.contains(sandbox) && is_web_read(&b))
+                    || (self.auto_any.contains(sandbox) && is_any_read(&b))
+                {
                     self.allowed_at.insert(k, Instant::now());
                     self.set(sandbox, &Denial::Blocked(b.clone()), State::Allowed(false));
                     self.auto.push((sandbox.into(), gateway.into(), b));
@@ -392,6 +436,28 @@ impl Watch {
     /// without asking; prompts already queued for it that qualify are answered the same way.
     pub fn enable_auto_web(&mut self, sandbox: &str) {
         self.auto_web.insert(sandbox.into());
+        self.answer_queued(sandbox, is_web_read);
+    }
+
+    /// Allow web reads by any program in `sandbox` without asking, also in later sessions,
+    /// until `disable_auto_any`. Queued prompts that qualify are answered the same way.
+    pub fn enable_auto_any(&mut self, sandbox: &str) {
+        self.auto_any.insert(sandbox.into());
+        self.save_auto_any();
+        self.answer_queued(sandbox, is_any_read);
+    }
+
+    pub fn disable_auto_any(&mut self, sandbox: &str) {
+        if self.auto_any.remove(sandbox) {
+            self.save_auto_any();
+        }
+    }
+
+    pub fn auto_any_on(&self, sandbox: &str) -> bool {
+        self.auto_any.contains(sandbox)
+    }
+
+    fn answer_queued(&mut self, sandbox: &str, covered: fn(&Blocked) -> bool) {
         let queued: Vec<Prompt> = self.queue.drain(..).collect();
         for p in queued {
             match p {
@@ -400,7 +466,7 @@ impl Watch {
                     gateway,
                     b,
                     ..
-                } if s == sandbox && is_web_read(&b) => {
+                } if s == sandbox && covered(&b) => {
                     self.allowed_at.insert(key(&s, &b), Instant::now());
                     self.set(&s, &Denial::Blocked(b.clone()), State::Allowed(false));
                     self.auto.push((s, gateway, b));
@@ -574,6 +640,50 @@ pub fn endpoint(b: &Blocked, all: bool) -> String {
     }
 }
 
+/// The registrable domain of `host` by the public suffix list (`dl.google.com` gives
+/// `google.com`, `a.b.github.io` gives `b.github.io`). `None` for a bare suffix or an unknown one.
+pub fn registrable_domain(host: &str) -> Option<String> {
+    psl::domain_str(host).map(str::to_string)
+}
+
+/// The update for `allow_domain`: the domain and every subdomain (`**.D` does not match `D`
+/// itself), read-only, for any program. One update, so one policy reload.
+pub fn domain_update_args(gateway: &str, sandbox: &str, port: u16, domain: &str) -> Vec<String> {
+    let mut args: Vec<String> = Vec::new();
+    if !gateway.is_empty() {
+        args.extend(["-g".into(), gateway.into()]);
+    }
+    args.extend(["policy".into(), "update".into(), sandbox.into()]);
+    for host in [domain.to_string(), format!("**.{domain}")] {
+        args.extend([
+            "--add-endpoint".into(),
+            format!("{host}:{port}:read-only:rest:enforce"),
+        ]);
+    }
+    args.extend(["--binary", "/**", "--wait", "--timeout", "60"].map(String::from));
+    args
+}
+
+/// Allow read-only web access for any program to the whole registrable domain of `b.host`, so
+/// the next host under it (a CDN, a download redirect) does not fail on its first request.
+/// Err when the host has no registrable domain or OpenShell refuses the update (an overlap with
+/// an endpoint of different settings); the caller then falls back to `allow`.
+pub fn allow_domain(gateway: &str, sandbox: &str, b: &Blocked) -> Result<String, String> {
+    if !cli::valid_host(&b.host) || is_ip(&b.host) {
+        return Err(format!("not a plain host name: {}", b.host));
+    }
+    let domain = registrable_domain(&b.host)
+        .ok_or_else(|| format!("{} has no registrable domain", b.host))?;
+    cli::run(
+        "openshell",
+        &domain_update_args(gateway, sandbox, b.port, &domain),
+        &[],
+    )?;
+    Ok(format!(
+        "Allowed any program to read {domain} and its subdomains in {sandbox}; it is live, ask again"
+    ))
+}
+
 /// Add exactly `host:port` for exactly one binary to the running sandbox.
 pub fn allow(gateway: &str, sandbox: &str, b: &Blocked, all: bool) -> Result<String, String> {
     if !cli::valid_host(&b.host) || is_ip(&b.host) {
@@ -706,6 +816,53 @@ mod tests {
         assert!(w.take_auto().is_empty(), "another sandbox still asks");
         w.end_session("a");
         assert!(!w.auto_web_on("a"));
+    }
+
+    #[test]
+    fn any_program_reads_are_allowed_for_the_sandbox_that_opted_in_and_survive_a_restart() {
+        let dir = std::env::temp_dir().join(format!("osh-auto-any-{}", std::process::id()));
+        let file = dir.join("auto_any");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut w = Watch::default().with_auto_any_file(Some(file.clone()));
+        let mut node = curl();
+        node.binary = "/usr/local/bin/node".into();
+        node.host = "registry.example".into();
+        w.push("a", "gw", Denial::Blocked(node.clone()));
+        assert!(w.has_queued(None), "asks until the sandbox opts in");
+        w.enable_auto_any("a");
+        assert!(!w.has_queued(None), "the queued prompt was answered");
+        assert_eq!(w.take_auto().len(), 1);
+        node.host = "ziglang.org".into();
+        w.push("a", "gw", Denial::Blocked(node.clone()));
+        assert_eq!(w.take_auto()[0].2.host, "ziglang.org");
+        let mut ssh = node.clone();
+        ssh.port = 22;
+        w.push("a", "gw", Denial::Blocked(ssh));
+        assert!(w.take_auto().is_empty(), "only HTTP ports");
+        w.push("b", "gw", Denial::Blocked(node.clone()));
+        assert!(w.take_auto().is_empty(), "another sandbox still asks");
+        w.end_session("a");
+        assert!(w.auto_any_on("a"), "outlives the session");
+        let mut again = Watch::default().with_auto_any_file(Some(file.clone()));
+        assert!(again.auto_any_on("a") && !again.auto_any_on("b"));
+        again.disable_auto_any("a");
+        let last = Watch::default().with_auto_any_file(Some(file));
+        assert!(!last.auto_any_on("a"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_registrable_domain_follows_the_public_suffix_list() {
+        let d = |h| registrable_domain(h);
+        assert_eq!(d("dl.google.com").as_deref(), Some("google.com"));
+        assert_eq!(d("google.com").as_deref(), Some("google.com"));
+        assert_eq!(d("a.b.example.co.uk").as_deref(), Some("example.co.uk"));
+        assert_eq!(d("com"), None, "a bare suffix has no registrable domain");
+        let args = domain_update_args("gw", "sb", 443, "google.com").join(" ");
+        assert_eq!(
+            args,
+            "-g gw policy update sb --add-endpoint google.com:443:read-only:rest:enforce --add-endpoint **.google.com:443:read-only:rest:enforce --binary /** --wait --timeout 60"
+        );
     }
 
     #[test]

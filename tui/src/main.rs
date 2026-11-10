@@ -13,6 +13,7 @@ mod gwops;
 mod logview;
 mod platform;
 mod ports;
+mod preload;
 mod setup;
 mod term;
 mod tmuxpass;
@@ -881,7 +882,7 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL));
         assert!(app.modal.is_some());
         term.draw(|f| ui::draw(f, &app)).unwrap();
-        for _ in 0..5 {
+        for _ in 0..7 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));
@@ -889,11 +890,30 @@ mod tests {
         term.draw(|f| ui::draw(f, &app)).unwrap();
         app.active = Some(0);
         app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
-        for _ in 0..6 {
+        for _ in 0..8 {
             app.on_key(KeyEvent::from(KeyCode::Char('j')));
         }
         app.on_key(KeyEvent::from(KeyCode::Enter));
         assert!(app.active.is_none() && app.sessions.is_empty());
+    }
+
+    #[test]
+    fn shell_menu_turns_any_program_auto_allow_on_and_off_at_will() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let s = term::Session::spawn("sb".into(), app.snap.gateway.clone(), "cat", &[], 60, 19)
+            .unwrap();
+        app.sessions.push(s);
+        app.active = Some(0);
+        for want_on in [true, false] {
+            app.on_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL));
+            for _ in 0..3 {
+                app.on_key(KeyEvent::from(KeyCode::Char('j')));
+            }
+            app.on_key(KeyEvent::from(KeyCode::Enter));
+            assert_eq!(app.watch.auto_any_on("sb"), want_on);
+        }
     }
 
     #[test]
@@ -984,12 +1004,19 @@ mod tests {
                     title,
                     "curl was blocked from reaching example.com:443 in sb (2x)"
                 );
-                assert_eq!(items[0], "Allow read-only (GET/HEAD/OPTIONS) for curl");
-                assert_eq!(items.len(), 6);
+                assert_eq!(
+                    items[0],
+                    "Allow read-only (GET/HEAD/OPTIONS) for curl to example.com:443 only"
+                );
+                assert_eq!(items.len(), 7);
                 assert!(
                     items[2].starts_with(
                         "Allow web reads (GET/HEAD/OPTIONS) by curl and Claude Code in sb"
                     ),
+                    "{items:?}"
+                );
+                assert!(
+                    items[3].starts_with("Allow web reads (GET/HEAD/OPTIONS) by any program in sb"),
                     "{items:?}"
                 );
             }

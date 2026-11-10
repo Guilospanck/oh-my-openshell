@@ -64,6 +64,7 @@ const FILES: &[(&str, &str)] = &[
         "sandbox-policy.yaml",
         include_str!("../../sandbox-policy.yaml"),
     ),
+    ("toolchains.toml", include_str!("../../toolchains.toml")),
     (".gitleaks.toml", include_str!("../../.gitleaks.toml")),
     (
         "gateway-docker.toml",

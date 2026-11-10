@@ -4,6 +4,7 @@ use crate::clip;
 use crate::ghrepo::{self, GhRepo};
 use crate::logview::LogView;
 use crate::ports::{self, Ports, Scan};
+use crate::preload;
 use crate::term::{self, Session};
 use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
@@ -859,7 +860,8 @@ impl App {
             sessions: Vec::new(),
             host_status: None,
             active: None,
-            watch: Watch::with_never_file(watch::never_path()),
+            watch: Watch::with_never_file(watch::never_path())
+                .with_auto_any_file(watch::auto_any_path()),
             follows: Vec::new(),
             ports: Ports::default(),
             scans: Vec::new(),
@@ -1475,11 +1477,24 @@ impl App {
         self.auto_running.store(true, Ordering::Relaxed);
         let running = self.auto_running.clone();
         self.status = format!("Allowing {} web read(s)...", batch.len());
+        let any: std::collections::HashSet<String> = batch
+            .iter()
+            .filter(|(sb, _, _)| self.watch.auto_any_on(sb))
+            .map(|(sb, _, _)| sb.clone())
+            .collect();
         self.bg_msg(move || {
             let mut done = Vec::new();
             let mut errs = Vec::new();
             for (sandbox, gateway, b) in &batch {
-                match watch::allow(gateway, sandbox, b, false) {
+                // In "any program" mode the whole registrable domain opens at once; a refused
+                // update (overlap with a provider's endpoint) falls back to the exact host.
+                let res = if any.contains(sandbox) {
+                    watch::allow_domain(gateway, sandbox, b)
+                        .or_else(|_| watch::allow(gateway, sandbox, b, false))
+                } else {
+                    watch::allow(gateway, sandbox, b, false)
+                };
+                match res {
                     Ok(_) => done.push(b.target()),
                     Err(e) => errs.push(format!("{}: {e}", b.target())),
                 }
@@ -1528,13 +1543,28 @@ impl App {
                 }
                 // Read-only means HTTP method rules, so only HTTP ports get it.
                 if matches!(b.port, 80 | 443 | 8080 | 8443) {
-                    items.push(format!("Allow read-only (GET/HEAD/OPTIONS) for {prog}"));
+                    items.push(format!(
+                        "Allow read-only (GET/HEAD/OPTIONS) for {prog} to {} only",
+                        b.target()
+                    ));
                 }
-                items.push(format!("Allow all methods for {prog}"));
+                items.push(format!(
+                    "Allow all methods for {prog} to {} only",
+                    b.target()
+                ));
                 if watch::is_web_read(&b) && !self.watch.auto_web_on(&sandbox) {
                     items.push(format!(
                         "Allow web reads (GET/HEAD/OPTIONS) by curl and Claude Code in {sandbox} until the session ends, no more prompts"
                     ));
+                }
+                if watch::is_any_read(&b) {
+                    items.push(if self.watch.auto_any_on(&sandbox) {
+                        format!("Stop auto-allowing web reads by any program in {sandbox}")
+                    } else {
+                        format!(
+                            "Allow web reads (GET/HEAD/OPTIONS) by any program in {sandbox}, always, no more prompts"
+                        )
+                    });
                 }
                 items.push("Ignore this time".into());
                 items.push("Ignore until the session ends".into());
@@ -2357,6 +2387,28 @@ impl App {
         self.job = Some(self.sandbox_steps(plan));
     }
 
+    /// The policy file for a new sandbox: `sandbox-policy.yaml` plus the toolchain hosts of
+    /// `toolchains.toml` (see `preload`). Without a readable base policy or list, or when the
+    /// generated copy cannot be written, the plain policy is used and the sandbox still starts.
+    fn creation_policy(&self) -> PathBuf {
+        let base = self.dir.join("sandbox-policy.yaml");
+        let generated = self.dir.join(".sandbox-policy.generated.yaml");
+        let (Ok(text), Ok(list)) = (
+            std::fs::read_to_string(&base),
+            std::fs::read_to_string(self.dir.join("toolchains.toml")),
+        ) else {
+            return base;
+        };
+        let Ok(groups) = preload::parse(&list) else {
+            return base;
+        };
+        let policy = preload::creation_policy(&text, &groups);
+        match std::fs::write(&generated, policy) {
+            Ok(()) => generated,
+            Err(_) => base,
+        }
+    }
+
     fn sandbox_steps(&self, plan: &Plan) -> Vec<Step> {
         let mut steps = Vec::new();
         if let Some(img) = self
@@ -2374,10 +2426,7 @@ impl App {
         // The default policy denies opening a PTY, which tmux needs in the shell.
         args.extend([
             "--policy".into(),
-            self.dir
-                .join("sandbox-policy.yaml")
-                .to_string_lossy()
-                .into(),
+            self.creation_policy().to_string_lossy().into(),
         ]);
         if !plan.name.is_empty() {
             args.extend(["--name".into(), plan.name.clone()]);
@@ -2798,6 +2847,19 @@ impl App {
                 } else if first.starts_with("Never allow ") {
                     self.watch.decide(&sandbox, &b, State::Never);
                     self.status = format!("Never asking about {} in {sandbox}", b.target());
+                } else if first.starts_with("Stop auto-allowing") {
+                    self.watch.disable_auto_any(&sandbox);
+                    self.watch.decide(&sandbox, &b, State::IgnoredOnce);
+                    self.status =
+                        format!("Web reads by any program in {sandbox} ask again from now on");
+                } else if first.starts_with("Allow web reads") && first.contains("by any program") {
+                    self.watch.enable_auto_any(&sandbox);
+                    self.watch.decide(&sandbox, &b, State::Allowed(false));
+                    self.status = format!(
+                        "Web reads by any program are allowed in {sandbox}, also next time; allowing {}...",
+                        b.target()
+                    );
+                    self.watch.auto_allow(&sandbox, &gateway, b);
                 } else if first.starts_with("Allow web reads") {
                     self.watch.enable_auto_web(&sandbox);
                     self.watch.decide(&sandbox, &b, State::Allowed(false));
@@ -2903,6 +2965,51 @@ impl App {
                 } else if first.starts_with("Blocked") {
                     if let Some(name) = self.session().map(|s| s.sandbox.clone()) {
                         self.review(name);
+                    }
+                } else if first.starts_with("Auto-allow web reads") {
+                    if let Some(name) = self.session().map(|s| s.sandbox.clone()) {
+                        if self.watch.auto_any_on(&name) {
+                            self.watch.disable_auto_any(&name);
+                            self.status =
+                                format!("Web reads by any program in {name} ask again from now on");
+                        } else {
+                            self.watch.enable_auto_any(&name);
+                            self.status = format!(
+                                "Web reads by any program are allowed in {name}, also next time"
+                            );
+                        }
+                    }
+                } else if first.starts_with("Open the toolchain hosts") {
+                    if let Some((name, gateway)) = self
+                        .session()
+                        .map(|s| (s.sandbox.clone(), s.gateway.clone()))
+                    {
+                        let list = std::fs::read_to_string(self.dir.join("toolchains.toml"))
+                            .unwrap_or_default();
+                        let groups = match preload::parse(&list) {
+                            Ok(g) => g,
+                            Err(e) => {
+                                self.status = format!(
+                                    "toolchains.toml is not valid TOML: {}",
+                                    e.lines().next().unwrap_or_default()
+                                );
+                                return;
+                            }
+                        };
+                        let cmds = preload::update_commands(&gateway, &name, &groups);
+                        if cmds.is_empty() {
+                            self.status = "No toolchain group is on in toolchains.toml".into();
+                        } else {
+                            self.status = format!("Opening the toolchain hosts in {name}...");
+                            self.bg_msg(move || {
+                                for args in &cmds {
+                                    cli::run("openshell", args, &[])?;
+                                }
+                                Ok(format!(
+                                    "Toolchain hosts are live in {name}; ask again if a request failed"
+                                ))
+                            });
+                        }
                     }
                 } else if first.starts_with("Port forwards") {
                     self.show_forwards();
@@ -3669,6 +3776,12 @@ impl App {
                     "Back to the session".into(),
                     "Providers and their permissions".into(),
                     "Blocked requests".into(),
+                    if self.watch.auto_any_on(&name) {
+                        "Auto-allow web reads by any program: on (Enter turns it off)".into()
+                    } else {
+                        "Auto-allow web reads by any program: off (Enter turns it on)".into()
+                    },
+                    "Open the toolchain hosts (toolchains.toml) in this sandbox".into(),
                     format!("Port forwards ({})", self.ports.forwards(&name).len()),
                     format!("Alerts ({})", self.visible_alerts().len()),
                     "Dashboard (keep the session running)".into(),

@@ -1,0 +1,139 @@
+# Hosts every new osh sandbox may read from the first command, so installing a toolchain does
+# not fail once per host. Edit freely: osh keeps your changes. Written to the data directory.
+#
+# One table per group. `enabled` switches the group; `hosts` are read-only (GET, HEAD and OPTIONS,
+# port 443, any program in the sandbox); `git_hosts` are the same plus the POST to
+# /**/git-upload-pack that git clone and fetch over https need (pushes stay denied). Exact hosts
+# only: OpenShell has no "any host", and a wildcard would overlap the provider profiles.
+#
+# Wider than it looks: storage.googleapis.com reaches any Google Cloud Storage bucket, and the
+# githubusercontent.com hosts serve anyone's files. They are listed because Go modules and GitHub
+# releases cannot be fetched without them. Turn a group off to drop its hosts.
+#
+# Groups apply to sandboxes created afterwards. For a running sandbox use the Ctrl-] menu.
+# A file that is not valid TOML is ignored: new sandboxes start without the list, and the Ctrl-]
+# entry that opens the hosts in a running sandbox says what is wrong.
+
+[github]
+enabled = true
+hosts = [
+  "codeload.github.com",
+  "release-assets.githubusercontent.com",
+  "raw.githubusercontent.com",
+  "api.github.com",
+]
+git_hosts = [
+  "github.com",
+]
+
+[go]
+enabled = true
+hosts = [
+  "go.dev",
+  "dl.google.com",
+  "proxy.golang.org",
+  "sum.golang.org",
+  "storage.googleapis.com",
+]
+
+[rust]
+enabled = true
+hosts = [
+  "sh.rustup.rs",
+  "rustup.rs",
+  "static.rust-lang.org",
+  "index.crates.io",
+  "static.crates.io",
+  "crates.io",
+]
+
+[zig]
+enabled = true
+hosts = [
+  "ziglang.org",
+  "builds.zigtools.org",
+]
+
+[node]
+enabled = true
+hosts = [
+  "registry.npmjs.org",
+  "registry.yarnpkg.com",
+  "repo.yarnpkg.com",
+  "nodejs.org",
+  "bun.sh",
+  "deno.land",
+  "dl.deno.land",
+  "jsr.io",
+  "npm.jsr.io",
+]
+
+[python]
+enabled = true
+hosts = [
+  "pypi.org",
+  "files.pythonhosted.org",
+  "astral.sh",
+  "releases.astral.sh",
+  "install.python-poetry.org",
+  "www.python.org",
+  "downloads.python.org",
+  "bootstrap.pypa.io",
+]
+
+[gitlab-codeberg]
+enabled = false
+git_hosts = [
+  "gitlab.com",
+  "codeberg.org",
+]
+
+[java]
+enabled = false
+hosts = [
+  "repo.maven.apache.org",
+  "repo1.maven.org",
+  "plugins.gradle.org",
+  "services.gradle.org",
+  "downloads.gradle.org",
+  "maven.google.com",
+]
+
+[ruby]
+enabled = false
+hosts = [
+  "rubygems.org",
+  "index.rubygems.org",
+  "cache.ruby-lang.org",
+]
+
+[php]
+enabled = false
+hosts = [
+  "packagist.org",
+  "repo.packagist.org",
+  "getcomposer.org",
+]
+
+[dotnet]
+enabled = false
+hosts = [
+  "api.nuget.org",
+  "builds.dotnet.microsoft.com",
+  "dot.net",
+]
+
+[elixir]
+enabled = false
+hosts = [
+  "hex.pm",
+  "repo.hex.pm",
+  "builds.hex.pm",
+]
+
+[playwright]
+enabled = false
+hosts = [
+  "cdn.playwright.dev",
+  "playwright.download.prss.microsoft.com",
+]

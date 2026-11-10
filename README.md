@@ -151,7 +151,7 @@ in Terminal.app or "Esc+" for Option in iTerm2; that setting is outside osh.
 While a sandbox has a shell open, osh follows its logs. When the network
 policy blocks a program from reaching a host, a prompt opens (over the shell,
 or the dashboard): `curl was blocked from reaching example.com:443`, with
-allow read-only (GET/HEAD/OPTIONS), allow all methods, ignore this time,
+allow read-only (GET/HEAD/OPTIONS) or all methods for that program to that `host:port` only, ignore this time,
 ignore until the session ends, or never allow that `host:port` in this sandbox
 (any program; saved in `~/.local/state/osh/never`, and `p` then Enter asks
 again). When a profile in `providers/` (no credential needed) declares the
@@ -290,9 +290,24 @@ database), `js` (npm, pnpm, yarn, bun; same registry shape as `npm`, so both att
 together). A blocked-request prompt offers
 `rust` or `go` when the blocked host is one of theirs and no ordinary profile covers it.
 
+Toolchain hosts: `toolchains.toml` in the data directory lists exact hosts, in groups, that every
+new sandbox may read from its first command (GET/HEAD/OPTIONS by any program, so installs do not
+fail once per host). `github`, `go`, `rust`, `zig`, `node` and `python` are on; `gitlab-codeberg`,
+`java`, `ruby`, `php`, `dotnet`, `elixir` and `playwright` are off. Edit the file to switch a group
+(`[java]` then `enabled = true`), add hosts, or move a git host to `git_hosts` (adds the `POST /**/git-upload-pack` that
+clone and fetch need; pushes stay denied). osh keeps your edits. The list goes into the
+`--policy` file given to `sandbox create`; for a running sandbox use `Open the toolchain hosts`
+in the `Ctrl-]` menu, which adds the rules with `policy update` (never `policy set`, which would
+drop rules you allowed since). Some entries are wide on purpose: `storage.googleapis.com` reaches
+any Google Cloud Storage bucket and the `githubusercontent.com` hosts serve anyone's files, but
+Go modules and GitHub releases cannot be fetched without them. Where a provider profile defines
+the same host, the list narrows it to read-only for that host.
+
 For open-ended research ("any website") there is no profile, because OpenShell refuses `*`
 hosts. Instead, when `curl` or Claude Code is blocked on a web host (ports 80/443), the prompt
-offers "Allow web reads ... until the session ends, no more prompts". From then on, until that
+offers "Allow web reads ... until the session ends, no more prompts". The same prompt offers
+"by any program ... always": every program, HTTP ports 80/443, read-only, and the whole registrable domain of the blocked host with its subdomains at once (`dl.google.com` opens `google.com` and `**.google.com`; if OpenShell refuses that, osh allows the exact host), kept for that sandbox
+only in `~/.local/state/osh/auto_any` (the prompt then offers "Stop auto-allowing" for it). From then on, until that
 sandbox's shell closes, osh answers every such denial for those two programs with the same
 read-only allow you would have picked (one `policy update` at a time, no popups). The first
 request to each new host still fails once; the retry works. Reads can carry data out in a URL,

@@ -10,3 +10,4 @@ dist/
 
 TASKS.md
 __pycache__/
+/.sandbox-policy.generated.yaml

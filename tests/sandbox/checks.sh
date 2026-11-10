@@ -68,6 +68,32 @@ sandbox_checks() {
   out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://www.iana.org/')"
   [[ "$out" == 200 ]] && pass "curl reads the host once it is allowed" || fail "curl reads the host once it is allowed" "$out"
 
+  # The "any program" auto-allow (watch::allow_domain): the registrable domain and its
+  # subdomains in one update, for every program. `**.D` does not match D itself, so both go in.
+  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 20 https://www.ietf.org/')"
+  [[ "$out" != 200 ]] && pass "a host of another domain is refused before the domain allow" || fail "a host of another domain is refused before the domain allow" "$out"
+  openshell -g "$main" policy update "$name" --add-endpoint ietf.org:443:read-only:rest:enforce \
+    --add-endpoint '**.ietf.org:443:read-only:rest:enforce' --binary '/**' --wait --timeout 60 >"$HOME/domain-allow.log" 2>&1 \
+    && pass "the domain-wide allow osh issues is accepted" || fail "the domain-wide allow osh issues is accepted" "$(tail -5 "$HOME/domain-allow.log")"
+  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" --max-time 30 https://www.ietf.org/')"
+  [[ "$out" == 200 ]] && pass "curl reads a subdomain of the allowed domain" || fail "curl reads a subdomain of the allowed domain" "$out"
+  out="$(ex 'python3 -c "import urllib.request as u; print(u.urlopen(\"https://datatracker.ietf.org/\", timeout=30).status)"')"
+  [[ "$out" == 200 ]] && pass "another program reads a second subdomain on its first try" || fail "another program reads a second subdomain on its first try" "$out"
+  out="$(ex 'curl -s -o /dev/null -w "%{http_code}" -X POST --max-time 30 https://www.ietf.org/')"
+  [[ "$out" == 403 ]] && pass "a POST to the allowed domain is still denied" || fail "a POST to the allowed domain is still denied" "$out"
+
+  # The toolchain host list on a running sandbox (preload::update_commands): the endpoints in
+  # one update, the git fetch POST in a second (OpenShell refuses both flags together), after
+  # which a clone over https works.
+  openshell -g "$main" policy update "$name" --add-endpoint github.com:443:read-only:rest:enforce \
+    --add-endpoint codeload.github.com:443:read-only:rest:enforce --binary '/**' --wait --timeout 60 >"$HOME/toolchain-1.log" 2>&1 \
+    && pass "the toolchain endpoints update is accepted" || fail "the toolchain endpoints update is accepted" "$(tail -5 "$HOME/toolchain-1.log")"
+  openshell -g "$main" policy update "$name" --rule-name allow_github_com_443 --binary '/**' \
+    --add-allow 'github.com:443:POST:/**/git-upload-pack' --wait --timeout 60 >"$HOME/toolchain-2.log" 2>&1 \
+    && pass "the git fetch allow update is accepted" || fail "the git fetch allow update is accepted" "$(tail -5 "$HOME/toolchain-2.log")"
+  out="$(ex 'rm -rf /tmp/hw && git clone --depth 1 -q https://github.com/octocat/Hello-World /tmp/hw && ls /tmp/hw | head -1')"
+  [[ -n "$out" ]] && pass "git clone over https works once the list is applied" || fail "git clone over https works once the list is applied" "$out"
+
   # Port forwarding offers (ports.rs): the scan osh runs must list a new listener, and the
   # forward osh starts must reach it from the host.
   ex 'nohup python3 -m http.server 18765 --bind 127.0.0.1 >/dev/null 2>&1 & sleep 2' >/dev/null
