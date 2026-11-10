@@ -630,6 +630,8 @@ fn main() -> io::Result<()> {
     let (alert_tx, alert_rx) = mpsc::channel();
     alerts::spawn_watch(dir.clone(), alert_tx, Duration::from_secs(4));
 
+    tmuxpass::load(&dir);
+    tmuxpass::recover();
     let mut app = App::new(dir, selected, wake_tx, done_tx);
     for n in notes {
         app.data_notice(n);
@@ -907,6 +909,7 @@ mod tests {
             title: ".envrc appeared in app".into(),
             detail: "direnv runs it".into(),
             sandbox: Some("sb".into()),
+            file: None,
         });
         let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
         term.draw(|f| ui::draw(f, &app)).unwrap();

@@ -67,6 +67,9 @@ pub const EDIT_TOOLCHAINS_ITEM: &str = "Edit toolchains.toml (add hosts or group
 const TOOLCHAINS_FILE: &str = "toolchains.toml";
 const GH_REPO_ITEM: &str = "Git repo, read/write (GitHub, GitLab, Bitbucket or Forgejo token)...";
 
+/// The secret-scan choice that lists the findings.
+const SECRETS_SHOW: &str = "Show the findings (file, rule, line)";
+
 /// Data files list entries that start a new file.
 const NEW_PROFILE_ITEM: &str = "New provider profile...";
 const NEW_DOCKERFILE_ITEM: &str = "New Dockerfile...";
@@ -265,6 +268,15 @@ pub enum SelKind {
     Review {
         sandbox: String,
     },
+    /// The secret scan flagged uploads: see the findings, drop the flagged items, or stop.
+    Secrets {
+        sync: SyncPlan,
+        flagged: Vec<String>,
+    },
+    /// A remembered git host answer to forget.
+    ForgetHost,
+    /// The alerts list when some are about files: read them all, or view one file.
+    Alerts(Vec<String>),
     /// Every data file (paths relative to the data dir, in list order), plus "new" entries.
     DataFiles(Vec<String>),
     /// What to do with one data file (relative path).
@@ -853,7 +865,7 @@ pub fn pane(w: u16, h: u16) -> (u16, u16) {
 
 fn notice_text(sandbox: &str, what: &str, reason: &str) -> String {
     format!(
-        "{sandbox} blocked: {what}\nReason: {reason}\n\nThis is not a missing host rule (for example an L7 rule rejected the request), so allowing the host would not fix it. Review the policy: openshell policy get {sandbox}"
+        "{sandbox} blocked: {what}\nReason: {reason}\n\nThis is not a missing host rule (for example an L7 rule rejected the request), so allowing the host would not fix it. See the sandbox's policy with i on the Sandboxes tab, and what its providers allow under Ctrl-] > Providers."
     )
 }
 
@@ -1269,7 +1281,24 @@ impl App {
         let n = self.visible_alerts().len();
         let text = self.alerts_text();
         self.toast = None;
-        self.open_viewer(&format!("Alerts ({n})"), text, back);
+        let mut files: Vec<String> = Vec::new();
+        for a in self.visible_alerts().into_iter().rev() {
+            if let Some(f) = a.file.as_ref().filter(|f| !files.contains(f)) {
+                files.push(f.clone());
+            }
+        }
+        if files.is_empty() {
+            return self.open_viewer(&format!("Alerts ({n})"), text, back);
+        }
+        // Alerts about files in a shared folder: each file can be read here, on the host side.
+        let mut items = vec![format!("Read all {n} alert(s)")];
+        items.extend(files.iter().map(|f| format!("View {f}")));
+        self.select(
+            &format!("Alerts ({n})"),
+            items,
+            false,
+            SelKind::Alerts(files),
+        );
     }
 
     /// Whether the status names work still in progress (`Detaching x...`).
@@ -2134,10 +2163,15 @@ impl App {
         else {
             return;
         };
-        // Take values already exported in the TUI's environment instead of prompting.
-        while let Some(key) = keys.get(values.len()) {
+        // A new provider takes values already exported in osh's environment instead of prompting
+        // (said in the status line). Renewing never does: an exported token is usually the stale
+        // one being replaced, and only unsetting it in the shell that started osh would get past it.
+        while let Some(key) = keys.get(values.len()).filter(|_| !update) {
             match std::env::var(key) {
-                Ok(v) if !v.is_empty() => values.push((key.clone(), v)),
+                Ok(v) if !v.is_empty() => {
+                    self.status = format!("Using {key} from osh's environment");
+                    values.push((key.clone(), v));
+                }
                 _ => break,
             }
         }
@@ -2339,7 +2373,7 @@ impl App {
                 }
                 text.push('\n');
             }
-            text.push_str("\nAttach a provider profile that grants it (a: attach provider), or edit the policy, then retry.");
+            text.push_str("\nAttach a provider that grants it (a on the Sandboxes tab), or allow the host when osh asks about the blocked request (p lists them), then press K again.");
             self.cleanup_sync_stage();
             self.modal = Some(Modal::Info(text));
             return;
@@ -2349,12 +2383,7 @@ impl App {
             .iter()
             .any(|s| s.args.iter().any(|a| a == "upload"));
         if uploads && sync.manifest.findings.unwrap_or(0) > 0 {
-            let n = sync.manifest.findings.unwrap_or(0);
-            self.cleanup_sync_stage();
-            self.modal = Some(Modal::Info(format!(
-                "The secret scan found {n} finding(s) in the files that would be uploaded. Run `osh sync-agents --json` and review the staged files, or deselect the uploads (own-skills, context)."
-            )));
-            return;
+            return self.offer_secret_fix(sync);
         }
         let steps = steps_list.len();
         self.modal = Some(Modal::Confirm {
@@ -2364,6 +2393,28 @@ impl App {
             ),
             kind: ConfKind::Sync(sync),
         });
+    }
+
+    /// The secret scan flagged files that would be uploaded: show which (file, rule, line), or go
+    /// on without the flagged items. The staged copies stay until the flow ends.
+    fn offer_secret_fix(&mut self, sync: SyncPlan) {
+        let n = sync.manifest.findings.unwrap_or(0);
+        let flagged = sync.manifest.flagged_ids();
+        let mut items = vec![SECRETS_SHOW.to_string()];
+        let rest = sync.ids.iter().filter(|i| !flagged.contains(i)).count();
+        if rest > 0 && !flagged.is_empty() {
+            items.push(format!(
+                "Continue without the flagged item(s): {}",
+                flagged.join(", ")
+            ));
+        }
+        items.push("Cancel (nothing is uploaded)".into());
+        self.select(
+            &format!("The secret scan found {n} finding(s) in files that would be uploaded"),
+            items,
+            false,
+            SelKind::Secrets { sync, flagged },
+        );
     }
 
     /// Create (the ones in `create`) and attach `profiles`, then check the policy again.
@@ -3220,6 +3271,68 @@ impl App {
                 }
             },
             SelKind::DataFile(rel) => self.on_file_action(rel, &first),
+            SelKind::Alerts(files) => {
+                let n = self.visible_alerts().len();
+                let back = |app: &mut App| {
+                    app.show_alerts(None);
+                    app.modal.take()
+                };
+                match first.strip_prefix("View ") {
+                    Some(f) if files.iter().any(|x| x == f) => {
+                        // Read as bytes and shown as text: a file a sandbox wrote may not be UTF-8.
+                        let text = match std::fs::read(f) {
+                            Ok(b) => {
+                                let mut t = String::from_utf8_lossy(&b[..b.len().min(200_000)])
+                                    .into_owned();
+                                if b.len() > 200_000 {
+                                    t.push_str("\n... (cut at 200 KB)");
+                                }
+                                t
+                            }
+                            Err(e) => format!("Cannot read {f}: {e}"),
+                        };
+                        let back = back(self);
+                        self.open_viewer(f, text, back);
+                    }
+                    _ => {
+                        let text = self.alerts_text();
+                        let back = back(self);
+                        self.open_viewer(&format!("Alerts ({n})"), text, back);
+                    }
+                }
+            }
+            SelKind::ForgetHost => {
+                let host = first
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                ghrepo::forget_host(self.hosts_file.as_deref(), &host);
+                self.status = format!("Forgot the answer for {host}: osh asks again next time");
+            }
+            SelKind::Secrets { mut sync, flagged } => {
+                if first == SECRETS_SHOW {
+                    let text = sync.manifest.findings_text();
+                    self.offer_secret_fix(sync);
+                    let back = self.modal.take();
+                    self.open_viewer("Secret scan findings", text, back);
+                } else if first.starts_with("Continue without") {
+                    sync.ids.retain(|i| !flagged.contains(i));
+                    // What is left carries no flagged file, so the scan does not stop it again.
+                    sync.manifest.findings = Some(0);
+                    self.confirm_sync(
+                        sync,
+                        cli::SyncCheck {
+                            ok: true,
+                            ..Default::default()
+                        },
+                        0,
+                    );
+                } else {
+                    self.cleanup_sync_stage();
+                    self.status = "Cancelled: nothing was uploaded".into();
+                }
+            }
             SelKind::Review { sandbox } => {
                 let seen: Vec<Denial> = self
                     .watch
@@ -3685,6 +3798,39 @@ impl App {
             }
             C::DataFiles => self.data_files(),
             C::EditPolicy => self.file_menu("sandbox-policy.yaml".into()),
+            C::TmuxKeys => {
+                self.status = match crate::tmuxpass::toggle(&self.dir) {
+                    Ok(true) => "Host tmux keys now go to a focused sandbox shell".into(),
+                    Ok(false) => {
+                        "Host tmux keys now stay with the host tmux, also in sandbox shells".into()
+                    }
+                    Err(e) => format!("Error: could not save the setting: {e}"),
+                }
+            }
+            C::ForgetGitHost => {
+                let hosts = ghrepo::load_hosts(self.hosts_file.as_deref());
+                if hosts.is_empty() {
+                    self.status = "No git host answers are remembered".into();
+                    return;
+                }
+                let items = hosts
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "{}  ({})",
+                            e.host,
+                            e.forge
+                                .map_or("None / other: no repo access", |f| f.label())
+                        )
+                    })
+                    .collect();
+                self.select(
+                    "Forget which answer? osh asks again the next time",
+                    items,
+                    false,
+                    SelKind::ForgetHost,
+                );
+            }
         }
     }
 
@@ -3697,6 +3843,7 @@ impl App {
             title,
             detail: text,
             sandbox: None,
+            file: None,
         });
     }
 
@@ -4460,6 +4607,7 @@ impl App {
                     title: format!("Sharing {} is risky", plan.share),
                     detail: format!("{why}. Share the project folder instead."),
                     sandbox: Some(plan.name.clone()).filter(|n| !n.is_empty()),
+                    file: None,
                 });
                 format!("Access to the shared folder (RISKY: {why})")
             }
@@ -4917,7 +5065,7 @@ impl App {
         let Some(name) = self.selected_sandbox().map(|s| s.name.clone()) else {
             if matches!(
                 code,
-                KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p' | 't' | 'T')
+                KeyCode::Char('K' | 'l' | 'd' | 's' | 'S' | 'a' | 'x' | 'p' | 't' | 'T' | 'i')
                     | KeyCode::Enter
             ) {
                 self.modal = Some(Modal::Info(
@@ -4928,6 +5076,22 @@ impl App {
         };
         match code {
             KeyCode::Char('p') => self.review(name),
+            KeyCode::Char('i') => {
+                self.status = format!("Reading the settings of {name}...");
+                self.bg_msg(move || {
+                    let got = cli::os(&["sandbox", "get", &name])?;
+                    let providers = cli::attached_providers(&name);
+                    Ok(format!(
+                        "{name}: settings and effective policy (v shows it all, scrollable)\n\nProviders attached: {}\n\n{}\n\nThe image, the shared folder and the toolchain hosts are fixed when a sandbox is created; to change them, create a new sandbox (n). Providers can be attached and detached any time (a / x).",
+                        if providers.is_empty() {
+                            "none".to_string()
+                        } else {
+                            providers.join(", ")
+                        },
+                        got.trim_end()
+                    ))
+                });
+            }
             KeyCode::Char('t') => {
                 let attached = cli::attached_providers(&name);
                 let mine: Vec<ghrepo::Tracked> = self
@@ -5882,6 +6046,7 @@ mod tests {
             title: title.into(),
             detail: "look at it".into(),
             sandbox: None,
+            file: None,
         }
     }
 
@@ -6050,6 +6215,7 @@ mod tests {
         let mut a = app();
         let scoped = |sb: Option<&str>, t: &str| crate::alerts::Alert {
             sandbox: sb.map(str::to_string),
+            file: None,
             ..alert(t)
         };
         a.push_alert(scoped(Some("a"), "in a"));
@@ -7087,6 +7253,88 @@ mod tests {
     }
 
     #[test]
+    fn secret_scan_findings_are_listed_and_the_flagged_uploads_can_be_left_out() {
+        let item = |id: &str, spec: serde_json::Value| cli::SyncItem {
+            id: id.into(),
+            agents: vec![("claude-code".into(), spec)],
+            ..Default::default()
+        };
+        let manifest = cli::SyncManifest {
+            stage_dir: "/s".into(),
+            items: vec![
+                item("own:a", serde_json::json!({"src": "/s/a", "dest": "/x"})),
+                item("run:b", serde_json::json!(["echo hi"])),
+            ],
+            findings: Some(1),
+            flagged: vec![("a/secret.txt".into(), "generic-api-key".into(), 3)],
+        };
+        let sync = SyncPlan {
+            sandbox: "box".into(),
+            agent: "claude-code".into(),
+            manifest,
+            ids: vec!["own:a".into(), "run:b".into()],
+            skip: 0,
+        };
+        let mut a = app();
+        let ok = cli::SyncCheck {
+            ok: true,
+            ..Default::default()
+        };
+        a.confirm_sync(sync.clone(), ok, 0);
+        let list = items(&a);
+        assert_eq!(list[0], SECRETS_SHOW);
+        assert!(list[1].ends_with("own:a"), "{list:?}");
+        let flagged = vec!["own:a".to_string()];
+        a.modal = None;
+        a.on_select(
+            SelKind::Secrets {
+                sync: sync.clone(),
+                flagged: flagged.clone(),
+            },
+            vec![SECRETS_SHOW.into()],
+        );
+        assert!(
+            matches!(&a.modal, Some(Modal::Viewer { text, back: Some(_), .. }) if text.contains("a/secret.txt:3  generic-api-key"))
+        );
+        a.modal = None;
+        a.on_select(SelKind::Secrets { sync, flagged }, vec![list[1].clone()]);
+        let Some(Modal::Confirm {
+            kind: ConfKind::Sync(left),
+            ..
+        }) = &a.modal
+        else {
+            panic!("the rest goes on");
+        };
+        assert_eq!(left.ids, vec!["run:b"]);
+    }
+
+    #[test]
+    fn a_none_or_wrong_git_host_answer_can_be_forgotten_from_the_palette() {
+        let hosts = std::env::temp_dir().join(format!("osh-forget-{}", std::process::id()));
+        let _ = std::fs::remove_file(&hosts);
+        ghrepo::remember_host(Some(&hosts), "git.example", None, None);
+        ghrepo::remember_host(
+            Some(&hosts),
+            "lab.example",
+            Some(ghrepo::Forge::GitLab),
+            None,
+        );
+        let mut a = app();
+        a.hosts_file = Some(hosts.clone());
+        a.run_command(crate::palette::Command::ForgetGitHost);
+        let list = items(&a);
+        assert!(list
+            .iter()
+            .any(|l| l.starts_with("git.example  (None / other")));
+        a.modal = None;
+        a.on_select(SelKind::ForgetHost, vec![list[0].clone()]);
+        assert!(ghrepo::host_entry(Some(&hosts), "git.example").is_none());
+        assert!(ghrepo::host_entry(Some(&hosts), "lab.example").is_some());
+        assert!(a.status.contains("asks again"));
+        let _ = std::fs::remove_file(&hosts);
+    }
+
+    #[test]
     fn a_profile_update_that_reaches_running_sandboxes_offers_their_restart() {
         let mut a = app();
         a.on_done(Done {
@@ -7107,6 +7355,44 @@ mod tests {
         };
         assert!(text.starts_with("Profile npm is updated. box uses a provider"));
         assert_eq!(names, &["box"]);
+    }
+
+    #[test]
+    fn an_alert_about_a_shared_file_lets_the_file_be_read_inside_osh() {
+        let f = std::env::temp_dir().join(format!("osh-alert-{}", std::process::id()));
+        std::fs::write(&f, "echo hook\n").unwrap();
+        let path = f.to_string_lossy().into_owned();
+        let mut a = app();
+        a.push_alert(crate::alerts::Alert {
+            file: Some(path.clone()),
+            ..alert(".git/hooks/pre-commit appeared in app")
+        });
+        press(&mut a, KeyCode::Char('!'));
+        let list = items(&a);
+        assert_eq!(list[1], format!("View {path}"));
+        a.modal = None;
+        a.on_select(SelKind::Alerts(vec![path.clone()]), vec![list[1].clone()]);
+        assert!(
+            matches!(&a.modal, Some(Modal::Viewer { text, back: Some(_), .. }) if text == "echo hook\n")
+        );
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn renewing_credentials_asks_even_when_the_key_is_exported() {
+        std::env::set_var("OSH_TEST_RENEW_TOKEN", "stale");
+        let mut a = app();
+        a.snap.providers = vec![cli::Provider {
+            name: "p".into(),
+            keys: vec!["OSH_TEST_RENEW_TOKEN".into()],
+            ..Default::default()
+        }];
+        a.start_creds("p".into(), true, None);
+        assert!(
+            matches!(&a.modal, Some(Modal::Input { title, mask: true, .. }) if title.contains("OSH_TEST_RENEW_TOKEN")),
+            "u prompts for the new value"
+        );
+        std::env::remove_var("OSH_TEST_RENEW_TOKEN");
     }
 
     #[test]

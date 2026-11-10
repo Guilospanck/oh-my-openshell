@@ -21,6 +21,10 @@ pub enum Command {
     DataFiles,
     /// The filesystem policy every new sandbox gets (`sandbox-policy.yaml`).
     EditPolicy,
+    /// Pass the host tmux's keys to a focused sandbox shell, or not.
+    TmuxKeys,
+    /// Forget a "Which git provider hosts HOST?" answer.
+    ForgetGitHost,
 }
 
 pub struct Action {
@@ -67,6 +71,12 @@ pub const ACTIONS: &[Action] = &[
         "l",
         KeyCode::Char('l'),
         "Show the sandbox logs",
+    ),
+    a(
+        T(Tab::Sandboxes),
+        "i",
+        KeyCode::Char('i'),
+        "Show the sandbox's settings and effective policy",
     ),
     a(
         T(Tab::Sandboxes),
@@ -255,6 +265,16 @@ pub const ACTIONS: &[Action] = &[
         Global,
         "Sandbox policy: the filesystem policy of new sandboxes (sandbox-policy.yaml)",
         Command::EditPolicy,
+    ),
+    command(
+        Global,
+        "Host tmux keys in sandbox shells: switch on or off",
+        Command::TmuxKeys,
+    ),
+    command(
+        Global,
+        "Git hosts: forget a \"which git provider hosts it\" answer",
+        Command::ForgetGitHost,
     ),
 ];
 

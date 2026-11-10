@@ -1296,6 +1296,44 @@ pub struct SyncManifest {
     pub items: Vec<SyncItem>,
     /// Secret-scan findings in the staged files; `None` when gitleaks is missing.
     pub findings: Option<usize>,
+    /// Each finding: file (relative to `stage_dir`), gitleaks rule id, line.
+    pub flagged: Vec<(String, String, u64)>,
+}
+
+impl SyncManifest {
+    /// Ids of the upload items whose staged files hold a finding.
+    pub fn flagged_ids(&self) -> Vec<String> {
+        let stage = Path::new(&self.stage_dir);
+        let mut ids: Vec<String> = Vec::new();
+        for (file, _, _) in &self.flagged {
+            let at = stage.join(file);
+            for i in &self.items {
+                let hit = i.agents.iter().any(|(_, spec)| {
+                    spec["src"]
+                        .as_str()
+                        .is_some_and(|src| at.starts_with(stage.join(src)))
+                });
+                if hit && !ids.contains(&i.id) {
+                    ids.push(i.id.clone());
+                }
+            }
+        }
+        ids
+    }
+
+    /// The findings as lines for a viewer: which file, which rule, which line (values redacted).
+    pub fn findings_text(&self) -> String {
+        let mut out = String::from(
+            "The secret scan (gitleaks, values redacted) flagged these staged files:\n\n",
+        );
+        for (file, rule, line) in &self.flagged {
+            out.push_str(&format!("  {file}:{line}  {rule}\n"));
+        }
+        out.push_str("\nNothing has been uploaded. The files are copies of yours, staged in:\n  ");
+        out.push_str(&self.stage_dir);
+        out.push('\n');
+        out
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1337,6 +1375,18 @@ pub fn parse_manifest(text: &str) -> Result<SyncManifest, String> {
         stage_dir: text_of(&v["stage_dir"]),
         items,
         findings: v["secret_findings"].as_array().map(|a| a.len()),
+        flagged: v["secret_findings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|f| {
+                (
+                    text_of(&f["file"]),
+                    text_of(&f["rule"]),
+                    f["line"].as_u64().unwrap_or(0),
+                )
+            })
+            .collect(),
     })
 }
 

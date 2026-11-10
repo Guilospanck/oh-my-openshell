@@ -14,6 +14,7 @@ global | : | nav-palette
 global | q | nav-quit
 Sandboxes | Enter | sandbox-shell
 Sandboxes | l | sandbox-logs
+Sandboxes | i | sandbox-info
 Sandboxes | p | sandbox-blocked
 Sandboxes | n | sandbox-create
 Sandboxes | d | sandbox-delete

@@ -145,9 +145,63 @@ fn tmux(args: &[&str], stdin: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// Switched off from the command palette; kept as a marker file in the data dir across runs.
+static OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const OFF_FILE: &str = ".tmux-passthrough-off";
+
+/// Read the palette's choice (call once at start).
+pub fn load(dir: &std::path::Path) {
+    OFF.store(
+        dir.join(OFF_FILE).exists(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Flip the palette's choice and keep it; returns whether passing keys is now on.
+pub fn toggle(dir: &std::path::Path) -> std::io::Result<bool> {
+    let off = !OFF.load(std::sync::atomic::Ordering::Relaxed);
+    if off {
+        std::fs::write(dir.join(OFF_FILE), "")?;
+    } else {
+        match std::fs::remove_file(dir.join(OFF_FILE)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+    }
+    OFF.store(off, std::sync::atomic::Ordering::Relaxed);
+    Ok(!off)
+}
+
 fn enabled() -> bool {
     std::env::var_os("TMUX").is_some()
         && std::env::var("OSH_TMUX_PASSTHROUGH").as_deref() != Ok("0")
+        && !OFF.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// At start: an osh that crashed with a shell focused left its window flagged and the host
+/// prefix handed over. Clear this window's flag, then give the prefix back the way quitting does
+/// (still kept when another osh window has a focused shell).
+pub fn recover() {
+    if std::env::var_os("TMUX").is_none() {
+        return;
+    }
+    if let Ok(pane) = std::env::var("TMUX_PANE") {
+        tmux(&["set-option", "-w", "-t", &pane, "-u", "@osh_focus"], None);
+    }
+    let (_, table, prefix, saved) = state();
+    if saved.is_empty() {
+        return;
+    }
+    if tmux(&["list-windows", "-a", "-F", "#{@osh_focus}"], None)
+        .lines()
+        .any(|l| l == "1")
+    {
+        return;
+    }
+    let script = release_script(&table, &prefix, &saved);
+    if !script.is_empty() {
+        tmux(&["source-file", "-"], Some(&script));
+    }
 }
 
 fn state() -> (String, String, String, String) {
@@ -161,7 +215,7 @@ fn state() -> (String, String, String, String) {
 }
 
 /// A shell takes focus (`on`) or the dashboard gets it back: the host's keys go to this
-/// window's pane only while `on`. `OSH_TMUX_PASSTHROUGH=0` turns it off.
+/// window's pane only while `on`. The palette (or `OSH_TMUX_PASSTHROUGH=0`) turns it off.
 pub fn focus(on: bool) {
     let (true, Ok(pane)) = (enabled(), std::env::var("TMUX_PANE")) else {
         return;
@@ -198,6 +252,21 @@ pub fn release() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_palette_switch_is_kept_in_the_data_dir() {
+        let d = std::env::temp_dir().join(format!("osh-tp-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        super::load(&d);
+        assert!(!super::toggle(&d).unwrap(), "first press turns it off");
+        assert!(d.join(super::OFF_FILE).exists());
+        super::load(&d);
+        assert!(super::OFF.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(super::toggle(&d).unwrap(), "and back on");
+        assert!(!d.join(super::OFF_FILE).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     use super::*;
 
     const ROOT: &str = "bind-key    -T root         M-h                if-shell -F \"#{pane_at_left}\" \"previous-window\" \"select-pane -L\"\n\

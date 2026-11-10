@@ -931,6 +931,24 @@ pub fn remember_host(
     let _ = std::fs::write(file, text);
 }
 
+/// Drop the answer for `host` (an older Forgejo answer too), so osh asks again next time.
+pub fn forget_host(file: Option<&std::path::Path>, host: &str) {
+    let Some(file) = file else { return };
+    for f in [file.to_path_buf(), legacy_hosts_path(file)] {
+        let Ok(text) = std::fs::read_to_string(&f) else {
+            continue;
+        };
+        let kept: String = text
+            .lines()
+            .filter(|l| l.split('\t').next() != Some(host))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        if kept != text {
+            let _ = std::fs::write(&f, kept);
+        }
+    }
+}
+
 pub fn load_tracked(file: Option<&std::path::Path>) -> Vec<Tracked> {
     file.and_then(|f| std::fs::read_to_string(f).ok())
         .map(|t| parse_tracked(&t))

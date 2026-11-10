@@ -559,6 +559,16 @@ def sandbox_logs():
         assert "PHASE" not in o.text().splitlines()[0], "the log view takes the screen"
         o.press("q"); o.wait("PHASE", 10)
 
+@scenario("sandbox-info")
+def sandbox_info():
+    """i shows the sandbox's settings and its effective policy (the PTY grant osh adds)."""
+    ensure_sandbox()
+    with dashboard() as o:
+        select_sandbox(o)
+        o.press("i"); o.wait("settings and effective policy", 30)
+        o.press("v"); o.wait("filesystem_policy", 10)
+        o.press("esc"); o.press("esc"); o.wait("PHASE", 10)
+
 @scenario("sandbox-blocked")
 def sandbox_blocked():
     ensure_sandbox()

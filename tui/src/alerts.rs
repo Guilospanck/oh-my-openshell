@@ -26,6 +26,8 @@ pub struct Alert {
     pub detail: String,
     /// The sandbox this is about; `None` is shown on the dashboard only, never inside a shell.
     pub sandbox: Option<String>,
+    /// The file the alert is about, for the alerts list to show inside osh.
+    pub file: Option<String>,
 }
 
 /// Folders under `$HOME` that hold secrets or tool configuration the host trusts.
@@ -351,8 +353,9 @@ pub fn diff(folder: &str, old: &Scan, new: &Scan) -> Vec<Alert> {
                 sev: *sev,
                 title: format!("{path} {verb} in {folder}"),
                 detail: format!(
-                    "{why}. Look at it before you run git, make, npm or open an editor in {folder} on this machine (git diff, cat {path})."
+                    "{why}. Look at it before you run git, make, npm or open an editor in {folder} on this machine: the alerts list (!) shows the file."
                 ),
+                file: Some(path.to_string()),
             }
         })
         .collect()
@@ -473,6 +476,10 @@ pub fn spawn_watch(data: PathBuf, tx: Sender<Alert>, every: Duration) {
                         for o in &owners {
                             let a = Alert {
                                 sandbox: o.map(str::to_string),
+                                file: a
+                                    .file
+                                    .as_ref()
+                                    .map(|f| root.join(f).to_string_lossy().into_owned()),
                                 ..a.clone()
                             };
                             if tx.send(a).is_err() {
@@ -546,7 +553,10 @@ mod tests {
         assert!(alerts[0]
             .title
             .contains(".git/hooks/pre-commit appeared in app"));
-        assert!(alerts[0].detail.contains("git diff"));
+        assert!(alerts[0]
+            .detail
+            .contains("the alerts list (!) shows the file"));
+        assert!(alerts[0].file.is_some());
         let _ = fs::remove_dir_all(&d);
     }
 

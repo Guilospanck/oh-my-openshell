@@ -107,10 +107,12 @@ A few actions have no key and live only in the palette:
 | `Editor: switch auto / your own / built-in` | which editor the edit actions use: `auto` (yours when one is found, else the built-in one), always yours, or always the built-in one (kept across runs in `editor-mode` in the data folder) |
 | `Data files` | every file osh keeps in its data folder: view, edit, compare with the shipped default, restore it, delete; new profile or Dockerfile |
 | `Sandbox policy` | the same actions for `sandbox-policy.yaml`, the filesystem policy every new sandbox gets (checked as YAML with a `version` on save) |
+| `Host tmux keys in sandbox shells` | switches passing the host tmux's keys to a focused shell on or off (kept across runs) |
+| `Git hosts: forget an answer` | drops a remembered "which git provider hosts HOST?" answer, `None / other` included, so osh asks again |
 
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), blocked requests (`p`), renew a repo token (`t`), install skills and plugins (`K`, below), transfer state to another sandbox (`T`: copies the home directory, workspace and tool caches through a temp folder on the host; same-path files are overwritten; system packages cannot move, so put those in the image) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), settings and effective policy (`i`; the image, shared folder and toolchain hosts are fixed at creation), blocked requests (`p`), renew a repo token (`t`), install skills and plugins (`K`, below), transfer state to another sandbox (`T`: copies the home directory, workspace and tool caches through a temp folder on the host; same-path files are overwritten; system packages cannot move, so put those in the image) |
 | Providers | create from a `providers/*.yaml` profile or a read/write repo token for GitHub, GitLab, Bitbucket or Forgejo (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`; the file is linted first, and an update that reaches running sandboxes offers to restart them), the file's actions (`e`: view, edit, compare with the shipped default or the gateway's copy, restore, delete; save the gateway's copy as a file; delete the profile from the gateway), a new profile from a template (`n`). `.yml` files count too |
 | Images | build `images/Dockerfile-*` (`b`); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from) |
@@ -118,55 +120,6 @@ A few actions have no key and live only in the palette:
 
 Credentials are read from the environment when exported, else prompted hidden;
 they never go through argv. The footer shows the keys for the current tab.
-
-### Editing files
-
-Every "edit this file" action opens your own editor inside osh's terminal (the one sandbox shells
-use), full screen above a status bar, so osh keeps running and its alerts still show. The editor is
-`$VISUAL`, else `$EDITOR` (arguments and quotes are split as a shell would, without running one,
-so `EDITOR="code --wait"` works), else the first of `nvim`, `vim`, `nano`, `vi` on `PATH`; a
-variable naming a program that is not there is skipped. osh hands the editor a copy of the file in
-a private temporary folder (mode 0700, the file 0600, with the real file name so the editor picks
-the syntax), and when the editor exits it reads the copy back: unchanged, or an editor that exits
-with an error, writes nothing; otherwise the file's check runs (the same checks as below) and only
-a file that passes replaces the real one. When the check fails a box shows the first line of the
-error; `Enter` or `r` reopens the editor on your edits, `d` discards them. The temporary folder is
-removed afterwards in every case. When no editor is found, or it does not start, osh opens its
-built-in editor instead and its status bar says why. The palette's `Editor: switch auto / your own
-/ built-in` forces one or the other (with "your own" forced and none found, osh says so and opens
-nothing).
-
-### Built-in editor
-
-The fallback editor runs inside the TUI with no outside program.
-Edit actions open it (when your editor is not used) with `Edit toolchains.toml` from the command palette (`:`) or from the toolchain pickers
-(new sandbox, and `Open the toolchain hosts` in the `Ctrl-]` menu; after either editor closes the picker comes
-back with the fresh groups), on any file under `Data files` or `Sandbox policy`, with `e` / `n` on the
-Profiles and Images tabs, and with `e` on the Gateways tab. Saving checks the file first:
-`toolchains.toml` must parse as TOML with exact host names, `sandbox-policy.yaml` must be YAML with a
-`version`, a profile must be YAML with an `id` and pass OpenShell's `profile lint`, a Dockerfile must
-start with `FROM`, other TOML and YAML files must parse; when it does not, nothing is written, the status bar shows the first line of the error and the
-cursor jumps to the line it names, so you fix it and save again. Closing with unsaved changes asks
-whether to save, discard or keep editing.
-
-| Key | What it does |
-| --- | --- |
-| `Ctrl-S` | Save (the file is checked first; a broken file is not written) |
-| `Esc` / `Ctrl-Q` | Close; asks to save or discard unsaved changes (`Esc` first clears a selection) |
-| Arrows, `Home` / `End`, `Ctrl-A` / `Ctrl-E` | Move; `Home` goes to the first non-blank, then the line start |
-| `Ctrl-Left` / `Ctrl-Right` (`Alt-b` / `Alt-f`) | Word left / right |
-| `PgUp` / `PgDn`, `Ctrl-Home` / `Ctrl-End` | Page; file start and end |
-| `Shift` + any move | Select; `Ctrl-Space` sets a mark so plain moves select; `Alt-a` selects all |
-| `Ctrl-C` / `Ctrl-X` / `Ctrl-V` | Copy, cut, paste; with nothing selected they take the whole line |
-| `Ctrl-Z` / `Ctrl-Y` | Undo / redo (a run of typing is one step) |
-| `Ctrl-K` / `Ctrl-W` (`Alt-Backspace`), `Alt-d` | Cut to the line end; delete the word before / after |
-| `Enter`, `Tab` / `Shift-Tab` | New line with the same indent; indent / outdent by two spaces (the selected lines too) |
-| `Ctrl-F`, then `Ctrl-N` / `Ctrl-P` (or `F3` / `Shift-F3`) | Find as you type (a capital letter makes it case-sensitive); next and previous, wrapping |
-| `Ctrl-G` | Go to a line, or `line:col` |
-
-Copy also puts the text on your computer's clipboard (OSC 52 through the terminal, plus `pbcopy` on
-macOS, as the shells do); `Ctrl-V` pastes the editor's own clipboard, and your terminal's paste
-(`Cmd-V`) arrives as one paste. Wide and combined characters count as the columns they take.
 
 ### Embedded shells
 
@@ -328,13 +281,13 @@ on a real Linux desktop.
 
 ## Claude Code provider
 
-1. `claude setup-token` on the host and export `CLAUDE_CODE_OAUTH_TOKEN`.
-2. In `osh`, Providers, `n`, pick `claude-code`.
-3. Create a sandbox with that provider and attach.
+1. In `osh`, Providers, `n`, pick `claude-code`, then `Generate a new token` (osh runs
+   `claude setup-token` and asks you to paste what it prints) or `Paste an existing token`.
+2. Create a sandbox with that provider and attach.
 
 The real token stays outside the sandbox; only `api.anthropic.com` is
-allowed. Tokens expire and are not refreshed: generate a new one and use `u`
-in Providers.
+allowed. Tokens expire and are not refreshed: use `u` in Providers, which always asks for the
+new token (an exported `CLAUDE_CODE_OAUTH_TOKEN` is not reused there).
 
 ## Skills and plugins in a sandbox
 
@@ -344,7 +297,8 @@ the sandbox's network policy first and lists any missing access. Items are
 reinstalled from their sources (`npx skills`, `claude plugin install`,
 `pi install`, graphify from PyPI); only your own skills, `CLAUDE.md` and your host `tmux.conf`
 (to `~/.tmux.conf` in the sandbox, so its tmux has your prefix and bindings) are
-uploaded, after a secret scan (findings block the upload). The OpenShell skills
+uploaded, after a secret scan (findings stop the upload: osh lists each file, rule and line, and
+offers to go on without the flagged items). The OpenShell skills
 and the language-server plugins are left out. Versions are pinned: the `skills`
 CLI to `SKILLS_CLI` in `tui/src/agents.rs`, graphify to the host's version, and
 superpowers for pi to the commit installed on the host.
