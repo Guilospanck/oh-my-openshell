@@ -25,7 +25,7 @@
 # Credential scope:  none. PyPI access here is anonymous.
 # Endpoint access:   pypi.org and files.pythonhosted.org for packages;
 #                    downloads.python.org for interpreters; github.com,
-#                    api.github.com and objects.githubusercontent.com for
+#                    api.github.com and release-assets.githubusercontent.com for
 #                    sdists that build from a Git source.
 # Smoke test:        openshell sandbox create --provider <name> -- \
 #                      python -m pip download --no-deps -d /tmp/wheels requests
@@ -51,7 +51,7 @@ endpoints:
       - allow: { method: HEAD, path: "**" }
       - allow: { method: OPTIONS, path: "**" }
       - allow: { method: POST, path: "/**/git-upload-pack" }
-  - host: objects.githubusercontent.com
+  - host: release-assets.githubusercontent.com
     port: 443
   - host: api.github.com
     port: 443
