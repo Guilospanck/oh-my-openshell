@@ -1,5 +1,6 @@
 //! Static data compiled into the binary and written to the data directory, so a lone `osh`
 //! needs no checkout. The layout matches the repo root, which is what `OSH_DIR` points at in dev.
+use saphyr::LoadableYamlNode;
 use serde_json::{Map, Value};
 use std::{
     fs, io,
@@ -249,26 +250,25 @@ pub fn remove(dir: &Path, rel: &str) -> io::Result<()> {
 
 /// The text parses as YAML (duplicate keys included, which OpenShell would reject or drop).
 pub fn check_yaml(text: &str) -> Result<(), String> {
-    yaml_rust2::YamlLoader::load_from_str(text)
+    saphyr::Yaml::load_from_str(text)
         .map(|_| ())
         .map_err(|e| e.to_string())
 }
 
 /// `sandbox-policy.yaml`: YAML, a mapping, with the `version` OpenShell requires.
 pub fn check_policy(text: &str) -> Result<(), String> {
-    let docs = yaml_rust2::YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
+    let docs = saphyr::Yaml::load_from_str(text).map_err(|e| e.to_string())?;
     let doc = docs.first().ok_or("the policy is empty")?;
-    if doc.as_hash().is_none() {
+    if doc.as_mapping().is_none() {
         return Err("the policy must be a mapping (version:, filesystem_policy:, ...)".into());
     }
-    if doc["version"].is_badvalue() {
+    if doc.as_mapping_get("version").is_none() {
         return Err("the policy needs a version: line (version: 1)".into());
     }
-    if !doc["network_policies"].is_badvalue()
-        && !doc["network_policies"].is_null()
-        && doc["network_policies"].as_hash().is_none()
-    {
-        return Err("network_policies must map policy names to policies".into());
+    if let Some(n) = doc.as_mapping_get("network_policies") {
+        if !n.is_null() && n.as_mapping().is_none() {
+            return Err("network_policies must map policy names to policies".into());
+        }
     }
     Ok(())
 }
@@ -480,6 +480,16 @@ pub fn materialize(dir: &Path) -> io::Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_yaml_rejects_duplicate_keys_and_survives_deep_nesting() {
+        assert!(check_yaml("a: 1\nb: 2\n").is_ok());
+        assert!(check_yaml("a: 1\na: 2\n").is_err(), "duplicate keys");
+        assert!(check_yaml("a: [\n").is_err(), "broken YAML");
+        // A pathologically nested file must give an error or pass, never overflow the stack.
+        let deep = format!("{}1{}", "[".repeat(100_000), "]".repeat(100_000));
+        let _ = check_yaml(&deep);
+    }
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("osh-assets-{name}-{}", std::process::id()));

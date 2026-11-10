@@ -2,6 +2,7 @@
 use crate::agents;
 use crate::ghrepo::{self, Forge, GhRepo, Tracked};
 use crate::platform::{self, Runtime};
+use saphyr::LoadableYamlNode;
 use serde_json::Value;
 use std::{
     fs,
@@ -429,9 +430,13 @@ pub fn profile_path(dir: &Path, id: &str) -> PathBuf {
 /// (read-only) when the CLI is there. "Already exists" is not a problem for a file being edited,
 /// and a lint that cannot reach the gateway does not block the save.
 pub fn check_profile(text: &str) -> Result<(), String> {
-    let docs = yaml_rust2::YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
+    let docs = saphyr::Yaml::load_from_str(text).map_err(|e| e.to_string())?;
     let doc = docs.first().ok_or("the profile is empty")?;
-    if doc["id"].as_str().is_none_or(str::is_empty) {
+    if doc
+        .as_mapping_get("id")
+        .and_then(|v| v.as_str())
+        .is_none_or(str::is_empty)
+    {
         return Err("a profile needs an id: line (the name it is imported under)".into());
     }
     if cfg!(test) || !have("openshell") {
@@ -924,12 +929,17 @@ pub fn env_keys_of(body: &str) -> Vec<String> {
     if body.contains("${FORGEJO_HOST}") {
         keys.push("FORGEJO_HOST".to_string());
     }
-    if let Ok(docs) = yaml_rust2::YamlLoader::load_from_str(body) {
-        if let Some(creds) = docs.first().and_then(|d| d["credentials"].as_vec()) {
+    if let Ok(docs) = saphyr::Yaml::load_from_str(body) {
+        if let Some(creds) = docs
+            .first()
+            .and_then(|d| d.as_mapping_get("credentials"))
+            .and_then(|c| c.as_sequence())
+        {
             for c in creds {
-                let first = match &c["env_vars"] {
-                    yaml_rust2::Yaml::Array(a) => a.first().and_then(|v| v.as_str()),
-                    v => v.as_str(),
+                let first = match c.as_mapping_get("env_vars") {
+                    Some(saphyr::Yaml::Sequence(a)) => a.first().and_then(|v| v.as_str()),
+                    Some(v) => v.as_str(),
+                    None => None,
                 };
                 if let Some(k) = first.filter(|k| !k.is_empty()) {
                     keys.push(k.to_string());

@@ -14,4 +14,4 @@ serde_json = "1.0.154"
 toml = "1.2.1"
 unicode-segmentation = "1.13.3"
 unicode-width = "0.2.2"
-yaml-rust2 = { version = "0.13.0", default-features = false }
+saphyr = { version = "0.3.3", default-features = false }
