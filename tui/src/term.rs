@@ -652,6 +652,8 @@ pub struct Session {
     /// When the child was seen gone; output still queued gets a moment to arrive.
     reaped: Option<Instant>,
     pub exited: bool,
+    /// Whether the program exited with status 0, once it was reaped.
+    pub success: Option<bool>,
     /// A left-drag is selecting text; it is drawn reversed and copied on release.
     selecting: bool,
     /// Set once an image was pasted into this sandbox, so closing the last shell cleans up.
@@ -845,6 +847,7 @@ impl Session {
             rx,
             reaped: None,
             exited: false,
+            success: None,
             selecting: false,
             pasted: Arc::new(AtomicBool::new(false)),
         })
@@ -868,7 +871,8 @@ impl Session {
         }
         if self.reaped.is_none() {
             if let Some(c) = &mut self.child {
-                if matches!(c.try_wait(), Ok(Some(_))) {
+                if let Ok(Some(st)) = c.try_wait() {
+                    self.success = Some(st.success());
                     self.reaped = Some(Instant::now());
                 }
             }
@@ -974,6 +978,20 @@ impl Session {
             }
         }
         None
+    }
+
+    /// Whether the program exited with status 0. The output can end (the PTY closes) a moment
+    /// before the child is reaped, so this waits up to a second for the status.
+    pub fn wait_exit(&mut self) -> Option<bool> {
+        let end = Instant::now() + Duration::from_secs(1);
+        while self.success.is_none() && Instant::now() < end {
+            match self.child.as_mut().map(|c| c.try_wait()) {
+                Some(Ok(Some(st))) => self.success = Some(st.success()),
+                Some(Ok(None)) => thread::sleep(Duration::from_millis(10)),
+                _ => break,
+            }
+        }
+        self.success
     }
 
     /// Channel into the shell's input, for a thread that types after the UI moved on.

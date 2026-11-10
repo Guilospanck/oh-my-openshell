@@ -165,6 +165,48 @@ pub fn creation_policy(base: &str, groups: &[Group]) -> String {
     out
 }
 
+/// Hosts in the list that are not used because they are not exact names (wildcards, addresses,
+/// junk), so the editor and the picker can say so instead of dropping them silently.
+pub fn skipped_hosts(text: &str) -> Vec<String> {
+    let Ok(table) = text.parse::<toml::Table>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for v in table.values().filter_map(toml::Value::as_table) {
+        for key in ["hosts", "git_hosts"] {
+            for h in v
+                .get(key)
+                .and_then(toml::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(toml::Value::as_str)
+            {
+                if !crate::cli::valid_host(h) || h.contains('*') || crate::watch::is_ip(h) {
+                    out.push(h.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The editor's check for `toolchains.toml`: valid TOML, and every host an exact name.
+pub fn check(text: &str) -> Result<(), String> {
+    parse(text)?;
+    match skipped_hosts(text).first() {
+        Some(h) => {
+            let line = text
+                .lines()
+                .position(|l| l.contains(&format!("\"{h}\"")))
+                .map_or(String::new(), |i| format!(" at line {}", i + 1));
+            Err(format!(
+                "{h:?}{line} is not an exact host name: OpenShell allows no wildcards or addresses here"
+            ))
+        }
+        None => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -315,5 +357,15 @@ enabled = true"
             ),
             "version: 1\n"
         );
+    }
+
+    #[test]
+    fn wildcard_and_address_hosts_are_named_and_the_editor_check_refuses_them() {
+        let text = "[a]\nhosts = [\"ok.example\", \"*.bad\"]\ngit_hosts = [\"10.0.0.1\"]\n";
+        assert_eq!(skipped_hosts(text), vec!["*.bad", "10.0.0.1"]);
+        let e = check(text).unwrap_err();
+        assert!(e.contains("*.bad") && e.contains("line 2"), "{e}");
+        assert!(check("[a]\nhosts = [\"ok.example\"]\n").is_ok());
+        assert!(check("not toml [").is_err());
     }
 }

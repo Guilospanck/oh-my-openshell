@@ -13,6 +13,8 @@ KEYS = {
     "enter": "\r", "esc": "\x1b", "tab": "\t", "backtab": "\x1b[Z", "up": "\x1b[A", "down": "\x1b[B",
     "right": "\x1b[C", "left": "\x1b[D", "space": " ", "backspace": "\x7f",
     "ctrl-]": "\x1d", "ctrl-5": "\x1d", "ctrl-c": "\x03",
+    "ctrl-s": "\x13", "ctrl-z": "\x1a", "ctrl-f": "\x06", "ctrl-g": "\x07",
+    "end": "\x1b[F", "ctrl-end": "\x1b[1;5F",
 }
 
 

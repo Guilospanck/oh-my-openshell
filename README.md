@@ -93,6 +93,12 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 Two keys help you find your way on any tab: `?` opens the key reference for the tab you are on, and
 `:` (or `Ctrl-P`) opens the command palette, where you type a few letters of any action (`del`, `go to g`) and
 press `Enter` to run it. The palette sends the action's own key, so it does exactly what the key does.
+A few actions have no key and live only in the palette:
+
+| Palette action | What it does |
+| --- | --- |
+| `Edit toolchains.toml` | opens the list of toolchain hosts in your editor, or the built-in one (below) |
+| `Editor: switch auto / your own / built-in` | which editor the edit actions use: `auto` (yours when one is found, else the built-in one), always yours, or always the built-in one (kept across runs in `editor-mode` in the data folder) |
 
 | Tab | What you can do |
 | --- | --- |
@@ -104,6 +110,55 @@ press `Enter` to run it. The palette sends the action's own key, so it does exac
 
 Credentials are read from the environment when exported, else prompted hidden;
 they never go through argv. The footer shows the keys for the current tab.
+
+### Editing files
+
+Every "edit this file" action opens your own editor inside osh's terminal (the one sandbox shells
+use), full screen above a status bar, so osh keeps running and its alerts still show. The editor is
+`$VISUAL`, else `$EDITOR` (arguments and quotes are split as a shell would, without running one,
+so `EDITOR="code --wait"` works), else the first of `nvim`, `vim`, `nano`, `vi` on `PATH`; a
+variable naming a program that is not there is skipped. osh hands the editor a copy of the file in
+a private temporary folder (mode 0700, the file 0600, with the real file name so the editor picks
+the syntax), and when the editor exits it reads the copy back: unchanged, or an editor that exits
+with an error, writes nothing; otherwise the file's check runs (the same checks as below) and only
+a file that passes replaces the real one. When the check fails a box shows the first line of the
+error; `Enter` or `r` reopens the editor on your edits, `d` discards them. The temporary folder is
+removed afterwards in every case. When no editor is found, or it does not start, osh opens its
+built-in editor instead and its status bar says why. The palette's `Editor: switch auto / your own
+/ built-in` forces one or the other (with "your own" forced and none found, osh says so and opens
+nothing).
+
+### Built-in editor
+
+The fallback editor runs inside the TUI with no outside program.
+Edit actions open it (when your editor is not used) with `Edit toolchains.toml` from the command palette (`:`) or from the toolchain pickers
+(new sandbox, and `Open the toolchain hosts` in the `Ctrl-]` menu; after either editor closes the picker comes
+back with the fresh groups), on any file under `Data files` or `Sandbox policy`, with `e` / `n` on the
+Profiles and Images tabs, and with `e` on the Gateways tab. Saving checks the file first:
+`toolchains.toml` must parse as TOML with exact host names, `sandbox-policy.yaml` must be YAML with a
+`version`, a profile must be YAML with an `id` and pass OpenShell's `profile lint`, a Dockerfile must
+start with `FROM`, other TOML and YAML files must parse; when it does not, nothing is written, the status bar shows the first line of the error and the
+cursor jumps to the line it names, so you fix it and save again. Closing with unsaved changes asks
+whether to save, discard or keep editing.
+
+| Key | What it does |
+| --- | --- |
+| `Ctrl-S` | Save (the file is checked first; a broken file is not written) |
+| `Esc` / `Ctrl-Q` | Close; asks to save or discard unsaved changes (`Esc` first clears a selection) |
+| Arrows, `Home` / `End`, `Ctrl-A` / `Ctrl-E` | Move; `Home` goes to the first non-blank, then the line start |
+| `Ctrl-Left` / `Ctrl-Right` (`Alt-b` / `Alt-f`) | Word left / right |
+| `PgUp` / `PgDn`, `Ctrl-Home` / `Ctrl-End` | Page; file start and end |
+| `Shift` + any move | Select; `Ctrl-Space` sets a mark so plain moves select; `Alt-a` selects all |
+| `Ctrl-C` / `Ctrl-X` / `Ctrl-V` | Copy, cut, paste; with nothing selected they take the whole line |
+| `Ctrl-Z` / `Ctrl-Y` | Undo / redo (a run of typing is one step) |
+| `Ctrl-K` / `Ctrl-W` (`Alt-Backspace`), `Alt-d` | Cut to the line end; delete the word before / after |
+| `Enter`, `Tab` / `Shift-Tab` | New line with the same indent; indent / outdent by two spaces (the selected lines too) |
+| `Ctrl-F`, then `Ctrl-N` / `Ctrl-P` (or `F3` / `Shift-F3`) | Find as you type (a capital letter makes it case-sensitive); next and previous, wrapping |
+| `Ctrl-G` | Go to a line, or `line:col` |
+
+Copy also puts the text on your computer's clipboard (OSC 52 through the terminal, plus `pbcopy` on
+macOS, as the shells do); `Ctrl-V` pastes the editor's own clipboard, and your terminal's paste
+(`Cmd-V`) arrives as one paste. Wide and combined characters count as the columns they take.
 
 ### Embedded shells
 

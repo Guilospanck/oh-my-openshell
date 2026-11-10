@@ -237,6 +237,10 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn draw_screen(f: &mut Frame, app: &App) {
+    if let Some(Modal::ExtEdit { run, .. }) = &app.modal {
+        draw_ext_edit(f, app, run);
+        return;
+    }
     if let Some(s) = app.session() {
         draw_session(f, app, s);
         if let Some(m) = &app.modal {
@@ -1015,6 +1019,11 @@ pub fn help_lines(tab: Tab) -> Vec<Line<'static>> {
     out.push(key_row("f", "Follow the end of the log"));
     out.push(key_row("s", "Change the log source"));
     out.push(key_row("h / l", "Pan sideways; q closes"));
+    out.push(Line::default());
+    out.push(section("In the editor"));
+    for (k, what) in crate::editor::KEYS {
+        out.push(key_row(k, what));
+    }
     out
 }
 
@@ -1162,6 +1171,9 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
                 "j/k PgUp/PgDn g/G scroll · Esc close",
             );
         }
+        Modal::Editor { ed, .. } => crate::editor::draw(f, screen, ed),
+        // Drawn by `draw_ext_edit`, over the whole screen.
+        Modal::ExtEdit { .. } => {}
         Modal::Viewer {
             title,
             text,
@@ -1317,6 +1329,72 @@ fn prefix(line: Line<'static>, pad: &str) -> Line<'static> {
     let mut spans = vec![Span::raw(pad.to_string())];
     spans.extend(line.spans);
     Line::from(spans)
+}
+
+/// The user's editor fills the screen above a status bar naming the file; after a failed check
+/// a box says why and offers to reopen the editor or discard the edits.
+fn draw_ext_edit(f: &mut Frame, app: &App, run: &crate::exted::Run) {
+    let area = f.area();
+    let pane = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
+    let bar = Rect::new(area.x, pane.bottom(), area.width, area.height - pane.height);
+    let prog = run.editor.program();
+    if let Some(s) = &run.session {
+        if let Some(p) = s.vt.render(pane, f.buffer_mut()) {
+            f.set_cursor_position(p);
+        }
+    } else {
+        let w = popup_width(area.width, 76);
+        let mut lines = wrap_text(
+            run.error.as_deref().unwrap_or("The check failed"),
+            text_cols(w),
+        );
+        lines.push(Line::raw(""));
+        lines.extend(wrap_text(
+            &format!("Your edits are kept. Enter or r opens them in {prog} again; d discards them and leaves {} as it was.", run.name),
+            text_cols(w),
+        ));
+        let lines: Vec<Line> = lines
+            .into_iter()
+            .enumerate()
+            .map(|(i, l)| {
+                if i == 0 {
+                    l.style(Style::default().fg(role::ERR))
+                } else {
+                    l
+                }
+            })
+            .collect();
+        let r = centered(area, w, lines.len() as u16 + 2);
+        f.render_widget(Clear, r);
+        f.render_widget(
+            Paragraph::new(lines).block(frame(
+                &format!("{} is not valid: not saved", run.name),
+                "Enter/r reopen · d discard",
+                role::ERR,
+            )),
+            r,
+        );
+    }
+    let base = Style::default()
+        .fg(Color::Indexed(250))
+        .bg(Color::Indexed(236));
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", run.name),
+            base.fg(role::ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {prog} ({}) ", run.editor.from), base),
+    ];
+    if let Some(m) = app.flash().filter(|m| !m.is_empty() && *m != "Ready") {
+        spans.extend(status_spans(app, m, base, Color::Green));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)).style(base), bar);
+    let hint = "save and quit the editor: osh checks, then writes ";
+    let w = (hint.chars().count() as u16).min(bar.width);
+    f.render_widget(
+        Paragraph::new(hint).style(base.fg(Color::Indexed(244))),
+        Rect::new(bar.right() - w, bar.y, w, bar.height),
+    );
 }
 
 /// The shell fills the screen above a one-row status bar; the cursor is shown only with focus.

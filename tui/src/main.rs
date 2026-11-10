@@ -6,6 +6,8 @@ mod app;
 mod assets;
 mod cli;
 mod clip;
+mod editor;
+mod exted;
 mod gateway;
 mod ghrepo;
 mod gwmodel;
@@ -590,6 +592,9 @@ fn main() -> io::Result<()> {
     let mut terminal = ratatui::init();
     let keys = host_keys(supports_keyboard_enhancement().unwrap_or(false));
     let mut captured = false;
+    // Bracketed paste is on with a focused shell (host_modes) and while the editor is open, so a
+    // pasted block arrives as one paste, not as typed keys that Enter would auto-indent.
+    let mut pasting = false;
     let result = (|| -> io::Result<()> {
         while !app.quit {
             if let Some(lv) = &mut app.logview {
@@ -601,10 +606,22 @@ fn main() -> io::Result<()> {
                 app.push_alert(a);
             }
             app.tick();
-            let focused = app.active.is_some();
+            // The user's editor runs in osh's terminal too, so it is handled like a shell.
+            let focused = app.active.is_some() || app.ext_editing();
             if focused != captured {
                 host_modes(focused, keys);
                 captured = focused;
+                pasting = focused;
+            }
+            let paste = focused || app.editing();
+            if paste != pasting {
+                let mut out = io::stdout();
+                let _ = if paste {
+                    execute!(out, EnableBracketedPaste)
+                } else {
+                    execute!(out, DisableBracketedPaste)
+                };
+                pasting = paste;
             }
             if focused {
                 let size = terminal.size()?;
@@ -623,7 +640,10 @@ fn main() -> io::Result<()> {
                 loop {
                     match event::read()? {
                         Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
-                        Event::Key(k) if k.kind == KeyEventKind::Repeat && app.active.is_some() => {
+                        Event::Key(k)
+                            if k.kind == KeyEventKind::Repeat
+                                && (app.active.is_some() || app.editing()) =>
+                        {
                             app.on_key(k)
                         }
                         Event::Mouse(m) => app.on_mouse(m),
@@ -653,6 +673,7 @@ fn main() -> io::Result<()> {
                 if captured {
                     host_modes(false, keys);
                     captured = false;
+                    pasting = false;
                 }
                 let failed = run_steps(steps, app.capture, app.job_prints_secret());
                 terminal = ratatui::init();
@@ -665,6 +686,7 @@ fn main() -> io::Result<()> {
                 if captured {
                     host_modes(false, keys);
                     captured = false;
+                    pasting = false;
                 }
                 let data = app.dir.clone();
                 match wizard::run(&mut terminal, wizard::open(mode, &data), &data) {
@@ -683,6 +705,8 @@ fn main() -> io::Result<()> {
     })();
     if captured {
         host_modes(false, keys);
+    } else if pasting {
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
     }
     tmuxpass::release();
     ratatui::restore();

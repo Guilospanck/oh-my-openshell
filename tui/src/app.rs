@@ -60,6 +60,7 @@ fn unfit(remote: &ghrepo::Remote, forge: Option<ghrepo::Forge>) -> String {
     }
 }
 
+const TOOLCHAINS_FILE: &str = "toolchains.toml";
 const GH_REPO_ITEM: &str = "Git repo, read/write (GitHub, GitLab, Bitbucket or Forgejo token)...";
 
 #[derive(Clone, Default)]
@@ -201,6 +202,12 @@ pub enum SelKind {
     },
 }
 
+/// Where to go once the editor closes: back to the picker that opened it, with the fresh file.
+#[derive(Clone)]
+pub enum EditThen {
+    Nothing,
+}
+
 #[derive(Clone)]
 pub enum InKind {
     OtherImage,
@@ -326,6 +333,16 @@ pub enum Modal {
         sandbox: String,
         perms: Vec<cli::ProviderPerm>,
         scroll: u16,
+    },
+    /// The built-in editor over the whole screen; `then` runs once it closes.
+    Editor {
+        ed: Box<crate::editor::Editor>,
+        then: EditThen,
+    },
+    /// The user's own editor in osh's terminal over the whole screen; `then` runs once it is done.
+    ExtEdit {
+        run: Box<crate::exted::Run>,
+        then: EditThen,
     },
     /// Read-only scrollable text; `back` is shown again when it closes.
     Viewer {
@@ -1316,6 +1333,7 @@ impl App {
 
     /// Feed every shell's output to its terminal, focused or not, and drop ended ones.
     pub fn pump_sessions(&mut self) {
+        self.pump_ext_editor();
         let mut copy = None;
         for (i, s) in self.sessions.iter_mut().enumerate() {
             s.pump();
@@ -1347,9 +1365,15 @@ impl App {
         for s in &mut self.sessions {
             s.resize(cols, rows);
         }
+        if let Some(s) = self.ext_session() {
+            s.resize(cols, rows);
+        }
     }
 
     pub fn on_mouse(&mut self, me: MouseEvent) {
+        if let Some(text) = self.ext_session().and_then(|s| s.on_mouse(&me)) {
+            self.copy(&text, "copied");
+        }
         if self.modal.is_none() {
             if let Some(text) = self.session_mut().and_then(|s| s.on_mouse(&me)) {
                 self.copy(&text, "copied");
@@ -1730,6 +1754,14 @@ impl App {
     }
 
     pub fn on_paste(&mut self, text: String) {
+        if let Some(Modal::Editor { ed, .. }) = &mut self.modal {
+            ed.paste(&text);
+            return;
+        }
+        if let Some(s) = self.ext_session() {
+            s.on_paste(text);
+            return;
+        }
         if self.modal.is_none() {
             // A terminal that holds only an image on the clipboard reports an empty paste.
             if text.is_empty() && self.paste_image() {
@@ -3327,6 +3359,250 @@ impl App {
         }
     }
 
+    /// Open `toolchains.toml` in the editor; saving checks it parses.
+    fn edit_toolchains(&mut self, then: EditThen) {
+        let check: crate::editor::Check = preload::check;
+        let path = self.dir.join(TOOLCHAINS_FILE);
+        self.open_editor(TOOLCHAINS_FILE, path, None, Some(check), then);
+    }
+
+    /// A palette command that has no key of its own.
+    fn run_command(&mut self, cmd: crate::palette::Command) {
+        use crate::palette::Command as C;
+        match cmd {
+            C::EditToolchains => self.edit_toolchains(EditThen::Nothing),
+            C::EditorMode => {
+                use crate::exted::Pref;
+                let next = crate::exted::load_pref(&self.dir).next();
+                self.status = match crate::exted::save_pref(&self.dir, next) {
+                    Ok(()) => match next {
+                        Pref::Auto => "Editor: auto (yours from $VISUAL, $EDITOR or PATH; else the built-in one)",
+                        Pref::External => "Editor: always yours ($VISUAL, $EDITOR or PATH), never the built-in one",
+                        Pref::Builtin => "Editor: always osh's built-in one",
+                    }
+                    .into(),
+                    Err(e) => format!("Error: could not save the setting: {e}"),
+                }
+            }
+        }
+    }
+
+    /// The editor is open (it takes every key and paste).
+    pub fn editing(&self) -> bool {
+        matches!(
+            self.modal,
+            Some(Modal::Editor { .. } | Modal::ExtEdit { .. })
+        )
+    }
+
+    /// Act on what the editor asked for after a key: copy to the host clipboard, save, close.
+    fn editor_done(
+        &mut self,
+        mut ed: Box<crate::editor::Editor>,
+        then: EditThen,
+        out: crate::editor::Out,
+    ) {
+        use crate::editor::Out;
+        if let Some(text) = ed.take_copied() {
+            if !cfg!(test) {
+                self.copy(&text, "Copied");
+            }
+        }
+        let close = match out {
+            Out::Stay => false,
+            Out::Save => {
+                if ed.save().is_ok() {
+                    self.status = format!("Saved {}", ed.name);
+                }
+                false
+            }
+            Out::SaveQuit => match ed.save() {
+                Ok(()) => {
+                    self.status = format!("Saved {}", ed.name);
+                    true
+                }
+                Err(_) => false,
+            },
+            Out::Quit => true,
+        };
+        if !close {
+            self.modal = Some(Modal::Editor { ed, then });
+            return;
+        }
+        self.edit_closed(then, ed.saves > 0);
+    }
+
+    /// After an edit, in either editor: back to where it was opened from, with what comes next.
+    fn edit_closed(&mut self, then: EditThen, _saved: bool) {
+        match then {
+            EditThen::Nothing => {}
+        }
+    }
+
+    /// The one way osh opens a file for editing: the user's editor ($VISUAL, $EDITOR, or one on
+    /// PATH) in osh's terminal, else the built-in editor, as the palette's editor setting says.
+    /// `template` starts a file that does not exist yet; `check` must pass before it is written.
+    fn open_editor(
+        &mut self,
+        name: &str,
+        path: PathBuf,
+        template: Option<String>,
+        check: Option<crate::editor::Check>,
+        then: EditThen,
+    ) {
+        use crate::exted::{Choice, Pref};
+        let text = match &template {
+            Some(t) => t.clone(),
+            None => match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => {
+                    self.modal = Some(Modal::Info(format!("Cannot open {name}: {e}")));
+                    return;
+                }
+            },
+        };
+        let pref = crate::exted::load_pref(&self.dir);
+        let why = match crate::exted::choose(pref, crate::exted::host_editor()) {
+            Choice::External(r) => {
+                let (prog, from) = (r.program().to_string(), r.from.clone());
+                let (w, h) = modal_screen();
+                match crate::exted::Run::start(r, name, path.clone(), &text, check, pane(w, h)) {
+                    Ok(run) => {
+                        self.status = format!(
+                            "Editing {name} in {prog} ({from}); osh checks and saves it when {prog} exits"
+                        );
+                        self.modal = Some(Modal::ExtEdit {
+                            run: Box::new(run),
+                            then,
+                        });
+                        return;
+                    }
+                    Err(e) if pref == Pref::External => {
+                        self.modal = Some(Modal::Info(format!(
+                            "{prog} ({from}) did not start: {e}. The editor setting (palette) is external, so osh did not open its built-in editor."
+                        )));
+                        return;
+                    }
+                    Err(e) => format!("built-in editor: {prog} ({from}) did not start: {e}"),
+                }
+            }
+            Choice::Builtin(why) => why,
+            Choice::Refuse(why) => {
+                self.modal = Some(Modal::Info(format!(
+                    "No editor of your own to open {name} in: {why}. Set $VISUAL or $EDITOR, or set the editor (palette) back to auto or built-in."
+                )));
+                return;
+            }
+        };
+        let ed = match template {
+            Some(t) => Ok(crate::editor::Editor::create(name, path, &t, check)),
+            None => crate::editor::Editor::open(name, path, check),
+        };
+        match ed {
+            Ok(mut ed) => {
+                ed.hint(&why);
+                self.status = why;
+                self.modal = Some(Modal::Editor {
+                    ed: Box::new(ed),
+                    then,
+                })
+            }
+            Err(e) => self.modal = Some(Modal::Info(e)),
+        }
+    }
+
+    fn ext_session(&mut self) -> Option<&mut Session> {
+        match &mut self.modal {
+            Some(Modal::ExtEdit { run, .. }) => run.session.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// The user's editor is running in front (it wants every key, the mouse and frames).
+    pub fn ext_editing(&self) -> bool {
+        matches!(&self.modal, Some(Modal::ExtEdit { run, .. }) if run.session.is_some())
+    }
+
+    /// Feed the editor's output to its terminal; once it exits, check and save what it wrote.
+    fn pump_ext_editor(&mut self) {
+        let Some(s) = self.ext_session() else {
+            return;
+        };
+        s.pump();
+        let (copy, exited) = (s.vt.take_clipboard(), s.exited);
+        if let Some(t) = copy {
+            if !cfg!(test) {
+                self.copy(&t, "copied");
+            }
+        }
+        if !exited {
+            return;
+        }
+        let Some(Modal::ExtEdit { mut run, then }) = self.modal.take() else {
+            return;
+        };
+        let ok = run.session.as_mut().and_then(|s| s.wait_exit());
+        self.ext_finished(run, then, ok);
+    }
+
+    fn ext_finished(&mut self, mut run: Box<crate::exted::Run>, then: EditThen, ok: Option<bool>) {
+        use crate::exted::Outcome;
+        let (name, prog) = (run.name.clone(), run.editor.program().to_string());
+        match run.finish(ok) {
+            Outcome::Saved => {
+                self.status = format!("Saved {name} (edited in {prog})");
+                self.edit_closed(then, true);
+            }
+            Outcome::Unchanged => {
+                self.status = format!("{name} unchanged: nothing written");
+                self.edit_closed(then, false);
+            }
+            Outcome::Cancelled(why) => {
+                self.status = format!("Cancelled: {why}");
+                self.edit_closed(then, false);
+            }
+            // The edits stay in the temporary copy; the screen asks to reopen it or discard.
+            Outcome::Invalid(e) => {
+                self.status = format!("Not saved: {e}");
+                self.modal = Some(Modal::ExtEdit { run, then });
+            }
+        }
+    }
+
+    /// Keys go to the running editor; after a failed check, Enter (or r) reopens it on the same
+    /// copy and d discards the edits.
+    fn ext_editor_key(&mut self, mut run: Box<crate::exted::Run>, then: EditThen, key: KeyEvent) {
+        if let Some(s) = run.session.as_mut() {
+            s.on_key(&key);
+            self.modal = Some(Modal::ExtEdit { run, then });
+            return;
+        }
+        let (name, prog) = (run.name.clone(), run.editor.program().to_string());
+        match key.code {
+            KeyCode::Enter | KeyCode::Char('r') => {
+                let (w, h) = modal_screen();
+                match run.spawn(pane(w, h)) {
+                    Ok(()) => {
+                        self.status = format!("Editing {name} again in {prog}");
+                        self.modal = Some(Modal::ExtEdit { run, then });
+                    }
+                    Err(e) => {
+                        self.status = format!(
+                            "Discarded: {prog} did not start again ({e}); {name} not changed"
+                        );
+                        self.edit_closed(then, false);
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                self.status = format!("Discarded the edits: {name} not changed");
+                self.edit_closed(then, false);
+            }
+            _ => self.modal = Some(Modal::ExtEdit { run, then }),
+        }
+    }
+
     fn pick_providers(&mut self, plan: Plan) {
         let mut names: Vec<String> = self.snap.providers.iter().map(|p| p.name.clone()).collect();
         for id in cli::profile_ids(&self.dir) {
@@ -3777,6 +4053,13 @@ impl App {
             self.session_key(key);
             return;
         }
+        // The editor takes every key, Ctrl-C (copy) included.
+        if self.editing() {
+            if let Some(m) = self.modal.take() {
+                self.modal_key(m, key);
+            }
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -3831,6 +4114,12 @@ impl App {
 
     /// Keys while a shell has focus: the chord, then an open modal, then the shell.
     fn session_key(&mut self, key: KeyEvent) {
+        if self.editing() {
+            if let Some(m) = self.modal.take() {
+                self.modal_key(m, key);
+            }
+            return;
+        }
         let menu = matches!(
             self.modal,
             Some(Modal::Select {
@@ -4273,7 +4562,10 @@ impl App {
                     KeyCode::Esc => return,
                     KeyCode::Enter => {
                         if let Some((action, _)) = hits.get(cursor) {
-                            self.on_key(KeyEvent::from(action.code));
+                            match action.cmd {
+                                Some(cmd) => self.run_command(cmd),
+                                None => self.on_key(KeyEvent::from(action.code)),
+                            }
                         }
                         return;
                     }
@@ -4327,6 +4619,11 @@ impl App {
                     scroll,
                 });
             }
+            Modal::Editor { mut ed, then } => {
+                let out = ed.on_key(key);
+                self.editor_done(ed, then, out);
+            }
+            Modal::ExtEdit { run, then } => self.ext_editor_key(run, then, key),
             Modal::Viewer {
                 title,
                 text,
@@ -5000,6 +5297,318 @@ mod tests {
             ..Plan::default()
         });
         assert_eq!(a.tmux_after_create, None);
+    }
+
+    fn toolchain_dir(tag: &str, text: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("osh-tce-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("toolchains.toml"), text).unwrap();
+        dir
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    fn ctrl_key(app: &mut App, c: char) {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn type_text(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(
+                app,
+                if c == '\n' {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Char(c)
+                },
+            );
+        }
+    }
+
+    /// The user's editor for the rest of this test thread (`None`: none can be found).
+    fn fake_editor(argv: Option<&[&str]>) {
+        crate::exted::FAKE
+            .with(|f| *f.borrow_mut() = argv.map(|a| a.iter().map(|s| s.to_string()).collect()));
+    }
+
+    /// A shell script as the user's editor; the file to edit is `$1`.
+    fn sh_editor(script: &str) {
+        fake_editor(Some(&["sh", "-c", script, "fake-editor"]));
+    }
+
+    /// Pump until the user's editor has exited and osh has acted on what it wrote.
+    fn wait_editor(app: &mut App) {
+        let end = Instant::now() + Duration::from_secs(10);
+        while app.ext_editing() {
+            assert!(Instant::now() < end, "the editor never exited");
+            app.pump_sessions();
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn ext_run(app: &App) -> &crate::exted::Run {
+        match &app.modal {
+            Some(Modal::ExtEdit { run, .. }) => run,
+            _ => panic!("expected the user's editor"),
+        }
+    }
+
+    #[test]
+    fn an_invalid_edit_reopens_the_editor_with_it_or_is_discarded() {
+        let original = "[a]\nenabled = true\n";
+        let dir = toolchain_dir("extbad", original);
+        let mut app = app();
+        app.dir = dir.clone();
+        // Breaks the file; run again on its own broken text, fixes it.
+        sh_editor(
+            r#"if grep -q broken "$1"; then printf '[c]\nhosts = ["c.example"]\n' > "$1"; else printf '[broken\n' > "$1"; fi"#,
+        );
+        app.edit_toolchains(EditThen::Nothing);
+        let copy = ext_run(&app).scratch.file.clone();
+        wait_editor(&mut app);
+        assert!(app.editing() && !app.ext_editing(), "osh asks what to do");
+        assert!(
+            ext_run(&app)
+                .error
+                .as_deref()
+                .unwrap()
+                .starts_with("TOML parse error"),
+            "{:?}",
+            ext_run(&app).error
+        );
+        assert!(
+            app.status.starts_with("Not saved: TOML parse error"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("toolchains.toml")).unwrap(),
+            original
+        );
+        // Other keys do nothing; r reopens the same copy, which still holds the edit.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(app.editing());
+        press(&mut app, KeyCode::Char('r'));
+        assert!(app.ext_editing());
+        assert_eq!(ext_run(&app).scratch.file, copy, "the same copy");
+        wait_editor(&mut app);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("toolchains.toml")).unwrap(),
+            "[c]\nhosts = [\"c.example\"]\n"
+        );
+        assert!(app.modal.is_none());
+        // Broken again, and this time discarded.
+        sh_editor(r#"printf '[broken\n' > "$1""#);
+        app.edit_toolchains(EditThen::Nothing);
+        let copy = ext_run(&app).scratch.file.clone();
+        wait_editor(&mut app);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!app.editing());
+        assert_eq!(
+            app.status,
+            "Discarded the edits: toolchains.toml not changed"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("toolchains.toml")).unwrap(),
+            "[c]\nhosts = [\"c.example\"]\n"
+        );
+        assert!(
+            !copy.parent().unwrap().exists(),
+            "the temporary copy is gone"
+        );
+        fake_editor(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quitting_without_a_change_or_a_failing_editor_writes_nothing() {
+        let dir = toolchain_dir("extcancel", "[a]\n");
+        let mut app = app();
+        app.dir = dir.clone();
+        sh_editor("true");
+        app.edit_toolchains(EditThen::Nothing);
+        wait_editor(&mut app);
+        assert_eq!(app.status, "toolchains.toml unchanged: nothing written");
+        sh_editor(r#"printf '[z]\n' > "$1"; exit 1"#);
+        app.edit_toolchains(EditThen::Nothing);
+        wait_editor(&mut app);
+        assert!(
+            app.status.starts_with("Cancelled: sh exited with an error"),
+            "{}",
+            app.status
+        );
+        // Ctrl-C goes to the editor (here it stops it), not to osh.
+        sh_editor("sleep 5");
+        app.edit_toolchains(EditThen::Nothing);
+        ctrl_key(&mut app, 'c');
+        assert!(!app.quit);
+        wait_editor(&mut app);
+        assert!(
+            app.status.starts_with("Cancelled: sh exited with an error"),
+            "{}",
+            app.status
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("toolchains.toml")).unwrap(),
+            "[a]\n"
+        );
+        fake_editor(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_built_in_editor_is_the_fallback_and_can_be_forced_either_way() {
+        let dir = toolchain_dir("extpick", "[a]\n");
+        let mut app = app();
+        app.dir = dir.clone();
+        let note = |app: &App| match &app.modal {
+            Some(Modal::Editor { ed, .. }) => ed.note().unwrap().0.clone(),
+            _ => panic!("expected the built-in editor"),
+        };
+        fake_editor(None);
+        app.edit_toolchains(EditThen::Nothing);
+        assert_eq!(note(&app), "built-in editor: no editor in unit tests");
+        assert_eq!(app.status, note(&app));
+        fake_editor(Some(&["/nonexistent/osh-editor"]));
+        app.modal = None;
+        app.edit_toolchains(EditThen::Nothing);
+        assert!(
+            note(&app).starts_with("built-in editor: osh-editor (test) did not start"),
+            "{}",
+            note(&app)
+        );
+        // The palette cycles auto, external, built-in.
+        app.modal = None;
+        app.run_command(crate::palette::Command::EditorMode);
+        assert_eq!(crate::exted::load_pref(&dir), crate::exted::Pref::External);
+        assert!(
+            app.status.starts_with("Editor: always yours"),
+            "{}",
+            app.status
+        );
+        app.edit_toolchains(EditThen::Nothing);
+        assert!(
+            matches!(&app.modal, Some(Modal::Info(t)) if t.starts_with("osh-editor (test) did not start")),
+            "forced external does not fall back"
+        );
+        fake_editor(None);
+        app.modal = None;
+        app.edit_toolchains(EditThen::Nothing);
+        assert!(
+            matches!(&app.modal, Some(Modal::Info(t)) if t.starts_with("No editor of your own"))
+        );
+        app.modal = None;
+        app.run_command(crate::palette::Command::EditorMode);
+        assert_eq!(crate::exted::load_pref(&dir), crate::exted::Pref::Builtin);
+        sh_editor("true");
+        app.edit_toolchains(EditThen::Nothing);
+        assert_eq!(note(&app), "built-in editor (chosen in the palette)");
+        app.modal = None;
+        app.run_command(crate::palette::Command::EditorMode);
+        assert_eq!(crate::exted::load_pref(&dir), crate::exted::Pref::Auto);
+        fake_editor(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_users_editor_fills_the_screen_and_a_failed_check_is_explained() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = toolchain_dir("extdraw", "[a]\n");
+        let mut app = app();
+        app.dir = dir.clone();
+        let screen = |app: &App| {
+            let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            term.draw(|f| crate::ui::draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            (0..24)
+                .map(|y| {
+                    (0..100)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        sh_editor(r#"echo HELLO-EDITOR; read x; printf '[broken\n' > "$1""#);
+        app.edit_toolchains(EditThen::Nothing);
+        let end = Instant::now() + Duration::from_secs(10);
+        while !screen(&app)[0].contains("HELLO-EDITOR") {
+            assert!(Instant::now() < end, "{:?}", screen(&app));
+            app.pump_sessions();
+            thread::sleep(Duration::from_millis(10));
+        }
+        let rows = screen(&app);
+        assert!(
+            rows[23].contains(" toolchains.toml ") && rows[23].contains("sh (test)"),
+            "{}",
+            rows[23]
+        );
+        press(&mut app, KeyCode::Enter);
+        wait_editor(&mut app);
+        let rows = screen(&app).join("\n");
+        assert!(
+            rows.contains("toolchains.toml is not valid: not saved"),
+            "{rows}"
+        );
+        assert!(rows.contains("TOML parse error"), "{rows}");
+        assert!(rows.contains("Enter/r reopen"), "{rows}");
+        press(&mut app, KeyCode::Char('d'));
+        fake_editor(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_palette_opens_the_editor_without_a_key_and_pastes_go_into_it() {
+        let dir = toolchain_dir("palette", "[a]\nenabled = true\n");
+        let mut app = app();
+        app.dir = dir.clone();
+        press(&mut app, KeyCode::Char(':'));
+        type_text(&mut app, "edit toolchains");
+        press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Editor {
+                then: EditThen::Nothing,
+                ..
+            })
+        ));
+        app.on_paste("# pasted\n".into());
+        let Some(Modal::Editor { ed, .. }) = &app.modal else {
+            panic!("editor");
+        };
+        assert!(ed.text().starts_with("# pasted\n[a]"), "{}", ed.text());
+        ctrl_key(&mut app, 's');
+        press(&mut app, KeyCode::Esc);
+        assert!(
+            app.modal.is_none(),
+            "closing from the palette returns to the dashboard"
+        );
+        assert!(std::fs::read_to_string(dir.join("toolchains.toml"))
+            .unwrap()
+            .starts_with("# pasted"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_editor_is_drawn_over_the_whole_screen() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = toolchain_dir("draw", "[a]\nenabled = true\n");
+        let mut app = app();
+        app.dir = dir.clone();
+        app.edit_toolchains(EditThen::Nothing);
+        let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
+        term.draw(|f| crate::ui::draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let row = |y: u16| {
+            (0..100)
+                .map(|x| buf[(x, y)].symbol().to_string())
+                .collect::<String>()
+        };
+        assert!(row(0).contains("Edit toolchains.toml"), "{}", row(0));
+        assert!(row(1).contains(" 1 [a]"), "{}", row(1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

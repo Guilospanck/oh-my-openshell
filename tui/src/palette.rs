@@ -10,12 +10,23 @@ pub enum Scope {
     Tab(Tab),
 }
 
+/// An action only the palette offers: it has no key, so the footer stays as it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Command {
+    /// Open `toolchains.toml` in the editor.
+    EditToolchains,
+    /// Which editor the edit actions use: auto, always the user's, always the built-in one.
+    EditorMode,
+}
+
 pub struct Action {
     pub scope: Scope,
     /// The key as shown (`Enter`, `S`, `1`); empty for a palette command.
     pub key: &'static str,
     pub code: KeyCode,
     pub title: &'static str,
+    /// Set for a palette command, which runs this instead of sending `code`.
+    pub cmd: Option<Command>,
 }
 
 const fn a(scope: Scope, key: &'static str, code: KeyCode, title: &'static str) -> Action {
@@ -24,6 +35,17 @@ const fn a(scope: Scope, key: &'static str, code: KeyCode, title: &'static str) 
         key,
         code,
         title,
+        cmd: None,
+    }
+}
+
+const fn command(scope: Scope, title: &'static str, cmd: Command) -> Action {
+    Action {
+        scope,
+        key: "",
+        code: KeyCode::Null,
+        title,
+        cmd: Some(cmd),
     }
 }
 
@@ -162,6 +184,16 @@ pub const ACTIONS: &[Action] = &[
     a(Global, "!", KeyCode::Char('!'), "Show alerts"),
     a(Global, "?", KeyCode::Char('?'), "Show help"),
     a(Global, "q", KeyCode::Char('q'), "Quit"),
+    command(
+        Global,
+        "Edit toolchains.toml (hosts new sandboxes may read from)",
+        Command::EditToolchains,
+    ),
+    command(
+        Global,
+        "Editor: switch auto / your own ($VISUAL, $EDITOR) / built-in",
+        Command::EditorMode,
+    ),
 ];
 
 /// What the current tab can do: its own actions first, then the global ones.

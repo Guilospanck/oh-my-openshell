@@ -37,6 +37,15 @@ Gateways | a | gateway-add
 Gateways | d | gateway-wipe
 Gateways | x | gateway-remove
 shell | ctrl-] menu | shell-menu
+palette | Edit toolchains.toml | editor-toolchains
+palette | Editor: switch auto / your own / built-in | editor-external
+external-editor | $EDITOR with arguments runs inside osh | editor-external
+external-editor | Enter/r reopen after a failed check | editor-external
+external-editor | d discard after a failed check | SKIP: unit tests in app.rs drive the discard; editor-external covers the reopen path on the same screen
+editor | Ctrl-S save | editor-toolchains
+editor | Esc close | editor-toolchains
+editor | Ctrl-F find | editor-toolchains
+editor | Ctrl-G go to line | editor-toolchains
 shell | alerts | alerts-toast
 command | osh doctor | cmd-doctor
 command | osh setup | SKIP: covered by tests/linux/real-suite.sh (setup, wizard, idempotence) which runs before these scenarios

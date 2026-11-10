@@ -188,6 +188,112 @@ def data_dir():
         return os.path.join(xdg, "osh")
     return os.path.expanduser("~/.local/share/osh")
 
+@scenario("editor-toolchains")
+def editor_toolchains():
+    """The built-in editor from the palette: a broken file is refused, a fixed one is saved,
+    find and go-to-line work, and closing with changes asks first."""
+    path = os.path.join(data_dir(), "toolchains.toml")
+    with open(path) as f:
+        before = f.read()
+    def now():
+        with open(path) as f:
+            return f.read()
+    try:
+        with dashboard() as o:
+            o.press(":"); o.wait("Commands", 10)
+            o.type("edit toolchains"); o.wait("Edit toolchains.toml", 5)
+            o.press("enter"); o.wait("Ctrl-S save", 10)
+            o.press("ctrl-end", "enter")
+            o.type("[e2e")
+            o.press("ctrl-s"); o.wait("Not saved: TOML parse error", 10)
+            assert now() == before, "a broken file is not written"
+            o.press("end"); o.type("]"); o.press("enter")
+            o.type("enabled = false"); o.press("enter")
+            o.type('hosts = ["e2e.example.com"]')
+            o.press("ctrl-s"); o.wait("Saved toolchains.toml", 10)
+            assert "[e2e]" in now() and "e2e.example.com" in now(), now()
+            o.press("ctrl-g"); o.type("1"); o.press("enter"); o.wait("Ln 1, Col 1", 5)
+            o.press("ctrl-f"); o.type("e2e.example"); o.wait("Match 1 of 1", 5)
+            o.press("enter")
+            o.type("x"); o.wait("[modified]", 5)
+            o.press("esc"); o.wait("Unsaved changes", 5)
+            o.press("d"); o.wait_gone("Ctrl-S save", 10)
+            assert "e2e.example.com" in now(), "discarding keeps the saved file"
+            o.wait("PHASE", 10)
+    finally:
+        with open(path, "w") as f:
+            f.write(before)
+
+EXT_EDITOR = r"""#!/bin/sh
+# A scripted stand-in for the user's editor: the file is the last argument, and each run does
+# the next step (counted in a file next to this script).
+for f; do :; done
+here=$(dirname "$0")
+n=$(cat "$here/count" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$here/count"
+echo "fake editor run $n on $(basename "$f") args $1"
+sleep 2
+case $n in
+1) printf '\n[e2e-ext\n' >> "$f" ;;
+2) grep -v '^\[e2e-ext$' "$f" > "$here/fixed"; cat "$here/fixed" > "$f"
+   printf '\n[e2e-ext]\nenabled = false\nhosts = ["e2e-ext.example.com"]\n' >> "$f" ;;
+3) : ;;
+*) printf 'junk\n' >> "$f"; exit 1 ;;
+esac
+"""
+
+@scenario("editor-external")
+def editor_external():
+    """$EDITOR (with an argument) runs inside osh: a broken result is refused and reopened with the
+    edits, a fixed one is saved, an unchanged file and a failing editor write nothing, and the
+    palette's editor setting forces the built-in editor."""
+    path = os.path.join(data_dir(), "toolchains.toml")
+    with open(path) as f:
+        before = f.read()
+    def now():
+        with open(path) as f:
+            return f.read()
+    tmp = tempfile.mkdtemp(prefix="osh-e2e-ed-")
+    script = os.path.join(tmp, "fake editor")
+    with open(script, "w") as f:
+        f.write(EXT_EDITOR)
+    os.chmod(script, 0o755)
+    env = {"VISUAL": "", "EDITOR": f"'{script}' --e2e"}
+    def edit(o):
+        o.press(":"); o.wait("Commands", 10)
+        o.type("edit toolchains"); o.wait("Edit toolchains.toml", 5)
+        o.press("enter")
+    try:
+        with dashboard(env=env, editor="auto") as o:
+            edit(o); o.wait("fake editor run 1 on toolchains.toml args --e2e", 10)
+            o.wait("save and quit the editor", 5)
+            o.wait("toolchains.toml is not valid: not saved", 15)
+            o.wait("TOML parse error", 5)
+            assert now() == before, "a broken file is not written"
+            o.press("r"); o.wait("fake editor run 2", 10)
+            o.wait("Saved toolchains.toml (edited in fake editor)", 15)
+            assert "e2e-ext.example.com" in now(), now()
+            saved = now()
+            edit(o); o.wait("fake editor run 3", 10)
+            o.wait("toolchains.toml unchanged: nothing written", 15)
+            edit(o); o.wait("fake editor run 4", 10)
+            o.wait("Cancelled: fake editor exited with an error", 15)
+            assert now() == saved, "a failing editor writes nothing"
+            o.press(":"); o.wait("Commands", 10)
+            o.type("editor: switch"); o.press("enter"); o.wait("Editor: always yours", 10)
+            o.press(":"); o.wait("Commands", 10)
+            o.type("editor: switch"); o.press("enter"); o.wait("Editor: always osh's built-in", 10)
+            edit(o); o.wait("Ctrl-S save", 10)
+            o.wait("built-in editor (chosen in the palette)", 5)
+            o.press("esc"); o.wait_gone("Ctrl-S save", 10)
+            o.press(":"); o.wait("Commands", 10)
+            o.type("editor: switch"); o.press("enter"); o.wait("Editor: auto", 10)
+            assert not os.path.exists(os.path.join(data_dir(), "editor-mode"))
+    finally:
+        with open(path, "w") as f:
+            f.write(before)
+        editor_mode("builtin")
+        shutil.rmtree(tmp, ignore_errors=True)
+
 @scenario("nav-quit")
 def nav_quit():
     o = dashboard()
