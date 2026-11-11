@@ -1028,15 +1028,28 @@ pub fn help_lines(tab: Tab) -> Vec<Line<'static>> {
     out.extend(
         ACTIONS
             .iter()
-            .filter(|x| x.scope == Scope::Global && !matches!(x.key, "1" | "2" | "3" | "4" | "5"))
-            // A palette command has no key: it is found by typing in the palette.
-            .map(|x| key_row(if x.key.is_empty() { ":" } else { x.key }, x.title)),
+            .filter(|x| {
+                x.scope == Scope::Global
+                    && !x.key.is_empty()
+                    && !matches!(x.key, "1" | "2" | "3" | "4" | "5")
+            })
+            .map(|x| key_row(x.key, x.title)),
     );
     out.push(key_row("1-5", "Go to a tab"));
     out.push(key_row(
         ": or Ctrl-P",
         "Command palette: type to find any action",
     ));
+    out.push(Line::default());
+    out.push(section(
+        "Only in the command palette (press : and type part of the name)",
+    ));
+    out.extend(
+        ACTIONS
+            .iter()
+            .filter(|x| x.scope == Scope::Global && x.key.is_empty())
+            .map(|x| key_row("", x.title)),
+    );
     out.push(Line::default());
     out.push(section("In a shell"));
     out.push(key_row(
@@ -1844,5 +1857,40 @@ mod tests {
                 assert_eq!(buf[(w - 1, y)].symbol(), " ", "width {w} row {y}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    fn text(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn palette_only_actions_are_listed_without_a_key_and_none_shows_a_colon() {
+        let rows = text(&help_lines(Tab::Sandboxes));
+        let at = rows
+            .iter()
+            .position(|r| r.starts_with("Only in the command palette"))
+            .expect("a palette-only section");
+        let row = rows
+            .iter()
+            .skip(at + 1)
+            .find(|r| r.contains("toolchains.toml"))
+            .expect("the toolchains action");
+        assert_eq!(
+            row.trim_start().chars().next(),
+            Some('E'),
+            "no key column text: {row}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.starts_with("  :  ")),
+            "no row may claim ':' is the key of an action"
+        );
     }
 }
