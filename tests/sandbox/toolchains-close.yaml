@@ -1,0 +1,24 @@
+network_policies:
+  osh_tc_codeberg_org:
+    endpoints:
+      - host: codeberg.org
+        ports: [443]
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow: { method: GET, path: "/**" }
+          - allow: { method: HEAD, path: "/**" }
+          - allow: { method: OPTIONS, path: "/**" }
+          - allow: { method: POST, path: "/**/git-upload-pack" }
+    binaries:
+      - { path: "/**" }
+  osh_tc_example_com:
+    endpoints:
+      - { host: example.com, ports: [443], protocol: rest, enforcement: enforce, access: read-only }
+    binaries:
+      - { path: "/**" }
+  osh_tc_www_example_org:
+    endpoints:
+      - { host: www.example.org, ports: [443], protocol: rest, enforcement: enforce, access: read-only }
+    binaries:
+      - { path: "/**" }

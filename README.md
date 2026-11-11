@@ -123,7 +123,7 @@ A few actions have no key and live only in the palette:
 
 | Tab | What you can do |
 | --- | --- |
-| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), settings and effective policy (`i`; the image, shared folder and toolchain hosts are fixed at creation), blocked requests (`p`), renew a repo token (`t`), install skills and plugins (`K`, below), transfer state to another sandbox (`T`: copies the home directory, workspace and tool caches through a temp folder on the host; same-path files are overwritten; system packages cannot move, so put those in the image) |
+| Sandboxes | create (`n`), open a shell inside osh (`Enter`; `Ctrl-]` for the menu, `●` marks a running one), delete (`d`), stop/start (`s`/`S`), attach/detach providers (`a`/`x`), live logs (`l`), settings and effective policy (`i`; the image and shared folder are fixed at creation), blocked requests (`p`), renew a repo token (`t`), install skills and plugins (`K`, below), transfer state to another sandbox (`T`: copies the home directory, workspace and tool caches through a temp folder on the host; same-path files are overwritten; system packages cannot move, so put those in the image) |
 | Providers | create from a `providers/*.yaml` profile or a read/write repo token for GitHub, GitLab, Bitbucket or Forgejo (`n`), update credentials (`u`), delete (`d`) |
 | Profiles | import or refresh a profile on the gateway (`u`; the file is linted first, and an update that reaches running sandboxes offers to restart them), the file's actions (`e`: view, edit, compare with the shipped default or the gateway's copy, restore, delete; save the gateway's copy as a file; delete the profile from the gateway), a new profile from a template (`n`). `.yml` files count too |
 | Images | build `images/Dockerfile-*` (`b`; with no runtime running, osh offers to start Colima, the Podman machine or the daemon); shows when a build is outdated (creating a sandbox from an outdated image asks whether to rebuild it first, since a sandbox keeps the image it was created from); the Dockerfile's actions (`e`), a new Dockerfile started from pi's (`n`) |
@@ -412,15 +412,24 @@ what the defaults for new sandboxes now are). Hosts that are not exact
 names (wildcards, addresses) are refused by the file's check and named in the status line. When the file is not
 valid TOML or has no group, both pickers say why and offer the editor (a new sandbox can also go on
 without the list). For a running sandbox use `Open the toolchain
-hosts` in the `Ctrl-]` menu (`Toolchain hosts for sandbox NAME only`): it asks which groups, and adds the rules with `policy update` (never `policy set`, which would
-drop rules you allowed since). Its marks start at what that sandbox already has, not at the defaults:
+hosts` in the `Ctrl-]` menu (`Toolchain hosts for sandbox NAME only`): it asks which groups, opens the marked ones
+and closes the unmarked ones that were open, with `policy update` (never `policy set`, which would
+drop rules you allowed since). Every host gets its own rule, `osh_tc_HOST` (dots become `_`), at creation and
+when opened later, so closing a host is `--remove-rule` of exactly that rule. Its marks start at what that sandbox already has, not at the defaults:
 osh records the groups of each sandbox it creates and of every apply in `sandbox-toolchains.json` in the
 data directory (keyed by gateway and sandbox; entries of sandboxes the gateway no longer has are dropped
 when it is read), marks them and tags them `(open here)`. A sandbox with no record (made outside this osh,
-or before the record) shows `open here: unknown` and nothing marked. Applying only adds: unmarking a group
-that is open shows it as `(stays open)`, and the report says it stayed open, because OpenShell's
-`--remove-endpoint` takes a host out of every rule, a provider's included, so osh does not close hosts in a
-running sandbox. To close them, create a new sandbox without those groups. Some entries are wide on purpose: `storage.googleapis.com` reaches
+or before the record) shows `open here: unknown` and nothing marked, so nothing is closed there. Unmarking
+an open group tags it `(closes)`. On apply osh reads the sandbox's policy (`policy get --full -o json`,
+read-only) and removes only rules it made (`osh_tc_*`; never a provider's `_provider_*` rule, your own rules, or
+the `allow_HOST_443` rules an older osh added). A host that a group which stays marked also lists stays open.
+The report names each host that closed, each that stays open and why (another marked group needs it; a
+provider's or your own rule still allows it, which osh leaves alone), and each that failed; the record
+drops only the groups that really closed. OpenShell's `--remove-endpoint` is not used: it takes the host
+out of every rule of the sandbox, your own included. Sandboxes made by an older osh hold the hosts of all
+their groups in one rule (`osh_toolchains`, and `osh_toolchains_git` for git hosts): osh removes that rule
+only when every host in it closes (unmark every group), because removing it would close the groups that
+stay; until then its groups show `(stays open: older osh rule)` once a close found them there. Some entries are wide on purpose: `storage.googleapis.com` reaches
 any Google Cloud Storage bucket and the `githubusercontent.com` hosts serve anyone's files, but
 Go modules and GitHub releases cannot be fetched without them. Where a provider profile defines
 the same host, the list narrows it to read-only for that host. `registry.npmjs.org` carries the npm profile's `allow_encoded_slash` setting in the creation policy (a mismatch makes OpenShell reject the provider attach); `policy update` cannot set it, so `Open the toolchain hosts` skips that host: attach the `npm` or `js` profile, or answer the prompt.

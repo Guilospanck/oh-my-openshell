@@ -3893,6 +3893,7 @@ impl App {
             return self.offer_toolchain_fix(&why, EditThen::Running(name, gateway, prev));
         };
         let open = self.recorded_toolchains(&gateway, &name);
+        let stuck = preload::stuck_groups(&preload::load_records(&self.dir), &gateway, &name);
         let is_open = |g: &preload::Group| open.as_ref().is_some_and(|o| o.contains(&g.name));
         let mut marked: Vec<bool> = match &prev {
             Some(m) => preload::remark(&groups, m),
@@ -3901,7 +3902,9 @@ impl App {
         let mut items: Vec<String> = groups
             .iter()
             .zip(&marked)
-            .map(|(g, m)| preload::retag_open(&preload::label(g, is_open(g)), *m))
+            .map(|(g, m)| {
+                preload::retag_open(&preload::label(g, is_open(g)), *m, stuck.contains(&g.name))
+            })
             .collect();
         items.push(EDIT_TOOLCHAINS_ITEM.into());
         marked.push(false);
@@ -3915,7 +3918,7 @@ impl App {
                 "osh has no record of the toolchain hosts open in {name} (not created by this osh, or before it kept one): nothing is marked"
             ),
             Some(_) => format!(
-                "Marked: open in {name} (osh's record). Unmarking cannot close hosts that are already open; (default) = on for new sandboxes"
+                "Marked: open in {name} (osh's record). Unmark a group to close its hosts there; (default) = on for new sandboxes"
             ),
         };
         self.select_marked(
@@ -4537,70 +4540,54 @@ impl App {
         }
     }
 
-    /// Open the hosts of the named groups in a running sandbox, one `policy update` per host, and
-    /// record the groups that opened. Only adds: a group that was open and is now unmarked stays
-    /// open, and the report says so (see `preload::retag_open` for why it is not removed).
+    /// Apply the running picker: open the hosts of the marked groups (one `policy update` per
+    /// host) and close the hosts of the groups recorded open there that are now unmarked
+    /// (`preload::close_plan`), then record what actually opened and closed.
     fn open_toolchains(&mut self, name: String, gateway: String, names: &[String]) {
-        let Some(groups) = self.toolchain_groups() else {
+        let Some(all) = self.toolchain_groups() else {
             return;
         };
-        let stays: Vec<String> = self
+        let unmarked: Vec<String> = self
             .recorded_toolchains(&gateway, &name)
             .unwrap_or_default()
             .into_iter()
             .filter(|g| !names.contains(g))
             .collect();
-        let stays_note = if stays.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "\n\n\u{2022} {} stay open: osh cannot close hosts in a running sandbox (OpenShell's remove takes a host out of every rule, a provider's too). Create a new sandbox without them to close them.",
-                stays.join(", ")
-            )
-        };
-        let groups = preload::select(&groups, names);
+        let groups = preload::select(&all, names);
         let cmds = preload::update_commands(&gateway, &name, &groups);
-        if cmds.is_empty() {
-            self.status = if stays.is_empty() {
-                "No toolchain group was marked".into()
-            } else {
-                format!(
-                    "Nothing changed in {name}: {} stay open (osh cannot close hosts in a running sandbox)",
-                    stays.join(", ")
-                )
-            };
+        if cmds.is_empty() && unmarked.is_empty() {
+            self.status = "No toolchain group was marked".into();
             return;
         }
-        self.status = format!("Opening the toolchain hosts in {name}...");
+        let verb = match (cmds.is_empty(), unmarked.is_empty()) {
+            (false, true) => "Opening",
+            (true, false) => "Closing",
+            _ => "Opening and closing",
+        };
+        self.status = format!("{verb} the toolchain hosts in {name}...");
         let task = std::sync::Arc::new(std::sync::Mutex::new(Task::new(
-            format!("Opening toolchain hosts in {name}"),
-            cmds.len(),
+            format!("{verb} toolchain hosts in {name}"),
+            cmds.len() + usize::from(!unmarked.is_empty()),
         )));
         self.modal = Some(Modal::Task(task.clone()));
         let dir = self.dir.clone();
+        let names = names.to_vec();
         self.bg_msg(move || {
-            // One refused host (a provider's rule already covers it, say) must not stop the
-            // rest; the report names what happened to each.
-            let mut results = Vec::new();
-            for args in &cmds {
-                let host = preload::command_host(args);
+            let run = |args: &[String]| cli::run("openshell", args, &[]);
+            let progress = |current: &str, done: bool, total: Option<usize>| {
                 if let Ok(mut t) = task.lock() {
-                    t.current = host.clone();
+                    t.current = current.to_string();
+                    if let Some(n) = total {
+                        t.total = n;
+                    }
+                    if done {
+                        t.done += 1;
+                    }
                 }
-                results.push((host, cli::run("openshell", args, &[]).map(|_| ())));
-                if let Ok(mut t) = task.lock() {
-                    t.done += 1;
-                }
-            }
-            let opened = preload::opened_groups(&groups, &results);
-            let mut out = preload::report(&name, &results);
-            if let Err(e) = preload::record_open(&dir, &gateway, &name, &opened, false) {
-                out.push_str(&format!(
-                    "\n\n\u{2717} Could not record the open groups ({e}); the picker will not show them as open here"
-                ));
-            }
-            out.push_str(&stays_note);
-            Ok(out)
+            };
+            Ok(apply_toolchains(
+                &run, &progress, &dir, &gateway, &name, &all, &names, &unmarked,
+            ))
         });
     }
 
@@ -5360,7 +5347,7 @@ impl App {
                     let got = cli::os(&["sandbox", "get", &name])?;
                     let providers = cli::attached_providers(&name);
                     Ok(format!(
-                        "{name}: settings and effective policy (v shows it all, scrollable)\n\nProviders attached: {}\n\n{}\n\nThe image, the shared folder and the toolchain hosts are fixed when a sandbox is created; to change them, create a new sandbox (n). Providers can be attached and detached any time (a / x).",
+                        "{name}: settings and effective policy (v shows it all, scrollable)\n\nProviders attached: {}\n\n{}\n\nThe image and the shared folder are fixed when a sandbox is created; to change them, create a new sandbox (n). Providers can be attached and detached any time (a / x), and toolchain hosts opened or closed from the Ctrl-] menu of its shell.",
                         if providers.is_empty() {
                             "none".to_string()
                         } else {
@@ -6125,8 +6112,16 @@ impl App {
                         KeyCode::Char('k') | KeyCode::Up => cursor = cursor.saturating_sub(1),
                         KeyCode::Char(' ') if multi => {
                             marked[cursor] = !marked[cursor];
-                            if matches!(kind, SelKind::ToolchainsRunning(..)) {
-                                items[cursor] = preload::retag_open(&items[cursor], marked[cursor]);
+                            if let SelKind::ToolchainsRunning(name, gateway) = &kind {
+                                let stuck = preload::stuck_groups(
+                                    &preload::load_records(&self.dir),
+                                    gateway,
+                                    name,
+                                )
+                                .iter()
+                                .any(|g| g == preload::group_of(&items[cursor]));
+                                items[cursor] =
+                                    preload::retag_open(&items[cursor], marked[cursor], stuck);
                             }
                         }
                         _ => {}
@@ -6143,6 +6138,89 @@ impl App {
             },
         }
     }
+}
+
+/// The work of `App::open_toolchains`, off the UI thread, with `run` standing for `openshell`
+/// (a fake in tests) and `progress(current, step_done, new_total)` for the task popup. Opens the
+/// hosts of the `marked` groups; closes the hosts of `unmarked` (recorded open, now unmarked)
+/// after a read-only `policy get` shows which rules hold them; records the result. Returns the
+/// report.
+#[allow(clippy::too_many_arguments)]
+fn apply_toolchains(
+    run: &dyn Fn(&[String]) -> Result<String, String>,
+    progress: &dyn Fn(&str, bool, Option<usize>),
+    dir: &std::path::Path,
+    gateway: &str,
+    name: &str,
+    all: &[preload::Group],
+    marked: &[String],
+    unmarked: &[String],
+) -> String {
+    let groups = preload::select(all, marked);
+    let cmds = preload::update_commands(gateway, name, &groups);
+    // One refused host (a provider's rule already covers it, say) must not stop the rest; the
+    // report names what happened to each.
+    let mut results = Vec::new();
+    for args in &cmds {
+        let host = preload::command_host(args);
+        progress(&host, false, None);
+        results.push((host, run(args).map(|_| ())));
+        progress("", true, None);
+    }
+    let opened = preload::opened_groups(&groups, &results);
+    let mut parts: Vec<String> = Vec::new();
+    if !cmds.is_empty() {
+        parts.push(preload::report(name, &results));
+    }
+    let known: Vec<String> = unmarked
+        .iter()
+        .filter(|g| all.iter().any(|a| &a.name == *g))
+        .cloned()
+        .collect();
+    let gone: Vec<&str> = unmarked
+        .iter()
+        .filter(|g| !known.contains(g))
+        .map(String::as_str)
+        .collect();
+    let (mut closed, mut stuck) = (Vec::new(), Vec::new());
+    if !known.is_empty() {
+        progress("reading the policy", false, None);
+        let rules = run(&preload::policy_get_args(gateway, name))
+            .and_then(|out| preload::parse_rules(&out));
+        progress("", true, None);
+        match rules {
+            Err(e) => parts.push(format!(
+                "\u{2717} Nothing was closed: osh could not read the policy of {name} to see which rules hold the hosts ({})",
+                e.lines().next().unwrap_or_default().trim()
+            )),
+            Ok(rules) => {
+                let plan = preload::close_plan(all, marked, &known, &rules);
+                let close = preload::close_commands(gateway, name, &plan);
+                progress("", false, Some(cmds.len() + 1 + close.len()));
+                let mut removed = Vec::new();
+                for (rule, args) in &close {
+                    progress(rule, false, None);
+                    removed.push((rule.clone(), run(args).map(|_| ())));
+                    progress("", true, None);
+                }
+                let done = preload::close_results(&plan, &removed);
+                (closed, stuck) = preload::closed_groups(all, &known, &plan, &done);
+                parts.push(preload::close_report(name, &plan, &done));
+            }
+        }
+    }
+    if !gone.is_empty() {
+        parts.push(format!(
+            "\u{2022} {} stay open: no longer in toolchains.toml, so osh does not know their hosts.",
+            gone.join(", ")
+        ));
+    }
+    if let Err(e) = preload::record_apply(dir, gateway, name, &opened, &closed, &stuck, &known) {
+        parts.push(format!(
+            "\u{2717} Could not record the open groups ({e}); the picker will not show what is open here"
+        ));
+    }
+    parts.join("\n\n")
 }
 
 #[cfg(test)]
@@ -6863,25 +6941,32 @@ mod tests {
         assert_eq!(items[1], "b  (1 host)  (open here)");
         assert_eq!(marked, vec![false, true, false], "the record, not the file");
         assert!(
-            app.status.contains("Unmarking cannot close"),
+            app.status.contains("Unmark a group to close its hosts"),
             "{}",
             app.status
         );
         toggle(&mut app, "b");
         assert_eq!(
             picker(&app).1[1],
-            "b  (1 host)  (stays open)",
-            "unmarking an open group says it stays open"
+            "b  (1 host)  (closes)",
+            "unmarking an open group says applying closes it"
         );
         toggle(&mut app, "b");
         assert_eq!(picker(&app).1[1], "b  (1 host)  (open here)");
-        // Unmarking the only open group and applying changes nothing and says so.
+        // A group an earlier close found held by an older osh's combined rule says it stays.
+        preload::record_apply(&dir, "gw", "sb", &[], &[], &["b".into()], &[]).unwrap();
+        app.pick_toolchains_running("sb".into(), "gw".into(), None);
         toggle(&mut app, "b");
-        press(&mut app, KeyCode::Enter);
         assert_eq!(
-            app.status,
-            "Nothing changed in sb: b stay open (osh cannot close hosts in a running sandbox)"
+            picker(&app).1[1],
+            "b  (1 host)  (stays open: older osh rule)"
         );
+        toggle(&mut app, "b");
+        assert_eq!(picker(&app).1[1], "b  (1 host)  (open here)");
+        // Nothing marked and nothing open: nothing to do.
+        app.pick_toolchains_running("none".into(), "gw".into(), None);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.status, "No toolchain group was marked");
         // A sandbox osh has no record of: unknown, nothing marked.
         app.pick_toolchains_running("other".into(), "gw".into(), None);
         let (title, _, marked) = picker(&app);
@@ -6906,7 +6991,7 @@ mod tests {
         let (_, items, marked) = picker(&app);
         assert_eq!(marked, vec![false, true, true, false], "{items:?}");
         assert_eq!(
-            items[0], "a  (1 host)  (default)  (stays open)",
+            items[0], "a  (1 host)  (default)  (closes)",
             "a is still open here and unmarked"
         );
         assert!(matches!(
@@ -6979,6 +7064,85 @@ mod tests {
             tail: Vec::new(),
         }));
         assert!(!preload::load_records(&dir).contains_key(&preload::record_key(&gw, "broken")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn applying_the_running_picker_closes_unmarked_groups_and_records_it() {
+        let text = "[a]\nhosts = [\"a.example\", \"s.example\"]\n[b]\nhosts = [\"s.example\"]\n[c]\nhosts = [\"c.example\"]\n";
+        let dir = toolchain_dir("apply-close", text);
+        preload::record_open(
+            &dir,
+            "gw",
+            "sb",
+            &["a".into(), "b".into(), "c".into()],
+            true,
+        )
+        .unwrap();
+        let all = preload::parse(text).unwrap();
+        let calls = std::sync::Mutex::new(Vec::<String>::new());
+        let json = r#"{"policy": {"network_policies": {
+            "osh_tc_a_example": {"endpoints": [{"host": "a.example", "port": 443}]},
+            "osh_tc_s_example": {"endpoints": [{"host": "s.example", "port": 443}]},
+            "osh_toolchains": {"endpoints": [{"host": "c.example", "port": 443}, {"host": "z.example", "port": 443}]},
+            "_provider_x": {"endpoints": [{"host": "a.example", "port": 443}]}
+        }}}"#;
+        let run = |args: &[String]| -> Result<String, String> {
+            let line = args.join(" ");
+            calls.lock().unwrap().push(line.clone());
+            if line.contains("policy get") {
+                Ok(json.to_string())
+            } else {
+                Ok(String::new())
+            }
+        };
+        let progress = |_: &str, _: bool, _: Option<usize>| {};
+        let unmarked = vec!["a".to_string(), "c".to_string()];
+        let out = apply_toolchains(
+            &run,
+            &progress,
+            &dir,
+            "gw",
+            "sb",
+            &all,
+            &["b".into()],
+            &unmarked,
+        );
+        let calls = calls.into_inner().unwrap();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "-g gw policy get sb --full -o json"),
+            "{calls:?}"
+        );
+        let removes: Vec<&String> = calls.iter().filter(|c| c.contains("--remove")).collect();
+        assert_eq!(
+            removes,
+            ["-g gw policy update sb --remove-rule osh_tc_a_example --wait --timeout 60"],
+            "only a's own rule: s is shared with b, c is in the older combined rule with z"
+        );
+        assert!(out.contains("1 hosts are open in sb"), "{out}");
+        assert!(
+            out.contains("1 hosts are closed in sb.\n  a.example"),
+            "{out}"
+        );
+        assert!(out.contains("s.example (b)"), "{out}");
+        assert!(out.contains("a.example (_provider_x)"), "{out}");
+        assert!(out.contains("an older osh"), "{out}");
+        let rec = preload::load_records(&dir);
+        assert_eq!(rec["gw/sb"], ["b", "c"], "a closed; c is still open");
+        assert_eq!(preload::stuck_groups(&rec, "gw", "sb"), ["c"]);
+        // An unreadable policy closes nothing and keeps the record.
+        let fail = |args: &[String]| -> Result<String, String> {
+            if args.join(" ").contains("policy get") {
+                Err("Error: gateway down".into())
+            } else {
+                Ok(String::new())
+            }
+        };
+        let out = apply_toolchains(&fail, &progress, &dir, "gw", "sb", &all, &[], &["b".into()]);
+        assert!(out.contains("Nothing was closed"), "{out}");
+        assert_eq!(preload::load_records(&dir)["gw/sb"], ["b", "c"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

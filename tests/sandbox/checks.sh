@@ -14,9 +14,13 @@ sandbox_checks() {
   check "osh wrote the sandbox policy" test -f "$data/sandbox-policy.yaml"
   "$runtime" build -f "$data/images/Dockerfile-claude_code" -t "$tag" "$data/images" >"$HOME/image.log" 2>&1 \
     && pass "the claude-code image builds" || { fail "the claude-code image builds"; tail -8 "$HOME/image.log"; return; }
+  # The policy osh writes for a new sandbox with two toolchain groups chosen ("one":
+  # example.com and www.example.org; "two": www.example.org and git host codeberg.org): the base
+  # plus one rule per host. A unit test (preload) keeps this block equal to what osh generates.
+  { printf '%s\n\n' "$(cat "$data/sandbox-policy.yaml")"; cat /repo/tests/sandbox/toolchains-close.yaml; } >"$HOME/tc-policy.yaml"
   timeout 900 openshell -g "$main" sandbox create --name "$name" --from "$tag" \
-    --policy "$data/sandbox-policy.yaml" --detach >"$HOME/sandbox.log" 2>&1 \
-    && pass "a sandbox is created with the policy" || { fail "a sandbox is created with the policy"; tail -8 "$HOME/sandbox.log"; return; }
+    --policy "$HOME/tc-policy.yaml" --detach >"$HOME/sandbox.log" 2>&1 \
+    && pass "a sandbox is created with the policy and two toolchain groups" || { fail "a sandbox is created with the policy and two toolchain groups"; tail -8 "$HOME/sandbox.log"; return; }
   ex() { timeout 120 openshell -g "$main" sandbox exec -n "$name" -- sh -c "$1" 2>&1; }
 
   out="$(ex 'python3 -c "import os; os.openpty(); print(\"openpty-ok\")"')"
@@ -82,17 +86,41 @@ sandbox_checks() {
   out="$(ex 'curl -s -o /dev/null -w "%{http_code}" -X POST --max-time 30 https://www.ietf.org/')"
   [[ "$out" == 403 ]] && pass "a POST to the allowed domain is still denied" || fail "a POST to the allowed domain is still denied" "$out"
 
-  # The toolchain host list on a running sandbox (preload::update_commands): the endpoints in
-  # one update, the git fetch POST in a second (OpenShell refuses both flags together), after
-  # which a clone over https works.
+  # The toolchain host list on a running sandbox (preload::update_commands): one update per host,
+  # each into its own osh_tc_ rule, the git fetch POST in a later one (OpenShell refuses both flags
+  # together), after which a clone over https works.
   openshell -g "$main" policy update "$name" --add-endpoint github.com:443:read-only:rest:enforce \
-    --add-endpoint codeload.github.com:443:read-only:rest:enforce --binary '/**' --wait --timeout 60 >"$HOME/toolchain-1.log" 2>&1 \
-    && pass "the toolchain endpoints update is accepted" || fail "the toolchain endpoints update is accepted" "$(tail -5 "$HOME/toolchain-1.log")"
-  openshell -g "$main" policy update "$name" --rule-name allow_github_com_443 --binary '/**' \
+    --rule-name osh_tc_github_com --binary '/**' >"$HOME/toolchain-1.log" 2>&1 \
+    && openshell -g "$main" policy update "$name" --add-endpoint codeload.github.com:443:read-only:rest:enforce \
+    --rule-name osh_tc_codeload_github_com --binary '/**' >>"$HOME/toolchain-1.log" 2>&1 \
+    && pass "the toolchain endpoints updates are accepted" || fail "the toolchain endpoints updates are accepted" "$(tail -5 "$HOME/toolchain-1.log")"
+  openshell -g "$main" policy update "$name" --rule-name osh_tc_github_com --binary '/**' \
     --add-allow 'github.com:443:POST:/**/git-upload-pack' --wait --timeout 60 >"$HOME/toolchain-2.log" 2>&1 \
     && pass "the git fetch allow update is accepted" || fail "the git fetch allow update is accepted" "$(tail -5 "$HOME/toolchain-2.log")"
   out="$(ex 'rm -rf /tmp/hw && git clone --depth 1 -q https://github.com/octocat/Hello-World /tmp/hw && ls /tmp/hw | head -1')"
   [[ -n "$out" ]] && pass "git clone over https works once the list is applied" || fail "git clone over https works once the list is applied" "$out"
+
+  # Closing toolchain group "one" while "two" stays marked (preload::close_plan/close_commands):
+  # osh removes only example.com's own rule; www.example.org stays because "two" lists it, and the
+  # providers' rules and the user's own (the ietf.org allow above) are left alone.
+  code() { ex "curl -s -o /dev/null -w '%{http_code}' --max-time 30 https://$1/"; }
+  out="$(code example.com)"
+  [[ "$out" == 200 ]] && pass "a host of toolchain group one is open from creation" || fail "a host of toolchain group one is open from creation" "$out"
+  openshell -g "$main" policy get "$name" --full -o json >"$HOME/tc-before.json" 2>&1 \
+    && grep -q '"osh_tc_example_com"' "$HOME/tc-before.json" && grep -q '"_provider_rust"' "$HOME/tc-before.json" \
+    && pass "policy get shows osh's per-host rule and the provider's rule" || fail "policy get shows osh's per-host rule and the provider's rule" "$(head -c 400 "$HOME/tc-before.json")"
+  openshell -g "$main" policy update "$name" --remove-rule osh_tc_example_com --wait --timeout 60 >"$HOME/tc-close.log" 2>&1 \
+    && pass "the close osh issues for group one is accepted" || fail "the close osh issues for group one is accepted" "$(tail -5 "$HOME/tc-close.log")"
+  out="$(code example.com)"
+  [[ "$out" != 200 ]] && pass "the closed group's host is refused" || fail "the closed group's host is refused" "$out"
+  out="$(code www.example.org)"
+  [[ "$out" == 200 ]] && pass "the host group two shares stays open" || fail "the host group two shares stays open" "$out"
+  out="$(code www.ietf.org)"
+  [[ "$out" == 200 ]] && pass "a rule that is not osh's still works after the close" || fail "a rule that is not osh's still works after the close" "$out"
+  openshell -g "$main" policy get "$name" --full -o json >"$HOME/tc-after.json" 2>&1
+  ! grep -q '"osh_tc_example_com"' "$HOME/tc-after.json" && grep -q '"_provider_rust"' "$HOME/tc-after.json" \
+    && grep -q '"osh_tc_www_example_org"' "$HOME/tc-after.json" && grep -q '"osh_tc_codeberg_org"' "$HOME/tc-after.json" \
+    && pass "only the closed rule is gone; provider and group two rules are intact" || fail "only the closed rule is gone; provider and group two rules are intact" "$(head -c 400 "$HOME/tc-after.json")"
 
   # Port forwarding offers (ports.rs): the scan osh runs must list a new listener, and the
   # forward osh starts must reach it from the host.

@@ -10,7 +10,9 @@
 # githubusercontent.com hosts serve anyone's files. They are listed because Go modules and GitHub
 # releases cannot be fetched without them. Turn a group off to drop its hosts.
 #
-# Groups apply to sandboxes created afterwards. For a running sandbox use the Ctrl-] menu.
+# Groups apply to sandboxes created afterwards. For a running sandbox use the Ctrl-] menu: it
+# opens marked groups and closes unmarked ones (each host is its own rule, osh_tc_HOST; a host
+# another marked group lists stays open).
 # Edit it inside osh: "Edit toolchains.toml" in the command palette (:) or in the toolchain
 # pickers; saving there refuses a file that is not valid TOML. A broken file is otherwise ignored:
 # the pickers say what is wrong and offer the editor.

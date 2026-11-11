@@ -69,8 +69,23 @@ pub fn hosts(groups: &[Group]) -> (Vec<String>, Vec<String>) {
     (plain, git.into_iter().collect())
 }
 
-/// The `network_policies` block for a policy file: read-only for the plain hosts, read-only plus
-/// the git fetch POST for git hosts, for any program. Empty when no group is on.
+/// Start of the name of every network rule the list makes: one rule per host (`rule_name`), so
+/// closing a host in a running sandbox is `--remove-rule` of exactly that rule. OpenShell's other
+/// remove, `--remove-endpoint`, takes the host out of every rule of the sandbox, the user's own too.
+pub const RULE_PREFIX: &str = "osh_tc_";
+/// The rules osh wrote at creation before it made one per host: all the hosts of all chosen groups
+/// in one rule (and the git hosts in a second), so one group cannot be closed by removing a rule.
+pub const LEGACY_RULES: [&str; 2] = ["osh_toolchains", "osh_toolchains_git"];
+
+/// The rule osh's list uses for `host`. Hosts are `[a-z0-9.-]` (`parse`), so turning the dots into
+/// underscores keeps two hosts from sharing a name.
+pub fn rule_name(host: &str) -> String {
+    format!("{RULE_PREFIX}{}", host.replace('.', "_"))
+}
+
+/// The `network_policies` block for a policy file: one rule per host (`rule_name`), read-only for
+/// the plain hosts, read-only plus the git fetch POST for git hosts, for any program. Empty when
+/// no group is on.
 pub fn network_policies(groups: &[Group]) -> String {
     let (plain, git) = hosts(groups);
     let mut out = String::new();
@@ -78,9 +93,16 @@ pub fn network_policies(groups: &[Group]) -> String {
         return out;
     }
     out.push_str("network_policies:\n");
-    if !plain.is_empty() {
-        out.push_str("  osh_toolchains:\n    endpoints:\n");
-        for h in &plain {
+    let mut all: Vec<(&String, bool)> = plain.iter().map(|h| (h, false)).collect();
+    all.extend(git.iter().map(|h| (h, true)));
+    all.sort();
+    for (h, is_git) in all {
+        out.push_str(&format!("  {}:\n    endpoints:\n", rule_name(h)));
+        if is_git {
+            out.push_str(&format!(
+                "      - host: {h}\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: {{ method: GET, path: \"/**\" }}\n          - allow: {{ method: HEAD, path: \"/**\" }}\n          - allow: {{ method: OPTIONS, path: \"/**\" }}\n          - allow: {{ method: POST, path: \"/**/git-upload-pack\" }}\n"
+            ));
+        } else {
             let slash = if ENCODED_SLASH_HOSTS.contains(&h.as_str()) {
                 ", allow_encoded_slash: true"
             } else {
@@ -88,15 +110,6 @@ pub fn network_policies(groups: &[Group]) -> String {
             };
             out.push_str(&format!(
                 "      - {{ host: {h}, ports: [443], protocol: rest, enforcement: enforce, access: read-only{slash} }}\n"
-            ));
-        }
-        out.push_str("    binaries:\n      - { path: \"/**\" }\n");
-    }
-    if !git.is_empty() {
-        out.push_str("  osh_toolchains_git:\n    endpoints:\n");
-        for h in &git {
-            out.push_str(&format!(
-                "      - host: {h}\n        ports: [443]\n        protocol: rest\n        enforcement: enforce\n        rules:\n          - allow: {{ method: GET, path: \"/**\" }}\n          - allow: {{ method: HEAD, path: \"/**\" }}\n          - allow: {{ method: OPTIONS, path: \"/**\" }}\n          - allow: {{ method: POST, path: \"/**/git-upload-pack\" }}\n"
             ));
         }
         out.push_str("    binaries:\n      - { path: \"/**\" }\n");
@@ -110,7 +123,9 @@ pub fn network_policies(groups: &[Group]) -> String {
 /// clashes with a rule already on the sandbox (a provider's, say), and one clash must not block
 /// the other hosts. Only the last waits for the sandbox to load the policy. The git POST is a
 /// separate update after the endpoints because OpenShell does not take `--add-allow` and
-/// `--add-endpoint` together; it needs the endpoint to exist first.
+/// `--add-endpoint` together; it needs the endpoint to exist first. Each host goes into its own
+/// rule (`rule_name`), as at creation, so it can be closed alone; when another rule of the
+/// sandbox already has the host, OpenShell folds the endpoint into that one instead.
 pub fn update_commands(gateway: &str, sandbox: &str, groups: &[Group]) -> Vec<Vec<String>> {
     // The command line cannot set `allow_encoded_slash`, and a rule without it would clash with the
     // npm provider's for the same host, so those hosts are left out here (the creation policy
@@ -120,20 +135,14 @@ pub fn update_commands(gateway: &str, sandbox: &str, groups: &[Group]) -> Vec<Ve
         .into_iter()
         .filter(|h| !ENCODED_SLASH_HOSTS.contains(&h.as_str()))
         .collect();
-    let base = |extra: Vec<String>| {
-        let mut a: Vec<String> = Vec::new();
-        if !gateway.is_empty() {
-            a.extend(["-g".into(), gateway.into()]);
-        }
-        a.extend(["policy".into(), "update".into(), sandbox.into()]);
-        a.extend(extra);
-        a
-    };
+    let base = |extra: Vec<String>| update_base(gateway, sandbox, extra);
     let mut out: Vec<Vec<String>> = Vec::new();
     for h in plain.iter().chain(&git) {
         out.push(base(vec![
             "--add-endpoint".into(),
             format!("{h}:443:read-only:rest:enforce"),
+            "--rule-name".into(),
+            rule_name(h),
             "--binary".into(),
             "/**".into(),
         ]));
@@ -141,7 +150,7 @@ pub fn update_commands(gateway: &str, sandbox: &str, groups: &[Group]) -> Vec<Ve
     for h in &git {
         out.push(base(vec![
             "--rule-name".into(),
-            format!("allow_{}_443", h.replace(['.', '-'], "_")),
+            rule_name(h),
             "--binary".into(),
             "/**".into(),
             "--add-allow".into(),
@@ -150,6 +159,335 @@ pub fn update_commands(gateway: &str, sandbox: &str, groups: &[Group]) -> Vec<Ve
     }
     if let Some(last) = out.last_mut() {
         last.extend(["--wait".into(), "--timeout".into(), "60".into()]);
+    }
+    out
+}
+
+/// `[-g GATEWAY] policy update SANDBOX EXTRA...`.
+fn update_base(gateway: &str, sandbox: &str, extra: Vec<String>) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    if !gateway.is_empty() {
+        a.extend(["-g".into(), gateway.into()]);
+    }
+    a.extend(["policy".into(), "update".into(), sandbox.into()]);
+    a.extend(extra);
+    a
+}
+
+/// The read-only call whose output `parse_rules` reads: the sandbox's effective policy, provider
+/// rules included, so the close can say which other rules still allow a host.
+pub fn policy_get_args(gateway: &str, sandbox: &str) -> Vec<String> {
+    let mut a: Vec<String> = Vec::new();
+    if !gateway.is_empty() {
+        a.extend(["-g".into(), gateway.into()]);
+    }
+    a.extend(
+        ["policy", "get", sandbox, "--full", "-o", "json"]
+            .iter()
+            .map(|s| s.to_string()),
+    );
+    a
+}
+
+/// Rule name to the hosts it allows on port 443, lowercased (wildcards as written).
+pub type Rules = std::collections::BTreeMap<String, Vec<String>>;
+
+/// The network rules of `openshell policy get --full -o json` (`.policy.network_policies`).
+pub fn parse_rules(json: &str) -> Result<Rules, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(json).map_err(|e| format!("policy get: not JSON ({e})"))?;
+    let Some(rules) = v.pointer("/policy/network_policies") else {
+        return Ok(Rules::new());
+    };
+    let rules = rules
+        .as_object()
+        .ok_or("policy get: network_policies is not a map")?;
+    let mut out = Rules::new();
+    for (name, rule) in rules {
+        let hosts = rule
+            .get("endpoints")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|e| {
+                let port = e.get("port").and_then(serde_json::Value::as_u64);
+                let ports = e.get("ports").and_then(serde_json::Value::as_array);
+                port == Some(443)
+                    || ports.is_some_and(|p| p.iter().any(|x| x.as_u64() == Some(443)))
+            })
+            .filter_map(|e| e.get("host").and_then(serde_json::Value::as_str))
+            .map(str::to_ascii_lowercase)
+            .collect();
+        out.insert(name.clone(), hosts);
+    }
+    Ok(out)
+}
+
+/// A rule host covers `host`: the same name, or a `*.` / `**.` wildcard over it.
+fn covers(pattern: &str, host: &str) -> bool {
+    if pattern == host {
+        return true;
+    }
+    pattern
+        .strip_prefix("**.")
+        .or_else(|| pattern.strip_prefix("*."))
+        .is_some_and(|suffix| host.ends_with(&format!(".{suffix}")))
+}
+
+/// What closing does to one host of an unmarked group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum How {
+    /// osh's rules that hold it are removed (its own `rule_name`, and the old combined rule
+    /// when every host in that one is being closed too).
+    Remove(Vec<String>),
+    /// A group that stays marked needs it too, so it stays open.
+    Shared(Vec<String>),
+    /// Only the old combined rule (`LEGACY_RULES`) holds it, and that rule also holds hosts of
+    /// groups that stay: removing it would close those too.
+    Legacy(String),
+    /// No rule of osh's holds it (already closed, or never opened by osh): nothing to remove.
+    NotOpen,
+}
+
+/// One host of the close: what is done, and the rules that are not osh's and still allow it
+/// (a provider's, the user's own), which closing leaves alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostClose {
+    pub host: String,
+    pub how: How,
+    pub also: Vec<String>,
+}
+
+/// A rule osh's toolchain list made: the only ones a close may remove. Never a provider rule.
+pub fn is_osh_rule(name: &str) -> bool {
+    !name.starts_with("_provider")
+        && (name.starts_with(RULE_PREFIX) || LEGACY_RULES.contains(&name))
+}
+
+/// What closing the groups named in `close` does to each of their hosts, given the groups that
+/// stay marked (`keep`) and the sandbox's rules. A host a kept group also lists stays open; a host
+/// only the old combined rule holds stays open unless every host of that rule is being closed.
+pub fn close_plan(
+    all: &[Group],
+    keep: &[String],
+    close: &[String],
+    rules: &Rules,
+) -> Vec<HostClose> {
+    let hosts_of = |names: &[String]| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for g in all.iter().filter(|g| names.contains(&g.name)) {
+            for (h, _) in &g.hosts {
+                if !out.contains(h) {
+                    out.push(h.clone());
+                }
+            }
+        }
+        out
+    };
+    let needed = hosts_of(keep);
+    let closing: Vec<String> = hosts_of(close)
+        .into_iter()
+        .filter(|h| !needed.contains(h))
+        .collect();
+    // An old combined rule can go only when nothing in it is still needed.
+    let legacy_free = |name: &str| {
+        rules
+            .get(name)
+            .is_some_and(|hs| hs.iter().all(|h| closing.contains(h)))
+    };
+    let mut out = Vec::new();
+    for h in hosts_of(close) {
+        let also: Vec<String> = rules
+            .iter()
+            .filter(|(n, hs)| !is_osh_rule(n) && hs.iter().any(|p| covers(p, &h)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        let how = if needed.contains(&h) {
+            How::Shared(
+                all.iter()
+                    .filter(|g| keep.contains(&g.name) && g.hosts.iter().any(|(x, _)| x == &h))
+                    .map(|g| g.name.clone())
+                    .collect(),
+            )
+        } else {
+            let own = rule_name(&h);
+            let legacy: Vec<&str> = LEGACY_RULES
+                .iter()
+                .copied()
+                .filter(|n| rules.get(*n).is_some_and(|hs| hs.contains(&h)))
+                .collect();
+            if let Some(stuck) = legacy.iter().find(|n| !legacy_free(n)) {
+                How::Legacy(stuck.to_string())
+            } else {
+                let mut remove: Vec<String> = legacy.iter().map(|s| s.to_string()).collect();
+                if rules.contains_key(&own) {
+                    remove.insert(0, own);
+                }
+                if remove.is_empty() {
+                    How::NotOpen
+                } else {
+                    How::Remove(remove)
+                }
+            }
+        };
+        out.push(HostClose { host: h, how, also });
+    }
+    out
+}
+
+/// The `policy update --remove-rule` calls for a plan: one per rule, each rule once, only rules
+/// osh made (`is_osh_rule`). Only the last waits for the sandbox to load the policy.
+pub fn close_commands(
+    gateway: &str,
+    sandbox: &str,
+    plan: &[HostClose],
+) -> Vec<(String, Vec<String>)> {
+    let mut rules: Vec<String> = Vec::new();
+    for hc in plan {
+        if let How::Remove(rs) = &hc.how {
+            for r in rs {
+                if is_osh_rule(r) && !rules.contains(r) {
+                    rules.push(r.clone());
+                }
+            }
+        }
+    }
+    let mut out: Vec<(String, Vec<String>)> = rules
+        .into_iter()
+        .map(|r| {
+            let args = update_base(gateway, sandbox, vec!["--remove-rule".into(), r.clone()]);
+            (r, args)
+        })
+        .collect();
+    if let Some((_, last)) = out.last_mut() {
+        last.extend(["--wait".into(), "--timeout".into(), "60".into()]);
+    }
+    out
+}
+
+/// Whether each host of the plan closed, from the result of each removed rule: closed when every
+/// rule it needed removed went; `Shared`, `Legacy` and `NotOpen` hosts send nothing.
+pub fn close_results(
+    plan: &[HostClose],
+    results: &[(String, Result<(), String>)],
+) -> Vec<(String, Result<(), String>)> {
+    plan.iter()
+        .filter_map(|hc| match &hc.how {
+            How::Remove(rs) => {
+                let err = rs.iter().find_map(|r| {
+                    results
+                        .iter()
+                        .find(|(n, _)| n == r)
+                        .and_then(|(_, res)| res.clone().err())
+                });
+                Some((hc.host.clone(), err.map_or(Ok(()), Err)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The groups of `close` that are closed now: none of their hosts stayed open because of an old
+/// combined rule or failed. Hosts a kept group needs, or that only a rule that is not osh's
+/// allows, do not keep a group open: osh's part of it is gone.
+pub fn closed_groups(
+    all: &[Group],
+    close: &[String],
+    plan: &[HostClose],
+    done: &[(String, Result<(), String>)],
+) -> (Vec<String>, Vec<String>) {
+    let mut closed = Vec::new();
+    let mut stuck = Vec::new();
+    for g in all.iter().filter(|g| close.contains(&g.name)) {
+        let of = |h: &str| plan.iter().find(|hc| hc.host == h);
+        let legacy = g
+            .hosts
+            .iter()
+            .any(|(h, _)| of(h).is_some_and(|hc| matches!(hc.how, How::Legacy(_))));
+        let failed = g
+            .hosts
+            .iter()
+            .any(|(h, _)| done.iter().any(|(x, r)| x == h && r.is_err()));
+        if legacy {
+            stuck.push(g.name.clone());
+        } else if !failed {
+            closed.push(g.name.clone());
+        }
+    }
+    (closed, stuck)
+}
+
+/// The popup text for a close: what closed, what stays open and why, what failed.
+pub fn close_report(
+    sandbox: &str,
+    plan: &[HostClose],
+    done: &[(String, Result<(), String>)],
+) -> String {
+    let ok: Vec<&str> = done
+        .iter()
+        .filter(|(_, r)| r.is_ok())
+        .map(|(h, _)| h.as_str())
+        .collect();
+    let mut out = format!("\u{2713} {} hosts are closed in {sandbox}.", ok.len());
+    if !ok.is_empty() {
+        out.push_str(&format!("\n  {}", ok.join(", ")));
+    }
+    let shared: Vec<String> = plan
+        .iter()
+        .filter_map(|hc| match &hc.how {
+            How::Shared(gs) => Some(format!("{} ({})", hc.host, gs.join(", "))),
+            _ => None,
+        })
+        .collect();
+    if !shared.is_empty() {
+        out.push_str(&format!(
+            "\n\n\u{2022} {} stay open because a group that is still marked needs them:\n  {}",
+            shared.len(),
+            shared.join(", ")
+        ));
+    }
+    let legacy: Vec<&HostClose> = plan
+        .iter()
+        .filter(|hc| matches!(hc.how, How::Legacy(_)))
+        .collect();
+    if let Some(first) = legacy.first() {
+        let How::Legacy(rule) = &first.how else {
+            unreachable!()
+        };
+        out.push_str(&format!(
+            "\n\n\u{2022} {} stay open: an older osh created this sandbox with the hosts of all its groups in one rule ({rule}), and removing it would also close the groups that stay marked. Unmark every group to close them all, or create a new sandbox:\n  {}",
+            legacy.len(),
+            legacy.iter().map(|hc| hc.host.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let also: Vec<String> = plan
+        .iter()
+        .filter(|hc| !hc.also.is_empty() && !matches!(hc.how, How::Shared(_)))
+        .map(|hc| format!("{} ({})", hc.host, hc.also.join(", ")))
+        .collect();
+    if !also.is_empty() {
+        out.push_str(&format!(
+            "\n\n\u{2022} {} are still allowed by a rule that is not one of osh's toolchain rules (a provider's, your own, or an allow_HOST_443 an older osh added), which osh does not remove:\n  {}",
+            also.len(),
+            also.join(", ")
+        ));
+    }
+    let failed: Vec<(&str, String)> = done
+        .iter()
+        .filter_map(|(h, r)| {
+            r.as_ref().err().map(|e| {
+                (
+                    h.as_str(),
+                    refusal(e).unwrap_or_else(|| e.trim().to_string()),
+                )
+            })
+        })
+        .collect();
+    if !failed.is_empty() {
+        out.push_str(&format!("\n\n\u{2717} {} failed to close:", failed.len()));
+        for (h, why) in failed {
+            out.push_str(&format!("\n  {h}  {why}"));
+        }
     }
     out
 }
@@ -170,6 +508,7 @@ fn refusal(err: &str) -> Option<String> {
     let first = err.lines().map(str::trim).find(|l| !l.is_empty())?;
     let clean = first
         .trim_start_matches("Error:")
+        .trim_start()
         .trim_start_matches('\u{d7}')
         .trim();
     Some(clean.chars().take(120).collect())
@@ -215,8 +554,10 @@ pub fn report(sandbox: &str, results: &[(String, Result<(), String>)]) -> String
 pub const TAG_DEFAULT: &str = "(default)";
 /// Running-sandbox picker tag of a group osh recorded as open there, while it is marked.
 pub const TAG_OPEN: &str = "(open here)";
-/// The same group once unmarked: osh cannot close its hosts (see `retag_open`).
-pub const TAG_STAYS: &str = "(stays open)";
+/// The same group once unmarked: applying closes its hosts (`close_plan`).
+pub const TAG_CLOSES: &str = "(closes)";
+/// An unmarked open group a close already found held by the old combined rule (`How::Legacy`).
+pub const TAG_STAYS: &str = "(stays open: older osh rule)";
 
 /// The picker line of a group: its name first, so `group_of` can read the pick back, then the
 /// tags (`TAG_*`) that tell the file's defaults and what a sandbox already has apart from the marks.
@@ -232,14 +573,19 @@ pub fn label(g: &Group, open_here: bool) -> String {
     out
 }
 
-/// A running-sandbox picker line after Space: a group that is open there says it stays open
-/// when unmarked, because removing its hosts is not safe (`update_commands` only adds; OpenShell's
-/// `--remove-endpoint` takes a host out of every rule, a provider's included).
-pub fn retag_open(line: &str, marked: bool) -> String {
+/// A running-sandbox picker line after Space: a group that is open there says it closes when
+/// unmarked, or that it stays open when an earlier close found its hosts in the combined rule an
+/// older osh wrote (`stuck`), which cannot be removed while other groups stay.
+pub fn retag_open(line: &str, marked: bool, stuck: bool) -> String {
+    let line = line
+        .replace(TAG_STAYS, TAG_OPEN)
+        .replace(TAG_CLOSES, TAG_OPEN);
     if marked {
-        line.replace(TAG_STAYS, TAG_OPEN)
-    } else {
+        line
+    } else if stuck {
         line.replace(TAG_OPEN, TAG_STAYS)
+    } else {
+        line.replace(TAG_OPEN, TAG_CLOSES)
     }
 }
 
@@ -314,14 +660,28 @@ pub fn prune(records: &mut Records, gateway: &str, live: &[String]) -> bool {
     let before = records.len();
     let prefix = record_key(gateway, "");
     records.retain(|k, _| {
-        k.strip_prefix(&prefix)
-            .is_none_or(|sb| live.iter().any(|l| l == sb))
+        k.strip_prefix(&prefix).is_none_or(|sb| {
+            let sb = sb.strip_suffix(STUCK_SUFFIX).unwrap_or(sb);
+            live.iter().any(|l| l == sb)
+        })
     });
     records.len() != before
 }
 
+/// Suffix of the record key (`record_key` + this) that lists the open groups a close found held
+/// by an older osh's combined rule (`How::Legacy`), so the picker can say they stay open.
+pub const STUCK_SUFFIX: &str = "#stays";
+
+/// The groups recorded as stuck open in a sandbox (`STUCK_SUFFIX`).
+pub fn stuck_groups(records: &Records, gateway: &str, sandbox: &str) -> Vec<String> {
+    records
+        .get(&(record_key(gateway, sandbox) + STUCK_SUFFIX))
+        .cloned()
+        .unwrap_or_default()
+}
+
 /// Add `groups` to what is recorded as open in a sandbox (`replace`: at creation, the choice is
-/// the whole of it). Nothing osh does closes a group, so an apply only ever adds.
+/// the whole of it, and nothing is stuck).
 pub fn record_open(
     dir: &std::path::Path,
     gateway: &str,
@@ -329,17 +689,55 @@ pub fn record_open(
     groups: &[String],
     replace: bool,
 ) -> Result<(), String> {
-    let mut records = load_records(dir);
-    let entry = records.entry(record_key(gateway, sandbox)).or_default();
     if replace {
-        entry.clear();
+        let mut records = load_records(dir);
+        records.remove(&(record_key(gateway, sandbox) + STUCK_SUFFIX));
+        records.insert(record_key(gateway, sandbox), Vec::new());
+        save_records(dir, &records)?;
     }
-    for g in groups {
+    record_apply(dir, gateway, sandbox, groups, &[], &[], &[])
+}
+
+/// After an apply: `opened` join the record, `closed` leave it, and the stuck list becomes what
+/// this close found (`stuck`) plus what was stuck before and was not tried again (`tried`).
+/// Only groups still recorded open can be stuck.
+pub fn record_apply(
+    dir: &std::path::Path,
+    gateway: &str,
+    sandbox: &str,
+    opened: &[String],
+    closed: &[String],
+    stuck: &[String],
+    tried: &[String],
+) -> Result<(), String> {
+    let mut records = load_records(dir);
+    let key = record_key(gateway, sandbox);
+    let entry = records.entry(key.clone()).or_default();
+    for g in opened {
         if !entry.contains(g) {
             entry.push(g.clone());
         }
     }
+    entry.retain(|g| !closed.contains(g));
     entry.sort();
+    let open = entry.clone();
+    let skey = key + STUCK_SUFFIX;
+    let mut s: Vec<String> = records
+        .get(&skey)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|g| !tried.contains(g))
+        .chain(stuck.iter().cloned())
+        .filter(|g| open.contains(g))
+        .collect();
+    s.sort();
+    s.dedup();
+    if s.is_empty() {
+        records.remove(&skey);
+    } else {
+        records.insert(skey, s);
+    }
     save_records(dir, &records)
 }
 
@@ -458,7 +856,11 @@ pub fn creation_policy(base: &str, groups: &[Group]) -> Result<String, String> {
             )
         }
     };
-    for name in ["osh_toolchains:", "osh_toolchains_git:"] {
+    let names = net
+        .lines()
+        .filter(|l| l.starts_with("  ") && !l.starts_with("   "))
+        .map(str::trim);
+    for name in names {
         if lines.iter().any(|l| l.trim_start() == name) {
             return Err(format!(
                 "sandbox-policy.yaml already has a policy named {}, so the toolchain hosts were left out",
@@ -631,7 +1033,7 @@ enabled = true"
         let first = cmds[0].join(" ");
         assert_eq!(
             first,
-            "-g gw policy update sb --add-endpoint x.example:443:read-only:rest:enforce --binary /**"
+            "-g gw policy update sb --add-endpoint x.example:443:read-only:rest:enforce --rule-name osh_tc_x_example --binary /**"
         );
         assert!(cmds[1]
             .join(" ")
@@ -651,7 +1053,7 @@ enabled = true"
         );
         assert!(!first.contains("--wait") && !cmds[1].join(" ").contains("--wait"));
         assert!(
-            second.contains("--rule-name allow_git_host_example_443"),
+            second.contains("--rule-name osh_tc_git-host_example"),
             "{second}"
         );
         assert!(second.contains("--add-allow git-host.example:443:POST:/**/git-upload-pack"));
@@ -712,7 +1114,7 @@ enabled = true"
         let p = creation_policy(base, &groups).unwrap();
         assert_eq!(p.matches("network_policies:").count(), 1, "{p}");
         assert!(
-            p.contains("\n    osh_toolchains:\n      endpoints:\n"),
+            p.contains("\n    osh_tc_x_example:\n      endpoints:\n"),
             "{p}"
         );
         assert!(
@@ -722,16 +1124,19 @@ enabled = true"
         // An empty block, flow or not, takes the entries at the usual indent.
         let p = creation_policy("network_policies: {}\nx: 1\n", &groups).unwrap();
         assert!(
-            p.starts_with("network_policies:\n  osh_toolchains:\n"),
+            p.starts_with("network_policies:\n  osh_tc_x_example:\n"),
             "{p}"
         );
         assert!(p.ends_with("x: 1\n"), "{p}");
         // A one-line block cannot be added to: an error the caller shows.
         let e = creation_policy("network_policies: { mine: {} }\n", &groups).unwrap_err();
         assert!(e.contains("block"), "{e}");
-        let e = creation_policy("network_policies:\n  osh_toolchains:\n    x: 1\n", &groups)
-            .unwrap_err();
-        assert!(e.contains("osh_toolchains"), "{e}");
+        let e = creation_policy(
+            "network_policies:\n  osh_tc_x_example:\n    x: 1\n",
+            &groups,
+        )
+        .unwrap_err();
+        assert!(e.contains("osh_tc_x_example"), "{e}");
     }
 
     #[test]
@@ -752,17 +1157,27 @@ enabled = true"
     }
 
     #[test]
-    fn labels_tag_the_defaults_and_what_is_open_and_say_when_it_stays_open() {
+    fn labels_tag_the_defaults_and_what_is_open_and_say_when_it_closes_or_stays_open() {
         let groups = g(SAMPLE);
         assert_eq!(label(&groups[0], false), "a  (2 hosts)  (default)");
         assert_eq!(label(&groups[1], true), "b  (2 hosts)  (open here)");
         let open = label(&groups[0], true);
         assert_eq!(open, "a  (2 hosts)  (default)  (open here)");
         assert_eq!(group_of(&open), "a");
-        let stays = retag_open(&open, false);
-        assert_eq!(stays, "a  (2 hosts)  (default)  (stays open)");
-        assert_eq!(retag_open(&stays, true), open);
-        assert_eq!(retag_open(&label(&groups[1], false), false), "b  (2 hosts)");
+        let closes = retag_open(&open, false, false);
+        assert_eq!(closes, "a  (2 hosts)  (default)  (closes)");
+        assert_eq!(retag_open(&closes, true, false), open);
+        let stays = retag_open(&open, false, true);
+        assert_eq!(
+            stays,
+            "a  (2 hosts)  (default)  (stays open: older osh rule)"
+        );
+        assert_eq!(retag_open(&stays, true, true), open);
+        assert_eq!(group_of(&stays), "a");
+        assert_eq!(
+            retag_open(&label(&groups[1], false), false, false),
+            "b  (2 hosts)"
+        );
         assert_eq!(defaults_line(&groups), "a");
         assert_eq!(defaults_line(&select(&groups, &[])), "none");
     }
@@ -840,5 +1255,283 @@ enabled = true"
             "hosts stay"
         );
         assert_eq!(set_enabled(&out, &[("a".into(), false)]), out, "idempotent");
+    }
+
+    /// The groups of the close tests: `a` and `b` share `s.example`, `b` has a git host.
+    const CLOSE: &str = "[a]\nhosts = [\"a.example\", \"s.example\"]\n[b]\nhosts = [\"s.example\"]\ngit_hosts = [\"g.example\"]\n[c]\nhosts = [\"c.example\"]\n";
+
+    fn rules(pairs: &[(&str, &[&str])]) -> Rules {
+        pairs
+            .iter()
+            .map(|(n, hs)| (n.to_string(), hs.iter().map(|h| h.to_string()).collect()))
+            .collect()
+    }
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_creation_policy_has_one_rule_per_host_and_grants_the_same_as_before() {
+        use saphyr::LoadableYamlNode;
+        let groups = select(&g(CLOSE), &names(&["a", "b"]));
+        let p = creation_policy("version: 1\n", &groups).unwrap();
+        let docs = saphyr::Yaml::load_from_str(&p).expect("valid YAML");
+        let net = docs[0].as_mapping_get("network_policies").unwrap();
+        let mut seen: Vec<(String, String, bool)> = Vec::new();
+        for (k, rule) in net.as_mapping().unwrap() {
+            let name = k.as_str().unwrap().to_string();
+            let eps = rule.as_mapping_get("endpoints").unwrap().as_vec().unwrap();
+            assert_eq!(eps.len(), 1, "one host per rule: {name}");
+            let host = eps[0].as_mapping_get("host").unwrap().as_str().unwrap();
+            assert_eq!(name, rule_name(host));
+            assert!(is_osh_rule(&name));
+            let bins = rule.as_mapping_get("binaries").unwrap().as_vec().unwrap();
+            assert_eq!(
+                bins[0].as_mapping_get("path").unwrap().as_str(),
+                Some("/**"),
+                "any program, as the combined rule had"
+            );
+            let git = eps[0].as_mapping_get("rules").is_some();
+            if !git {
+                assert_eq!(
+                    eps[0].as_mapping_get("access").unwrap().as_str(),
+                    Some("read-only")
+                );
+            }
+            seen.push((name, host.to_string(), git));
+        }
+        let (plain, git) = hosts(&groups);
+        let mut want: Vec<(String, String, bool)> = plain
+            .iter()
+            .map(|h| (rule_name(h), h.clone(), false))
+            .chain(git.iter().map(|h| (rule_name(h), h.clone(), true)))
+            .collect();
+        want.sort();
+        seen.sort();
+        assert_eq!(seen, want, "the same hosts, git ones with the fetch POST");
+        assert!(p.contains("POST, path: \"/**/git-upload-pack\""));
+        assert_eq!(rule_name("a-b.example"), "osh_tc_a-b_example");
+        assert_ne!(rule_name("a-b.example"), rule_name("a.b-example"));
+    }
+
+    #[test]
+    fn the_sandbox_check_policy_is_what_osh_writes_for_its_two_groups() {
+        let base = crate::assets::embedded("sandbox-policy.yaml").unwrap();
+        let groups = select(
+            &g("[one]\nhosts = [\"example.com\", \"www.example.org\"]\n[two]\nhosts = [\"www.example.org\"]\ngit_hosts = [\"codeberg.org\"]\n"),
+            &names(&["one", "two"]),
+        );
+        let fixture = include_str!("../../tests/sandbox/toolchains-close.yaml");
+        assert_eq!(
+            creation_policy(base, &groups).unwrap(),
+            format!("{}\n\n{fixture}", base.trim_end()),
+            "tests/sandbox/checks.sh creates its sandbox from this block"
+        );
+    }
+
+    #[test]
+    fn closing_a_group_removes_only_its_own_rules_and_keeps_shared_hosts() {
+        let all = g(CLOSE);
+        let r = rules(&[
+            ("osh_tc_a_example", &["a.example"]),
+            ("osh_tc_s_example", &["s.example"]),
+            ("osh_tc_g_example", &["g.example"]),
+            ("_provider_npm", &["a.example"]),
+            ("mine", &["*.example"]),
+        ]);
+        let plan = close_plan(&all, &names(&["b"]), &names(&["a"]), &r);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].host, "a.example");
+        assert_eq!(plan[0].how, How::Remove(names(&["osh_tc_a_example"])));
+        assert_eq!(
+            plan[0].also,
+            names(&["_provider_npm", "mine"]),
+            "a provider's rule and a wildcard of the user's still allow it"
+        );
+        assert_eq!(plan[1].how, How::Shared(names(&["b"])), "b still needs it");
+        let cmds = close_commands("gw", "sb", &plan);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0].1.join(" "),
+            "-g gw policy update sb --remove-rule osh_tc_a_example --wait --timeout 60"
+        );
+        // Both unmarked: the shared host goes too, once; a host no rule of osh's holds sends
+        // nothing.
+        let r2 = rules(&[("osh_tc_s_example", &["s.example"])]);
+        let plan = close_plan(&all, &[], &names(&["a", "b"]), &r2);
+        let hows: Vec<&How> = plan.iter().map(|h| &h.how).collect();
+        assert_eq!(
+            hows,
+            [
+                &How::NotOpen,
+                &How::Remove(names(&["osh_tc_s_example"])),
+                &How::NotOpen
+            ]
+        );
+        assert_eq!(close_commands("", "sb", &plan).len(), 1);
+    }
+
+    #[test]
+    fn a_rule_that_is_not_oshs_is_never_removed() {
+        for bad in [
+            "_provider_osh_tc_x",
+            "allow_x_example_443",
+            "mine",
+            "osh_tc",
+            "osh_toolchains_other",
+        ] {
+            assert!(!is_osh_rule(bad), "{bad}");
+        }
+        for ok in ["osh_tc_x_example", "osh_toolchains", "osh_toolchains_git"] {
+            assert!(is_osh_rule(ok), "{ok}");
+        }
+        // Even a plan that names a foreign rule sends nothing for it.
+        let plan = vec![HostClose {
+            host: "x.example".into(),
+            how: How::Remove(names(&["_provider_x", "mine", "osh_tc_x_example"])),
+            also: vec![],
+        }];
+        let cmds = close_commands("", "sb", &plan);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].0, "osh_tc_x_example");
+    }
+
+    #[test]
+    fn the_combined_rule_of_an_older_osh_goes_only_when_all_its_hosts_close() {
+        let all = g(CLOSE);
+        let old = rules(&[
+            ("osh_toolchains", &["a.example", "s.example", "c.example"]),
+            ("osh_toolchains_git", &["g.example"]),
+        ]);
+        // c stays marked: removing osh_toolchains would close c.example.
+        let plan = close_plan(&all, &names(&["c"]), &names(&["a", "b"]), &old);
+        assert_eq!(plan[0].how, How::Legacy("osh_toolchains".into()));
+        assert_eq!(plan[1].how, How::Legacy("osh_toolchains".into()));
+        assert_eq!(
+            plan[2].how,
+            How::Remove(names(&["osh_toolchains_git"])),
+            "the git rule holds only hosts that close"
+        );
+        assert_eq!(close_commands("", "sb", &plan).len(), 1);
+        let removed = vec![("osh_toolchains_git".to_string(), Ok(()))];
+        let done = close_results(&plan, &removed);
+        assert_eq!(done, vec![("g.example".to_string(), Ok(()))]);
+        let (closed, stuck) = closed_groups(&all, &names(&["a", "b"]), &plan, &done);
+        assert!(closed.is_empty(), "both groups have a host held open");
+        assert_eq!(stuck, names(&["a", "b"]));
+        let t = close_report("sb", &plan, &done);
+        assert!(
+            t.starts_with("\u{2713} 1 hosts are closed in sb.\n  g.example"),
+            "{t}"
+        );
+        assert!(t.contains("an older osh created this sandbox"), "{t}");
+        assert!(t.contains("(osh_toolchains)"), "{t}");
+        assert!(t.contains("a.example, s.example"), "{t}");
+        // Everything unmarked: the combined rule goes.
+        let plan = close_plan(&all, &[], &names(&["a", "b", "c"]), &old);
+        let cmds: Vec<String> = close_commands("", "sb", &plan)
+            .into_iter()
+            .map(|c| c.0)
+            .collect();
+        assert_eq!(cmds, names(&["osh_toolchains", "osh_toolchains_git"]));
+    }
+
+    #[test]
+    fn the_close_report_and_the_record_follow_what_actually_closed() {
+        let all = g(CLOSE);
+        let r = rules(&[
+            ("osh_tc_a_example", &["a.example"]),
+            ("osh_tc_c_example", &["c.example"]),
+            ("osh_tc_s_example", &["s.example"]),
+            ("allow_c_example_443", &["c.example"]),
+        ]);
+        let plan = close_plan(&all, &names(&["b"]), &names(&["a", "c"]), &r);
+        let removed = vec![
+            ("osh_tc_a_example".to_string(), Ok(())),
+            (
+                "osh_tc_c_example".to_string(),
+                Err("Error: \u{d7} boom".to_string()),
+            ),
+        ];
+        let done = close_results(&plan, &removed);
+        let (closed, stuck) = closed_groups(&all, &names(&["a", "c"]), &plan, &done);
+        assert_eq!(closed, names(&["a"]), "c failed, so it is still open");
+        assert!(stuck.is_empty());
+        let t = close_report("sb", &plan, &done);
+        assert!(
+            t.starts_with("\u{2713} 1 hosts are closed in sb.\n  a.example"),
+            "{t}"
+        );
+        assert!(
+            t.contains(
+                "1 stay open because a group that is still marked needs them:\n  s.example (b)"
+            ),
+            "{t}"
+        );
+        assert!(t.contains("c.example (allow_c_example_443)"), "{t}");
+        assert!(
+            t.contains("\u{2717} 1 failed to close:\n  c.example  boom"),
+            "{t}"
+        );
+
+        let dir = std::env::temp_dir().join(format!("osh-rec-close-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        record_open(&dir, "gw", "sb", &names(&["a", "b", "c"]), true).unwrap();
+        record_apply(
+            &dir,
+            "gw",
+            "sb",
+            &[],
+            &closed,
+            &names(&["c"]),
+            &names(&["a", "c"]),
+        )
+        .unwrap();
+        let rec = load_records(&dir);
+        assert_eq!(rec["gw/sb"], names(&["b", "c"]));
+        assert_eq!(stuck_groups(&rec, "gw", "sb"), names(&["c"]));
+        assert!(
+            !prune(&mut rec.clone(), "gw", &names(&["sb"])),
+            "the stuck list is kept with its sandbox"
+        );
+        let mut gone = rec.clone();
+        assert!(prune(&mut gone, "gw", &[]));
+        assert!(gone.is_empty(), "and pruned with it: {gone:?}");
+        // Trying c again and closing it: it leaves the record and the stuck list.
+        record_apply(&dir, "gw", "sb", &[], &names(&["c"]), &[], &names(&["c"])).unwrap();
+        let rec = load_records(&dir);
+        assert_eq!(rec["gw/sb"], names(&["b"]));
+        assert!(!rec.contains_key("gw/sb#stays"));
+        // A new sandbox under the same name starts clean.
+        record_apply(&dir, "gw", "sb", &[], &[], &names(&["b"]), &[]).unwrap();
+        assert_eq!(stuck_groups(&load_records(&dir), "gw", "sb"), names(&["b"]));
+        record_open(&dir, "gw", "sb", &names(&["b"]), true).unwrap();
+        assert!(stuck_groups(&load_records(&dir), "gw", "sb").is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_rules_are_read_from_policy_get_json() {
+        let json = r#"{"policy": {"network_policies": {
+            "_provider_x": {"endpoints": [{"host": "A.example", "port": 443}, {"host": "b.example", "port": 80}]},
+            "osh_tc_c_example": {"endpoints": [{"host": "c.example", "ports": [80, 443]}]},
+            "empty": {}
+        }}}"#;
+        let r = parse_rules(json).unwrap();
+        assert_eq!(
+            r["_provider_x"],
+            names(&["a.example"]),
+            "port 443 only, lowercased"
+        );
+        assert_eq!(r["osh_tc_c_example"], names(&["c.example"]));
+        assert!(r["empty"].is_empty());
+        assert!(parse_rules(r#"{"policy": {}}"#).unwrap().is_empty());
+        assert!(parse_rules("Error: no sandbox").is_err());
+        assert_eq!(
+            policy_get_args("gw", "sb").join(" "),
+            "-g gw policy get sb --full -o json"
+        );
     }
 }
