@@ -829,7 +829,7 @@ dependencies = [
 
 [[package]]
 name = "osh-tui"
-version = "0.3.16"
+version = "0.4.0"
 dependencies = [
  "libghostty-vt",
  "portable-pty",
