@@ -6,6 +6,7 @@ dist/
 /wizard.json
 .act-run.*
 /rw-shares.json
+/sandbox-toolchains.json
 .e2e-dist/
 
 TASKS.md

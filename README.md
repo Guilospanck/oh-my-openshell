@@ -107,7 +107,7 @@ A few actions have no key and live only in the palette:
 
 | Palette action | What it does |
 | --- | --- |
-| `Edit toolchains.toml` | opens the list of toolchain hosts in your editor, or the built-in one (below) |
+| `Edit toolchains.toml` | opens the list of toolchain hosts and the defaults for all new sandboxes in your editor, or the built-in one (below) |
 | `Editor: switch auto / your own / built-in` | which editor the edit actions use: `auto` (yours when one is found, else the built-in one), always yours, or always the built-in one (kept across runs in `editor-mode` in the data folder) |
 | `Data files` | every file osh keeps in its data folder: view, edit, compare with the shipped default, restore it, delete; new profile or Dockerfile |
 | `Sandbox policy` | the same actions for `sandbox-policy.yaml`, the filesystem policy every new sandbox gets (checked as YAML with a `version` on save) |
@@ -152,7 +152,7 @@ nothing).
 The fallback editor runs inside the TUI with no outside program.
 Edit actions open it (when your editor is not used) with `Edit toolchains.toml` from the command palette (`:`) or from the toolchain pickers
 (new sandbox, and `Open the toolchain hosts` in the `Ctrl-]` menu; after either editor closes the picker comes
-back with the fresh groups), on any file under `Data files` or `Sandbox policy`, with `e` / `n` on the
+back with your marks kept, groups the edit added marked as their `enabled` says and removed ones gone), on any file under `Data files` or `Sandbox policy`, with `e` / `n` on the
 Profiles and Images tabs, and with `e` on the Gateways tab. Saving checks the file first:
 `toolchains.toml` must parse as TOML with exact host names, `sandbox-policy.yaml` must be YAML with a
 `version`, a profile must be YAML with an `id` and pass OpenShell's `profile lint`, a Dockerfile must
@@ -399,15 +399,26 @@ fail once per host). `github`, `go`, `rust`, `zig`, `node` and `python` are on; 
 clone and fetch need; pushes stay denied). osh keeps your edits. The list goes into the
 `--policy` file given to `sandbox create`, inside the `network_policies` block of `sandbox-policy.yaml`
 when you added one there (a one-line block cannot be added to: the create question says the hosts were
-left out, and why). Creating a sandbox asks which groups it may read from
-(marks start at the file; the last line, `Save this choice as the default`, writes them back to the
-file, so groups can be switched without leaving `osh`; the line after it, `Edit toolchains.toml`, opens the
-file in your editor (or the built-in one) and brings the picker back with the saved groups). Hosts that are not exact
+left out, and why). The file is global: its groups, hosts and
+`enabled` flags are the list and the defaults for ALL new sandboxes. A picker's marks are per sandbox:
+they change only the sandbox in its title. Creating a sandbox asks which groups it may read from
+(`Toolchain hosts for the new sandbox only`; marks start at the file's defaults, which carry a `(default)` tag; the
+line `Save this choice as the default for ALL new sandboxes` writes the marks back to the file, so
+defaults can be switched without leaving `osh`; the line after it, `Edit the toolchain list and defaults`, opens the
+file in your editor (or the built-in one) and brings the picker back; after a save the status line says
+what the defaults for new sandboxes now are). Hosts that are not exact
 names (wildcards, addresses) are refused by the file's check and named in the status line. When the file is not
 valid TOML or has no group, both pickers say why and offer the editor (a new sandbox can also go on
 without the list). For a running sandbox use `Open the toolchain
-hosts` in the `Ctrl-]` menu: it asks which groups, and adds the rules with `policy update` (never `policy set`, which would
-drop rules you allowed since). Some entries are wide on purpose: `storage.googleapis.com` reaches
+hosts` in the `Ctrl-]` menu (`Toolchain hosts for sandbox NAME only`): it asks which groups, and adds the rules with `policy update` (never `policy set`, which would
+drop rules you allowed since). Its marks start at what that sandbox already has, not at the defaults:
+osh records the groups of each sandbox it creates and of every apply in `sandbox-toolchains.json` in the
+data directory (keyed by gateway and sandbox; entries of sandboxes the gateway no longer has are dropped
+when it is read), marks them and tags them `(open here)`. A sandbox with no record (made outside this osh,
+or before the record) shows `open here: unknown` and nothing marked. Applying only adds: unmarking a group
+that is open shows it as `(stays open)`, and the report says it stayed open, because OpenShell's
+`--remove-endpoint` takes a host out of every rule, a provider's included, so osh does not close hosts in a
+running sandbox. To close them, create a new sandbox without those groups. Some entries are wide on purpose: `storage.googleapis.com` reaches
 any Google Cloud Storage bucket and the `githubusercontent.com` hosts serve anyone's files, but
 Go modules and GitHub releases cannot be fetched without them. Where a provider profile defines
 the same host, the list narrows it to read-only for that host. `registry.npmjs.org` carries the npm profile's `allow_encoded_slash` setting in the creation policy (a mismatch makes OpenShell reject the provider attach); `policy update` cannot set it, so `Open the toolchain hosts` skips that host: attach the `npm` or `js` profile, or answer the prompt.

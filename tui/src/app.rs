@@ -61,9 +61,12 @@ fn unfit(remote: &ghrepo::Remote, forge: Option<ghrepo::Forge>) -> String {
 }
 
 /// Last line of the new-sandbox toolchain picker: writes the marks back to `toolchains.toml`.
-const SAVE_TOOLCHAINS_ITEM: &str = "Save this choice as the default for new sandboxes";
-/// Toolchain picker line that opens `toolchains.toml` in the editor (Enter on it).
-pub const EDIT_TOOLCHAINS_ITEM: &str = "Edit toolchains.toml (add hosts or groups)...";
+const SAVE_TOOLCHAINS_ITEM: &str =
+    "Save this choice as the default for ALL new sandboxes (rewrites toolchains.toml)";
+/// Toolchain picker line that opens `toolchains.toml` in the editor (Enter on it). The file is
+/// global while the marks are per sandbox, so the line says so.
+pub const EDIT_TOOLCHAINS_ITEM: &str =
+    "Edit the toolchain list and defaults (toolchains.toml, affects ALL new sandboxes)...";
 const TOOLCHAINS_FILE: &str = "toolchains.toml";
 const GH_REPO_ITEM: &str = "Git repo, read/write (GitHub, GitLab, Bitbucket or Forgejo token)...";
 
@@ -286,13 +289,16 @@ pub enum SelKind {
 /// Where to go once the editor closes: back to the picker that opened it, with the fresh file.
 #[derive(Clone)]
 pub enum EditThen {
-    Nothing,
     /// Back to the actions of this data file.
     DataFile(String),
     /// A gateway's config was edited: offer the restart that applies it.
     Gateway(String),
-    NewSandbox(Box<Plan>),
-    Running(String, String),
+    /// Back to the new-sandbox picker, with the marks it had.
+    NewSandbox(Box<Plan>, Option<preload::Marks>),
+    /// Back to the running-sandbox picker (sandbox, gateway), with the marks it had.
+    Running(String, String, Option<preload::Marks>),
+    /// `toolchains.toml` from the palette: say what the defaults are after a save.
+    ToolchainList,
 }
 
 #[derive(Clone)]
@@ -684,6 +690,8 @@ pub struct App {
     /// A detached sandbox being created: its name (empty = generated) and the names that existed
     /// before, so the host tmux config can be copied in once the job ends.
     tmux_after_create: Option<(String, Vec<String>)>,
+    /// (gateway, sandbox, groups) of the create job: recorded as open there once it succeeds.
+    toolchains_after_create: Option<(String, String, Vec<String>)>,
     /// Embedded sandbox shells; they keep running while the dashboard is shown.
     pub sessions: Vec<Session>,
     /// Last status sent to the host tmux window (`workmux set-window-status`).
@@ -1035,6 +1043,7 @@ impl App {
             capture: false,
             running_sync: None,
             tmux_after_create: None,
+            toolchains_after_create: None,
             sessions: Vec::new(),
             host_status: None,
             active: None,
@@ -2559,6 +2568,13 @@ impl App {
             self.quit = true;
             return;
         }
+        if let Some((gateway, name, groups)) = self.toolchains_after_create.take() {
+            if failed.is_none() {
+                if let Err(e) = preload::record_open(&self.dir, &gateway, &name, &groups, true) {
+                    self.status = format!("Could not record the toolchain groups of {name}: {e}");
+                }
+            }
+        }
         if let Some((name, before)) = self.tmux_after_create.take() {
             if failed.is_none() {
                 let dir = self.dir.clone();
@@ -2643,7 +2659,7 @@ impl App {
     fn proceed(&mut self, plan: Plan) {
         let mut missing = self.missing(&plan.providers);
         if missing.is_empty() {
-            self.pick_toolchains(plan);
+            self.pick_toolchains(plan, None);
         } else {
             let first = missing.remove(0);
             self.start_creds(first, false, Some((plan, missing)));
@@ -2711,6 +2727,10 @@ impl App {
             let before = self.snap.sandboxes.iter().map(|s| s.name.clone()).collect();
             self.tmux_after_create = Some((plan.name.clone(), before));
         }
+        self.toolchains_after_create = (!plan.name.is_empty())
+            .then(|| self.creation_policy_groups(plan).2)
+            .flatten()
+            .map(|groups| (cli::gateway(), plan.name.clone(), groups));
         self.job = Some(self.sandbox_steps(plan));
     }
 
@@ -2719,6 +2739,16 @@ impl App {
     /// policy is replaced by the shipped one (never a `--policy` path that does not exist), and an
     /// unusable list or block leaves the hosts out. The sandbox still starts either way.
     fn creation_policy(&self, plan: &Plan) -> (PathBuf, Option<String>) {
+        let (path, note, _) = self.creation_policy_groups(plan);
+        (path, note)
+    }
+
+    /// `creation_policy`, plus the toolchain groups the policy opens (`None` when the hosts were
+    /// left out), for the per-sandbox record.
+    fn creation_policy_groups(
+        &self,
+        plan: &Plan,
+    ) -> (PathBuf, Option<String>, Option<Vec<String>>) {
         let base = self.dir.join("sandbox-policy.yaml");
         let generated = self.dir.join(".sandbox-policy.generated.yaml");
         let mut note = None;
@@ -2749,21 +2779,31 @@ impl App {
             Some(picks) => preload::select(&groups, picks),
             None => groups,
         };
+        let mut opened: Option<Vec<String>> = Some(
+            groups
+                .iter()
+                .filter(|g| g.on)
+                .map(|g| g.name.clone())
+                .collect(),
+        );
         let policy = preload::creation_policy(&text, &groups).unwrap_or_else(|e| {
             note = Some(e);
+            opened = None;
             preload::creation_policy(&text, &[]).unwrap_or_else(|_| text.clone())
         });
         match std::fs::write(&generated, policy) {
-            Ok(()) => (generated, note),
+            Ok(()) => (generated, note, opened),
             Err(e) if base.is_file() => (
                 base,
                 Some(format!(
                     "Could not write the generated policy ({e}), so the plain sandbox-policy.yaml is used without toolchain hosts"
                 )),
+                None,
             ),
             Err(e) => (
                 generated,
                 Some(format!("Could not write the sandbox policy: {e}")),
+                None,
             ),
         }
     }
@@ -2878,17 +2918,19 @@ impl App {
                 self.proceed(plan);
             }
             SelKind::Toolchains(plan) if picks.iter().any(|p| p == EDIT_TOOLCHAINS_ITEM) => {
-                self.edit_toolchains(EditThen::NewSandbox(Box::new(plan)))
+                let marks = self.picker_marks(&picks);
+                self.edit_toolchains(EditThen::NewSandbox(Box::new(plan), Some(marks)))
             }
             SelKind::ToolchainsRunning(name, gateway)
                 if picks.iter().any(|p| p == EDIT_TOOLCHAINS_ITEM) =>
             {
-                self.edit_toolchains(EditThen::Running(name, gateway))
+                let marks = self.picker_marks(&picks);
+                self.edit_toolchains(EditThen::Running(name, gateway, Some(marks)))
             }
             SelKind::ToolchainsFix(then) => {
                 if first == EDIT_TOOLCHAINS_ITEM {
                     self.edit_toolchains(then);
-                } else if let EditThen::NewSandbox(plan) = then {
+                } else if let EditThen::NewSandbox(plan, _) = then {
                     self.ask_name(*plan);
                 }
             }
@@ -3454,7 +3496,7 @@ impl App {
                         .session()
                         .map(|s| (s.sandbox.clone(), s.gateway.clone()))
                     {
-                        self.pick_toolchains_running(name, gateway);
+                        self.pick_toolchains_running(name, gateway, None);
                     }
                 } else if first.starts_with("Port forwards") {
                     self.show_forwards();
@@ -3745,27 +3787,51 @@ impl App {
     }
 
     /// New-sandbox step: which toolchain host groups it may read from. Marks start at the file's
-    /// defaults; the last line saves the marks as the new defaults. Skipped when the list is
-    /// missing or broken (the sandbox then starts without it, as before).
-    fn pick_toolchains(&mut self, plan: Plan) {
+    /// defaults (or, back from the editor, at the marks it had); the save line writes the marks
+    /// back as the defaults for every new sandbox. Skipped when the list is missing or broken
+    /// (the sandbox then starts without it, as before).
+    fn pick_toolchains(&mut self, plan: Plan, prev: Option<preload::Marks>) {
         let Some(groups) = self.toolchain_groups() else {
             if let Some(why) = self.toolchains_broken() {
-                return self.offer_toolchain_fix(&why, EditThen::NewSandbox(Box::new(plan)));
+                return self.offer_toolchain_fix(&why, EditThen::NewSandbox(Box::new(plan), prev));
             }
             return self.ask_name(plan);
         };
-        let mut items: Vec<String> = groups.iter().map(preload::label).collect();
-        let mut marked: Vec<bool> = groups.iter().map(|g| g.on).collect();
+        let mut items: Vec<String> = groups.iter().map(|g| preload::label(g, false)).collect();
+        let mut marked: Vec<bool> = match &prev {
+            Some(m) => preload::remark(&groups, m),
+            None => groups.iter().map(|g| g.on).collect(),
+        };
         items.push(SAVE_TOOLCHAINS_ITEM.into());
         items.push(EDIT_TOOLCHAINS_ITEM.into());
-        marked.extend([false, false]);
+        marked.extend([prev.is_some_and(|m| m.save), false]);
         self.select_marked(
-            "Toolchain hosts this sandbox may read from (space to mark, Enter to confirm)",
+            "Toolchain hosts for the new sandbox only (space to mark, Enter to confirm)",
             items,
             marked,
             true,
             SelKind::Toolchains(plan),
         );
+    }
+
+    /// A toolchain picker's marks (its `picks`), to bring back after the editor closes.
+    fn picker_marks(&self, picks: &[String]) -> preload::Marks {
+        let known = std::fs::read_to_string(self.dir.join(TOOLCHAINS_FILE))
+            .ok()
+            .and_then(|t| preload::parse(&t).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|g| g.name)
+            .collect();
+        preload::Marks {
+            picked: picks
+                .iter()
+                .filter(|p| *p != SAVE_TOOLCHAINS_ITEM && *p != EDIT_TOOLCHAINS_ITEM)
+                .map(|p| preload::group_of(p).to_string())
+                .collect(),
+            known,
+            save: picks.iter().any(|p| p == SAVE_TOOLCHAINS_ITEM),
+        }
     }
 
     /// Writes the marked groups into `toolchains.toml` as the defaults, keeping its comments.
@@ -3783,26 +3849,77 @@ impl App {
             .iter()
             .map(|g| (g.name.clone(), on.contains(&g.name)))
             .collect();
-        match std::fs::write(&path, preload::set_enabled(&text, &want)) {
-            Ok(()) => self.status = "Toolchain defaults saved".into(),
+        let text = preload::set_enabled(&text, &want);
+        match std::fs::write(&path, &text) {
+            Ok(()) => {
+                let now = preload::parse(&text).unwrap_or_default();
+                self.status = format!(
+                    "Saved toolchains.toml: defaults for ALL new sandboxes now: {}",
+                    preload::defaults_line(&now)
+                );
+            }
             Err(e) => self.status = format!("Could not save toolchains.toml: {e}"),
         }
     }
 
-    /// Ctrl-] entry: choose which groups to open in a running sandbox (marks start at the defaults).
-    fn pick_toolchains_running(&mut self, name: String, gateway: String) {
+    /// What osh recorded as open in a sandbox (`None`: no record, so unknown). Reading prunes the
+    /// entries of sandboxes the shown gateway no longer has.
+    fn recorded_toolchains(&mut self, gateway: &str, name: &str) -> Option<Vec<String>> {
+        let mut records = preload::load_records(&self.dir);
+        let live: Vec<String> = self.snap.sandboxes.iter().map(|s| s.name.clone()).collect();
+        if self.snap.gateway_ok
+            && self.snap.error.is_none()
+            && self.snap.gateway == gateway
+            && preload::prune(&mut records, gateway, &live)
+        {
+            let _ = preload::save_records(&self.dir, &records);
+        }
+        records.remove(&preload::record_key(gateway, name))
+    }
+
+    /// Ctrl-] entry: choose which groups to open in a running sandbox. Marks start at what osh
+    /// recorded as open there (tagged "open here"), not at the defaults for new sandboxes; back
+    /// from the editor they keep what they were.
+    fn pick_toolchains_running(
+        &mut self,
+        name: String,
+        gateway: String,
+        prev: Option<preload::Marks>,
+    ) {
         let Some(groups) = self.toolchain_groups() else {
             let why = self
                 .toolchains_broken()
                 .unwrap_or_else(|| "toolchains.toml has no usable groups".into());
-            return self.offer_toolchain_fix(&why, EditThen::Running(name, gateway));
+            return self.offer_toolchain_fix(&why, EditThen::Running(name, gateway, prev));
         };
-        let mut items: Vec<String> = groups.iter().map(preload::label).collect();
-        let mut marked: Vec<bool> = groups.iter().map(|g| g.on).collect();
+        let open = self.recorded_toolchains(&gateway, &name);
+        let is_open = |g: &preload::Group| open.as_ref().is_some_and(|o| o.contains(&g.name));
+        let mut marked: Vec<bool> = match &prev {
+            Some(m) => preload::remark(&groups, m),
+            None => groups.iter().map(is_open).collect(),
+        };
+        let mut items: Vec<String> = groups
+            .iter()
+            .zip(&marked)
+            .map(|(g, m)| preload::retag_open(&preload::label(g, is_open(g)), *m))
+            .collect();
         items.push(EDIT_TOOLCHAINS_ITEM.into());
         marked.push(false);
+        let here = match &open {
+            None => "unknown".to_string(),
+            Some(o) if o.is_empty() => "none".to_string(),
+            Some(o) => o.join(", "),
+        };
+        self.status = match &open {
+            None => format!(
+                "osh has no record of the toolchain hosts open in {name} (not created by this osh, or before it kept one): nothing is marked"
+            ),
+            Some(_) => format!(
+                "Marked: open in {name} (osh's record). Unmarking cannot close hosts that are already open; (default) = on for new sandboxes"
+            ),
+        };
         self.select_marked(
-            &format!("Toolchain hosts to open in {name} (space to mark, Enter to confirm)"),
+            &format!("Toolchain hosts for sandbox {name} only (open here: {here})"),
             items,
             marked,
             true,
@@ -3826,7 +3943,7 @@ impl App {
     /// The fix path for a broken list: edit it here, or (new sandbox) go on without it.
     fn offer_toolchain_fix(&mut self, why: &str, then: EditThen) {
         let other = match then {
-            EditThen::NewSandbox(_) => "Continue without the toolchain hosts",
+            EditThen::NewSandbox(..) => "Continue without the toolchain hosts",
             _ => "Cancel",
         };
         self.select(
@@ -3848,7 +3965,7 @@ impl App {
     fn run_command(&mut self, cmd: crate::palette::Command) {
         use crate::palette::Command as C;
         match cmd {
-            C::EditToolchains => self.edit_toolchains(EditThen::Nothing),
+            C::EditToolchains => self.edit_toolchains(EditThen::ToolchainList),
             C::EditorMode => {
                 use crate::exted::Pref;
                 let next = crate::exted::load_pref(&self.dir).next();
@@ -4198,8 +4315,8 @@ impl App {
 
     /// After an edit, in either editor: back to where it was opened from, with what comes next.
     fn edit_closed(&mut self, then: EditThen, saved: bool) {
+        let said = self.status.clone();
         match then {
-            EditThen::Nothing => {}
             EditThen::DataFile(rel) => self.file_menu(rel),
             EditThen::Gateway(name) => {
                 if saved {
@@ -4216,9 +4333,44 @@ impl App {
                     });
                 }
             }
-            EditThen::NewSandbox(plan) => self.pick_toolchains(*plan),
-            EditThen::Running(name, gateway) => self.pick_toolchains_running(name, gateway),
+            EditThen::ToolchainList => {
+                if saved {
+                    self.say_toolchain_defaults(&said);
+                }
+            }
+            EditThen::NewSandbox(plan, marks) => {
+                self.pick_toolchains(*plan, marks);
+                if saved {
+                    self.say_toolchain_defaults(&said);
+                }
+            }
+            EditThen::Running(name, gateway, marks) => {
+                self.pick_toolchains_running(name, gateway, marks);
+                if saved {
+                    self.say_toolchain_defaults(&said);
+                }
+            }
         }
+    }
+
+    /// After `toolchains.toml` was saved: the file is global, so say what every new sandbox now
+    /// gets, next to the save message.
+    fn say_toolchain_defaults(&mut self, said: &str) {
+        let Some(groups) = std::fs::read_to_string(self.dir.join(TOOLCHAINS_FILE))
+            .ok()
+            .and_then(|t| preload::parse(&t).ok())
+        else {
+            return;
+        };
+        let saved = if said.starts_with("Saved toolchains.toml") {
+            said.to_string()
+        } else {
+            "Saved toolchains.toml".into()
+        };
+        self.status = format!(
+            "{saved}: defaults for ALL new sandboxes now: {}",
+            preload::defaults_line(&groups)
+        );
     }
 
     /// The one way osh opens a file for editing: the user's editor ($VISUAL, $EDITOR, or one on
@@ -4385,15 +4537,38 @@ impl App {
         }
     }
 
-    /// Open the hosts of the named groups in a running sandbox, one `policy update` per host.
+    /// Open the hosts of the named groups in a running sandbox, one `policy update` per host, and
+    /// record the groups that opened. Only adds: a group that was open and is now unmarked stays
+    /// open, and the report says so (see `preload::retag_open` for why it is not removed).
     fn open_toolchains(&mut self, name: String, gateway: String, names: &[String]) {
         let Some(groups) = self.toolchain_groups() else {
             return;
         };
+        let stays: Vec<String> = self
+            .recorded_toolchains(&gateway, &name)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|g| !names.contains(g))
+            .collect();
+        let stays_note = if stays.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "\n\n\u{2022} {} stay open: osh cannot close hosts in a running sandbox (OpenShell's remove takes a host out of every rule, a provider's too). Create a new sandbox without them to close them.",
+                stays.join(", ")
+            )
+        };
         let groups = preload::select(&groups, names);
         let cmds = preload::update_commands(&gateway, &name, &groups);
         if cmds.is_empty() {
-            self.status = "No toolchain group was marked".into();
+            self.status = if stays.is_empty() {
+                "No toolchain group was marked".into()
+            } else {
+                format!(
+                    "Nothing changed in {name}: {} stay open (osh cannot close hosts in a running sandbox)",
+                    stays.join(", ")
+                )
+            };
             return;
         }
         self.status = format!("Opening the toolchain hosts in {name}...");
@@ -4402,6 +4577,7 @@ impl App {
             cmds.len(),
         )));
         self.modal = Some(Modal::Task(task.clone()));
+        let dir = self.dir.clone();
         self.bg_msg(move || {
             // One refused host (a provider's rule already covers it, say) must not stop the
             // rest; the report names what happened to each.
@@ -4416,7 +4592,15 @@ impl App {
                     t.done += 1;
                 }
             }
-            Ok(preload::report(&name, &results))
+            let opened = preload::opened_groups(&groups, &results);
+            let mut out = preload::report(&name, &results);
+            if let Err(e) = preload::record_open(&dir, &gateway, &name, &opened, false) {
+                out.push_str(&format!(
+                    "\n\n\u{2717} Could not record the open groups ({e}); the picker will not show them as open here"
+                ));
+            }
+            out.push_str(&stays_note);
+            Ok(out)
         });
     }
 
@@ -5895,7 +6079,7 @@ impl App {
             },
             Modal::Select {
                 title,
-                items,
+                mut items,
                 mut cursor,
                 mut marked,
                 multi,
@@ -5909,8 +6093,17 @@ impl App {
                     self.on_select(kind, vec!["Not now".into()])
                 }
                 KeyCode::Esc => self.cleanup_sync_stage(),
+                // Enter on the edit line opens the editor, even with nothing marked; the marks go
+                // along so the picker comes back with them.
                 KeyCode::Enter if items[cursor] == EDIT_TOOLCHAINS_ITEM => {
-                    self.on_select(kind, vec![EDIT_TOOLCHAINS_ITEM.into()])
+                    let mut picks: Vec<String> = items
+                        .iter()
+                        .zip(&marked)
+                        .filter(|(i, m)| **m && *i != EDIT_TOOLCHAINS_ITEM)
+                        .map(|(i, _)| i.clone())
+                        .collect();
+                    picks.push(EDIT_TOOLCHAINS_ITEM.into());
+                    self.on_select(kind, picks)
                 }
                 KeyCode::Enter => {
                     let mut picks: Vec<String> = items
@@ -5930,7 +6123,12 @@ impl App {
                             cursor = (cursor + 1).min(items.len() - 1)
                         }
                         KeyCode::Char('k') | KeyCode::Up => cursor = cursor.saturating_sub(1),
-                        KeyCode::Char(' ') if multi => marked[cursor] = !marked[cursor],
+                        KeyCode::Char(' ') if multi => {
+                            marked[cursor] = !marked[cursor];
+                            if matches!(kind, SelKind::ToolchainsRunning(..)) {
+                                items[cursor] = preload::retag_open(&items[cursor], marked[cursor]);
+                            }
+                        }
                         _ => {}
                     }
                     self.modal = Some(Modal::Select {
@@ -6542,6 +6740,248 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The open picker's (title, items, marks).
+    fn picker(app: &App) -> (String, Vec<String>, Vec<bool>) {
+        match &app.modal {
+            Some(Modal::Select {
+                title,
+                items,
+                marked,
+                ..
+            }) => (title.clone(), items.clone(), marked.clone()),
+            _ => panic!("no picker"),
+        }
+    }
+
+    /// Move the picker's cursor to the line of group `name` and press Space.
+    fn toggle(app: &mut App, name: &str) {
+        let at = picker(app)
+            .1
+            .iter()
+            .position(|i| preload::group_of(i) == name)
+            .expect("group in the picker");
+        for _ in 0..20 {
+            press(app, KeyCode::Up);
+        }
+        for _ in 0..at {
+            press(app, KeyCode::Down);
+        }
+        press(app, KeyCode::Char(' '));
+    }
+
+    /// Built-in editor: append `text` to the open file, save, close.
+    fn append_and_close(app: &mut App, text: &str) {
+        ctrl_key(app, 'e');
+        app.on_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        type_text(app, text);
+        ctrl_key(app, 's');
+        press(app, KeyCode::Esc);
+    }
+
+    const TWO_GROUPS: &str =
+        "[a]\nenabled = true\nhosts = [\"a.example\"]\n[b]\nenabled = false\nhosts = [\"b.example\"]\n";
+
+    #[test]
+    fn the_new_sandbox_picker_names_its_scope_and_tags_the_defaults() {
+        let dir = toolchain_dir("scope-new", TWO_GROUPS);
+        let mut app = app();
+        app.dir = dir.clone();
+        app.proceed(Plan::default());
+        let (title, items, _) = picker(&app);
+        assert!(title.contains("for the new sandbox only"), "{title}");
+        assert_eq!(items[0], "a  (1 host)  (default)");
+        assert_eq!(items[1], "b  (1 host)");
+        assert!(SAVE_TOOLCHAINS_ITEM.contains("ALL new sandboxes"));
+        assert!(EDIT_TOOLCHAINS_ITEM.contains("affects ALL new sandboxes"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_new_sandbox_picker_keeps_its_marks_across_the_editor() {
+        let dir = toolchain_dir("marks-new", TWO_GROUPS);
+        fake_editor(None);
+        let mut app = app();
+        app.dir = dir.clone();
+        app.proceed(Plan::default());
+        toggle(&mut app, "a");
+        toggle(&mut app, "b");
+        toggle(&mut app, "Save");
+        enter_on(&mut app, EDIT_TOOLCHAINS_ITEM);
+        assert!(app.editing());
+        append_and_close(
+            &mut app,
+            "\n[c]\nenabled = true\nhosts = [\"c.example\"]\n[d]\nenabled = false\nhosts = [\"d.example\"]",
+        );
+        let (_, items, marked) = picker(&app);
+        let names: Vec<&str> = items.iter().map(|i| preload::group_of(i)).collect();
+        assert_eq!(&names[..4], ["a", "b", "c", "d"]);
+        assert_eq!(
+            marked,
+            vec![false, true, true, false, true, false],
+            "the user's marks stay (a off, b on, save on); new groups follow enabled: {items:?}"
+        );
+        assert_eq!(
+            app.status,
+            "Saved toolchains.toml: defaults for ALL new sandboxes now: a, c"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_group_removed_in_the_editor_leaves_the_picker() {
+        let dir = toolchain_dir("marks-gone", TWO_GROUPS);
+        fake_editor(Some(&[
+            "sh",
+            "-c",
+            r#"printf '[b]\nenabled = false\nhosts = ["b.example"]\n' > "$1""#,
+            "fake-editor",
+        ]));
+        let mut app = app();
+        app.dir = dir.clone();
+        app.pick_toolchains_running("sb".into(), "gw".into(), None);
+        toggle(&mut app, "b");
+        enter_on(&mut app, EDIT_TOOLCHAINS_ITEM);
+        wait_editor(&mut app);
+        let (_, items, marked) = picker(&app);
+        assert_eq!(items.len(), 2, "{items:?}");
+        assert_eq!(preload::group_of(&items[0]), "b");
+        assert_eq!(marked, vec![true, false], "b keeps its mark");
+        fake_editor(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_running_picker_starts_from_what_the_sandbox_has_not_the_defaults() {
+        let dir = toolchain_dir("rec", TWO_GROUPS);
+        preload::record_open(&dir, "gw", "sb", &["b".into()], true).unwrap();
+        let mut app = app();
+        app.dir = dir.clone();
+        app.pick_toolchains_running("sb".into(), "gw".into(), None);
+        let (title, items, marked) = picker(&app);
+        assert_eq!(title, "Toolchain hosts for sandbox sb only (open here: b)");
+        assert_eq!(items[0], "a  (1 host)  (default)");
+        assert_eq!(items[1], "b  (1 host)  (open here)");
+        assert_eq!(marked, vec![false, true, false], "the record, not the file");
+        assert!(
+            app.status.contains("Unmarking cannot close"),
+            "{}",
+            app.status
+        );
+        toggle(&mut app, "b");
+        assert_eq!(
+            picker(&app).1[1],
+            "b  (1 host)  (stays open)",
+            "unmarking an open group says it stays open"
+        );
+        toggle(&mut app, "b");
+        assert_eq!(picker(&app).1[1], "b  (1 host)  (open here)");
+        // Unmarking the only open group and applying changes nothing and says so.
+        toggle(&mut app, "b");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            app.status,
+            "Nothing changed in sb: b stay open (osh cannot close hosts in a running sandbox)"
+        );
+        // A sandbox osh has no record of: unknown, nothing marked.
+        app.pick_toolchains_running("other".into(), "gw".into(), None);
+        let (title, _, marked) = picker(&app);
+        assert!(title.ends_with("(open here: unknown)"), "{title}");
+        assert!(marked.iter().all(|m| !m), "{marked:?}");
+        assert!(app.status.contains("no record"), "{}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_running_picker_keeps_its_marks_across_the_editor() {
+        let dir = toolchain_dir("marks-run", TWO_GROUPS);
+        preload::record_open(&dir, "gw", "sb", &["a".into()], true).unwrap();
+        fake_editor(None);
+        let mut app = app();
+        app.dir = dir.clone();
+        app.pick_toolchains_running("sb".into(), "gw".into(), None);
+        toggle(&mut app, "a");
+        toggle(&mut app, "b");
+        enter_on(&mut app, EDIT_TOOLCHAINS_ITEM);
+        append_and_close(&mut app, "\n[c]\nenabled = true\nhosts = [\"c.example\"]");
+        let (_, items, marked) = picker(&app);
+        assert_eq!(marked, vec![false, true, true, false], "{items:?}");
+        assert_eq!(
+            items[0], "a  (1 host)  (default)  (stays open)",
+            "a is still open here and unmarked"
+        );
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Select { kind: SelKind::ToolchainsRunning(n, g), .. }) if n == "sb" && g == "gw"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn records_of_sandboxes_the_gateway_no_longer_has_are_pruned_on_read() {
+        let dir = toolchain_dir("prune", TWO_GROUPS);
+        preload::record_open(&dir, "gw", "sb", &["a".into()], true).unwrap();
+        preload::record_open(&dir, "gw", "gone", &["a".into()], true).unwrap();
+        preload::record_open(&dir, "other", "gone", &["a".into()], true).unwrap();
+        let mut app = app();
+        app.dir = dir.clone();
+        app.snap.gateway = "gw".into();
+        app.snap.gateway_ok = true;
+        app.snap.sandboxes = vec![cli::Sandbox {
+            name: "sb".into(),
+            ..Default::default()
+        }];
+        app.pick_toolchains_running("sb".into(), "gw".into(), None);
+        let keys: Vec<String> = preload::load_records(&dir).into_keys().collect();
+        assert_eq!(
+            keys,
+            ["gw/sb", "other/gone"],
+            "only the shown gateway is pruned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_created_sandbox_records_the_groups_its_policy_opens() {
+        let dir = toolchain_dir("create-rec", TWO_GROUPS);
+        std::fs::write(dir.join("sandbox-policy.yaml"), "version: 1\n").unwrap();
+        let mut app = app();
+        app.dir = dir.clone();
+        let plan = Plan {
+            name: "fresh".into(),
+            command: "true".into(),
+            toolchains: Some(vec!["b".into()]),
+            ..Plan::default()
+        };
+        app.start_create(&plan);
+        app.job = None;
+        let gw = cli::gateway();
+        assert_eq!(
+            app.toolchains_after_create,
+            Some((gw.clone(), "fresh".into(), vec!["b".to_string()]))
+        );
+        app.finish_job(None);
+        assert_eq!(
+            preload::load_records(&dir).get(&preload::record_key(&gw, "fresh")),
+            Some(&vec!["b".to_string()])
+        );
+        // A failed create records nothing.
+        let plan = Plan {
+            name: "broken".into(),
+            ..plan
+        };
+        app.start_create(&plan);
+        app.tmux_after_create = None;
+        app.job = None;
+        app.finish_job(Some(Failed {
+            index: 0,
+            label: "create".into(),
+            status: "exit 1".into(),
+            tail: Vec::new(),
+        }));
+        assert!(!preload::load_records(&dir).contains_key(&preload::record_key(&gw, "broken")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn toolchain_dir(tag: &str, text: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("osh-tce-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -6599,7 +7039,7 @@ mod tests {
         assert!(
             matches!(
                 &app.modal,
-                Some(Modal::Editor { then: EditThen::NewSandbox(p), .. }) if p.name == "keep-me"
+                Some(Modal::Editor { then: EditThen::NewSandbox(p, _), .. }) if p.name == "keep-me"
             ),
             "Enter on the line opens the editor, even with nothing marked"
         );
@@ -6643,7 +7083,7 @@ mod tests {
         let dir = toolchain_dir("bad", original);
         let mut app = app();
         app.dir = dir.clone();
-        app.pick_toolchains_running("sb".into(), "gw".into());
+        app.pick_toolchains_running("sb".into(), "gw".into(), None);
         enter_on(&mut app, EDIT_TOOLCHAINS_ITEM);
         type_text(&mut app, "[broken");
         ctrl_key(&mut app, 's');
@@ -6714,7 +7154,7 @@ mod tests {
         let mut app = app();
         app.dir = dir.clone();
         sh_editor(r#"printf '[b]\nenabled = true\nhosts = ["b.example"]\n' > "$1""#);
-        app.pick_toolchains_running("sb".into(), "gw".into());
+        app.pick_toolchains_running("sb".into(), "gw".into(), None);
         enter_on(&mut app, EDIT_TOOLCHAINS_ITEM);
         assert!(app.ext_editing() && app.editing());
         let copy = ext_run(&app).scratch.file.clone();
@@ -6725,7 +7165,10 @@ mod tests {
             std::fs::read_to_string(dir.join("toolchains.toml")).unwrap(),
             "[b]\nenabled = true\nhosts = [\"b.example\"]\n"
         );
-        assert_eq!(app.status, "Saved toolchains.toml (edited in sh)");
+        assert_eq!(
+            app.status,
+            "Saved toolchains.toml (edited in sh): defaults for ALL new sandboxes now: b"
+        );
         let Some(Modal::Select {
             items,
             kind: SelKind::ToolchainsRunning(..),
@@ -6753,7 +7196,7 @@ mod tests {
         sh_editor(
             r#"if grep -q broken "$1"; then printf '[c]\nhosts = ["c.example"]\n' > "$1"; else printf '[broken\n' > "$1"; fi"#,
         );
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         let copy = ext_run(&app).scratch.file.clone();
         wait_editor(&mut app);
         assert!(app.editing() && !app.ext_editing(), "osh asks what to do");
@@ -6789,7 +7232,7 @@ mod tests {
         assert!(app.modal.is_none());
         // Broken again, and this time discarded.
         sh_editor(r#"printf '[broken\n' > "$1""#);
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         let copy = ext_run(&app).scratch.file.clone();
         wait_editor(&mut app);
         press(&mut app, KeyCode::Char('d'));
@@ -6816,11 +7259,11 @@ mod tests {
         let mut app = app();
         app.dir = dir.clone();
         sh_editor("true");
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         wait_editor(&mut app);
         assert_eq!(app.status, "toolchains.toml unchanged: nothing written");
         sh_editor(r#"printf '[z]\n' > "$1"; exit 1"#);
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         wait_editor(&mut app);
         assert!(
             app.status.starts_with("Cancelled: sh exited with an error"),
@@ -6829,7 +7272,7 @@ mod tests {
         );
         // Ctrl-C goes to the editor (here it stops it), not to osh.
         sh_editor("sleep 5");
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         ctrl_key(&mut app, 'c');
         assert!(!app.quit);
         wait_editor(&mut app);
@@ -6856,12 +7299,12 @@ mod tests {
             _ => panic!("expected the built-in editor"),
         };
         fake_editor(None);
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         assert_eq!(note(&app), "built-in editor: no editor in unit tests");
         assert_eq!(app.status, note(&app));
         fake_editor(Some(&["/nonexistent/osh-editor"]));
         app.modal = None;
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         assert!(
             note(&app).starts_with("built-in editor: osh-editor (test) did not start"),
             "{}",
@@ -6876,14 +7319,14 @@ mod tests {
             "{}",
             app.status
         );
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         assert!(
             matches!(&app.modal, Some(Modal::Info(t)) if t.starts_with("osh-editor (test) did not start")),
             "forced external does not fall back"
         );
         fake_editor(None);
         app.modal = None;
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         assert!(
             matches!(&app.modal, Some(Modal::Info(t)) if t.starts_with("No editor of your own"))
         );
@@ -6891,7 +7334,7 @@ mod tests {
         app.run_command(crate::palette::Command::EditorMode);
         assert_eq!(crate::exted::load_pref(&dir), crate::exted::Pref::Builtin);
         sh_editor("true");
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         assert_eq!(note(&app), "built-in editor (chosen in the palette)");
         app.modal = None;
         app.run_command(crate::palette::Command::EditorMode);
@@ -6919,7 +7362,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         sh_editor(r#"echo HELLO-EDITOR; read x; printf '[broken\n' > "$1""#);
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         let end = Instant::now() + Duration::from_secs(10);
         while !screen(&app)[0].contains("HELLO-EDITOR") {
             assert!(Instant::now() < end, "{:?}", screen(&app));
@@ -6992,7 +7435,7 @@ mod tests {
             wait_editor(app);
             app.modal = None;
         };
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         check(&mut app);
         app.edit_file("sandbox-policy.yaml".into());
         check(&mut app);
@@ -7069,7 +7512,7 @@ mod tests {
         // A running sandbox with an empty list gets the same offer, with Cancel.
         std::fs::write(dir.join("toolchains.toml"), "# nothing yet\n").unwrap();
         app.modal = None;
-        app.pick_toolchains_running("sb".into(), String::new());
+        app.pick_toolchains_running("sb".into(), String::new(), None);
         assert_eq!(
             select_items(&app).1,
             vec![EDIT_TOOLCHAINS_ITEM.to_string(), "Cancel".into()]
@@ -7090,7 +7533,7 @@ mod tests {
         assert!(matches!(
             &app.modal,
             Some(Modal::Editor {
-                then: EditThen::Nothing,
+                then: EditThen::ToolchainList,
                 ..
             })
         ));
@@ -7117,7 +7560,7 @@ mod tests {
         let dir = toolchain_dir("draw", "[a]\nenabled = true\n");
         let mut app = app();
         app.dir = dir.clone();
-        app.edit_toolchains(EditThen::Nothing);
+        app.edit_toolchains(EditThen::ToolchainList);
         let mut term = Terminal::new(TestBackend::new(100, 20)).unwrap();
         term.draw(|f| crate::ui::draw(f, &app)).unwrap();
         let buf = term.backend().buffer().clone();

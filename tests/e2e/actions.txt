@@ -62,7 +62,8 @@ editor | Ctrl-S save | editor-toolchains
 editor | Esc close | editor-toolchains
 editor | Ctrl-F find | editor-toolchains
 editor | Ctrl-G go to line | editor-toolchains
-picker | Edit toolchains.toml (new-sandbox and Ctrl-] pickers) | SKIP: the pickers need a sandbox create or a running shell; unit tests in app.rs drive both pickers into the editor and back
+picker | Ctrl-] toolchain picker (scope title, (default) tag, edit line wording) | shell-menu
+picker | Edit the toolchain list and defaults (new-sandbox and Ctrl-] pickers) | SKIP: editing from a picker needs a sandbox create or a running shell plus an editor round trip; unit tests in app.rs drive both pickers into the editor and back and check the marks survive
 shell | alerts | alerts-toast
 command | osh doctor | cmd-doctor
 command | osh setup | SKIP: covered by tests/linux/real-suite.sh (setup, wizard, idempotence) which runs before these scenarios

@@ -211,10 +211,152 @@ pub fn report(sandbox: &str, results: &[(String, Result<(), String>)]) -> String
     out
 }
 
-/// The picker line of a group: its name first, so `group_of` can read the pick back.
-pub fn label(g: &Group) -> String {
+/// Picker tag of a group the file switches on for every new sandbox.
+pub const TAG_DEFAULT: &str = "(default)";
+/// Running-sandbox picker tag of a group osh recorded as open there, while it is marked.
+pub const TAG_OPEN: &str = "(open here)";
+/// The same group once unmarked: osh cannot close its hosts (see `retag_open`).
+pub const TAG_STAYS: &str = "(stays open)";
+
+/// The picker line of a group: its name first, so `group_of` can read the pick back, then the
+/// tags (`TAG_*`) that tell the file's defaults and what a sandbox already has apart from the marks.
+pub fn label(g: &Group, open_here: bool) -> String {
     let n = g.hosts.len();
-    format!("{}  ({n} host{})", g.name, if n == 1 { "" } else { "s" })
+    let mut out = format!("{}  ({n} host{})", g.name, if n == 1 { "" } else { "s" });
+    if g.on {
+        out.push_str(&format!("  {TAG_DEFAULT}"));
+    }
+    if open_here {
+        out.push_str(&format!("  {TAG_OPEN}"));
+    }
+    out
+}
+
+/// A running-sandbox picker line after Space: a group that is open there says it stays open
+/// when unmarked, because removing its hosts is not safe (`update_commands` only adds; OpenShell's
+/// `--remove-endpoint` takes a host out of every rule, a provider's included).
+pub fn retag_open(line: &str, marked: bool) -> String {
+    if marked {
+        line.replace(TAG_STAYS, TAG_OPEN)
+    } else {
+        line.replace(TAG_OPEN, TAG_STAYS)
+    }
+}
+
+/// `"a, b"`, or `"none"`: the groups the file switches on, for the status line after a save.
+pub fn defaults_line(groups: &[Group]) -> String {
+    let on: Vec<&str> = groups
+        .iter()
+        .filter(|g| g.on)
+        .map(|g| g.name.as_str())
+        .collect();
+    if on.is_empty() {
+        "none".into()
+    } else {
+        on.join(", ")
+    }
+}
+
+/// The marks of a toolchain picker, kept while `toolchains.toml` is edited from it: `picked` are
+/// the marked groups, `known` every group the picker showed, so a group the edit added can be told
+/// from one the user unmarked.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Marks {
+    pub picked: Vec<String>,
+    pub known: Vec<String>,
+    /// The new-sandbox picker's "save as the default" line was marked.
+    pub save: bool,
+}
+
+/// The marks for `groups` coming back from the editor: the user's own marks for groups the picker
+/// showed before, the file's `enabled` for groups the edit added. Removed groups are gone with
+/// `groups`.
+pub fn remark(groups: &[Group], prev: &Marks) -> Vec<bool> {
+    groups
+        .iter()
+        .map(|g| {
+            if prev.known.contains(&g.name) {
+                prev.picked.contains(&g.name)
+            } else {
+                g.on
+            }
+        })
+        .collect()
+}
+
+/// Which groups osh opened in which sandbox (`<data>/sandbox-toolchains.json`, keyed by
+/// `record_key`): written when osh creates a sandbox and after each apply, so the running picker
+/// can start from what that sandbox has instead of the defaults for new ones.
+pub const RECORD_FILE: &str = "sandbox-toolchains.json";
+
+pub fn record_key(gateway: &str, sandbox: &str) -> String {
+    format!("{gateway}/{sandbox}")
+}
+
+pub type Records = std::collections::BTreeMap<String, Vec<String>>;
+
+/// The record; empty when it is missing or unreadable (every sandbox is then "unknown").
+pub fn load_records(dir: &std::path::Path) -> Records {
+    std::fs::read_to_string(dir.join(RECORD_FILE))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_records(dir: &std::path::Path, records: &Records) -> Result<(), String> {
+    let text = serde_json::to_string_pretty(records).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(RECORD_FILE), text + "\n").map_err(|e| e.to_string())
+}
+
+/// Drop the entries of `gateway` whose sandbox is not in `live`. Other gateways are left alone:
+/// osh only knows the sandboxes of the gateway it shows. True when something was dropped.
+pub fn prune(records: &mut Records, gateway: &str, live: &[String]) -> bool {
+    let before = records.len();
+    let prefix = record_key(gateway, "");
+    records.retain(|k, _| {
+        k.strip_prefix(&prefix)
+            .is_none_or(|sb| live.iter().any(|l| l == sb))
+    });
+    records.len() != before
+}
+
+/// Add `groups` to what is recorded as open in a sandbox (`replace`: at creation, the choice is
+/// the whole of it). Nothing osh does closes a group, so an apply only ever adds.
+pub fn record_open(
+    dir: &std::path::Path,
+    gateway: &str,
+    sandbox: &str,
+    groups: &[String],
+    replace: bool,
+) -> Result<(), String> {
+    let mut records = load_records(dir);
+    let entry = records.entry(record_key(gateway, sandbox)).or_default();
+    if replace {
+        entry.clear();
+    }
+    for g in groups {
+        if !entry.contains(g) {
+            entry.push(g.clone());
+        }
+    }
+    entry.sort();
+    save_records(dir, &records)
+}
+
+/// The groups of `groups` (the ones that are on) that ended up open after the updates: every host
+/// they have that was sent was opened or already allowed by another rule. A group with a failed
+/// host is not counted, so the record never claims more than the sandbox has.
+pub fn opened_groups(groups: &[Group], results: &[(String, Result<(), String>)]) -> Vec<String> {
+    let failed = |h: &str| {
+        results
+            .iter()
+            .any(|(host, r)| host == h && matches!(r, Err(e) if refusal(e).is_some()))
+    };
+    groups
+        .iter()
+        .filter(|g| g.on && !g.hosts.iter().any(|(h, _)| failed(h)))
+        .map(|g| g.name.clone())
+        .collect()
 }
 
 /// The group a picker line (`label`) stands for.
@@ -605,8 +747,83 @@ enabled = true"
     fn select_switches_exactly_the_named_groups_on() {
         let groups = select(&g(SAMPLE), &["b".to_string()]);
         assert!(!groups[0].on && groups[1].on && !groups[2].on);
-        assert_eq!(group_of(&label(&groups[0])), "a");
-        assert_eq!(label(&groups[2]), "c  (1 host)");
+        assert_eq!(group_of(&label(&groups[0], false)), "a");
+        assert_eq!(label(&groups[2], false), "c  (1 host)");
+    }
+
+    #[test]
+    fn labels_tag_the_defaults_and_what_is_open_and_say_when_it_stays_open() {
+        let groups = g(SAMPLE);
+        assert_eq!(label(&groups[0], false), "a  (2 hosts)  (default)");
+        assert_eq!(label(&groups[1], true), "b  (2 hosts)  (open here)");
+        let open = label(&groups[0], true);
+        assert_eq!(open, "a  (2 hosts)  (default)  (open here)");
+        assert_eq!(group_of(&open), "a");
+        let stays = retag_open(&open, false);
+        assert_eq!(stays, "a  (2 hosts)  (default)  (stays open)");
+        assert_eq!(retag_open(&stays, true), open);
+        assert_eq!(retag_open(&label(&groups[1], false), false), "b  (2 hosts)");
+        assert_eq!(defaults_line(&groups), "a");
+        assert_eq!(defaults_line(&select(&groups, &[])), "none");
+    }
+
+    #[test]
+    fn remark_keeps_the_users_marks_and_follows_the_file_for_new_groups() {
+        let groups = g(SAMPLE);
+        let prev = Marks {
+            picked: vec!["b".into()],
+            known: vec!["a".into(), "b".into(), "gone".into()],
+            save: false,
+        };
+        // a was unmarked by the user, b marked; c is new and the file has it off.
+        assert_eq!(remark(&groups, &prev), vec![false, true, false]);
+        let groups = g("[c]\nenabled = true\nhosts = [\"z.example\"]\n");
+        assert_eq!(
+            remark(&groups, &prev),
+            vec![true],
+            "new and enabled: marked"
+        );
+    }
+
+    #[test]
+    fn the_record_reads_writes_adds_and_prunes() {
+        let dir = std::env::temp_dir().join(format!("osh-rec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_records(&dir).is_empty(), "no file: nothing known");
+        record_open(&dir, "gw", "sb", &["b".into(), "a".into()], true).unwrap();
+        record_open(&dir, "gw", "sb", &["c".into(), "a".into()], false).unwrap();
+        record_open(&dir, "gw", "old", &["a".into()], true).unwrap();
+        record_open(&dir, "gw2", "old", &["a".into()], true).unwrap();
+        let mut r = load_records(&dir);
+        assert_eq!(r["gw/sb"], ["a", "b", "c"], "an apply only adds");
+        record_open(&dir, "gw", "sb", &["c".into()], true).unwrap();
+        assert_eq!(load_records(&dir)["gw/sb"], ["c"], "creation replaces");
+        assert!(prune(&mut r, "gw", &["sb".to_string()]));
+        assert_eq!(
+            r.keys().collect::<Vec<_>>(),
+            ["gw/sb", "gw2/old"],
+            "other gateways stay"
+        );
+        assert!(!prune(&mut r, "gw", &["sb".to_string()]));
+        std::fs::write(dir.join(RECORD_FILE), "not json").unwrap();
+        assert!(load_records(&dir).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_group_with_a_failed_host_is_not_recorded_as_open() {
+        let groups = select(
+            &g("[a]\nhosts = [\"a.example\"]\n[b]\nhosts = [\"b.example\", \"c.example\"]\n[off]\nhosts = [\"o.example\"]\n"),
+            &["a".into(), "b".into()],
+        );
+        let covered = "Error: would grant binary '/**' undeclared authorization".to_string();
+        let results = vec![
+            ("a.example".to_string(), Err(covered)),
+            ("b.example".to_string(), Ok(())),
+            ("c.example".to_string(), Err("Error: boom".to_string())),
+        ];
+        assert_eq!(opened_groups(&groups, &results), vec!["a".to_string()]);
     }
 
     #[test]

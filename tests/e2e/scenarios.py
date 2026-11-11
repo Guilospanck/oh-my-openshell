@@ -107,7 +107,7 @@ def create_sandbox(o, name, share=None, rw=False):
     choose(o, "Custom...")
     o.wait("Image"); choose(o, "claude-code:latest")
     o.wait("Providers (space"); o.press("enter")
-    o.wait("Toolchain hosts this sandbox"); o.press("enter")
+    o.wait("Toolchain hosts for the new sandbox only"); o.press("enter")
     o.wait("Sandbox name"); o.type(name); o.press("enter")
     o.wait("CPU limit"); o.press("enter")
     o.wait("Memory limit"); o.press("enter")
@@ -549,6 +549,13 @@ def shell_menu():
         o.wait(("Providers", "permissions", "no providers", "No providers"), 15); o.press("esc")
         menu(); choose(o, "Blocked requests")
         o.wait(("blocked", "Blocked", "No blocked"), 15); o.press("esc")
+        # The toolchain picker names the one sandbox it changes and tags the global defaults; the
+        # edit line says the file affects every new sandbox.
+        menu(); choose(o, "Open the toolchain hosts")
+        o.wait("Toolchain hosts for sandbox e2e-sb only (open here:", 10)
+        t = o.text()
+        assert "(default)" in t and "affects ALL new sandboxes" in t, t
+        o.press("esc"); o.wait_gone("Toolchain hosts for sandbox", 5)
         menu(); choose(o, "Alerts (0)"); o.wait("Nothing suspicious", 10); o.press("esc")
         menu(); choose(o, "Dashboard (keep the session running)")
         o.wait("PHASE", 15)
@@ -664,7 +671,7 @@ def alerts_toast():
         # A risky folder is flagged in the access question, and as an alert.
         o.press("n"); o.wait("New sandbox"); choose(o, "Custom..."); o.wait("Image")
         choose(o, "claude-code:latest"); o.wait("Providers (space"); o.press("enter")
-        o.wait("Toolchain hosts this sandbox"); o.press("enter")
+        o.wait("Toolchain hosts for the new sandbox only"); o.press("enter")
         for _ in range(3):
             o.wait(("Sandbox name", "CPU limit", "Memory limit")); o.press("enter")
         o.wait("Share a host folder?"); choose(o, "Other folder...")

@@ -259,7 +259,7 @@ pub const ACTIONS: &[Action] = &[
     a(Global, "q", KeyCode::Char('q'), "Quit"),
     command(
         Global,
-        "Edit toolchains.toml (hosts new sandboxes may read from)",
+        "Edit toolchains.toml (the toolchain list and defaults for ALL new sandboxes)",
         Command::EditToolchains,
     ),
     command(
