@@ -125,7 +125,12 @@ printf 'uninstall\n' | with_stubs "$OSH" uninstall >"$HOME/out.log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "uninstall exits 0" || { fail "uninstall exits 0" "rc=$rc"; tail -15 "$HOME/out.log"; }
 check "uninstall disables the user service" logged "systemctl --user disable --now openshell-gateway"
 check "uninstall removes the config dir" test ! -e "$XDG_CONFIG_HOME/openshell"
-check "uninstall prints the package removal commands" grep -q 'apt remove' "$HOME/out.log"
+# osh removes the OpenShell packages itself through sudo (apt and dnf); elsewhere it says to do it by hand.
+case "$ID" in
+  ubuntu|debian) check "uninstall removes the OpenShell packages with apt-get" logged 'apt-get remove -y openshell*' ;;
+  fedora) check "uninstall removes the OpenShell packages with dnf" logged 'dnf remove -y openshell*' ;;
+  *) check "uninstall tells the user to remove the OpenShell packages by hand" grep -q 'package manager' "$HOME/out.log" ;;
+esac
 check "uninstall removes the osh data dir" test ! -e "$HOME/.local/share/osh"
 fresh_home; mkdir -p "$XDG_CONFIG_HOME/openshell"
 printf 'no\n' | with_stubs "$OSH" uninstall >/dev/null 2>&1 && fail "uninstall aborts on a wrong answer" || pass "uninstall aborts on a wrong answer"
