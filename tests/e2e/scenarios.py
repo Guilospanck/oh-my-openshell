@@ -265,7 +265,7 @@ def editor_external():
     try:
         with dashboard(env=env, editor="auto") as o:
             edit(o); o.wait("fake editor run 1 on toolchains.toml args --e2e", 10)
-            o.wait("save and quit the editor", 5)
+            o.wait("save and quit", 5)
             o.wait("toolchains.toml is not valid: not saved", 15)
             o.wait("TOML parse error", 5)
             assert now() == before, "a broken file is not written"
