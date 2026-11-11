@@ -133,6 +133,13 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   `openshell sandbox|provider|policy` write command. Read-only ones
   (`openshell status`, `... list`, `provider profile lint`) are fine.
 - Dev builds land in `tui/target/` (git-ignored). Do not commit it.
+- `./osh` runs with `OSH_DIR` = the checkout, so the app's own writes (editor saves, `Save this choice as
+  the default` in the toolchain picker, Data files restore) edit tracked files that `assets.rs` embeds and
+  the tests read (`toolchains.toml`, `sandbox-policy.yaml`, `providers/`, ...). Before `just check` or a
+  commit, look at `git status`: an uncommitted change there may be the user's, made through osh. Do not
+  commit it and do not discard it; copy it aside, check and commit with the shipped file, put it back.
+  The data dir stays the checkout on purpose: gateway registries, launchd agents and systemd units
+  pin `OSH_DIR` to it, and `main.rs` skips the asset refresh for it.
 
 ## Conventions
 

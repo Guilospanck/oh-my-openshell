@@ -93,7 +93,9 @@ no flag to skip it.
 `just release-setup-ci-key` is the one-time deploy key (stored as the repo secret `HOMEBREW_TAP_DEPLOY_KEY`) the workflow uses to push the tap; once Actions run again, release by pushing the tag only, since `just release` also creates the GitHub release and would make the workflow fail. From a
 checkout, `./osh` is a launcher that builds the TUI with cargo when its sources
 change and sets `OSH_DIR` to the checkout, so edits to the repo's providers and
-Dockerfiles apply with no copy. Build needs `cargo` and Zig 0.15.
+Dockerfiles apply with no copy. It also means osh's own writes (an edit saved in osh, `Save this choice as
+the default`) change the tracked files, which are compiled into the binary and read by the tests: check
+`git status` before committing. Build needs `cargo` and Zig 0.15.
 
 The embedded sandbox shell uses libghostty-vt (Ghostty's terminal engine),
 which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
