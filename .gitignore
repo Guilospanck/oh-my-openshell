@@ -16,3 +16,5 @@ __pycache__/
 *.osh-bak
 /vm-size.toml
 /.tmux-passthrough-off
+
+.claude
