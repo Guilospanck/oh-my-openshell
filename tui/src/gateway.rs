@@ -388,6 +388,8 @@ const REMOVE_DATA_SCRIPT: &str = r#"if [ -f "$1/.osh-manifest.json" ] && [ ! -e 
 
 /// Removes the osh binary `$1` the way it was installed: `brew uninstall` for Homebrew's, a plain
 /// delete for the release installer's, nothing for a development build under `target/`.
+const REMOVE_PACKAGES_APT: &str = r#"pkgs=$(dpkg-query -W -f '${Package}\n' 'openshell*' 2>/dev/null); if [ -z "$pkgs" ]; then echo "no OpenShell packages are installed"; else apt-get remove -y $pkgs; fi"#;
+const REMOVE_PACKAGES_DNF: &str = r#"pkgs=$(rpm -qa 'openshell*' 2>/dev/null); if [ -z "$pkgs" ]; then echo "no OpenShell packages are installed"; else dnf remove -y $pkgs; fi"#;
 const REMOVE_BINARY_SCRIPT: &str = r#"real=$(readlink "$1" 2>/dev/null || echo "$1"); case "$real" in */Cellar/*) brew uninstall Guilospanck/tap/oh-my-openshell || true ;; */target/*) echo "$1 is a development build: left in place" ;; *) rm -f "$1" ;; esac"#;
 
 /// Removes OpenShell's files and services, then osh's own data and binary.
@@ -489,21 +491,18 @@ pub fn uninstall_steps(f: &Facts, p: &Paths) -> Vec<Step> {
     if f.os == Os::Linux {
         // The packages OpenShell's installer added, removed with the package manager (through
         // sudo, which asks for the password on this terminal).
-        let argv: Option<Vec<&str>> = match f.pkg {
-            PkgMgr::Apt => Some(vec!["apt-get", "remove", "-y", "openshell*"]),
-            PkgMgr::Dnf => Some(vec!["dnf", "remove", "-y", "openshell*"]),
+        // Only packages that are installed are removed: `apt-get remove openshell*` fails when
+        // nothing matches, and a machine OpenShell was not installed on by package is fine.
+        let body: Option<&str> = match f.pkg {
+            PkgMgr::Apt => Some(REMOVE_PACKAGES_APT),
+            PkgMgr::Dnf => Some(REMOVE_PACKAGES_DNF),
             _ => None,
         };
-        let kind = match argv {
-            Some(a) if f.is_root => cmd(a[0], &a[1..]),
-            Some(a) if f.has_sudo => {
-                let mut with = vec!["sudo"];
-                with.extend(a);
-                cmd("sudo", &with[1..])
-            }
-            Some(a) => StepKind::Manual(format!(
-                "removing packages needs root, and sudo is not available to your user: as root, run {}",
-                a.join(" ")
+        let kind = match body {
+            Some(b) if f.is_root => script(b, &[]),
+            Some(b) if f.has_sudo => cmd("sudo", &["sh", "-c", b]),
+            Some(b) => StepKind::Manual(format!(
+                "removing packages needs root, and sudo is not available to your user: as root, run sh -c '{b}'"
             )),
             None => StepKind::Manual(
                 "remove the openshell packages with your package manager (osh knows apt and dnf only)"
@@ -1271,7 +1270,11 @@ mod tests {
             "rm -rf /h/.config/openshell /h/.local/state/openshell /h/.local/share/openshell"
         ));
         // osh removes the packages itself, through sudo (the facts have apt and sudo).
-        assert!(t.contains("sudo apt-get remove -y openshell*"), "{t}");
+        assert!(t.contains("sudo sh -c"), "{t}");
+        assert!(
+            t.contains("dpkg-query") && t.contains("apt-get remove -y $pkgs"),
+            "{t}"
+        );
         let mut f = facts(Os::Linux);
         f.has_sudo = false;
         let t = texts(&uninstall_steps(&f, &paths()));

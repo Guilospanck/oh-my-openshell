@@ -127,8 +127,7 @@ check "uninstall disables the user service" logged "systemctl --user disable --n
 check "uninstall removes the config dir" test ! -e "$XDG_CONFIG_HOME/openshell"
 # osh removes the OpenShell packages itself through sudo (apt and dnf); elsewhere it says to do it by hand.
 case "$ID" in
-  ubuntu|debian) check "uninstall removes the OpenShell packages with apt-get" logged 'sudo apt-get remove -y openshell*' ;;
-  fedora) check "uninstall removes the OpenShell packages with dnf" logged 'sudo dnf remove -y openshell*' ;;
+  ubuntu|debian|fedora) check "uninstall removes only the OpenShell packages that are installed (none here)" grep -q 'no OpenShell packages are installed' "$HOME/out.log" ;;
   *) check "uninstall tells the user to remove the OpenShell packages by hand" grep -q 'package manager' "$HOME/out.log" ;;
 esac
 check "uninstall removes the osh data dir" test ! -e "$HOME/.local/share/osh"
