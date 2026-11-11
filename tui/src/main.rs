@@ -969,6 +969,217 @@ mod tests {
         term.draw(|f| ui::draw(f, &app)).unwrap();
     }
 
+    /// The screen as rows of cell symbols.
+    fn screen_rows(term: &Terminal<TestBackend>) -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// Every word of `text` is on the screen, in order (wrapped, never cut).
+    fn shows_all_of(rows: &[String], text: &str) -> bool {
+        let joined: String = rows
+            .join(" ")
+            .chars()
+            .map(|c| {
+                if "│╭╮╰╯─".contains(c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let flat = joined.split_whitespace().collect::<Vec<_>>().join(" ");
+        let want = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        flat.contains(&want)
+    }
+
+    /// The screen without spaces and box lines, for values wrapped mid-word in a narrow pane.
+    /// Only columns from `x0` on count (one pane of a split screen).
+    fn squeezed(rows: &[String], x0: usize) -> String {
+        rows.iter()
+            .flat_map(|r| r.chars().skip(x0))
+            .filter(|c| !c.is_whitespace() && !"│╭╮╰╯─".contains(*c))
+            .collect()
+    }
+
+    /// No text is silently cut: at every common terminal size, every tab's footer shows each of
+    /// its keys whole, a long value shows whole somewhere on screen (the details pane or the
+    /// selected row in full), and each popup's keys and text are whole.
+    #[test]
+    fn no_text_is_cut_on_any_tab_or_popup_at_common_sizes() {
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut app = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let long_sb = "a-sandbox-with-a-really-quite-long-name-for-testing";
+        let long_key = "GITHUB_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY, SOME_OTHER_LONG_KEY";
+        app.on_snapshot(Snapshot {
+            gateway_ok: true,
+            gateway: "openshell-docker".into(),
+            driver: "docker".into(),
+            version: "openshell 0.0.36".into(),
+            sandboxes: vec![Sandbox {
+                name: long_sb.into(),
+                phase: "Provisioning".into(),
+                created: "2026-11-10 13:53:55".into(),
+                conditions: vec![Cond {
+                    kind: "Ready".into(),
+                    status: "False".into(),
+                    message: "the pod is waiting for its image to be pulled from the registry"
+                        .into(),
+                }],
+            }],
+            providers: vec![Provider {
+                name: "github-with-a-long-provider-name".into(),
+                ty: "github".into(),
+                keys: long_key.split(", ").map(String::from).collect(),
+            }],
+            profiles: vec![Profile {
+                id: "a-profile-id-that-is-long-too".into(),
+                version: 1,
+            }],
+            images: vec![Image {
+                tag: "registry.example.com/team/sandbox-image:latest-with-tag".into(),
+                file: "Dockerfile-sandbox-image-with-long-name".into(),
+                built: true,
+                freshness: Default::default(),
+            }],
+            logs: Some((long_sb.into(), format!("{} END-OF-LOG", "word ".repeat(40)))),
+            ..Default::default()
+        });
+        app.status = "Error: a status message long enough to need more than one row at sixty \
+                      columns, which used to run off the right edge of the footer"
+            .into();
+        let long_values = [long_sb, long_key, "a-profile-id-that-is-long-too"];
+        let sizes = [60u16, 80, 100, 120, 160]
+            .into_iter()
+            .flat_map(|w| [20u16, 24, 40].map(move |h| (w, h)));
+        for (w, h) in sizes {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            for (i, (tab, _)) in app::TABS.iter().enumerate() {
+                app.modal = None;
+                app.on_key(KeyEvent::from(KeyCode::Char((b'1' + i as u8) as char)));
+                term.draw(|f| ui::draw(f, &app)).unwrap();
+                let rows = screen_rows(&term);
+                let t = rows.join("\n");
+                assert!(!shows_all_of(&rows, ui::TOO_SMALL), "{w}x{h}:\n{t}");
+                ui::assert_hints_whole(&rows, &ui::footer_entries(*tab));
+                assert!(shows_all_of(&rows, &app.status), "status at {w}x{h}:\n{t}");
+                // The tab bar names the current tab whole and the gateway.
+                assert!(rows[0].contains("openshell-docker"), "{w}x{h}: {}", rows[0]);
+                let v = match tab {
+                    app::Tab::Sandboxes => Some(long_values[0]),
+                    app::Tab::Providers => Some("ANTHROPIC_API_KEY"),
+                    app::Tab::Profiles => Some(long_values[2]),
+                    _ => None,
+                };
+                if let Some(v) = v {
+                    // The sandbox's name shows whole in the details pane on the right.
+                    let x0 = rows[1]
+                        .chars()
+                        .collect::<Vec<_>>()
+                        .windows(9)
+                        .position(|c| c.iter().collect::<String>() == "╭ Details")
+                        .unwrap_or(0);
+                    assert!(squeezed(&rows, x0).contains(v), "{v} at {w}x{h}:\n{t}");
+                }
+                if *tab == app::Tab::Sandboxes {
+                    assert!(
+                        t.contains("registry") || t.contains("more rows"),
+                        "the condition wraps:\n{t}"
+                    );
+                    if t.contains("╭ Logs") {
+                        assert!(t.contains("END-OF-LOG"), "the log line wraps:\n{t}");
+                    }
+                    // Only the smallest size, with a three-row status and five rows of keys, is
+                    // short of rows; the details then say how many rows they leave out.
+                    if (w, h) != (60, 20) {
+                        assert!(!t.contains("more rows"), "details hidden at {w}x{h}:\n{t}");
+                    }
+                }
+            }
+            app.on_key(KeyEvent::from(KeyCode::Char('1')));
+            let modals: Vec<(app::Modal, Vec<&str>, &str)> = vec![
+                (
+                    app::Modal::Input {
+                        title: "A question that is far too long to be the title of a popup on \
+                                a narrow terminal"
+                            .into(),
+                        buf: String::new(),
+                        mask: false,
+                        kind: app::InKind::OtherImage,
+                    },
+                    vec!["Enter ok", "Esc cancel"],
+                    "far too long to be the title of a popup on a narrow terminal",
+                ),
+                (
+                    app::Modal::Select {
+                        title: "Pick one of these many entries; the title is long as well, so \
+                                it must wrap"
+                            .into(),
+                        items: (0..40).map(|i| format!("entry {i}")).collect(),
+                        cursor: 0,
+                        marked: vec![false; 40],
+                        multi: true,
+                        kind: app::SelKind::Image,
+                    },
+                    vec!["↑↓ move", "Space mark", "Enter ok", "Esc cancel"],
+                    "the title is long as well, so it must wrap",
+                ),
+                (
+                    app::Modal::Info("word ".repeat(10)),
+                    vec!["any key closes"],
+                    "word word",
+                ),
+                (
+                    app::Modal::Palette {
+                        query: String::new(),
+                        cursor: 0,
+                    },
+                    vec!["↑↓ move", "Enter run", "Esc close"],
+                    "",
+                ),
+                (app::Modal::Help { scroll: 0 }, vec!["j/k scroll"], ""),
+            ];
+            for (m, keys, text) in modals {
+                app.modal = Some(m);
+                term.draw(|f| ui::draw(f, &app)).unwrap();
+                let rows = screen_rows(&term);
+                let t = rows.join("\n");
+                for k in keys {
+                    assert!(t.contains(k), "{k:?} at {w}x{h}:\n{t}");
+                }
+                assert!(shows_all_of(&rows, text), "{text:?} at {w}x{h}:\n{t}");
+            }
+            // The palette's selected action shows its whole title.
+            let first = crate::palette::filter(app.tab, "")[0].0.title;
+            app.modal = Some(app::Modal::Palette {
+                query: String::new(),
+                cursor: 0,
+            });
+            term.draw(|f| ui::draw(f, &app)).unwrap();
+            assert!(
+                shows_all_of(&screen_rows(&term), first),
+                "{first} at {w}x{h}"
+            );
+            app.modal = None;
+            // The log view's keys are whole.
+            app.on_key(KeyEvent::from(KeyCode::Char('l')));
+            if app.logview.is_some() {
+                term.draw(|f| ui::draw(f, &app)).unwrap();
+                let rows = screen_rows(&term);
+                ui::assert_hints_whole(&rows, &ui::hint_entries(ui::LOGVIEW_HELP));
+                assert!(!shows_all_of(&rows, ui::TOO_SMALL), "{w}x{h}");
+                app.logview = None;
+            }
+        }
+        // A terminal too small for the keys says so instead of hiding any.
+        let mut term = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        term.draw(|f| ui::draw(f, &app)).unwrap();
+        assert!(shows_all_of(&screen_rows(&term), ui::TOO_SMALL));
+    }
+
     #[test]
     fn an_alert_is_drawn_top_right_on_the_dashboard_and_over_a_shell() {
         let (wake, _w) = mpsc::channel();

@@ -319,6 +319,36 @@ fn table(rows: Vec<Vec<Span<'static>>>, gap: usize, right: &[usize]) -> Vec<Line
         .collect()
 }
 
+/// `table` for a box `width` columns wide inside: a row too long wraps, its continuation under
+/// the last column, so no cell is cut at the box's edge.
+fn table_wrapped(
+    rows: Vec<Vec<Span<'static>>>,
+    gap: usize,
+    right: &[usize],
+    width: usize,
+) -> Vec<Line<'static>> {
+    let n = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let hang: usize = (0..n.saturating_sub(1))
+        .map(|i| {
+            rows.iter()
+                .filter_map(|r| r.get(i))
+                .map(Span::width)
+                .max()
+                .unwrap_or(0)
+                + gap
+        })
+        .sum();
+    table(rows, gap, right)
+        .iter()
+        .flat_map(|l| crate::ui::wrap_hang(l, width, Some(hang)))
+        .collect()
+}
+
+/// Plain text wrapped to `width` columns.
+fn wrapped(text: &str, width: u16) -> Vec<Line<'static>> {
+    crate::ui::wrap_text(text, usize::from(width))
+}
+
 fn mark(ok: bool) -> Span<'static> {
     if ok {
         Span::styled("✓", fg(OK))
@@ -342,13 +372,37 @@ fn step_number(w: &Wizard) -> usize {
     }
 }
 
-fn header(w: &Wizard) -> Line<'static> {
+/// The title and the four steps. Narrower than the whole line, the steps other than the current
+/// one show only their dot (the current step's name and its number stay), so nothing is cut.
+fn header(w: &Wizard, width: usize) -> Line<'static> {
+    let full = header_line(w, true, true);
+    if full.width() <= width {
+        return full;
+    }
+    let no_tag = header_line(w, false, true);
+    if no_tag.width() <= width {
+        return no_tag;
+    }
     let n = step_number(w);
-    let mut spans = vec![Span::styled(" oh-my-openshell ", bold()), dim("set up    ")];
+    let mut spans = header_line(w, false, false).spans;
+    spans.push(dim(format!(" step {n} of 4")));
+    Line::from(spans)
+}
+
+fn header_line(w: &Wizard, tag: bool, names: bool) -> Line<'static> {
+    let n = step_number(w);
+    let mut spans = vec![Span::styled(" oh-my-openshell ", bold())];
+    spans.push(dim(if tag { "set up    " } else { " " }));
     for (i, name) in ["Machine", "Gateways", "Review", "Install"]
         .iter()
         .enumerate()
     {
+        if !names && i + 1 != n {
+            let dot = if i + 1 < n { "●" } else { "○" };
+            let style = if i + 1 < n { fg(ACCENT) } else { fg(DIM) };
+            spans.push(Span::styled(format!("{dot} "), style));
+            continue;
+        }
         let (dot, style) = if i + 1 < n {
             ("●", fg(ACCENT))
         } else if i + 1 == n {
@@ -370,15 +424,36 @@ fn header(w: &Wizard) -> Line<'static> {
     Line::from(spans)
 }
 
-fn hints(w: &Wizard, p: &Progress) -> &'static str {
+/// The key hints of the screen, in priority order.
+fn hints(w: &Wizard, p: &Progress) -> &'static [&'static str] {
     match w.screen {
-        Screen::Machine => "enter  continue    q  quit",
-        Screen::Gateways => "↑↓ move   space tick   enter continue   esc back   q quit",
-        Screen::Review => "Commands are shown as they run.   enter  Install   b  back   q  quit",
-        Screen::Install if p.finished => "enter  continue",
-        Screen::Install => "working… esc  stop after this step",
-        Screen::Done => "enter  open the dashboard",
+        Screen::Machine => &["enter continue", "q quit"],
+        Screen::Gateways => &[
+            "↑↓ move",
+            "space tick",
+            "enter continue",
+            "esc back",
+            "q quit",
+        ],
+        Screen::Review => &[
+            "enter Install",
+            "b back",
+            "q quit",
+            "Commands are shown as they run.",
+        ],
+        Screen::Install if p.finished => &["enter continue"],
+        Screen::Install => &["working…", "esc stop after this step"],
+        Screen::Done => &["enter open the dashboard"],
     }
+}
+
+/// Rows of the hint bar for `width` columns: entries are kept whole and wrap between entries.
+fn hint_rows(w: &Wizard, p: &Progress, width: usize) -> Vec<Line<'static>> {
+    let entries = hints(w, p);
+    crate::ui::pack_hints(entries, width, 0)
+        .into_iter()
+        .map(|r| Line::from(dim(r)))
+        .collect()
 }
 
 pub fn draw(f: &mut Frame, w: &Wizard, p: &Progress) {
@@ -386,16 +461,27 @@ pub fn draw(f: &mut Frame, w: &Wizard, p: &Progress) {
         horizontal: 1,
         vertical: 0,
     });
+    let width = usize::from(area.width);
+    let head = header(w, width);
+    let note: Vec<Line<'static>> = if w.note.is_empty() {
+        Vec::new()
+    } else {
+        crate::ui::wrap_text(&w.note, width)
+            .into_iter()
+            .map(|l| l.style(fg(WARN)))
+            .collect()
+    };
+    let keys = hint_rows(w, p, width);
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(2),
             Constraint::Min(0),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(note.len().max(1) as u16),
+            Constraint::Length(keys.len() as u16),
         ])
         .split(area);
-    f.render_widget(Paragraph::new(header(w)), rows[0]);
+    f.render_widget(Paragraph::new(head), rows[0]);
     match w.screen {
         Screen::Machine => draw_machine(f, w, rows[1]),
         Screen::Gateways => draw_gateways(f, w, rows[1]),
@@ -403,13 +489,8 @@ pub fn draw(f: &mut Frame, w: &Wizard, p: &Progress) {
         Screen::Install => draw_install(f, w, p, rows[1]),
         Screen::Done => draw_done(f, w, p, rows[1]),
     }
-    if !w.note.is_empty() {
-        f.render_widget(
-            Paragraph::new(Span::styled(w.note.clone(), fg(WARN))),
-            rows[2],
-        );
-    }
-    f.render_widget(Paragraph::new(dim(hints(w, p))), rows[3]);
+    f.render_widget(Paragraph::new(note), rows[2]);
+    f.render_widget(Paragraph::new(keys), rows[3]);
 }
 
 fn runtime_line(f: &Facts, rt: Runtime) -> Vec<Span<'static>> {
@@ -475,19 +556,20 @@ fn draw_machine(f: &mut Frame, w: &Wizard, area: Rect) {
             dim("not installed: osh will install it"),
         ]
     });
-    let lines = table(rows, 2, &[]);
+    let lines = table_wrapped(rows, 2, &[], usize::from(area.width.saturating_sub(4)));
+    let intro = wrapped(
+        "Here is what I found on this machine. Nothing is changed yet.",
+        area.width,
+    );
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(intro.len() as u16),
             Constraint::Length(lines.len() as u16 + 2),
             Constraint::Min(0),
         ])
         .split(area);
-    f.render_widget(
-        Paragraph::new("Here is what I found on this machine. Nothing is changed yet."),
-        v[0],
-    );
+    f.render_widget(Paragraph::new(intro), v[0]);
     f.render_widget(Paragraph::new(lines).block(boxed("What I found")), v[1]);
 }
 
@@ -511,15 +593,18 @@ fn need_rows(needs: &[Need]) -> Vec<Vec<Span<'static>>> {
 }
 
 fn draw_gateways(f: &mut Frame, w: &Wizard, area: Rect) {
+    let intro = wrapped(
+        if w.mode == Mode::First {
+            "Pick the gateways you want. The first one you tick becomes your main one."
+        } else {
+            "Pick the gateways to add."
+        },
+        area.width,
+    );
     let v = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .constraints([Constraint::Length(intro.len() as u16), Constraint::Min(0)])
         .split(area);
-    let intro = if w.mode == Mode::First {
-        "Pick the gateways you want. The first one you tick becomes your main one."
-    } else {
-        "Pick the gateways to add."
-    };
     f.render_widget(Paragraph::new(intro), v[0]);
     let wide = area.width >= 70;
     // Build the list and the details first, so the boxes can be sized to what they hold.
@@ -552,7 +637,8 @@ fn draw_gateways(f: &mut Frame, w: &Wizard, area: Rect) {
         .collect();
     let mut lines = table(rows, 2, &[]);
     // The highlighted row is coloured across the whole box, not only under its text.
-    let inner = 30usize.saturating_sub(4);
+    let list_w: u16 = if wide { 30 } else { area.width };
+    let inner = usize::from(list_w).saturating_sub(4);
     for (idx, line) in lines.iter_mut().enumerate() {
         if idx == w.cursor {
             let pad = inner.saturating_sub(line.width());
@@ -566,44 +652,101 @@ fn draw_gateways(f: &mut Frame, w: &Wizard, area: Rect) {
         lines.push(Line::raw(""));
         lines.push(Line::from(dim("1st ticked = main")));
     }
+    // The details of the highlighted gateway: beside the list when wide, below it when narrow.
+    let dw = if wide {
+        area.width.saturating_sub(30)
+    } else {
+        area.width
+    };
+    let dcols = usize::from(dw.saturating_sub(4));
     let item = &w.items[w.cursor];
-    let mut d: Vec<Line<'static>> = vec![Line::raw(item.kind.describe()), Line::raw("")];
+    let mut d: Vec<Line<'static>> = wrapped(item.kind.describe(), dw.saturating_sub(4));
+    d.push(Line::raw(""));
     if item.existing {
         d.push(Line::from(dim("Already set up on this machine.")));
     } else if let State::Unavailable(why) = &item.avail.state {
-        d.push(Line::from(Span::styled(why.clone(), fg(WARN))));
+        d.extend(
+            crate::ui::wrap_text(why, dcols)
+                .into_iter()
+                .map(|l| l.style(fg(WARN))),
+        );
     } else {
         d.push(Line::from(Span::styled("What it needs", bold())));
-        d.extend(table(need_rows(&item.avail.needs), 2, &[]));
+        d.extend(table_wrapped(need_rows(&item.avail.needs), 2, &[], dcols));
     }
-    let want = (lines.len().max(d.len() + 1) + 2).max(9) as u16;
-    let body = Rect {
-        height: want.min(v[1].height),
-        ..v[1]
-    };
-    let panes = if wide {
-        Layout::default()
+    let (list_rect, detail_rect) = if wide {
+        let want = (lines.len().max(d.len()) + 2).max(9) as u16;
+        let body = Rect {
+            height: want.min(v[1].height),
+            ..v[1]
+        };
+        let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(30), Constraint::Min(0)])
-            .split(body)
+            .split(body);
+        (panes[0], panes[1])
     } else {
-        Layout::default()
-            .constraints([Constraint::Min(0)])
-            .split(body)
+        let lh = (lines.len() as u16 + 2).min(v[1].height);
+        let dh = (d.len() as u16 + 2).min(v[1].height - lh);
+        let panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(lh), Constraint::Length(dh)])
+            .split(v[1]);
+        (panes[0], panes[1])
     };
-    f.render_widget(Paragraph::new(lines).block(boxed("Gateways")), panes[0]);
-    if wide {
+    let room = usize::from(detail_rect.height.saturating_sub(2));
+    if d.len() > room && room > 0 {
+        // Say how much is below rather than dropping it without a word.
+        let more = d.len() - room + 1;
+        d.truncate(room - 1);
+        d.push(Line::from(dim(format!(
+            "… {more} more rows: a taller window shows them"
+        ))));
+    }
+    f.render_widget(Paragraph::new(lines).block(boxed("Gateways")), list_rect);
+    if detail_rect.height >= 3 {
         f.render_widget(
-            Paragraph::new(d)
-                .wrap(Wrap { trim: false })
-                .block(boxed(item.kind.label())),
-            panes[1],
+            Paragraph::new(d).block(boxed(item.kind.label())),
+            detail_rect,
         );
     }
 }
 
 fn privileged(s: &Step) -> bool {
     matches!(&s.kind, StepKind::Cmd { prog, .. } if prog == "sudo")
+}
+
+/// Rows of a box `room` rows high from `lines`, keeping row `focus` in view; rows left out above
+/// or below are counted in a row of their own, never dropped without a word.
+fn window(lines: Vec<Line<'static>>, room: usize, focus: usize) -> Vec<Line<'static>> {
+    let n = lines.len();
+    if n <= room {
+        return lines;
+    }
+    if room < 3 {
+        // No room for a list and its markers: the count alone says what is there.
+        return vec![Line::from(dim(format!(
+            "{n} rows: a taller window shows them"
+        )))];
+    }
+    let mut body = room - 2;
+    let mut top = focus.saturating_sub(body / 2).min(n - body);
+    if top == 0 {
+        body = room - 1;
+    } else if top + body >= n {
+        body = room - 1;
+        top = n - body;
+    }
+    let below = n - top - body;
+    let mut out = Vec::new();
+    if top > 0 {
+        out.push(Line::from(dim(format!("… {top} more above"))));
+    }
+    out.extend(lines.into_iter().skip(top).take(body));
+    if below > 0 {
+        out.push(Line::from(dim(format!("… {below} more below"))));
+    }
+    out
 }
 
 fn draw_review(f: &mut Frame, w: &Wizard, area: Rect) {
@@ -619,56 +762,46 @@ fn draw_review(f: &mut Frame, w: &Wizard, area: Rect) {
             }
         })
         .collect();
+    let n = kinds.len();
+    let mut intro = wrapped(
+        &format!(
+            "You will get {n} gateway{}: {}",
+            if n == 1 { "" } else { "s" },
+            names.join(", ")
+        ),
+        area.width,
+    );
+    intro.extend(wrapped(
+        &format!("I will run these {} steps:", w.steps.len()),
+        area.width,
+    ));
     let v = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .constraints([Constraint::Length(intro.len() as u16), Constraint::Min(0)])
         .split(area);
-    let plan_area = Rect {
-        height: (w.steps.len() as u16 + 2).min(v[1].height),
-        ..v[1]
-    };
-    let n = kinds.len();
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::raw(format!(
-                "You will get {n} gateway{}: {}",
-                if n == 1 { "" } else { "s" },
-                names.join(", ")
-            )),
-            Line::raw(format!("I will run these {} steps:", w.steps.len())),
-        ]),
-        v[0],
-    );
-    let room = (v[1].height as usize).saturating_sub(2).max(1);
-    let shown = w.steps.len().min(room);
-    let mut rows: Vec<Vec<Span<'static>>> = w
+    f.render_widget(Paragraph::new(intro), v[0]);
+    let rows: Vec<Vec<Span<'static>>> = w
         .steps
         .iter()
-        .take(if shown < w.steps.len() {
-            shown.saturating_sub(1)
-        } else {
-            shown
-        })
         .enumerate()
         .map(|(i, s)| {
-            vec![
-                Span::styled((i + 1).to_string(), bold()),
-                plain(s.title.clone()),
-                dim(if privileged(s) { "sudo" } else { "" }),
-            ]
+            // The title is the last column, so a long one wraps under itself.
+            let title = if privileged(s) {
+                format!("{}  (sudo)", s.title)
+            } else {
+                s.title.clone()
+            };
+            vec![Span::styled((i + 1).to_string(), bold()), plain(title)]
         })
         .collect();
-    if shown < w.steps.len() {
-        rows.push(vec![
-            plain(""),
-            dim(format!("… and {} more", w.steps.len() - rows.len())),
-            plain(""),
-        ]);
-    }
-    f.render_widget(
-        Paragraph::new(table(rows, 2, &[0])).block(boxed("Plan")),
-        plan_area,
-    );
+    let lines = table_wrapped(rows, 2, &[0], usize::from(area.width.saturating_sub(4)));
+    let room = usize::from(v[1].height.saturating_sub(2)).max(1);
+    let lines = window(lines, room, 0);
+    let plan_area = Rect {
+        height: (lines.len() as u16 + 2).min(v[1].height),
+        ..v[1]
+    };
+    f.render_widget(Paragraph::new(lines).block(boxed("Plan")), plan_area);
 }
 
 fn draw_install(f: &mut Frame, w: &Wizard, p: &Progress, area: Rect) {
@@ -677,22 +810,7 @@ fn draw_install(f: &mut Frame, w: &Wizard, p: &Progress, area: Rect) {
         .iter()
         .filter(|r| matches!(r, RowState::Done(_)))
         .count();
-    let v = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(w.steps.len() as u16 + 2),
-            Constraint::Min(0),
-            Constraint::Length(6),
-        ])
-        .split(area);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            plain("Working… "),
-            dim(format!("({done} of {} done)", w.steps.len())),
-        ])),
-        v[0],
-    );
+    let width = usize::from(area.width.saturating_sub(4));
     let rows: Vec<Vec<Span<'static>>> = w
         .steps
         .iter()
@@ -729,18 +847,49 @@ fn draw_install(f: &mut Frame, w: &Wizard, p: &Progress, area: Rect) {
             vec![icon, Span::styled((i + 1).to_string(), num), title, time]
         })
         .collect();
-    f.render_widget(
-        Paragraph::new(table(rows, 2, &[3])).block(boxed("Progress")),
-        v[1],
-    );
+    // A step title too long for the box wraps; the time is the last column, so the wrap hangs
+    // under the title only when the row has no time yet.
+    let table_lines = table(rows, 2, &[3]);
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut first_row_of = Vec::new();
+    for l in &table_lines {
+        first_row_of.push(lines.len());
+        lines.extend(crate::ui::wrap_hang(l, width, Some(6)));
+    }
     let now: Vec<Line<'static>> = p
         .now
         .iter()
-        .rev()
-        .take(4)
-        .rev()
-        .map(|l| Line::from(dim(l.clone())))
+        .flat_map(|l| crate::ui::wrap_text(l, width))
+        .map(|l| l.style(fg(DIM)))
         .collect();
+    let now_h = 6u16.min(area.height.saturating_sub(4)).max(3);
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(lines.len() as u16 + 2),
+            Constraint::Min(0),
+            Constraint::Length(now_h),
+        ])
+        .split(area);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            plain("Working… "),
+            dim(format!("({done} of {} done)", w.steps.len())),
+        ])),
+        v[0],
+    );
+    // The running step stays in view when the list is taller than its box.
+    let running = p
+        .rows
+        .iter()
+        .position(|r| matches!(r, RowState::Running))
+        .unwrap_or(done.min(w.steps.len().saturating_sub(1)));
+    let focus = first_row_of.get(running).copied().unwrap_or(0);
+    let lines = window(lines, usize::from(v[1].height.saturating_sub(2)), focus);
+    f.render_widget(Paragraph::new(lines).block(boxed("Progress")), v[1]);
+    let room = usize::from(now_h.saturating_sub(2));
+    let now: Vec<Line<'static>> = now[now.len().saturating_sub(room)..].to_vec();
     f.render_widget(Paragraph::new(now).block(boxed("Now running")), v[3]);
 }
 
@@ -791,7 +940,8 @@ fn draw_done(f: &mut Frame, w: &Wizard, p: &Progress, area: Rect) {
                     Span::styled("a", bold()),
                     plain("."),
                 ]),
-            ]),
+            ])
+            .wrap(Wrap { trim: false }),
             v[2],
         );
     } else {
@@ -1659,13 +1809,67 @@ mod tests {
     }
 
     #[test]
-    fn stacked_layout_under_70_columns_has_no_details_pane() {
+    fn under_70_columns_the_details_stack_below_the_list() {
         let w = wizard_with(Screen::Gateways);
-        let (rows, _) = render(&w, &progress(), 60, 20);
+        let (rows, _) = render(&w, &progress(), 60, 30);
         let t = all_text(&rows);
-        assert!(!t.contains("What it needs"), "{t}");
-        assert!(t.contains("Docker") && t.contains("Podman"), "{t}");
+        let list = rows.iter().position(|r| r.contains("[x] Docker")).unwrap();
+        let needs = rows.iter().position(|r| r.contains("What it needs"));
+        assert!(needs.is_some_and(|n| n > list), "{t}");
         assert_boxes_aligned(&rows);
+        // Short of rows, the details say how many rows they leave out.
+        let (rows, _) = render(&w, &progress(), 60, 18);
+        assert!(all_text(&rows).contains("more rows"), "{}", all_text(&rows));
+        assert_boxes_aligned(&rows);
+    }
+
+    /// No row of any screen is cut at the right edge: every word of the hints is whole, and no
+    /// line of text runs into the last column (where the terminal would cut it).
+    #[test]
+    fn no_screen_cuts_text_at_common_sizes() {
+        for screen in [
+            Screen::Machine,
+            Screen::Gateways,
+            Screen::Review,
+            Screen::Install,
+            Screen::Done,
+        ] {
+            for (cols, lines) in [(60, 20), (80, 24), (100, 40), (120, 24), (160, 40)] {
+                let mut w = wizard_with(screen);
+                w.note = "a note long enough to need wrapping at sixty columns, which it now does \
+                          instead of running off the edge"
+                    .into();
+                w.steps[1].title = "Install podman and the podman-docker shim from the \
+                                    distribution's packages, then check it answers"
+                    .into();
+                for p in [progress(), {
+                    let mut p = progress();
+                    p.finished = true;
+                    p
+                }] {
+                    let (rows, _) = render(&w, &p, cols, lines);
+                    let t = all_text(&rows);
+                    for h in hints(&w, &p) {
+                        assert!(t.contains(h), "{h:?} at {cols}x{lines}:\n{t}");
+                    }
+                    for r in &rows {
+                        // The screen keeps a one-column margin; text in the last one was cut.
+                        assert_eq!(r.chars().last(), Some(' '), "{cols}x{lines}:\n{t}");
+                    }
+                    // Every word of the note is on screen, in order (wrapped, not cut).
+                    let flat = t.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let note = w.note.split_whitespace().collect::<Vec<_>>().join(" ");
+                    assert!(flat.contains(&note), "{t}");
+                    if matches!(screen, Screen::Review | Screen::Install) {
+                        // A long step title wraps inside its box (hanging under the title).
+                        for word in ["podman-docker", "distribution's", "answers"] {
+                            assert!(t.contains(word), "{word} at {cols}x{lines}:\n{t}");
+                        }
+                    }
+                    assert_boxes_aligned(&rows);
+                }
+            }
+        }
     }
 
     #[test]
@@ -1814,7 +2018,9 @@ mod tests {
         assert!(matches!(w.on_key(KeyCode::Esc), Action::Cancel));
         assert!(matches!(w.on_key(KeyCode::Char('c')), Action::Cancel));
         assert!(matches!(w.on_key(KeyCode::Char('x')), Action::None));
-        assert!(hints(&w, &Progress::default()).contains("esc"));
+        assert!(hints(&w, &Progress::default())
+            .iter()
+            .any(|h| h.starts_with("esc")));
     }
 
     #[test]
