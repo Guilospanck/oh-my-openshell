@@ -132,6 +132,15 @@ A few actions have no key and live only in the palette:
 Credentials are prompted hidden (or, for a new provider, read from the environment when exported, which the
 status line says); renewing them with `u` always asks. They never go through argv. The footer shows the keys for the current tab.
 
+No text is cut off silently. The footer, the editor's key line, the log view's key line and the
+set-up wizard's hints wrap onto as many rows as their keys need (a key is never parted from its
+words), and the content above gets the rows that are left; a terminal too small for that says
+`Terminal too small: enlarge it to see every key` instead. Status lines, notes, popup titles and
+long values wrap too. A table too narrow for its columns leaves out the last ones and ends a cut
+cell with `…`; the bottom of the panel then shows the selected row in full (on Sandboxes, the
+details pane shows it), so moving the cursor shows any row whole. Lists longer than their box
+show the position (`3/40`) or a `… N more` row.
+
 ### Editing files
 
 Every "edit this file" action opens your own editor inside osh's terminal (the one sandbox shells

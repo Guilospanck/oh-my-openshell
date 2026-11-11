@@ -1213,10 +1213,112 @@ pub const KEYS: &[(&str, &str)] = &[
     ("Ctrl-G", "Go to a line (or line:col)"),
 ];
 
-const HINTS: &str = "Ctrl-S save  Ctrl-F find  Ctrl-N/P next/previous  Ctrl-G line  Ctrl-Z/Y undo/redo  Shift-arrows select  Ctrl-C/X/V copy/cut/paste  Esc close";
+/// The key line: it wraps onto as many rows as it needs, so every key is always on screen.
+pub const HINTS: &str = "Ctrl-S save  Ctrl-F find  Ctrl-N/P next/previous  Ctrl-G line  Ctrl-Z/Y undo/redo  Shift-arrows select  Ctrl-C/X/V copy/cut/paste  Esc close";
+/// The keys of the find, go-to-line and unsaved-changes prompts.
+pub const FIND_HINTS: &str = "Enter keep  ↓/Ctrl-N next  ↑/Ctrl-P previous  Esc back";
+pub const GOTO_HINTS: &str = "line or line:col  Enter go  Esc cancel";
+pub const QUIT_HINTS: &str = "s save and close  d discard changes  Esc keep editing";
 
-/// The editor over the whole of `area`: text with line numbers, a status bar and a key line (or
-/// the prompt the editor is in).
+/// The status bar: `left` (the path or a note) and `right` (the cursor) on one row when they fit,
+/// else the left part wraps and the cursor gets its own row, so neither is cut.
+fn status_rows(left: Line<'static>, right: &str, width: usize) -> Vec<Line<'static>> {
+    let rw = right.width();
+    let right_span = Span::styled(right.to_string(), Style::default().fg(ACCENT));
+    if left.width() + rw < width {
+        let pad = width - left.width() - rw;
+        let mut spans = left.spans;
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(right_span);
+        return vec![Line::from(spans)];
+    }
+    let mut out = crate::ui::wrap_line(&left, width);
+    out.push(Line::from(vec![
+        Span::raw(" ".repeat(width.saturating_sub(rw))),
+        right_span,
+    ]));
+    out
+}
+
+/// The hints of the editor's mode.
+fn mode_hints(mode: &Mode) -> &'static str {
+    match mode {
+        Mode::Find { .. } => FIND_HINTS,
+        Mode::Goto(_) => GOTO_HINTS,
+        Mode::Quit => QUIT_HINTS,
+        Mode::Edit => HINTS,
+    }
+}
+
+/// The bottom bar of the editor's mode as rows of `width` columns, every hint whole (the bar
+/// grows instead), and the cursor column in the first row (for the prompts).
+fn bar_rows(ed: &Editor, width: usize) -> (Vec<Line<'static>>, Option<u16>) {
+    let label = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
+    let rows = |lead: Vec<Span<'static>>, help: &str| -> Vec<Line<'static>> {
+        // Rows after the first start with one space, so the packing runs one column narrower
+        // and the first row's lead counts without that space.
+        let lw: usize = lead
+            .iter()
+            .map(Span::width)
+            .sum::<usize>()
+            .saturating_sub(1);
+        let entries = crate::ui::hint_entries(help);
+        crate::ui::pack_hints(&entries, width.saturating_sub(1), lw)
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let mut spans = if i == 0 {
+                    lead.clone()
+                } else {
+                    vec![Span::raw(" ")]
+                };
+                spans.extend(crate::ui::hint_spans(r));
+                Line::from(spans)
+            })
+            .collect()
+    };
+    let help = mode_hints(&ed.mode);
+    match &ed.mode {
+        Mode::Find { query, .. } => (
+            rows(
+                vec![
+                    Span::styled(" Find: ", label),
+                    Span::raw(query.clone()),
+                    Span::raw("  "),
+                ],
+                help,
+            ),
+            Some((7 + query.width()) as u16),
+        ),
+        Mode::Goto(buf) => (
+            rows(
+                vec![
+                    Span::styled(" Go to line: ", label),
+                    Span::raw(buf.clone()),
+                    Span::raw("  "),
+                ],
+                help,
+            ),
+            Some((13 + buf.width()) as u16),
+        ),
+        Mode::Quit => {
+            let warn = Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+            let mut out = crate::ui::wrap_line(
+                &Line::styled(format!(" Unsaved changes in {}.", ed.name), warn),
+                width,
+            );
+            out.extend(rows(vec![Span::raw(" ")], help));
+            (out, None)
+        }
+        Mode::Edit => (rows(vec![Span::raw(" ")], help), None),
+    }
+}
+
+/// The editor over the whole of `area`: text with line numbers, a status bar and the key rows (or
+/// the prompt the editor is in). The bars grow to the rows their text needs, so no hint or path
+/// is cut at the edge; a terminal too small to keep a row of text says so instead.
 pub fn draw(f: &mut Frame, area: Rect, ed: &Editor) {
     f.render_widget(Clear, area);
     let flag = if ed.modified() { " [modified]" } else { "" };
@@ -1234,20 +1336,45 @@ pub fn draw(f: &mut Frame, area: Rect, ed: &Editor) {
             Span::raw(" "),
         ]));
     let inner = block.inner(area);
+    let width = inner.width as usize;
+
+    let (line, col) = ed.cursor();
+    let right = format!("Ln {line}, Col {col}  {} lines ", ed.lines.len());
+    let left_txt = match ed.note() {
+        Some((n, _)) => format!(" {n}"),
+        None => format!(" {}{flag}", ed.path.display()),
+    };
+    let left_style = match ed.note() {
+        Some((_, true)) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        Some((_, false)) => Style::default().fg(Color::Green),
+        None => Style::default().fg(DIM),
+    };
+    let status = status_rows(Line::styled(left_txt, left_style), &right, width);
+    let (bar, cursor) = bar_rows(ed, width);
+    let entries = crate::ui::hint_entries(mode_hints(&ed.mode));
+    if (inner.height as usize) < 1 + status.len() + bar.len()
+        || !crate::ui::hints_fit(&entries, width)
+    {
+        crate::ui::draw_too_small(f, area);
+        return;
+    }
     f.render_widget(block, area);
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
+            Constraint::Length(status.len() as u16),
+            Constraint::Length(bar.len() as u16),
         ])
         .split(inner);
-    let (text, status, keys) = (parts[0], parts[1], parts[2]);
+    let (text, status_area, keys) = (parts[0], parts[1], parts[2]);
+    f.render_widget(Paragraph::new(status), status_area);
+    f.render_widget(Paragraph::new(bar), keys);
+
+    let rows = text.height as usize;
     let digits = ed.lines.len().to_string().len().max(2);
     let gutter = digits + 1;
     let cols = (text.width as usize).saturating_sub(gutter);
-    let rows = text.height as usize;
     ed.view.set((rows, cols));
     ed.follow(rows, cols);
     let (top, left) = (ed.top.get(), ed.left.get());
@@ -1264,74 +1391,6 @@ pub fn draw(f: &mut Frame, area: Rect, ed: &Editor) {
     }
     f.render_widget(Paragraph::new(out), text);
 
-    let (line, col) = ed.cursor();
-    let right = format!("Ln {line}, Col {col}  {} lines ", ed.lines.len());
-    let left_txt = match ed.note() {
-        Some((n, _)) => format!(" {n}"),
-        None => format!(" {}{flag}", ed.path.display()),
-    };
-    let left_style = match ed.note() {
-        Some((_, true)) => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        Some((_, false)) => Style::default().fg(Color::Green),
-        None => Style::default().fg(DIM),
-    };
-    let room = (status.width as usize).saturating_sub(right.chars().count() + 1);
-    let left_txt: String = left_txt.chars().take(room).collect();
-    let pad =
-        (status.width as usize).saturating_sub(left_txt.chars().count() + right.chars().count());
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(left_txt, left_style),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(right, Style::default().fg(ACCENT)),
-        ])),
-        status,
-    );
-
-    let prompt = |label: &str, buf: &str, help: &str| {
-        let mut spans = vec![
-            Span::styled(
-                format!(" {label} "),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(buf.to_string()),
-            Span::raw("  "),
-        ];
-        spans.extend(crate::ui::hint_spans(help));
-        Line::from(spans)
-    };
-    let (bar, cursor) = match &ed.mode {
-        Mode::Find { query, .. } => (
-            prompt(
-                "Find:",
-                query,
-                "Enter keep  ↓/Ctrl-N next  ↑/Ctrl-P previous  Esc back",
-            ),
-            Some((7 + query.width()) as u16),
-        ),
-        Mode::Goto(buf) => (
-            prompt("Go to line:", buf, "line or line:col  Enter go  Esc cancel"),
-            Some((13 + buf.width()) as u16),
-        ),
-        Mode::Quit => {
-            let mut spans = vec![Span::styled(
-                format!(" Unsaved changes in {}.  ", ed.name),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )];
-            spans.extend(crate::ui::hint_spans(
-                "s save and close  d discard changes  Esc keep editing",
-            ));
-            (Line::from(spans), None)
-        }
-        Mode::Edit => {
-            let mut spans = vec![Span::raw(" ")];
-            spans.extend(crate::ui::hint_spans(HINTS));
-            (Line::from(spans), None)
-        }
-    };
-    f.render_widget(Paragraph::new(bar), keys);
     match cursor {
         Some(x) => f.set_cursor_position(Position::new(
             keys.x + x.min(keys.width.saturating_sub(1)),
@@ -1960,19 +2019,73 @@ mod tests {
         (rows, buf)
     }
 
+    /// The row that contains `needle`.
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} not drawn:\n{}", rows.join("\n")))
+    }
+
     #[test]
     fn draw_shows_line_numbers_text_status_and_keys() {
         let mut e = ed("[github]\nenabled = true\n");
-        let (rows, _) = render(&e, 80, 8);
+        let (rows, _) = render(&e, 80, 10);
         assert!(rows[0].contains("Edit t.txt"), "{}", rows[0]);
         assert!(rows[1].contains(" 1 [github]"), "{}", rows[1]);
         assert!(rows[2].contains(" 2 enabled = true"), "{}", rows[2]);
-        assert!(rows[5].contains("Ln 1, Col 1  2 lines"), "{}", rows[5]);
-        assert!(rows[6].contains("Ctrl-S save"), "{}", rows[6]);
+        let status = row_of(&rows, "Ln 1, Col 1  2 lines");
+        assert!(row_of(&rows, "Ctrl-S save") > status);
         typ(&mut e, "x");
-        let (rows, _) = render(&e, 80, 8);
+        let (rows, _) = render(&e, 80, 10);
         assert!(rows[0].contains("[modified]"), "{}", rows[0]);
-        assert!(rows[5].contains("Ln 1, Col 2"), "{}", rows[5]);
+        row_of(&rows, "Ln 1, Col 2");
+    }
+
+    #[test]
+    fn every_key_hint_is_whole_at_every_common_size() {
+        // The user's report: at 80 columns the key line ended in a cut `Es`.
+        let sizes = [60u16, 80, 100, 120, 160]
+            .into_iter()
+            .flat_map(|w| [20u16, 24, 40].map(move |h| (w, h)));
+        for (w, h) in sizes {
+            let mut e = ed("a\n");
+            let (rows, _) = render(&e, w, h);
+            assert!(
+                !rows.join(" ").contains("too small"),
+                "{w}x{h} is a usual size"
+            );
+            crate::ui::assert_hints_whole(&rows, &crate::ui::hint_entries(HINTS));
+            row_of(&rows, "Esc close");
+            ctrl(&mut e, 'f');
+            let (rows, _) = render(&e, w, h);
+            crate::ui::assert_hints_whole(&rows, &crate::ui::hint_entries(FIND_HINTS));
+            key(&mut e, KeyCode::Esc);
+            ctrl(&mut e, 'g');
+            let (rows, _) = render(&e, w, h);
+            crate::ui::assert_hints_whole(&rows, &crate::ui::hint_entries(GOTO_HINTS));
+            key(&mut e, KeyCode::Esc);
+            typ(&mut e, "z");
+            key(&mut e, KeyCode::Esc);
+            let (rows, _) = render(&e, w, h);
+            crate::ui::assert_hints_whole(&rows, &crate::ui::hint_entries(QUIT_HINTS));
+        }
+        // Too small to show the keys and a row of text: it says so rather than hiding keys.
+        let (rows, _) = render(&ed("a\n"), 30, 5);
+        let flat = rows
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(flat.contains(crate::ui::TOO_SMALL), "{}", rows.join("\n"));
+    }
+
+    #[test]
+    fn a_long_path_or_note_wraps_instead_of_being_cut() {
+        let mut e = ed("a\n");
+        e.path = std::path::PathBuf::from(format!("/{}/end-of-path.toml", "dir/".repeat(30)));
+        let (rows, _) = render(&e, 60, 20);
+        row_of(&rows, "end-of-path.toml");
+        row_of(&rows, "Ln 1, Col 1");
     }
 
     #[test]
@@ -1981,19 +2094,27 @@ mod tests {
         ctrl(&mut e, 'f');
         typ(&mut e, "b");
         let (rows, _) = render(&e, 80, 6);
-        assert!(rows[4].contains("Find: b"), "{}", rows[4]);
-        assert!(rows[3].contains("Match 1 of 1"), "{}", rows[3]);
+        let find = row_of(&rows, "Find: b");
+        assert!(
+            rows[find - 1].contains("Match 1 of 1"),
+            "{}",
+            rows[find - 1]
+        );
+        let (rows, _) = render(&e, 40, 12);
+        crate::ui::assert_hints_whole(&rows, &crate::ui::hint_entries(FIND_HINTS));
         key(&mut e, KeyCode::Esc);
         ctrl(&mut e, 'g');
         typ(&mut e, "1");
         let (rows, _) = render(&e, 80, 6);
-        assert!(rows[4].contains("Go to line: 1"), "{}", rows[4]);
+        row_of(&rows, "Go to line: 1");
         key(&mut e, KeyCode::Esc);
         typ(&mut e, "z");
         key(&mut e, KeyCode::Esc);
-        let (rows, _) = render(&e, 80, 6);
-        assert!(rows[4].contains("Unsaved changes in t.txt"), "{}", rows[4]);
-        assert!(rows[4].contains("d discard"), "{}", rows[4]);
+        let (rows, _) = render(&e, 80, 8);
+        row_of(&rows, "Unsaved changes in t.txt");
+        row_of(&rows, "d discard");
+        let (rows, _) = render(&e, 40, 12);
+        crate::ui::assert_hints_whole(&rows, &crate::ui::hint_entries(QUIT_HINTS));
     }
 
     #[test]
@@ -2002,7 +2123,7 @@ mod tests {
         key(&mut e, KeyCode::Right);
         with(&mut e, KeyCode::Right, KeyModifiers::SHIFT);
         with(&mut e, KeyCode::Right, KeyModifiers::SHIFT);
-        let (_, buf) = render(&e, 40, 6);
+        let (_, buf) = render(&e, 40, 16);
         // Border (1) + gutter of 3: text starts at column 4.
         let rev = |x: u16| buf[(x, 1)].modifier.contains(Modifier::REVERSED);
         assert!(!rev(4) && rev(5) && rev(6) && !rev(7));
@@ -2010,21 +2131,21 @@ mod tests {
         let long = format!("{}END\n", "x".repeat(200));
         let mut f = ed(&long);
         key(&mut f, KeyCode::End);
-        let (rows, _) = render(&f, 40, 6);
+        let (rows, _) = render(&f, 40, 16);
         assert!(rows[1].contains("END"), "{}", rows[1]);
-        assert!(rows[3].contains("Ln 1, Col 204"), "{}", rows[3]);
+        row_of(&rows, "Ln 1, Col 204");
         // Many lines scroll down.
         let text: String = (1..=100).map(|i| format!("line{i}\n")).collect();
         let mut g = ed(&text);
         with(&mut g, KeyCode::End, KeyModifiers::CONTROL);
-        let (rows, _) = render(&g, 40, 8);
-        assert!(rows[4].contains("100 line100"), "{rows:?}");
+        let (rows, _) = render(&g, 40, 16);
+        row_of(&rows, "100 line100");
     }
 
     #[test]
     fn draw_puts_wide_characters_in_two_cells() {
         let e = ed("日本\n");
-        let (rows, _) = render(&e, 30, 5);
+        let (rows, _) = render(&e, 30, 20);
         assert!(rows[1].starts_with("│ 1 日"), "{}", rows[1]);
         let line = e.render_row(0, 1, 10);
         let shown: String = line.spans.iter().map(|s| s.content.to_string()).collect();

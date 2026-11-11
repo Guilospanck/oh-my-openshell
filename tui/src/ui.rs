@@ -110,92 +110,172 @@ fn panel(title: &str, at: Option<(usize, usize)>) -> Block<'static> {
 }
 
 /// A table header row: dim, so the data is what the eye lands on.
-fn head(cols: &[&str]) -> Row<'static> {
-    Row::new(cols.iter().map(|c| c.to_string()).collect::<Vec<_>>())
+fn head(cols: &[String]) -> Row<'static> {
+    Row::new(cols.to_vec())
         .style(role::dim().add_modifier(Modifier::BOLD))
         .bottom_margin(1)
 }
 
-/// Columns of each tab's table: the header names and widths, shared by the empty state so an
-/// empty tab still shows which list it is (and where its rows will go).
-type Cols = (&'static [&'static str], &'static [Constraint]);
-const SANDBOX_COLS: Cols = (
-    &["NAME", "PHASE", "CREATED"],
-    &[
-        Constraint::Min(14),
-        Constraint::Length(15),
-        Constraint::Length(19),
-    ],
-);
-const PROVIDER_COLS: Cols = (
-    &["NAME", "TYPE", "CREDENTIAL KEYS", "GITHUB TOKEN"],
-    &[
-        Constraint::Length(28),
-        Constraint::Length(24),
-        Constraint::Length(24),
-        Constraint::Min(20),
-    ],
-);
-const PROFILE_COLS: Cols = (
-    &["PROFILE", "ON GATEWAY", "SOURCE"],
-    &[
-        Constraint::Length(24),
-        Constraint::Length(16),
-        Constraint::Min(14),
-    ],
-);
-const IMAGE_COLS: Cols = (
-    &["IMAGE", "STATE", "DOCKERFILE"],
-    &[
-        Constraint::Length(30),
-        Constraint::Length(14),
-        Constraint::Min(20),
-    ],
-);
-const GATEWAY_COLS: Cols = (
-    &["GATEWAY", "TYPE", "PORT", "STATE"],
-    &[
-        Constraint::Min(28),
-        Constraint::Length(8),
-        Constraint::Length(7),
-        Constraint::Length(12),
-    ],
-);
+/// Columns of each tab's table: the header and the width below which the column is dropped rather
+/// than squeezed (the last columns go first). Shared by the empty state so an empty tab still
+/// shows which list it is.
+type Cols = &'static [(&'static str, usize)];
+const SANDBOX_COLS: Cols = &[("NAME", 8), ("PHASE", 9), ("CREATED", 19)];
+const PROVIDER_COLS: Cols = &[
+    ("NAME", 8),
+    ("TYPE", 6),
+    ("CREDENTIAL KEYS", 10),
+    ("GITHUB TOKEN", 12),
+];
+const PROFILE_COLS: Cols = &[("PROFILE", 8), ("ON GATEWAY", 10), ("SOURCE", 10)];
+const IMAGE_COLS: Cols = &[("IMAGE", 10), ("STATE", 9), ("DOCKERFILE", 10)];
+const GATEWAY_COLS: Cols = &[("GATEWAY", 10), ("TYPE", 6), ("PORT", 5), ("STATE", 10)];
 
-/// A tab's table with `rows`, its column header and a panel titled `title`.
-fn table<'a>(
-    rows: Vec<Row<'a>>,
-    (names, widths): Cols,
+/// Column widths for `cells` in `avail` columns (one column of space between): each column gets
+/// what its widest cell needs while there is room; short of room, later columns are dropped
+/// before a column is squeezed under its minimum. Returns one width per column kept.
+fn fit_widths(cols: Cols, cells: &[Vec<Line<'static>>], avail: usize) -> Vec<usize> {
+    let content = |i: usize| {
+        cells
+            .iter()
+            .filter_map(|r| r.get(i))
+            .map(Line::width)
+            .chain([text_width(cols[i].0)])
+            .max()
+            .unwrap_or(0)
+    };
+    let floor = |i: usize| cols[i].1.min(content(i));
+    let mut keep = cols.len();
+    while keep > 1 && (0..keep).map(floor).sum::<usize>() + keep - 1 > avail {
+        keep -= 1;
+    }
+    let mut widths: Vec<usize> = (0..keep).map(floor).collect();
+    let mut extra = avail.saturating_sub(widths.iter().sum::<usize>() + keep - 1);
+    for (i, w) in widths.iter_mut().enumerate() {
+        let add = extra.min(content(i).saturating_sub(*w));
+        *w += add;
+        extra -= add;
+    }
+    if let Some(last) = widths.last_mut() {
+        *last += extra;
+        if keep == 1 {
+            *last = (*last).min(avail);
+        }
+    }
+    widths
+}
+
+/// The selected row's every column in full, for the bottom of a table whose cells had to be cut
+/// or whose columns were dropped: moving the cursor shows any row whole.
+fn full_row(cols: Cols, row: &[Line<'static>], width: usize) -> Vec<Line<'static>> {
+    let label = cols.iter().map(|(n, _)| text_width(n)).max().unwrap_or(0) + 2;
+    let mut out = vec![Line::styled(
+        format!(
+            "── selected row in full {}",
+            "─".repeat(width.saturating_sub(25))
+        ),
+        role::dim(),
+    )];
+    for ((name, _), cell) in cols.iter().zip(row) {
+        let mut spans = vec![Span::styled(format!("{name:<label$}"), role::dim())];
+        spans.extend(cell.spans.iter().cloned());
+        for (i, l) in wrap_line(&Line::from(spans), width).into_iter().enumerate() {
+            out.push(if i == 0 {
+                l
+            } else {
+                prefix(l, &" ".repeat(label))
+            });
+        }
+    }
+    out
+}
+
+/// A tab's table in a panel titled `title`. Cells too wide for their column end in `…`; then
+/// (unless `elsewhere`, a details pane that already shows the selected row whole) the bottom of the
+/// panel shows the selected row in full, so no value is out of reach.
+fn draw_table(
+    f: &mut Frame,
+    area: Rect,
     title: &str,
-    count: Option<(usize, usize)>,
-) -> Table<'a> {
-    Table::new(rows, widths.to_vec())
-        .header(head(names))
-        .row_highlight_style(row_highlight())
-        .block(panel(title, count))
+    cols: Cols,
+    cells: Vec<Vec<Line<'static>>>,
+    cursor: usize,
+    elsewhere: bool,
+) {
+    let n = cells.len();
+    let block = panel(title, Some((cursor, n)));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let width = usize::from(inner.width);
+    let widths = fit_widths(cols, &cells, width);
+    let keep = widths.len();
+    let cut = cells.iter().any(|r| {
+        r.iter().enumerate().any(|(i, c)| {
+            if i < keep {
+                c.width() > widths[i]
+            } else {
+                c.width() > 0
+            }
+        })
+    });
+    let mut strip = match cells.get(cursor) {
+        Some(row) if cut && !elsewhere => full_row(cols, row, width),
+        _ => Vec::new(),
+    };
+    // The table keeps at least its header and one row.
+    let room = usize::from(inner.height).saturating_sub(3);
+    if strip.len() > room {
+        strip.truncate(room);
+    }
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(strip.len() as u16)])
+        .split(inner);
+    let names: Vec<String> = cols[..keep]
+        .iter()
+        .zip(&widths)
+        .map(|((name, _), w)| ellipsize(name, *w))
+        .collect();
+    let rows: Vec<Row> = cells
+        .into_iter()
+        .map(|r| {
+            Row::new(
+                r.into_iter()
+                    .take(keep)
+                    .zip(&widths)
+                    .map(|(c, w)| Cell::from(fit_line(&c, *w).0))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let t = Table::new(rows, widths.iter().map(|w| Constraint::Length(*w as u16)))
+        .column_spacing(1)
+        .header(head(&names))
+        .row_highlight_style(row_highlight());
+    f.render_stateful_widget(t, parts[0], &mut table_state(cursor));
+    f.render_widget(Paragraph::new(strip), parts[1]);
 }
 
 /// What a list says when it is empty: the table's header stays (the columns tell which list
-/// this is), and below it a line centred in the panel points at the next step.
+/// this is), and below it the next step, centred and wrapped to the panel.
 fn empty_state(f: &mut Frame, area: Rect, title: &str, cols: Cols, what: &str, hint: &str) {
-    f.render_widget(table(Vec::new(), cols, title, None), area);
+    draw_table(f, area, title, cols, Vec::new(), 0, true);
     let inner = area.inner(ratatui::layout::Margin::new(2, 1));
-    let h = 3.min(inner.height);
+    let w = usize::from(inner.width);
+    let mut lines: Vec<Line> = wrap_text(what, w)
+        .into_iter()
+        .map(|l| l.style(role::bold()))
+        .collect();
+    lines.push(Line::default());
+    lines.extend(wrap_text(hint, w).into_iter().map(|l| l.style(role::dim())));
+    let h = (lines.len() as u16).min(inner.height);
     let at = Rect::new(
         inner.x,
         inner.y + inner.height.saturating_sub(h) / 2,
         inner.width,
         h,
     );
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::styled(what.to_string(), role::bold()),
-            Line::default(),
-            Line::styled(hint.to_string(), role::dim()),
-        ])
-        .alignment(Alignment::Center),
-        at,
-    );
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Center), at);
 }
 
 /// A coloured dot and a word, for a state.
@@ -206,7 +286,8 @@ fn dot(text: &str, style: Style) -> Line<'static> {
     ])
 }
 
-/// The newest alert in a box at the top-right, over whatever else is drawn. Red for high.
+/// The newest alert in a box at the top-right, over whatever else is drawn. Red for high. A
+/// detail too long for the box ends in `…`; `!` lists the alerts in full.
 fn draw_toast(f: &mut Frame, app: &App) {
     let Some(a) = app.toast() else { return };
     let area = f.area();
@@ -220,9 +301,19 @@ fn draw_toast(f: &mut Frame, app: &App) {
         role::WARN
     };
     let cols = text_cols(w);
-    let mut lines = vec![Line::styled(a.title.clone(), role::bold())];
+    let mut lines: Vec<Line> = wrap_text(&a.title, cols)
+        .into_iter()
+        .map(|l| l.style(role::bold()))
+        .collect();
     lines.extend(wrap_text(&a.detail, cols));
-    let h = (lines.len() as u16 + 2).min((area.height / 2).max(5));
+    let max = usize::from((area.height / 2).max(5)) - 2;
+    if lines.len() > max {
+        lines.truncate(max);
+        if let Some(last) = lines.last_mut() {
+            *last = Line::styled("… ! lists it in full", role::dim());
+        }
+    }
+    let h = lines.len() as u16 + 2;
     let rect = Rect::new(area.x + area.width - w - 1, area.y + 1, w, h);
     f.render_widget(Clear, rect);
     f.render_widget(
@@ -234,6 +325,27 @@ fn draw_toast(f: &mut Frame, app: &App) {
 pub fn draw(f: &mut Frame, app: &App) {
     draw_screen(f, app);
     draw_toast(f, app);
+}
+
+/// The warnings above the tabs' content, each wrapped to the screen.
+fn banner_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut warn = |text: String| {
+        for l in wrap_text(&text, width.saturating_sub(3)) {
+            let first = out.is_empty();
+            out.push(prefix(
+                l.style(Style::default().fg(role::WARN)),
+                if first { " ⚠ " } else { "   " },
+            ));
+        }
+    };
+    if let Some(b) = app.expiry_banner() {
+        warn(b);
+    }
+    if app.config_stale {
+        warn("gateway.toml out of date (R on Gateways installs it)".into());
+    }
+    out
 }
 
 fn draw_screen(f: &mut Frame, app: &App) {
@@ -252,27 +364,30 @@ fn draw_screen(f: &mut Frame, app: &App) {
         draw_logview(f, lv);
         return;
     }
-    let banner = app.expiry_banner();
-    let help = footer_lines(app, f.area().width);
+    let width = f.area().width;
+    let banner = banner_lines(app, usize::from(width));
+    let help = footer_lines(app, width);
+    let status = status_lines(app, usize::from(width));
+    // Every key stays on screen: a terminal too small for the keys and a few rows of content
+    // says so instead of hiding any of them.
+    let need = 1 + banner.len() + 5 + status.len() + help.len();
+    if usize::from(f.area().height) < need
+        || !hints_fit(&footer_entries(app.tab), usize::from(width))
+    {
+        draw_too_small(f, f.area());
+        return;
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(u16::from(banner.is_some())),
+            Constraint::Length(banner.len() as u16),
             Constraint::Min(5),
-            Constraint::Length(1 + help.len() as u16),
+            Constraint::Length((status.len() + help.len()) as u16),
         ])
         .split(f.area());
     draw_tabs(f, app, rows[0]);
-    if let Some(b) = banner {
-        f.render_widget(
-            Paragraph::new(Line::styled(
-                format!(" ⚠ {b}"),
-                Style::default().fg(role::WARN),
-            )),
-            rows[1],
-        );
-    }
+    f.render_widget(Paragraph::new(banner), rows[1]);
     match app.tab {
         Tab::Sandboxes => draw_sandboxes(f, app, rows[2]),
         Tab::Providers => draw_providers(f, app, rows[2]),
@@ -280,35 +395,68 @@ fn draw_screen(f: &mut Frame, app: &App) {
         Tab::Images => draw_images(f, app, rows[2]),
         Tab::Gateways => draw_gateways(f, app, rows[2]),
     }
-    draw_footer(f, app, rows[3], help);
+    let mut lines = status;
+    lines.extend(help);
+    f.render_widget(Paragraph::new(lines), rows[3]);
     if let Some(m) = &app.modal {
         draw_modal(f, m, app.tab);
     }
 }
 
-/// The top bar: the app name, the tabs (the current one bold and underlined in the accent colour),
-/// and on the right the gateway as one dot and its name.
-fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::styled(" osh ", role::bold().fg(role::ACCENT))];
-    for (i, (tab, name)) in TABS.iter().enumerate() {
-        if *tab == app.tab {
-            spans.push(Span::styled(
-                format!(" {} {name} ", i + 1),
-                role::accent()
-                    .add_modifier(Modifier::BOLD)
-                    .add_modifier(Modifier::UNDERLINED),
-            ));
-        } else {
-            spans.push(Span::styled(format!(" {} {name} ", i + 1), role::dim()));
+/// The status line wrapped to the screen: at most four rows, a longer one ends in an explicit `…`.
+fn status_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let line = Line::from(status_spans(app, &app.status, Style::default(), role::OK));
+    let mut rows = wrap_line(&line, width.max(4));
+    if rows.len() > 4 {
+        rows.truncate(4);
+        let last = rows.pop().unwrap_or_default();
+        let (l, cut) = fit_line(&last, width.saturating_sub(1));
+        let mut spans = l.spans;
+        if !cut {
+            spans.push(Span::raw("…"));
         }
+        rows.push(Line::from(spans));
     }
-    let (txt, color) = if app.awaiting_snapshot {
-        let gw = if app.snap.gateway.is_empty() {
+    rows
+}
+
+/// The top bar: the app name, the tabs (the current one bold and underlined in the accent colour),
+/// and on the right the gateway as one dot and its name. On a narrow screen the gateway line drops
+/// its version, then its driver; then the other tabs show only their number (Tab and 1-5 still
+/// reach them, `?` names them), so nothing overlaps or is cut.
+fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
+    let tabs = |short: bool, name: bool| {
+        let mut spans = Vec::new();
+        if name {
+            spans.push(Span::styled(" osh ", role::bold().fg(role::ACCENT)));
+        }
+        for (i, (tab, title)) in TABS.iter().enumerate() {
+            if *tab == app.tab {
+                spans.push(Span::styled(
+                    format!(" {} {title} ", i + 1),
+                    role::accent()
+                        .add_modifier(Modifier::BOLD)
+                        .add_modifier(Modifier::UNDERLINED),
+                ));
+            } else if short {
+                spans.push(Span::styled(format!(" {} ", i + 1), role::dim()));
+            } else {
+                spans.push(Span::styled(format!(" {} {title} ", i + 1), role::dim()));
+            }
+        }
+        Line::from(spans)
+    };
+    let gw = &app.snap.gateway;
+    let (variants, color): (Vec<String>, Color) = if app.awaiting_snapshot {
+        let g = if gw.is_empty() {
             String::new()
         } else {
-            format!(" {}", app.snap.gateway)
+            format!(" {gw}")
         };
-        (format!("connecting{gw}..."), role::WARN)
+        (
+            vec![format!("connecting{g}..."), "connecting...".into()],
+            role::WARN,
+        )
     } else if app.snap.gateway_ok {
         let driver = if app.snap.driver.is_empty() {
             String::new()
@@ -316,32 +464,48 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
             format!(" [{}]", app.snap.driver)
         };
         (
-            format!(
-                "{}{driver} connected  {}",
-                app.snap.gateway, app.snap.version
-            ),
+            vec![
+                format!("{gw}{driver} connected  {}", app.snap.version),
+                format!("{gw}{driver} connected"),
+                format!("{gw} connected"),
+                gw.clone(),
+            ],
             role::OK,
         )
     } else {
-        (format!("{} unreachable", app.snap.gateway), role::ERR)
+        (vec![format!("{gw} unreachable"), gw.clone()], role::ERR)
     };
-    let mut right = vec![
-        Span::styled("● ", Style::default().fg(color)),
-        Span::styled(format!("{txt} "), Style::default().fg(color)),
-    ];
-    if app.config_stale {
-        right.insert(
-            0,
-            Span::styled(
-                "gateway.toml out of date (R on Gateways installs it)  ",
-                Style::default().fg(role::WARN),
-            ),
-        );
+    let right_of = |txt: &str| {
+        Line::from(vec![
+            Span::styled("● ", Style::default().fg(color)),
+            Span::styled(format!("{txt} "), Style::default().fg(color)),
+        ])
+    };
+    let w = usize::from(area.width);
+    let mut chosen = None;
+    // The gateway's name outranks the tab names, which outrank the version and driver.
+    let named = |v: &String| gw.is_empty() || v.contains(gw.as_str());
+    'pick: for (short, name, any) in [
+        (false, true, false),
+        (true, true, false),
+        (true, false, false),
+        (true, false, true),
+    ] {
+        let left = tabs(short, name);
+        for v in variants.iter().filter(|v| any || named(v)) {
+            let right = right_of(v);
+            if left.width() + 1 + right.width() <= w {
+                chosen = Some((left, right));
+                break 'pick;
+            }
+        }
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    let (left, right) = chosen.unwrap_or_else(|| (tabs(true, false), right_of("")));
+    let rw = (right.width() as u16).min(area.width);
+    f.render_widget(Paragraph::new(left), area);
     f.render_widget(
-        Paragraph::new(Line::from(right)).alignment(Alignment::Right),
-        area,
+        Paragraph::new(right),
+        Rect::new(area.right() - rw, area.y, rw, area.height),
     );
 }
 
@@ -349,11 +513,19 @@ fn table_state(i: usize) -> TableState {
     TableState::default().with_selected(Some(i))
 }
 
-/// A label and its value, labels aligned in a dim column.
-fn kv(label: &str, value: Vec<Span<'static>>) -> Line<'static> {
-    let mut spans = vec![Span::styled(format!("{label:<12}"), role::dim())];
-    spans.extend(value);
-    Line::from(spans)
+/// A label and its value, labels aligned in a dim column; a value too long for `width` columns
+/// wraps under its own column.
+fn kv(label: &str, value: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    wrap_line(&Line::from(value), width.max(8))
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let lab = if i == 0 { label } else { "" };
+            let mut spans = vec![Span::styled(format!("{lab:<12}"), role::dim())];
+            spans.extend(l.spans);
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
@@ -372,7 +544,7 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
             "n  create one",
         );
     } else {
-        let rows: Vec<Row> = app
+        let cells: Vec<Vec<Line<'static>>> = app
             .snap
             .sandboxes
             .iter()
@@ -386,39 +558,55 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     Line::from(s.name.clone())
                 };
-                Row::new(vec![
-                    Cell::from(name),
-                    Cell::from(dot(&s.phase, phase_style(&s.phase))),
-                    Cell::from(Line::styled(s.created.clone(), role::dim())),
-                ])
+                vec![
+                    name,
+                    dot(&s.phase, phase_style(&s.phase)),
+                    Line::styled(s.created.clone(), role::dim()),
+                ]
             })
             .collect();
-        let t = table(rows, SANDBOX_COLS, "Sandboxes", Some((app.cursor[0], n)));
-        f.render_stateful_widget(t, cols[0], &mut table_state(app.cursor[0]));
+        // The details pane shows the selected sandbox's name, phase and creation time in full.
+        draw_table(
+            f,
+            cols[0],
+            "Sandboxes",
+            SANDBOX_COLS,
+            cells,
+            app.cursor[0],
+            true,
+        );
     }
 
-    let right = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
-        .split(cols[1]);
-    let dcols = text_cols(right[0].width + 2).saturating_sub(12);
+    let dcols = usize::from(cols[1].width).saturating_sub(4 + 12).max(8);
     let mut detail: Vec<Line> = Vec::new();
     match app.selected_sandbox() {
         Some(s) => {
-            detail.push(kv("phase", dot(&s.phase, phase_style(&s.phase)).spans));
+            detail.extend(kv("name", vec![Span::raw(s.name.clone())], dcols));
+            detail.extend(kv(
+                "phase",
+                dot(&s.phase, phase_style(&s.phase)).spans,
+                dcols,
+            ));
+            if !s.created.is_empty() {
+                detail.extend(kv("created", vec![Span::raw(s.created.clone())], dcols));
+            }
             if s.phase == "Ready" {
                 match app.usage_of(&s.name, &app.snap.gateway) {
                     Some(u) => {
-                        detail.push(kv("usage", usage_spans(u, dcols, Style::default())));
-                        for l in wrap_text(totals_note(&app.snap.driver), dcols.max(8)) {
+                        detail.extend(kv("usage", usage_spans(u, dcols, Style::default()), dcols));
+                        for l in wrap_text(totals_note(&app.snap.driver), dcols) {
                             detail.push(prefix(l.style(role::dim()), &" ".repeat(12)));
                         }
                     }
-                    None => detail.push(kv("usage", vec![Span::styled("reading…", role::dim())])),
+                    None => detail.extend(kv(
+                        "usage",
+                        vec![Span::styled("reading…", role::dim())],
+                        dcols,
+                    )),
                 }
             }
             if let Some((_, l)) = app.snap.limits.as_ref().filter(|(n, _)| n == &s.name) {
-                detail.push(kv("limits", vec![Span::raw(l.clone())]));
+                detail.extend(kv("limits", vec![Span::raw(l.clone())], dcols));
             }
             for c in &s.conditions {
                 let (mark, color) = if c.status == "True" {
@@ -426,27 +614,51 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
                 } else {
                     ("✗", role::ERR)
                 };
-                let mut line = kv(
-                    &c.kind,
-                    vec![Span::styled(format!("{mark} "), Style::default().fg(color))],
-                );
                 // The message wraps under its own column, not under the label.
-                let msg = wrap_text(&c.message, dcols.max(8));
+                let msg = wrap_text(&c.message, dcols.saturating_sub(2).max(8));
+                let label = ellipsize(&c.kind, 11);
                 for (i, m) in msg.into_iter().enumerate() {
-                    if i == 0 {
-                        line.spans.extend(m.spans);
-                        detail.push(std::mem::take(&mut line));
+                    let mut spans = if i == 0 {
+                        vec![
+                            Span::styled(format!("{label:<12}"), role::dim()),
+                            Span::styled(format!("{mark} "), Style::default().fg(color)),
+                        ]
                     } else {
-                        detail.push(prefix(m, &" ".repeat(14)));
-                    }
+                        vec![Span::raw(" ".repeat(14))]
+                    };
+                    spans.extend(m.spans);
+                    detail.push(Line::from(spans));
                 }
-                if !line.spans.is_empty() {
-                    detail.push(line);
+                if c.message.is_empty() {
+                    detail.push(Line::from(vec![
+                        Span::styled(format!("{label:<12}"), role::dim()),
+                        Span::styled(mark, Style::default().fg(color)),
+                    ]));
                 }
             }
         }
         None => detail.push(Line::styled("Nothing selected.", role::dim())),
     }
+    // The details take the rows they need; the logs get the rest when that is at least four
+    // rows, else the logs pane gives way (`l` shows the logs whole). Rows past the pane on a
+    // tiny screen are counted in its last row, never dropped without a word.
+    let total = cols[1].height;
+    let floor = total * 35 / 100;
+    let want = (detail.len() as u16 + 2).max(floor);
+    let dh = if want + 4 <= total { want } else { total };
+    let shown = usize::from(dh.saturating_sub(2));
+    if detail.len() > shown && shown > 0 {
+        let more = detail.len() - shown + 1;
+        detail.truncate(shown - 1);
+        detail.push(Line::styled(
+            format!("… {more} more rows: a taller window shows them"),
+            role::dim(),
+        ));
+    }
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(dh), Constraint::Min(0)])
+        .split(cols[1]);
     f.render_widget(
         Paragraph::new(detail).block(panel("Details", None)),
         right[0],
@@ -458,12 +670,15 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
         .filter(|(n, _)| app.selected_sandbox().is_some_and(|s| &s.name == n))
         .map(|(_, l)| l.as_str())
         .unwrap_or("");
+    // Long log lines wrap; `l` opens the full view with the history.
     let height = right[1].height.saturating_sub(2) as usize;
+    let lw = usize::from(right[1].width.saturating_sub(4));
     let lines: Vec<&str> = log_text.lines().collect();
-    let tail: Vec<Line> = lines[lines.len().saturating_sub(height)..]
+    let wrapped: Vec<Line> = lines[lines.len().saturating_sub(height)..]
         .iter()
-        .map(|l| log_line(&crate::logview::humanize(l)))
+        .flat_map(|l| wrap_line(&log_line(&crate::logview::humanize(l)), lw))
         .collect();
+    let tail: Vec<Line> = wrapped[wrapped.len().saturating_sub(height)..].to_vec();
     f.render_widget(
         Paragraph::new(tail).block(
             panel("Logs", None)
@@ -514,7 +729,7 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let rows: Vec<Row> = app
+    let cells: Vec<Vec<Line<'static>>> = app
         .snap
         .providers
         .iter()
@@ -532,27 +747,34 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
                     )
                 });
             let (note, soon) = note.unwrap_or_default();
-            Row::new(vec![
-                Cell::from(p.name.clone()),
-                Cell::from(Line::styled(p.ty.clone(), role::dim())),
-                Cell::from(p.keys.join(", ")),
-                Cell::from(Line::styled(
+            vec![
+                Line::from(p.name.clone()),
+                Line::styled(p.ty.clone(), role::dim()),
+                Line::from(p.keys.join(", ")),
+                Line::styled(
                     note,
                     if soon {
                         Style::default().fg(role::WARN)
                     } else {
                         role::dim()
                     },
-                )),
-            ])
+                ),
+            ]
         })
         .collect();
-    let t = table(rows, PROVIDER_COLS, "Providers", Some((app.cursor[1], n)));
-    f.render_stateful_widget(t, area, &mut table_state(app.cursor[1]));
+    draw_table(
+        f,
+        area,
+        "Providers",
+        PROVIDER_COLS,
+        cells,
+        app.cursor[1],
+        false,
+    );
 }
 
 fn draw_profiles(f: &mut Frame, app: &App, area: Rect) {
-    let rows: Vec<Row> = app
+    let cells: Vec<Vec<Line<'static>>> = app
         .profile_rows()
         .into_iter()
         .map(|r| {
@@ -566,15 +788,14 @@ fn draw_profiles(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 "gateway only"
             };
-            Row::new(vec![
-                Cell::from(r.id),
-                Cell::from(Line::styled(gw, gs)),
-                Cell::from(Line::styled(src.to_string(), role::dim())),
-            ])
+            vec![
+                Line::from(r.id),
+                Line::styled(gw, gs),
+                Line::styled(src.to_string(), role::dim()),
+            ]
         })
         .collect();
-    let n = rows.len();
-    if n == 0 {
+    if cells.is_empty() {
         let hint = format!(
             "n creates one; the files live in {}",
             app.dir.join("providers").display()
@@ -582,8 +803,15 @@ fn draw_profiles(f: &mut Frame, app: &App, area: Rect) {
         empty_state(f, area, "Profiles", PROFILE_COLS, "No profiles", &hint);
         return;
     }
-    let t = table(rows, PROFILE_COLS, "Profiles", Some((app.cursor[2], n)));
-    f.render_stateful_widget(t, area, &mut table_state(app.cursor[2]));
+    draw_table(
+        f,
+        area,
+        "Profiles",
+        PROFILE_COLS,
+        cells,
+        app.cursor[2],
+        false,
+    );
 }
 
 fn draw_images(f: &mut Frame, app: &App, area: Rect) {
@@ -596,7 +824,7 @@ fn draw_images(f: &mut Frame, app: &App, area: Rect) {
         empty_state(f, area, "Images", IMAGE_COLS, "No images", &hint);
         return;
     }
-    let rows: Vec<Row> = app
+    let cells: Vec<Vec<Line<'static>>> = app
         .snap
         .images
         .iter()
@@ -607,21 +835,20 @@ fn draw_images(f: &mut Frame, app: &App, area: Rect) {
                 (true, Freshness::Outdated) => ("outdated", role::ERR),
                 (true, Freshness::Unverified) => ("unverified", role::WARN),
             };
-            Row::new(vec![
-                Cell::from(i.tag.clone()),
-                Cell::from(dot(s, Style::default().fg(c))),
-                Cell::from(Line::styled(
+            vec![
+                Line::from(i.tag.clone()),
+                dot(s, Style::default().fg(c)),
+                Line::styled(
                     i.file
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                     role::dim(),
-                )),
-            ])
+                ),
+            ]
         })
         .collect();
-    let t = table(rows, IMAGE_COLS, "Images", Some((app.cursor[3], n)));
-    f.render_stateful_widget(t, area, &mut table_state(app.cursor[3]));
+    draw_table(f, area, "Images", IMAGE_COLS, cells, app.cursor[3], false);
 }
 
 fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
@@ -637,7 +864,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    let rows: Vec<Row> = app
+    let cells: Vec<Vec<Line<'static>>> = app
         .snap
         .gateways
         .iter()
@@ -655,20 +882,27 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
             for t in tags {
                 name.push(Span::styled(format!("  {t}"), role::dim()));
             }
-            Row::new(vec![
-                Cell::from(Line::from(name)),
-                Cell::from(Line::styled(info.kind, role::dim())),
-                Cell::from(Line::styled(info.port, role::dim())),
-                Cell::from(if cur {
+            vec![
+                Line::from(name),
+                Line::styled(info.kind, role::dim()),
+                Line::styled(info.port, role::dim()),
+                if cur {
                     dot("selected", Style::default().fg(role::OK))
                 } else {
                     Line::default()
-                }),
-            ])
+                },
+            ]
         })
         .collect();
-    let t = table(rows, GATEWAY_COLS, "Gateways", Some((app.cursor[4], n)));
-    f.render_stateful_widget(t, area, &mut table_state(app.cursor[4]));
+    draw_table(
+        f,
+        area,
+        "Gateways",
+        GATEWAY_COLS,
+        cells,
+        app.cursor[4],
+        false,
+    );
 }
 
 /// The keys every tab has, last in the footer.
@@ -706,43 +940,139 @@ pub fn hint_spans(help: &str) -> Vec<Span<'static>> {
     out
 }
 
-/// The key help in rows that break between entries (never between a key and its words), at most
-/// three rows. The per-tab keys come first, the global keys after a dim dot.
-fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
-    let room = usize::from(width).saturating_sub(2).max(20);
-    let entries: Vec<&str> = footer_help(app.tab)
-        .split("  ")
-        .chain(["·"])
-        .chain(GLOBAL_HELP.split("  "))
+/// The entries of a help string (`key words` apart by two spaces).
+pub fn hint_entries(help: &str) -> Vec<&str> {
+    help.split("  ")
+        .map(str::trim)
         .filter(|e| !e.is_empty())
-        .collect();
+        .collect()
+}
+
+/// Display width of a string, as the terminal draws it.
+pub fn text_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+/// Key hint `entries` packed into as many rows of `width` columns as they need. A row breaks
+/// only between entries, never inside one, so every key is shown whole with its words; the bar
+/// grows instead of hiding a key. The first row starts `lead` columns in (a prompt before the
+/// hints). An entry wider than a whole row gets a row to itself (only on screens narrower than
+/// any entry, which the callers replace with a "terminal too small" line).
+pub fn pack_hints(entries: &[&str], width: usize, lead: usize) -> Vec<String> {
     let mut rows: Vec<String> = vec![String::new()];
+    let mut used = lead;
     for e in entries {
-        let cur = rows.last_mut().expect("one row");
-        if !cur.is_empty() && cur.chars().count() + 2 + e.chars().count() > room {
-            rows.push(e.to_string());
-        } else {
-            if !cur.is_empty() {
+        let ew = text_width(e);
+        let empty = rows.last().is_some_and(String::is_empty);
+        let gap = if empty { 0 } else { 2 };
+        if (empty && used == 0) || used + gap + ew <= width {
+            let cur = rows.last_mut().expect("a row");
+            if gap > 0 {
                 cur.push_str("  ");
             }
             cur.push_str(e);
+            used += gap + ew;
+        } else {
+            rows.push(e.to_string());
+            used = ew;
         }
     }
-    rows.truncate(3);
-    rows.iter()
+    rows
+}
+
+/// Key hint rows as styled lines, each after a one-column margin.
+pub fn hint_lines(entries: &[&str], width: usize) -> Vec<Line<'static>> {
+    pack_hints(entries, width.saturating_sub(1), 0)
+        .iter()
         .map(|r| prefix(Line::from(hint_spans(r)), " "))
         .collect()
 }
 
-fn draw_footer(f: &mut Frame, app: &App, area: Rect, help: Vec<Line<'static>>) {
-    let mut lines = vec![Line::from(status_spans(
-        app,
-        &app.status,
-        Style::default(),
-        role::OK,
-    ))];
-    lines.extend(help);
+/// Whether every entry fits on a row of `width` columns (after the one-column margin); narrower
+/// than that, a screen says it is too small rather than cutting a key.
+pub fn hints_fit(entries: &[&str], width: usize) -> bool {
+    entries.iter().all(|e| text_width(e) < width)
+}
+
+/// The one line drawn instead of a screen too small to show its text and every key whole.
+pub const TOO_SMALL: &str = "Terminal too small: enlarge it to see every key";
+
+/// `TOO_SMALL` (wrapped) over the whole of `area`.
+pub fn draw_too_small(f: &mut Frame, area: Rect) {
+    f.render_widget(Clear, area);
+    let lines: Vec<Line> = wrap_text(TOO_SMALL, usize::from(area.width))
+        .into_iter()
+        .map(|l| l.style(Style::default().fg(role::WARN).add_modifier(Modifier::BOLD)))
+        .collect();
     f.render_widget(Paragraph::new(lines), area);
+}
+
+/// `line` cut to `width` columns with an explicit `…` at the end when it is longer, and whether it
+/// was cut. Callers show the full text elsewhere (a details pane, the selected row in full).
+pub fn fit_line(line: &Line<'static>, width: usize) -> (Line<'static>, bool) {
+    if line.width() <= width {
+        return (line.clone(), false);
+    }
+    let room = width.saturating_sub(1);
+    let mut used = 0;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut last = line.style;
+    'outer: for s in &line.spans {
+        let mut out = String::new();
+        last = line.style.patch(s.style);
+        for c in s.content.chars() {
+            let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + cw > room {
+                spans.push(Span::styled(out, last));
+                break 'outer;
+            }
+            used += cw;
+            out.push(c);
+        }
+        spans.push(Span::styled(out, last));
+    }
+    if width > 0 {
+        spans.push(Span::styled("…", last));
+    }
+    (Line::from(spans), true)
+}
+
+/// A plain string cut with `…` to `width` columns.
+pub fn ellipsize(s: &str, width: usize) -> String {
+    plain_text(&fit_line(&Line::raw(s.to_string()), width).0)
+}
+
+/// Test check for a drawn screen (`rows` of cell symbols): every key hint entry (`key words`) of
+/// `entries` is drawn whole on one row, unless the screen says it is too small. Nothing else is
+/// accepted: no overflow entry, no cut piece at a row's end (the user's `... copy/cut/paste  Es`).
+#[cfg(test)]
+pub fn assert_hints_whole(rows: &[String], entries: &[&str]) {
+    let screen = rows.join("\n");
+    let flat = screen.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.contains(TOO_SMALL) {
+        return;
+    }
+    for e in entries {
+        assert!(
+            rows.iter().any(|r| r.contains(e)),
+            "hint {e:?} is not drawn whole:\n{screen}"
+        );
+    }
+}
+
+/// The key help in as many rows as it needs, breaking between entries (never between a key and
+/// its words). The per-tab keys come first, the global keys after a dim dot.
+fn footer_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    hint_lines(&footer_entries(app.tab), usize::from(width))
+}
+
+/// Every entry of the dashboard footer of `tab`.
+pub fn footer_entries(tab: Tab) -> Vec<&'static str> {
+    hint_entries(footer_help(tab))
+        .into_iter()
+        .chain(["·"])
+        .chain(hint_entries(GLOBAL_HELP))
+        .collect()
 }
 
 fn centered(area: Rect, w: u16, h: u16) -> Rect {
@@ -800,6 +1130,12 @@ fn cells_line(cells: &[Glyph], pad: usize) -> Line<'static> {
 /// Word-wraps one styled line to `width` columns. Continuation rows keep the line's indent, so a
 /// wrapped list entry stays visibly one entry. A word longer than the row is cut at the edge.
 pub fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
+    wrap_hang(line, width, None)
+}
+
+/// Word-wraps like `wrap_line`, with continuation rows indented `hang` columns (under a table's
+/// last column, say) instead of the line's own indent.
+pub fn wrap_hang(line: &Line, width: usize, hang: Option<usize>) -> Vec<Line<'static>> {
     let width = width.max(4);
     let cells: Vec<Glyph> = line
         .spans
@@ -813,7 +1149,10 @@ pub fn wrap_line(line: &Line, width: usize) -> Vec<Line<'static>> {
         return vec![cells_line(&cells, 0)];
     }
     let indent = cells.iter().take_while(|(c, _)| *c == ' ').count();
-    let hang = indent.min(width / 2);
+    let hang = match hang {
+        Some(h) => h.min(width.saturating_sub(8)),
+        None => indent.min(width / 2),
+    };
     let mut out = Vec::new();
     let (mut start, mut first) = (0, true);
     while start < cells.len() {
@@ -858,8 +1197,9 @@ fn frame(title: &str, hint: &str, accent: Color) -> Block<'static> {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(accent))
-        .padding(Padding::horizontal(1))
-        .title(Line::from(vec![
+        .padding(Padding::horizontal(1));
+    if !title.is_empty() {
+        b = b.title(Line::from(vec![
             Span::raw(" "),
             Span::styled(
                 title.to_string(),
@@ -867,6 +1207,7 @@ fn frame(title: &str, hint: &str, accent: Color) -> Block<'static> {
             ),
             Span::raw(" "),
         ]));
+    }
     if !hint.is_empty() {
         b = b.title_bottom(Line::styled(format!(" {hint} "), dim).right_aligned());
     }
@@ -908,12 +1249,23 @@ fn draw_scroller(f: &mut Frame, title: &str, lines: Vec<Line<'static>>, scroll: 
     f.render_widget(Clear, area);
     let shown = usize::from(area.height.saturating_sub(2));
     let rows = lines.len();
-    f.render_widget(
-        Paragraph::new(lines)
-            .scroll((scroll, 0))
-            .block(frame(title, hint, Color::Cyan).title(position(scroll, rows, shown))),
-        area,
-    );
+    let pos = position(scroll, rows, shown);
+    let w = usize::from(area.width);
+    // The title keeps the top edge; the position moves to the bottom-left when both do not fit,
+    // and only a title wider than the whole edge ends in `…`.
+    let (title, top) = if text_width(title) + pos.width() + 4 <= w {
+        (title.to_string(), true)
+    } else {
+        (ellipsize(title, w.saturating_sub(4)), false)
+    };
+    let pos = if top { pos } else { pos.left_aligned() };
+    let block = frame(&title, hint, Color::Cyan);
+    let block = if top {
+        block.title(pos)
+    } else {
+        block.title_bottom(pos)
+    };
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)).block(block), area);
 }
 
 /// Styled lines for the providers popup: one block per provider.
@@ -1090,15 +1442,28 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
             let hits = crate::palette::filter(tab, query);
             let w = popup_width(screen.width, 76);
             let cols = text_cols(w);
-            let show = hits
-                .len()
-                .min(usize::from(screen.height.saturating_sub(8)).clamp(1, 10));
+            // The selected action's title wraps in full; the others end in `…` when too long
+            // (moving the cursor onto one shows it whole).
+            let sel_rows = hits.get(*cursor).map_or(1, |(x, _)| {
+                let key = text_width(x.key) + 2;
+                wrap_text(x.title, cols.saturating_sub(key + 3).max(8)).len()
+            });
+            let show = hits.len().min(
+                usize::from(screen.height.saturating_sub(8))
+                    .saturating_sub(sel_rows.saturating_sub(1))
+                    .clamp(1, 10),
+            );
             let top = cursor.saturating_sub(show.saturating_sub(1));
+            let q = query.clone() + "█";
+            let qw = text_width(&q);
+            let shown_q: String = q
+                .chars()
+                .skip(qw.saturating_sub(cols.saturating_sub(2)))
+                .collect();
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled("› ", role::accent().add_modifier(Modifier::BOLD)),
-                    Span::raw(query.clone()),
-                    Span::styled("█", role::accent()),
+                    Span::raw(shown_q),
                 ]),
                 Line::styled("─".repeat(cols), role::dim()),
             ];
@@ -1108,34 +1473,48 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
             for (i, (x, at)) in hits.iter().enumerate().skip(top).take(show) {
                 let sel = i == *cursor;
                 let key = format!(" {} ", x.key);
-                let title_room = cols.saturating_sub(key.chars().count() + 4);
-                let mut spans = vec![Span::styled(if sel { "▌ " } else { "  " }, role::accent())];
-                for (n, c) in x.title.chars().take(title_room).enumerate() {
+                let room = cols.saturating_sub(text_width(&key) + 3).max(8);
+                let mut title: Vec<Span<'static>> = Vec::new();
+                for (n, c) in x.title.chars().enumerate() {
                     let mut st = Style::default();
                     if at.contains(&n) {
                         st = st.fg(role::ACCENT).add_modifier(Modifier::BOLD);
                     } else if sel {
                         st = st.add_modifier(Modifier::BOLD);
                     }
-                    spans.push(Span::styled(c.to_string(), st));
+                    title.push(Span::styled(c.to_string(), st));
                 }
-                let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-                spans.push(Span::raw(
-                    " ".repeat(cols.saturating_sub(used + key.chars().count())),
-                ));
-                spans.push(Span::styled(key, role::dim()));
-                lines.push(Line::from(spans));
+                let title = Line::from(title);
+                let rows = if sel {
+                    wrap_line(&title, room)
+                } else {
+                    vec![fit_line(&title, room).0]
+                };
+                for (r, row) in rows.into_iter().enumerate() {
+                    let bar = if sel { "▌ " } else { "  " };
+                    let mut spans = vec![Span::styled(bar, role::accent())];
+                    let used = 2 + row.width();
+                    spans.extend(row.spans);
+                    if r == 0 {
+                        spans.push(Span::raw(
+                            " ".repeat(cols.saturating_sub(used + text_width(&key))),
+                        ));
+                        spans.push(Span::styled(key.clone(), role::dim()));
+                    }
+                    lines.push(Line::from(spans));
+                }
             }
             let area = centered(screen, w, lines.len() as u16 + 2);
             f.render_widget(Clear, area);
-            f.render_widget(
-                Paragraph::new(lines).block(frame(
-                    "Commands",
-                    "↑↓ move · Enter run · Esc close",
-                    role::ACCENT,
-                )),
-                area,
-            );
+            let mut block = frame("Commands", "↑↓ move · Enter run · Esc close", role::ACCENT);
+            if hits.len() > show {
+                // Not every match fits: say where the cursor is among them.
+                block = block.title(
+                    Line::styled(format!(" {}/{} ", cursor + 1, hits.len()), role::dim())
+                        .right_aligned(),
+                );
+            }
+            f.render_widget(Paragraph::new(lines).block(block), area);
         }
         Modal::Task(t) => {
             let Ok(t) = t.lock() else { return };
@@ -1190,13 +1569,11 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
                     Span::styled("─".repeat(bar_w - filled), dim),
                     Span::raw(format!("  {count}")),
                 ]));
-                lines.push(Line::styled(
+                lines.extend(
                     wrap_text(&t.current, cols)
-                        .first()
-                        .map(plain_text)
-                        .unwrap_or_default(),
-                    dim,
-                ));
+                        .into_iter()
+                        .map(|l| l.style(dim)),
+                );
             }
             let area = centered(screen, w, lines.len() as u16 + 2);
             f.render_widget(Clear, area);
@@ -1272,8 +1649,9 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
         Modal::Input {
             title, buf, mask, ..
         } => {
-            let w = popup_width(screen.width, 72.max(title.chars().count() as u16 + 6));
-            let area = centered(screen, w, 3);
+            let w = popup_width(screen.width, 72.max(text_width(title) as u16 + 6));
+            let (name, head) = title_fit(title, w, 0);
+            let area = centered(screen, w, 3 + head.len() as u16);
             f.render_widget(Clear, area);
             let shown = if *mask {
                 "•".repeat(buf.chars().count())
@@ -1284,12 +1662,10 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
             let cols = text_cols(w).saturating_sub(1);
             let n = shown.chars().count();
             let tail: String = shown.chars().skip(n.saturating_sub(cols)).collect();
+            let mut lines = head;
+            lines.push(Line::raw(format!("{tail}█")));
             f.render_widget(
-                Paragraph::new(format!("{tail}█")).block(frame(
-                    title,
-                    "Enter ok · Esc cancel",
-                    Color::Cyan,
-                )),
+                Paragraph::new(lines).block(frame(&name, "Enter ok · Esc cancel", Color::Cyan)),
                 area,
             );
         }
@@ -1303,11 +1679,20 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
         } => {
             let widest = items
                 .iter()
-                .map(|i| i.chars().count() + 8)
-                .chain([title.chars().count() + 6])
+                .map(|i| text_width(i) + 8)
+                .chain([text_width(title) + 6])
                 .max()
                 .unwrap_or(0);
             let w = popup_width(screen.width, (widest as u16).clamp(48, 100));
+            // The position in the top-right corner, when the list scrolls, takes room from the
+            // title.
+            let total: usize = items.iter().map(|i| wrap_text(i, text_cols(w)).len()).sum();
+            let reserve = if total + 2 > usize::from(screen.height) {
+                format!(" {}/{} ", cursor + 1, items.len()).len() + 1
+            } else {
+                0
+            };
+            let (name, head) = title_fit(title, w, reserve);
             // "› " marker column, then the item; wrapped rows hang under the first character.
             let cols = text_cols(w).saturating_sub(2);
             let li: Vec<ListItem> = items
@@ -1329,24 +1714,52 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
                 })
                 .collect();
             let rows: usize = li.iter().map(|i| i.height()).sum();
-            let area = centered(screen, w, (rows as u16 + 2).min(screen.height));
+            let hh = head.len() as u16;
+            let area = centered(screen, w, (rows as u16 + 2 + hh).min(screen.height));
             f.render_widget(Clear, area);
             let hint = if *multi {
                 "↑↓ move · Space mark · Enter ok · Esc cancel"
             } else {
                 "↑↓ move · Enter choose · Esc cancel"
             };
+            let mut block = frame(&name, hint, Color::Cyan);
+            if rows + usize::from(hh) + 2 > usize::from(area.height) {
+                // The list scrolls: say where the cursor is among the entries.
+                block = block.title(
+                    Line::styled(format!(" {}/{} ", cursor + 1, items.len()), role::dim())
+                        .right_aligned(),
+                );
+            }
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let parts = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(hh), Constraint::Min(0)])
+                .split(inner);
+            f.render_widget(Paragraph::new(head), parts[0]);
             let list = List::new(li)
                 .highlight_style(highlight())
-                .highlight_symbol("› ")
-                .block(frame(title, hint, Color::Cyan));
+                .highlight_symbol("› ");
             f.render_stateful_widget(
                 list,
-                area,
+                parts[1],
                 &mut ListState::default().with_selected(Some(*cursor)),
             );
         }
     }
+}
+
+/// A popup's title when it fits in its frame `w` wide; otherwise no frame title and the title as
+/// bold wrapped lines for the top of the body, so a long question is never cut.
+fn title_fit(title: &str, w: u16, reserve: usize) -> (String, Vec<Line<'static>>) {
+    if text_width(title) + 4 + reserve <= usize::from(w) {
+        return (title.to_string(), Vec::new());
+    }
+    let head = wrap_text(title, text_cols(w))
+        .into_iter()
+        .map(|l| l.style(role::bold()))
+        .collect();
+    (String::new(), head)
 }
 
 fn plain_text(l: &Line) -> String {
@@ -1430,26 +1843,99 @@ fn draw_ext_edit(f: &mut Frame, app: &App, run: &crate::exted::Run) {
     let base = Style::default()
         .fg(Color::Indexed(250))
         .bg(Color::Indexed(236));
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", run.name),
-            base.fg(role::ACCENT).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!(" {prog} ({}) ", run.editor.from), base),
-    ];
-    if let Some(m) = app.flash().filter(|m| !m.is_empty() && *m != "Ready") {
-        spans.extend(status_spans(app, m, base, Color::Green));
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)).style(base), bar);
+    let flash = app
+        .flash()
+        .filter(|m| !m.is_empty() && *m != "Ready")
+        .map(|m| status_spans(app, m, base, Color::Green));
     let hint = "save and quit the editor: osh checks, then writes ";
-    let w = (hint.chars().count() as u16).min(bar.width);
+    // The name and a status first, then the hint (shorter on a narrow screen), then the program.
+    let short = "save and quit: osh checks ";
+    let hw = if text_width(hint)
+        + text_width(&run.name)
+        + 2
+        + flash.as_ref().map_or(0, |f| Line::from(f.clone()).width())
+        <= usize::from(bar.width)
+    {
+        hint
+    } else {
+        short
+    };
+    let w = (text_width(hw) as u16).min(bar.width);
+    let parts = vec![
+        BarPart::new(
+            0,
+            vec![Span::styled(
+                format!(" {} ", run.name),
+                base.fg(role::ACCENT).add_modifier(Modifier::BOLD),
+            )],
+            true,
+        ),
+        BarPart::new(
+            2,
+            vec![Span::styled(
+                format!(" {prog} ({}) ", run.editor.from),
+                base,
+            )],
+            true,
+        ),
+        BarPart::new(1, flash.unwrap_or_default(), true),
+    ];
+    let spans = fit_bar(parts, usize::from(bar.width - w));
+    f.render_widget(Paragraph::new(Line::from(spans)).style(base), bar);
     f.render_widget(
-        Paragraph::new(hint).style(base.fg(Color::Indexed(244))),
+        Paragraph::new(hw).style(base.fg(Color::Indexed(244))),
         Rect::new(bar.right() - w, bar.y, w, bar.height),
     );
 }
 
+/// One piece of a one-row bar: its priority (0 is kept first), its spans, and whether it may be
+/// shortened with `…` rather than left out.
+struct BarPart {
+    prio: u8,
+    spans: Vec<Span<'static>>,
+    shrink: bool,
+}
+
+impl BarPart {
+    fn new(prio: u8, spans: Vec<Span<'static>>, shrink: bool) -> Self {
+        BarPart {
+            prio,
+            spans,
+            shrink,
+        }
+    }
+}
+
+/// The parts of a one-row bar that fit in `width` columns, in their own order: parts are taken by
+/// priority while whole ones fit; a shrinkable part takes what is left with an explicit `…`.
+/// Nothing is drawn over anything else, so no part is cut silently.
+fn fit_bar(parts: Vec<BarPart>, width: usize) -> Vec<Span<'static>> {
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by_key(|&i| parts[i].prio);
+    let mut room = width;
+    let mut shown: Vec<Option<Line<'static>>> = vec![None; parts.len()];
+    for i in order {
+        let line = Line::from(parts[i].spans.clone());
+        let lw = line.width();
+        if lw == 0 {
+            continue;
+        }
+        if lw <= room {
+            room -= lw;
+            shown[i] = Some(line);
+        } else if parts[i].shrink && room >= 6 {
+            let (l, _) = fit_line(&line, room);
+            room = room.saturating_sub(l.width());
+            shown[i] = Some(l);
+        }
+    }
+    shown.into_iter().flatten().flat_map(|l| l.spans).collect()
+}
+
 /// The shell fills the screen above a one-row status bar; the cursor is shown only with focus.
+/// The bar keeps `Ctrl-] menu`, the sandbox's name and a status whole, then the scrollback mark,
+/// the branch, the window title (shortened with `…`) and the usage meter, as room allows; the
+/// dashboard shows the status and the usage in full.
 fn draw_session(f: &mut Frame, app: &App, s: &Session) {
     let focus = app.modal.is_none();
     let area = f.area();
@@ -1463,42 +1949,63 @@ fn draw_session(f: &mut Frame, app: &App, s: &Session) {
     let base = Style::default()
         .fg(Color::Indexed(250))
         .bg(Color::Indexed(236));
-    let mut spans = vec![Span::styled(
-        format!(" {} ", s.sandbox),
-        base.fg(role::ACCENT).add_modifier(Modifier::BOLD),
+    let mut parts = vec![BarPart::new(
+        0,
+        vec![Span::styled(
+            format!(" {} ", s.sandbox),
+            base.fg(role::ACCENT).add_modifier(Modifier::BOLD),
+        )],
+        true,
     )];
     let title = s.vt.title();
     if let Some(branch) = crate::term::branch_of(&title) {
-        spans.push(Span::styled(
-            format!(" {branch} "),
-            base.fg(Color::Indexed(176)).add_modifier(Modifier::BOLD),
+        parts.push(BarPart::new(
+            3,
+            vec![Span::styled(
+                format!(" {branch} "),
+                base.fg(Color::Indexed(176)).add_modifier(Modifier::BOLD),
+            )],
+            true,
         ));
     }
     let title = crate::term::shown_title(&title);
     if !title.is_empty() {
-        spans.push(Span::styled(format!(" {title} "), base));
+        parts.push(BarPart::new(
+            4,
+            vec![Span::styled(format!(" {title} "), base)],
+            true,
+        ));
     }
     let back = s.vt.scrolled_back();
     if back > 0 {
-        spans.push(Span::styled(
-            format!(" [scrollback -{back}, type to return] "),
-            base.fg(Color::Indexed(111)),
+        parts.push(BarPart::new(
+            2,
+            vec![Span::styled(
+                format!(" [scrollback -{back}, type to return] "),
+                base.fg(Color::Indexed(111)),
+            )],
+            true,
         ));
     }
     if let Some(m) = app.flash().filter(|m| !m.is_empty() && *m != "Ready") {
-        spans.extend(status_spans(app, m, base, Color::Green));
+        parts.push(BarPart::new(
+            1,
+            status_spans(app, m, base, Color::Green),
+            true,
+        ));
     }
-    f.render_widget(Paragraph::new(Line::from(spans.clone())).style(base), bar);
     // Its own rectangle: a style on a paragraph repaints the whole area, which would wipe the
     // colours of the name and branch drawn on the left.
     let hint = "Ctrl-] menu ";
     let w = (hint.chars().count() as u16).min(bar.width);
+    let spans = fit_bar(parts, usize::from(bar.width - w));
+    f.render_widget(Paragraph::new(Line::from(spans.clone())).style(base), bar);
     f.render_widget(
         Paragraph::new(hint).style(base.fg(Color::Indexed(244))),
         Rect::new(bar.right() - w, bar.y, w, bar.height),
     );
     // The sandbox's CPU, memory and disk use, right-aligned before the hint, in what the left
-    // side leaves free (a long status hides it rather than being overwritten).
+    // side leaves free (the details pane on the dashboard shows it whole).
     if let Some(u) = app.usage_of(&s.sandbox, &s.gateway) {
         let left: usize = spans.iter().map(|x| x.width()).sum();
         let free = usize::from(bar.width).saturating_sub(left + usize::from(w) + 2);
@@ -1570,14 +2077,42 @@ pub fn log_line(l: &str) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The log view's keys.
+pub const LOGVIEW_HELP: &str =
+    "/ search  s source  j/k PgUp/PgDn scroll  g/G top/bottom  f follow  h/l pan  q close";
+
+/// The log view: the lines (h/l pan sideways; the title says when lines go on past the right
+/// edge) and the keys below, on as many rows as they need.
 fn draw_logview(f: &mut Frame, lv: &LogView) {
+    let width = usize::from(f.area().width);
+    let bar: Vec<Line<'static>> = match &lv.typing {
+        Some(t) => wrap_text(&format!("/{t}\u{2588}"), width),
+        None => {
+            let help = if lv.query.is_empty() {
+                LOGVIEW_HELP.to_string()
+            } else {
+                format!("/{} search  n/N next/prev  Esc clear  q close", lv.query)
+            };
+            let entries = hint_entries(&help);
+            if !hints_fit(&entries, width) {
+                draw_too_small(f, f.area());
+                return;
+            }
+            hint_lines(&entries, width)
+        }
+    };
+    if usize::from(f.area().height) < bar.len() + 3 {
+        draw_too_small(f, f.area());
+        return;
+    }
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints([Constraint::Min(3), Constraint::Length(bar.len() as u16)])
         .split(f.area());
     let height = rows[0].height.saturating_sub(2) as usize;
+    let view = usize::from(rows[0].width.saturating_sub(4));
     lv.height.set(height);
-    let (lines, total): (Vec<Line>, usize) = {
+    let (lines, total, widest): (Vec<Line>, usize, usize) = {
         let Ok(b) = lv.buf.lock() else { return };
         let total = b.lines.len();
         let top = if lv.follow {
@@ -1585,13 +2120,13 @@ fn draw_logview(f: &mut Frame, lv: &LogView) {
         } else {
             lv.top.min(total.saturating_sub(height))
         };
-        let lines = b
-            .lines
-            .iter()
+        let shown: Vec<&String> = b.lines.iter().skip(top).take(height).collect();
+        let widest = shown.iter().map(|l| text_width(l)).max().unwrap_or(0);
+        let lines = shown
+            .into_iter()
             .enumerate()
-            .skip(top)
-            .take(height)
-            .map(|(i, l)| {
+            .map(|(n, l)| {
+                let i = top + n;
                 let style = if lv.current == Some(i) {
                     highlight()
                 } else if lv.matches(l) {
@@ -1606,7 +2141,7 @@ fn draw_logview(f: &mut Frame, lv: &LogView) {
                 }
             })
             .collect();
-        (lines, total)
+        (lines, total, widest)
     };
     let top = if lv.follow {
         total.saturating_sub(height)
@@ -1614,37 +2149,40 @@ fn draw_logview(f: &mut Frame, lv: &LogView) {
         lv.top.min(total.saturating_sub(height))
     };
     let mode = if lv.follow { "following" } else { "paused" };
-    f.render_widget(
-        Paragraph::new(lines).scroll((0, lv.left)).block(
-            panel(&format!("Logs · {}", lv.name), None).title(
-                Line::from(vec![
-                    Span::styled(
-                        format!(" {mode} "),
-                        Style::default().fg(if lv.follow { role::OK } else { role::WARN }),
-                    ),
-                    Span::styled(
-                        format!(
-                            "{} · {}/{total} ",
-                            lv.source_name(),
-                            (top + height).min(total)
-                        ),
-                        role::dim(),
-                    ),
-                ])
-                .right_aligned(),
+    let left = usize::from(lv.left);
+    // Columns hidden on either side of the view, so a long line never ends silently at the edge.
+    let pan = match (left > 0, widest > left + view) {
+        (false, false) => String::new(),
+        (true, false) => "← h ".to_string(),
+        (false, true) => "l → ".to_string(),
+        (true, true) => "← h · l → ".to_string(),
+    };
+    let mut block = panel(&format!("Logs · {}", lv.name), None).title(
+        Line::from(vec![
+            Span::styled(
+                format!(" {mode} "),
+                Style::default().fg(if lv.follow { role::OK } else { role::WARN }),
             ),
-        ),
+            Span::styled(
+                format!(
+                    "{} · {}/{total} ",
+                    lv.source_name(),
+                    (top + height).min(total)
+                ),
+                role::dim(),
+            ),
+        ])
+        .right_aligned(),
+    );
+    if !pan.is_empty() {
+        block = block.title_bottom(
+            Line::styled(format!(" more columns {pan}"), role::accent()).right_aligned(),
+        );
+    }
+    f.render_widget(
+        Paragraph::new(lines).scroll((0, lv.left)).block(block),
         rows[0],
     );
-    let bar = match &lv.typing {
-        Some(t) => Line::from(format!("/{t}\u{2588}")),
-        None => Line::from(hint_spans(&if lv.query.is_empty() {
-            " /  search  s source  j/k PgUp/PgDn scroll  g/G top/bottom  f follow  h/l pan  q close"
-                .to_string()
-        } else {
-            format!(" /{}  n/N next/prev  Esc clear  q close", lv.query)
-        })),
-    };
     f.render_widget(Paragraph::new(bar), rows[1]);
 }
 
@@ -1838,6 +2376,89 @@ mod tests {
                 .sum();
             assert!(n <= w);
         }
+    }
+
+    #[test]
+    fn hints_wrap_between_entries_and_never_lose_one() {
+        let entries = hint_entries(footer_help(Tab::Sandboxes));
+        for w in [30usize, 40, 60, 80, 200] {
+            let rows = pack_hints(&entries, w, 0);
+            let joined = rows.join("  ");
+            assert_eq!(hint_entries(&joined), entries, "width {w}");
+            assert!(
+                rows.iter().all(|r| text_width(r) <= w),
+                "width {w}: {rows:?}"
+            );
+        }
+        // A lead (a prompt) shortens only the first row.
+        let rows = pack_hints(&["aa bb", "cc dd"], 12, 6);
+        assert_eq!(rows, ["aa bb", "cc dd"]);
+    }
+
+    #[test]
+    fn columns_are_dropped_last_first_and_cut_cells_show_in_full_below() {
+        let cells = vec![vec![
+            Line::raw("a-long-provider-name"),
+            Line::raw("github"),
+            Line::raw("KEY_ONE, KEY_TWO"),
+            Line::raw("token expires in 3 days"),
+        ]];
+        let w = fit_widths(PROVIDER_COLS, &cells, 30);
+        assert!(w.len() < 4, "a column gives way: {w:?}");
+        assert!(w.iter().sum::<usize>() + w.len() - 1 <= 30);
+        assert_eq!(fit_widths(PROVIDER_COLS, &cells, 200).len(), 4);
+        let mut app = usage_app("docker");
+        app.snap.providers = vec![cli::Provider {
+            name: "a-long-provider-name".into(),
+            ty: "github".into(),
+            keys: vec!["KEY_ONE".into(), "KEY_TWO_THAT_IS_LONG".into()],
+        }];
+        app.tab = Tab::Providers;
+        let (all, _) = screen(&app, 60, 24);
+        assert!(all.contains("selected row in full"), "{all}");
+        assert!(all.contains("KEY_TWO_THAT_IS_LONG"), "{all}");
+        let (all, _) = screen(&app, 160, 24);
+        assert!(
+            !all.contains("selected row in full"),
+            "nothing cut, no strip"
+        );
+    }
+
+    #[test]
+    fn the_tab_bar_never_overlaps_and_the_gateway_stays() {
+        let mut app = usage_app("docker");
+        app.snap.gateway = "openshell-docker".into();
+        app.snap.gateway_ok = true;
+        app.snap.version = "openshell 0.0.36".into();
+        app.config_stale = true;
+        for w in [60u16, 80, 100, 160] {
+            let (_, buf) = screen(&app, w, 30);
+            let top: String = (0..w).map(|x| buf[(x, 0)].symbol()).collect();
+            assert!(top.contains("1 Sandboxes"), "{w}: {top}");
+            assert!(top.contains("openshell-docker"), "{w}: {top}");
+            let all: String = buf.content().iter().map(|c| c.symbol()).collect();
+            assert!(
+                all.contains("R on Gateways installs it"),
+                "the warning wraps in a banner"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bar_keeps_parts_by_priority_and_marks_a_shortened_one() {
+        let parts = vec![
+            BarPart::new(0, vec![Span::raw(" name ")], true),
+            BarPart::new(2, vec![Span::raw(" a very long window title here ")], true),
+            BarPart::new(1, vec![Span::raw(" ✓ Saved ")], true),
+        ];
+        let text: String = fit_bar(parts, 25)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(text.starts_with(" name "), "{text}");
+        assert!(text.ends_with(" ✓ Saved "), "{text}");
+        assert!(text.contains('…'), "the title is shortened visibly: {text}");
+        assert!(text_width(&text) <= 25);
     }
 
     #[test]
