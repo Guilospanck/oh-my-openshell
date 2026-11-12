@@ -60,6 +60,9 @@ pub struct Env {
     /// The host's tmux config, offered for upload so the tmux in the sandbox has the same
     /// prefix and bindings.
     pub tmux_conf: Option<PathBuf>,
+    /// The host's workmux config (`~/.config/workmux/config.yaml`), offered for upload so `workmux
+    /// add` in the sandbox has the same agent and panes.
+    pub workmux_conf: Option<PathBuf>,
     /// graphify's version when already known; otherwise `graphify --version` is run.
     pub graphify_version: Option<String>,
     /// OpenShell sets HOME inside sandboxes (`/workspace` on docker, `/sandbox` on vm).
@@ -83,6 +86,7 @@ impl Env {
             gitleaks: which("gitleaks"),
             memory_repo,
             tmux_conf: host_tmux_conf(&home),
+            workmux_conf: Some(home.join(".config/workmux/config.yaml")).filter(|p| p.is_file()),
             graphify_version: None,
             sandbox_home: sandbox_home.trim_end_matches('/').to_string(),
         }
@@ -235,6 +239,83 @@ pub fn sandbox_tmux_conf(text: &str, known: Option<&std::collections::HashSet<St
         out.push('\n');
     }
     out
+}
+
+/// Top-level workmux settings that only make sense on the host: `sandbox` runs agents in
+/// containers or VMs, `remotes` names other machines, `bubblewrap` and `hook_shell` name host
+/// tools and paths.
+const WORKMUX_HOST_ONLY: [&str; 4] = ["sandbox", "remotes", "bubblewrap", "hook_shell"];
+
+/// A workmux config made fit for a sandbox: the host-only settings are commented out (with their
+/// indented lines), and what `workmux add -P` needs is added when missing: an `agent`, a pane that
+/// runs it (`<agent>`; without one workmux refuses a prompt with "no pane is configured to run
+/// the agent") and `nerdfont` (unset, the first run asks a question nobody can answer when the
+/// caller is not a terminal). Empty text gives that minimal config. `files.symlink` and hooks stay.
+pub fn sandbox_workmux_conf(text: &str) -> String {
+    let mut out = String::new();
+    let mut dropping = false;
+    for line in text.lines() {
+        let top = line
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && c != '#' && c != '-');
+        if top {
+            let key = line.split(':').next().unwrap_or("").trim();
+            dropping = WORKMUX_HOST_ONLY.contains(&key);
+        } else if dropping && !(line.starts_with([' ', '\t', '-']) || line.trim().is_empty()) {
+            dropping = false;
+        }
+        if dropping {
+            out.push_str("# osh: left out for the sandbox: ");
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    let has = |key: &str| {
+        text.lines()
+            .any(|l| l.strip_prefix(key).is_some_and(|r| r.starts_with(':')))
+    };
+    if !has("agent") {
+        out.push_str("agent: claude\n");
+    }
+    if !has("nerdfont") {
+        out.push_str("# osh: unset, workmux asks about icons on its first run\nnerdfont: false\n");
+    }
+    if !has("panes") {
+        out.push_str(
+            "# osh: `workmux add -P` needs a pane that runs the agent\npanes:\n  - command: <agent>\n    focus: true\n  - split: horizontal\n",
+        );
+    }
+    out
+}
+
+/// The workmux config to put in a new sandbox: the host's, made fit for it, or the minimal one
+/// when the host has none (`bool`: from the host). A private regular-file copy like the tmux one;
+/// `Err` when the secret scan flags the host's. The caller removes the copy's directory (its
+/// parent) after the upload.
+pub fn workmux_conf_for_new_sandbox(data_dir: &Path) -> Result<(PathBuf, bool), String> {
+    let env = Env::detect(data_dir, "");
+    let stage = std::env::temp_dir().join(format!("osh-workmuxconf-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&stage);
+    fs::create_dir_all(&stage).map_err(|e| e.to_string())?;
+    fs::set_permissions(&stage, std::os::unix::fs::PermissionsExt::from_mode(0o700))
+        .map_err(|e| e.to_string())?;
+    let copy = stage.join("config.yaml");
+    let host = match &env.workmux_conf {
+        Some(c) => fs::read_to_string(c).map_err(|e| e.to_string()),
+        None => Ok(String::new()),
+    };
+    let written =
+        host.and_then(|t| fs::write(&copy, sandbox_workmux_conf(&t)).map_err(|e| e.to_string()));
+    if let Err(e) = written {
+        let _ = fs::remove_dir_all(&stage);
+        return Err(e);
+    }
+    if env.workmux_conf.is_some() && !scan(&env, &stage).unwrap_or_default().is_empty() {
+        let _ = fs::remove_dir_all(&stage);
+        return Err("the secret scan flagged your workmux config".into());
+    }
+    Ok((copy, env.workmux_conf.is_some()))
 }
 
 /// The host tmux config to put in a new sandbox, as a private regular-file copy (home-manager and
@@ -678,6 +759,25 @@ fn stage_and_describe(env: &Env, own: &[PathBuf], stage: &Path) -> io::Result<Ve
             true,
             vec![],
             "read after the image's /etc/tmux.conf; lines for host-only tools (pbcopy) print errors in the sandbox's tmux",
+        ));
+    }
+    if let Some(conf) = env.workmux_conf.as_ref().filter(|c| c.is_file()) {
+        let dst = stage.join("workmux.yaml");
+        fs::write(&dst, sandbox_workmux_conf(&fs::read_to_string(conf)?))?;
+        let up = Spec::Upload {
+            src: dst.to_string_lossy().into_owned(),
+            dest: format!("{h}/.config/workmux/config.yaml"),
+            result: format!("{h}/.config/workmux/config.yaml"),
+        };
+        items.push(item(
+            "context",
+            "workmux config",
+            "workmux agent and panes".into(),
+            vec![("claude-code", up.clone()), ("pi", up)],
+            "upload",
+            true,
+            vec![],
+            "host-only settings (sandbox, remotes) are commented out; replaces the sandbox's own config",
         ));
     }
     let mem = memory_dir(env);
@@ -1448,6 +1548,7 @@ mod tests {
             gitleaks: None,
             memory_repo: repo(),
             tmux_conf: None,
+            workmux_conf: None,
             graphify_version: Some("1.2.3".into()),
             sandbox_home: "/workspace".into(),
         }
@@ -1904,6 +2005,51 @@ mod tests {
         let static_only = sandbox_tmux_conf(conf, None);
         assert!(static_only.contains("# osh: left out for the sandbox: set -g default-shell"));
         assert!(!static_only.contains("left out for the sandbox: set -g extended-keys-format"));
+    }
+
+    #[test]
+    fn the_sandbox_workmux_conf_keeps_the_hosts_settings_and_adds_what_a_prompt_needs() {
+        let host = "agent: claude\nnerdfont: true\nsandbox:\n  enabled: true\n  container:\n    runtime: docker\n# note\nfiles:\n  symlink:\n    - node_modules\npanes:\n  - command: <agent>\n";
+        let out = sandbox_workmux_conf(host);
+        assert!(out.contains("# osh: left out for the sandbox: sandbox:"));
+        assert!(out.contains("# osh: left out for the sandbox:     runtime: docker"));
+        assert!(
+            out.contains("\nfiles:\n  symlink:\n    - node_modules\n"),
+            "{out}"
+        );
+        assert!(out.contains("\nnerdfont: true\n") && !out.contains("nerdfont: false"));
+        assert_eq!(out.matches("panes:").count(), 1, "{out}");
+        // No host config: the minimal one has an agent pane and answers the nerdfont question.
+        let min = sandbox_workmux_conf("");
+        assert!(min.contains("agent: claude") && min.contains("nerdfont: false"));
+        assert!(min.contains("panes:\n  - command: <agent>"));
+        // A host config with no panes gets them.
+        assert!(sandbox_workmux_conf("agent: pi\n").contains("command: <agent>"));
+        assert!(!sandbox_workmux_conf("agent: pi\n").contains("agent: claude"));
+    }
+
+    #[test]
+    fn host_workmux_conf_is_offered_for_upload_to_the_sandbox_home() {
+        let root = tmp("wmconf");
+        let claude = fixture(&root);
+        let conf = root.join("workmux.yaml");
+        fs::write(&conf, "agent: claude\nsandbox:\n  enabled: true\n").unwrap();
+        let env = Env {
+            workmux_conf: Some(conf),
+            ..env_with(&claude)
+        };
+        let v = normalized(&manifest(&env, "pi").unwrap());
+        let _ = fs::remove_dir_all(&root);
+        let item = v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["name"] == "workmux config")
+            .expect("workmux item");
+        assert_eq!(
+            item["agents"]["pi"]["dest"],
+            "/workspace/.config/workmux/config.yaml"
+        );
     }
 
     #[test]

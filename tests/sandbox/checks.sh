@@ -48,6 +48,18 @@ sandbox_checks() {
   [[ "$out" == *osh-git-alias* && "$out" == *$'\n'1* ]] && pass "a host git alias works and the include is added once" \
     || fail "a host git alias works and the include is added once" "$out"
 
+  # The workmux config copy (cli::upload_workmux_conf; text from agents::sandbox_workmux_conf with no
+  # host config): without an agent pane `workmux add -P` fails with "no pane is configured to run
+  # the agent", which is what /orchestrate hit in a sandbox. Upload the minimal config, then
+  # dispatch a prompt from a throwaway repo in a tmux session of its own.
+  printf 'agent: claude\nnerdfont: false\npanes:\n  - command: <agent>\n    focus: true\n  - split: horizontal\n' >"$HOME/osh-workmux.yaml"
+  ex 'mkdir -p "$HOME/.config/workmux"' >/dev/null
+  out="$(openshell -g "$main" sandbox upload "$name" "$HOME/osh-workmux.yaml" "$home/.config/workmux/config.yaml" --no-git-ignore 2>&1)" \
+    && pass "the workmux config uploads to a nested path" || fail "the workmux config uploads to a nested path" "home=[$home] $out"
+  out="$(ex 'export PATH="$HOME/.local/bin:$PATH"; D=$(mktemp -d /tmp/wmchk.XXXX); cd "$D" && git init -q . && git -c user.name=t -c user.email=t@t commit -q --allow-empty -m init && echo "do x" > p.md && tmux -L wmchk -f /dev/null new-session -d -s chk -c "$D" && tmux -L wmchk send-keys -t chk "workmux add chk-task -b -P p.md > out.txt 2>&1 </dev/null; echo DONE >> out.txt" Enter; for i in 1 2 3 4 5 6 7 8 9 10; do grep -q DONE out.txt 2>/dev/null && break; sleep 1; done; cat out.txt; tmux -L wmchk kill-server; cd /; rm -rf "$D"')"
+  [[ "$out" == *DONE* && "$out" != *"no pane is configured"* && "$out" != *Error* ]] && pass "workmux add -P finds the agent pane from the uploaded config" \
+    || fail "workmux add -P finds the agent pane from the uploaded config" "$out"
+
   # Opt-in profiles (providers/{rust,go,js}.yaml): import, create and attach each to the same
   # sandbox (the gateway refuses endpoints that overlap with conflicting metadata, so this proves
   # they compose). The attach is checked with --wait because the gateway saves an attachment

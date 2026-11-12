@@ -753,8 +753,7 @@ impl Editor {
         let (a, b) = self.rows();
         self.begin(Kind::Other);
         let mut delta: Vec<isize> = Vec::new();
-        for r in a..=b {
-            let l = &mut self.lines[r];
+        for l in &mut self.lines[a..=b] {
             if right {
                 if !l.is_empty() {
                     l.insert_str(0, &" ".repeat(INDENT));

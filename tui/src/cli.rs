@@ -1606,24 +1606,16 @@ fn find_file(dir: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Put the host's tmux config and a filtered copy of its global git config (allowlist in
-/// `agents::filter_git_config`) in a sandbox just created, so its tmux has the host's prefix and
-/// bindings and its git the host's aliases and colours from the first shell. `name` is empty when
+/// Put the host's tmux config, a filtered copy of its global git config (allowlist in
+/// `agents::filter_git_config`) and a workmux config (the host's, or a minimal one with an agent
+/// pane) in a sandbox just created, so its tmux has the host's prefix and bindings, its git the
+/// host's aliases and colours, and `workmux add -P` works from the first shell. `name` is empty when
 /// OpenShell generated it: the sandbox is then the first one not in `before`. One wait for the
 /// sandbox serves both. Each copy is skipped (with the reason) when the host has none, the secret
 /// scan flags it, or the image lacks the tool; a skip never fails the creation.
 pub fn install_sandbox_confs(dir: &Path, name: &str, before: &[String]) -> Result<String, String> {
     let has_tmux = agents::Env::detect(dir, "").tmux_conf.is_some();
     let git = agents::gitconfig_for_new_sandbox(dir);
-    if !has_tmux && !matches!(git, Ok(Some(_))) {
-        let git_note = match &git {
-            Err(e) => format!("git config not copied: {e}"),
-            _ => "no host git config to copy".into(),
-        };
-        return Ok(format!(
-            "Sandbox created (no host tmux config to copy; {git_note})"
-        ));
-    }
     let result = upload_sandbox_confs(dir, name, before, has_tmux, &git);
     if let Ok(Some(f)) = &git {
         if let Some(stage) = f.parent() {
@@ -1657,8 +1649,10 @@ fn upload_sandbox_confs(
         }
         if !name.is_empty() {
             let script = "printf '%s\\n' \"$HOME\"; \
+                export PATH=\"$HOME/.local/bin:$PATH\"; \
                 command -v tmux >/dev/null 2>&1 && echo tmux; \
-                command -v git >/dev/null 2>&1 && echo git; true";
+                command -v git >/dev/null 2>&1 && echo git; \
+                command -v workmux >/dev/null 2>&1 && echo workmux; true";
             if let Ok(t) = exec("openshell", &sandbox_sh(&name, script), &[]) {
                 probe = t;
                 break;
@@ -1691,7 +1685,54 @@ fn upload_sandbox_confs(
             Err(e) => format!("git config not copied: {e}"),
         },
     };
-    Ok(format!("Sandbox created ({tmux}; {gitmsg})"))
+    // Only an image with workmux gets a config; its note is left out of the message otherwise.
+    let workmux = if tools.contains(&"workmux") {
+        match upload_workmux_conf(dir, &name, &home) {
+            Ok(m) => format!("; {m}"),
+            Err(e) => format!("; workmux config not copied: {e}"),
+        }
+    } else {
+        String::new()
+    };
+    Ok(format!("Sandbox created ({tmux}; {gitmsg}{workmux})"))
+}
+
+/// Upload the workmux config (the host's, made fit for a sandbox, or a minimal one with an agent
+/// pane) to `~/.config/workmux/config.yaml`.
+fn upload_workmux_conf(dir: &Path, name: &str, home: &str) -> Result<String, String> {
+    let (conf, from_host) = agents::workmux_conf_for_new_sandbox(dir)?;
+    let result = exec(
+        "openshell",
+        &sandbox_sh(name, "mkdir -p \"$HOME/.config/workmux\""),
+        &[],
+    )
+    .and_then(|_| {
+        let args: Vec<String> = [
+            "sandbox",
+            "upload",
+            name,
+            &conf.to_string_lossy(),
+            &format!("{home}/.config/workmux/config.yaml"),
+            "--no-git-ignore",
+        ]
+        .map(String::from)
+        .to_vec();
+        exec("openshell", &args, &[])
+    })
+    .map(|_| {
+        if !from_host {
+            "workmux set up with an agent pane (no host config)"
+        } else if have("gitleaks") {
+            "host workmux config copied (secret scan clean)"
+        } else {
+            "host workmux config copied unscanned: gitleaks is missing"
+        }
+        .to_string()
+    });
+    if let Some(stage) = conf.parent() {
+        let _ = std::fs::remove_dir_all(stage);
+    }
+    result
 }
 
 /// Upload the filtered git config and make the sandbox's `~/.gitconfig` include it.
