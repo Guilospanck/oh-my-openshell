@@ -1128,6 +1128,16 @@ mod tests {
                     "the title is long as well, so it must wrap",
                 ),
                 (
+                    app::Modal::Input {
+                        title: "Sandbox name, up to 19 characters".into(),
+                        buf: "abc".into(),
+                        mask: false,
+                        kind: app::InKind::Name(app::Plan::default()),
+                    },
+                    vec!["3/19", "Enter ok", "Esc cancel"],
+                    "Sandbox name, up to 19 characters",
+                ),
+                (
                     app::Modal::Info("word ".repeat(10)),
                     vec!["any key closes"],
                     "word word",

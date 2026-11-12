@@ -415,6 +415,15 @@ pub fn profile_ids(dir: &Path) -> Vec<String> {
     v
 }
 
+/// The `id:` of a profile's text.
+pub fn profile_id_of(text: &str) -> Option<String> {
+    let docs = saphyr::Yaml::load_from_str(text).ok()?;
+    docs.first()?
+        .as_mapping_get("id")?
+        .as_str()
+        .map(String::from)
+}
+
 /// The profile file for `id`: `providers/ID.yaml`, or `ID.yml` when only that exists.
 pub fn profile_path(dir: &Path, id: &str) -> PathBuf {
     let yaml = dir.join("providers").join(format!("{id}.yaml"));

@@ -1,4 +1,9 @@
 //! Application state, modal flows and key handling.
+/// The longest sandbox name the gateway accepts, whatever the driver (probed on vm and docker).
+const SANDBOX_NAME_MAX: usize = 19;
+/// The longest provider name the gateway accepts (probed: 100 passed, 300 failed at 253).
+const PROVIDER_NAME_MAX: usize = 253;
+
 use crate::cli::{self, Snapshot};
 use crate::clip;
 use crate::ghrepo::{self, GhRepo};
@@ -68,6 +73,7 @@ const SAVE_TOOLCHAINS_ITEM: &str =
 pub const EDIT_TOOLCHAINS_ITEM: &str =
     "Edit the toolchain list and defaults (toolchains.toml, affects ALL new sandboxes)...";
 const TOOLCHAINS_FILE: &str = "toolchains.toml";
+const CUSTOM_PROVIDER_ITEM: &str = "Custom provider (write a new profile)...";
 const GH_REPO_ITEM: &str = "Git repo, read/write (GitHub, GitLab, Bitbucket or Forgejo token)...";
 
 /// The secret-scan choice that lists the findings.
@@ -112,6 +118,14 @@ fn restore_hint(rel: &str) -> &'static str {
 }
 
 /// A new provider profile: the narrowest grant, to widen on purpose.
+/// Letters, digits, `-` and `_`: safe as a file name and as a provider name.
+fn valid_file_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn profile_template(id: &str) -> String {
     format!(
         "# {id}: what this profile allows, and what it does not. Grant the narrowest host, port,\n\
@@ -121,6 +135,35 @@ fn profile_template(id: &str) -> String {
          description: Read-only access to example.com\n\
          category: data\n\
          endpoints:\n  - host: example.com\n    port: 443\n    protocol: rest\n    access: read-only\n    enforcement: enforce\n\
+         binaries: [/usr/bin/curl]\n"
+    )
+}
+
+/// Starting point of a custom provider's profile: one credential, one endpoint, one program.
+fn custom_provider_template(id: &str) -> String {
+    let var: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!(
+        "# {id}: a custom provider. Fill in the service, then save: osh imports this profile and asks\n\
+         # for the credential next. Grant the narrowest host, port, method and binary needed.\n\
+         # `binaries` decides which programs in the sandbox may reach the endpoints: name the paths\n\
+         # in YOUR image. `access: read-only` allows GET/HEAD; use `read-write` only when needed.\n\
+         # The credential stays on the host: the sandbox sees a placeholder in {var}_API_KEY.\n\
+         id: {id}\n\
+         display_name: {id}\n\
+         description: Access to api.example.com with an API key\n\
+         category: other\n\
+         credentials:\n  - name: api_key\n    description: API key for api.example.com\n    env_vars: [{var}_API_KEY]\n    required: true\n    auth_style: bearer\n    header_name: authorization\n\
+         discovery:\n  credentials: [api_key]\n\
+         endpoints:\n  - host: api.example.com\n    port: 443\n    protocol: rest\n    access: read-only\n    enforcement: enforce\n\
          binaries: [/usr/bin/curl]\n"
     )
 }
@@ -297,6 +340,8 @@ pub enum EditThen {
     NewSandbox(Box<Plan>, Option<preload::Marks>),
     /// Back to the running-sandbox picker (sandbox, gateway), with the marks it had.
     Running(String, String, Option<preload::Marks>),
+    /// A custom provider's new profile: on save, ask its credentials and create the provider.
+    CustomProvider(String),
     /// `toolchains.toml` from the palette: say what the defaults are after a save.
     ToolchainList,
 }
@@ -322,6 +367,8 @@ pub enum InKind {
     GenName(SyncPlan),
     /// Name of a new data file: a provider profile (true) or a Dockerfile (false).
     NewFile(bool),
+    /// Name of a custom provider: its profile is written in the editor, then its credential asked.
+    CustomProvider,
     /// vCPUs, then memory, for every sandbox of a VM gateway.
     VmCpus(String),
     VmMemory(String, u32),
@@ -333,6 +380,19 @@ pub enum InKind {
         update: bool,
         next: Option<(Plan, Vec<String>)>,
     },
+}
+
+impl InKind {
+    /// How many characters the prompt takes, when the thing typed has a hard limit.
+    pub fn max_len(&self) -> Option<usize> {
+        match self {
+            InKind::Name(_) => Some(SANDBOX_NAME_MAX),
+            // 65535 is five digits.
+            InKind::ForwardPort { .. } => Some(5),
+            InKind::GenName(_) | InKind::CustomProvider => Some(PROVIDER_NAME_MAX),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2634,9 +2694,19 @@ impl App {
         self.input(&title, true, flow);
     }
 
+    /// The gateway rejects sandbox names over 19 characters on every driver.
+    fn name_too_long(&self, name: &str) -> Option<String> {
+        (name.chars().count() > SANDBOX_NAME_MAX).then(|| {
+            format!(
+                "Error: a sandbox name has at most {SANDBOX_NAME_MAX} characters ({} given)",
+                name.chars().count()
+            )
+        })
+    }
+
     fn ask_name(&mut self, plan: Plan) {
         self.input(
-            "Sandbox name (empty = generated)",
+            &format!("Sandbox name, up to {SANDBOX_NAME_MAX} characters (empty = generated)"),
             false,
             InKind::Name(plan),
         );
@@ -3040,7 +3110,11 @@ impl App {
                     self.ask_command(plan);
                 } else if first.starts_with("Read and write, a token for this sandbox") {
                     if plan.name.is_empty() {
-                        plan.name = self.free_name(&ghrepo::slug(&repo.repo));
+                        let mut base = ghrepo::slug(&repo.repo);
+                        // Leave room for a "-N" suffix from free_name.
+                        base = base.chars().take(SANDBOX_NAME_MAX - 3).collect();
+                        base = base.trim_end_matches('-').to_string();
+                        plan.name = self.free_name(&base);
                         self.status = format!("Sandbox name set to {}", plan.name);
                     }
                     self.repo_steps(RepoFlow {
@@ -3515,7 +3589,15 @@ impl App {
                 }
             }
             SelKind::NewProvider => {
-                if first == GH_REPO_ITEM {
+                if first == CUSTOM_PROVIDER_ITEM {
+                    self.input(
+                        &format!(
+                            "Name of the custom provider, up to {PROVIDER_NAME_MAX} characters (letters, digits, - and _)"
+                        ),
+                        false,
+                        InKind::CustomProvider,
+                    );
+                } else if first == GH_REPO_ITEM {
                     let hint = self.project_repo().map(|r| r.shown()).unwrap_or_default();
                     let title = if hint.is_empty() {
                         "Repository, OWNER/REPO on github.com, or HOST/PATH as in its clone URL"
@@ -4231,14 +4313,56 @@ impl App {
         self.input(title, false, InKind::NewFile(profile));
     }
 
+    /// Name given: open a profile template in the editor; once saved, ask the credentials.
+    fn new_custom_provider(&mut self, name: &str) {
+        let name = name.trim();
+        if !valid_file_name(name) {
+            self.modal = Some(Modal::Info(format!(
+                "{name:?} cannot be a provider name here: use letters, digits, - and _ only."
+            )));
+            return;
+        }
+        if self.snap.providers.iter().any(|p| p.name == name) {
+            self.modal = Some(Modal::Info(format!(
+                "Provider {name} exists. Use u on the Providers tab to update credentials."
+            )));
+            return;
+        }
+        let rel = format!("providers/{name}.yaml");
+        if cli::profile_path(&self.dir, name).exists() {
+            self.modal = Some(Modal::Info(format!(
+                "A profile named {name} exists already ({rel}). Pick it in the list to create the provider, or edit it in Data files."
+            )));
+            return;
+        }
+        let (path, check) = (self.dir.join(&rel), crate::assets::check_for(&rel));
+        self.open_editor(
+            &rel,
+            path,
+            Some(custom_provider_template(name)),
+            check,
+            EditThen::CustomProvider(name.to_string()),
+        );
+    }
+
+    /// The saved profile of a custom provider: its `id` has to match the name, then the credentials.
+    fn custom_provider_saved(&mut self, name: String) {
+        let text = std::fs::read_to_string(cli::profile_path(&self.dir, &name)).unwrap_or_default();
+        let id = cli::profile_id_of(&text);
+        if id.as_deref() != Some(name.as_str()) {
+            self.modal = Some(Modal::Info(format!(
+                "The profile's id is {:?} but the provider is named {name}. Set `id: {name}` in providers/{name}.yaml (Data files), then pick {name} in the list.",
+                id.unwrap_or_default()
+            )));
+            return;
+        }
+        self.start_creds(name, false, None);
+    }
+
     /// Start the new file in the editor from a template; it is written on the first save.
     fn create_file(&mut self, profile: bool, name: &str) {
         let name = name.trim();
-        if name.is_empty()
-            || !name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
+        if !valid_file_name(name) {
             self.modal = Some(Modal::Info(format!(
                 "{name:?} cannot be a file name here: use letters, digits, - and _ only."
             )));
@@ -4321,6 +4445,14 @@ impl App {
         let said = self.status.clone();
         match then {
             EditThen::DataFile(rel) => self.file_menu(rel),
+            EditThen::CustomProvider(name) => {
+                if saved {
+                    self.custom_provider_saved(name);
+                } else {
+                    self.status =
+                        format!("Custom provider {name} not created: its profile was not saved");
+                }
+            }
             EditThen::Gateway(name) => {
                 if saved {
                     self.modal = Some(Modal::Confirm {
@@ -4610,6 +4742,7 @@ impl App {
     fn on_input(&mut self, kind: InKind, text: String) {
         match kind {
             InKind::NewFile(profile) => self.create_file(profile, &text),
+            InKind::CustomProvider => self.new_custom_provider(&text),
             InKind::VmCpus(name) => match text.trim().parse::<u32>() {
                 Ok(n) if (1..=64).contains(&n) => {
                     let (_, mem) = self.vm_size_now();
@@ -4680,6 +4813,15 @@ impl App {
             }
             InKind::Name(mut plan) => {
                 plan.name = text.trim().into();
+                if let Some(msg) = self.name_too_long(&plan.name) {
+                    self.ask_name(plan);
+                    // The popup hides the footer, so the reason goes in the popup's title too.
+                    if let Some(Modal::Input { title, .. }) = &mut self.modal {
+                        *title = format!("{msg}. {title}");
+                    }
+                    self.status = msg;
+                    return;
+                }
                 if self.limits_supported() {
                     self.input(
                         "CPU limit, e.g. 500m, 2 (empty = unlimited)",
@@ -5586,6 +5728,7 @@ impl App {
         match code {
             KeyCode::Char('n') => {
                 let mut ids = cli::profile_ids(&self.dir);
+                ids.push(CUSTOM_PROVIDER_ITEM.into());
                 ids.push(GH_REPO_ITEM.into());
                 self.select(
                     "Create provider from profile",
@@ -6050,7 +6193,11 @@ impl App {
                 KeyCode::Enter => self.on_input(kind, buf),
                 code => {
                     match code {
-                        KeyCode::Char(c) => buf.push(c),
+                        KeyCode::Char(c) => {
+                            if kind.max_len().is_none_or(|m| buf.chars().count() < m) {
+                                buf.push(c);
+                            }
+                        }
                         KeyCode::Backspace => {
                             buf.pop();
                         }
@@ -8234,6 +8381,109 @@ mod tests {
         a.tab = Tab::Images;
         a.pump_meter();
         assert!(a.usage.is_none() && a.meter.is_none());
+    }
+
+    #[test]
+    fn a_sandbox_name_over_19_characters_is_rejected_on_any_driver() {
+        let mut a = app();
+        a.snap.driver = "vm".into();
+        a.on_input(
+            InKind::Name(Plan::default()),
+            "factory-unnamed-project".into(),
+        );
+        assert!(a.status.contains("at most 19"), "{}", a.status);
+        let Some(Modal::Input { title, .. }) = &a.modal else {
+            panic!("no prompt")
+        };
+        assert!(
+            title.contains("at most 19") && title.contains("up to 19"),
+            "{title}"
+        );
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Input {
+                kind: InKind::Name(_),
+                ..
+            })
+        ));
+        a.snap.driver = "docker".into();
+        assert!(a.name_too_long("factory-unnamed-project").is_some());
+        assert!(a.name_too_long("exactly-19-chars-xx").is_none());
+    }
+
+    #[test]
+    fn typing_stops_at_the_limit_of_a_prompt() {
+        let mut a = app();
+        a.ask_name(Plan::default());
+        for c in "abcdefghijklmnopqrstuvwxyz".chars() {
+            a.on_key(KeyEvent::from(KeyCode::Char(c)));
+        }
+        let Some(Modal::Input { buf, .. }) = &a.modal else {
+            panic!("no prompt")
+        };
+        assert_eq!(buf, "abcdefghijklmnopqrs");
+        a.on_key(KeyEvent::from(KeyCode::Backspace));
+        a.on_key(KeyEvent::from(KeyCode::Char('z')));
+        let Some(Modal::Input { buf, .. }) = &a.modal else {
+            panic!("no prompt")
+        };
+        assert_eq!(buf, "abcdefghijklmnopqrz");
+    }
+
+    #[test]
+    fn a_custom_provider_opens_a_template_then_asks_its_credential() {
+        let dir = data_dir("customprov");
+        let mut a = app();
+        a.dir = dir.clone();
+        a.tab = Tab::Providers;
+        press(&mut a, KeyCode::Char('n'));
+        assert!(items(&a).contains(&CUSTOM_PROVIDER_ITEM.to_string()));
+        a.on_select(SelKind::NewProvider, vec![CUSTOM_PROVIDER_ITEM.into()]);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Input {
+                kind: InKind::CustomProvider,
+                ..
+            })
+        ));
+        a.on_input(InKind::CustomProvider, "a/b".into());
+        assert!(matches!(&a.modal, Some(Modal::Info(t)) if t.contains("letters, digits")));
+        a.on_input(InKind::CustomProvider, "my-api".into());
+        let Some(Modal::Editor { ed, .. }) = &mut a.modal else {
+            panic!("the editor opens");
+        };
+        assert!(ed.text().contains("id: my-api") && ed.text().contains("MY_API_API_KEY"));
+        assert!(!dir.join("providers/my-api.yaml").exists());
+        ed.save().unwrap();
+        // Closing after a save asks the credential the profile declares.
+        press(&mut a, KeyCode::Esc);
+        let Some(Modal::Input {
+            title, mask, kind, ..
+        }) = &a.modal
+        else {
+            panic!("the credential is asked: {:?}", a.status);
+        };
+        assert!(*mask && title.contains("MY_API_API_KEY"), "{title}");
+        assert!(matches!(kind, InKind::Cred { .. }));
+        // The same name again points at the profile that exists.
+        a.on_input(InKind::CustomProvider, "my-api".into());
+        assert!(matches!(&a.modal, Some(Modal::Info(t)) if t.contains("exists already")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_custom_provider_whose_id_was_changed_is_not_created() {
+        let dir = data_dir("customprov-id");
+        let mut a = app();
+        a.dir = dir.clone();
+        std::fs::create_dir_all(dir.join("providers")).unwrap();
+        std::fs::write(dir.join("providers/x.yaml"), "id: other\n").unwrap();
+        a.edit_closed(EditThen::CustomProvider("x".into()), true);
+        assert!(matches!(&a.modal, Some(Modal::Info(t)) if t.contains("id: x")));
+        a.modal = None;
+        a.edit_closed(EditThen::CustomProvider("x".into()), false);
+        assert!(a.modal.is_none() && a.status.contains("not created"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

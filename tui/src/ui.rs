@@ -1647,7 +1647,10 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
             );
         }
         Modal::Input {
-            title, buf, mask, ..
+            title,
+            buf,
+            mask,
+            kind,
         } => {
             let w = popup_width(screen.width, 72.max(text_width(title) as u16 + 6));
             let (name, head) = title_fit(title, w, 0);
@@ -1664,8 +1667,12 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
             let tail: String = shown.chars().skip(n.saturating_sub(cols)).collect();
             let mut lines = head;
             lines.push(Line::raw(format!("{tail}█")));
+            let hint = match kind.max_len() {
+                Some(m) => format!("{}/{m} · Enter ok · Esc cancel", buf.chars().count()),
+                None => "Enter ok · Esc cancel".to_string(),
+            };
             f.render_widget(
-                Paragraph::new(lines).block(frame(&name, "Enter ok · Esc cancel", Color::Cyan)),
+                Paragraph::new(lines).block(frame(&name, &hint, Color::Cyan)),
                 area,
             );
         }
