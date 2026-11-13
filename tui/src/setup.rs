@@ -3532,9 +3532,21 @@ mod tests {
             "aarch64" => "aarch64",
             _ => "x86_64",
         };
+        // macOS ships `shasum`, not `sha256sum`; the installer is Linux-only but the test runs
+        // on both, so stub the GNU name when the host lacks it.
+        let has_sha256sum = ["/usr/bin", "/bin"]
+            .iter()
+            .any(|dir| std::path::Path::new(dir).join("sha256sum").exists());
+        if !has_sha256sum {
+            let shim = bin.join("sha256sum");
+            std::fs::write(&shim, "#!/bin/sh\nexec shasum -a 256 \"$@\"\n").unwrap();
+            std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let stub_path = format!("{}:/usr/bin:/bin", bin.display());
         let sh = |script: &str| {
             let out = std::process::Command::new("sh")
                 .args(["-c", script])
+                .env("PATH", &stub_path)
                 .current_dir(&srv)
                 .output()
                 .unwrap();
