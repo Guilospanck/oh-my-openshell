@@ -568,7 +568,7 @@ fn find_in_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
     })
 }
 
-/// `openshell-gateway` from the Homebrew prefix, else from PATH as an absolute path. A bare name
+/// `openshell-gateway` from the Homebrew prefix, else from PATH or `~/.local/bin` as an absolute path. A bare name
 /// would be looked up again by `exec` in the child's PATH, and `gateway.env` replaces that PATH
 /// with Homebrew's folders, which hides a binary in `~/.local/bin`.
 pub(crate) fn gateway_binary() -> PathBuf {
@@ -581,7 +581,14 @@ pub(crate) fn gateway_binary() -> PathBuf {
             PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("bin/openshell-gateway")
         })
         .filter(|p| p.is_file())
-        .or_else(|| find_in_path("openshell-gateway", &std::env::var_os("PATH")?))
+        .or_else(|| {
+            // The service's own PATH is gateway.env's (Homebrew's folders), so also look where
+            // osh's tarball install puts the binaries.
+            let mut dirs: Vec<PathBuf> =
+                std::env::split_paths(&std::env::var_os("PATH")?).collect();
+            dirs.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/bin")));
+            find_in_path("openshell-gateway", &std::env::join_paths(dirs).ok()?)
+        })
         .unwrap_or_else(|| PathBuf::from("openshell-gateway"))
 }
 
