@@ -30,7 +30,7 @@ fresh_home() {
   : > "$STUB_LOG"
 }
 # The stubs; openshell itself appears in $HOME/.installed only once the stubbed installer has run.
-with_stubs() { PATH="$STUBS:$HOME/.installed:$PATH" "$@"; }
+with_stubs() { PATH="$STUBS:$HOME/.installed:$HOME/.local/bin:$PATH" "$@"; }
 # A machine that already has OpenShell.
 with_openshell_stub() { PATH="$STUBS:$STUBS_OPENSHELL:$PATH" "$@"; }
 # Adds a docker that answers `info` and lists one container and volume: a "ready" Docker runtime.
@@ -81,7 +81,7 @@ grep -q 'MISSING  container runtime' <<<"$out" && pass "doctor reports the runti
 out="$(with_stubs "$OSH" setup --dry-run --gateways docker,podman </dev/null 2>&1)"; rc=$?
 [[ $rc -eq 0 ]] && pass "setup --dry-run exits 0" || fail "setup --dry-run exits 0" "rc=$rc $out"
 grep -q "$docker_pkg_line" <<<"$out" && pass "dry-run plans this distro's docker package" || fail "dry-run plans this distro's docker package" "$out"
-grep -q 'OpenShell/main/install.sh' <<<"$out" && pass "dry-run plans the OpenShell installer" || fail "dry-run plans the OpenShell installer"
+grep -q 'Install OpenShell' <<<"$out" && pass "dry-run plans the OpenShell installer" || fail "dry-run plans the OpenShell installer"
 command -v docker >/dev/null 2>&1 && fail "dry-run must not install docker" || pass "dry-run installs nothing"
 out="$(with_stubs "$OSH" setup --dry-run </dev/null 2>&1)"
 grep -q -- '--gateways docker or --gateways podman' <<<"$out" && pass "without a pick, setup asks for --gateways" || fail "without a pick, setup asks for --gateways" "$out"

@@ -7,6 +7,36 @@
 log "$@"
 src="$(cd "$(dirname "$0")/../stubs-openshell" && pwd)/openshell"
 script="echo installer-ran >> \"$STUB_LOG\"; mkdir -p \"$HOME/.installed\" \"$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls\"; cp \"$src\" \"$HOME/.installed/openshell\""
-out=""
-while [[ $# -gt 0 ]]; do [[ "$1" == -o ]] && out="$2"; shift; done
+out=""; url=""
+while [[ $# -gt 0 ]]; do
+  [[ "$1" == -o ]] && out="$2"
+  [[ "$1" == http* ]] && url="$1"
+  shift
+done
+# Hosts without dpkg or rpm (Arch) install from the release tarballs instead: serve real tarballs
+# of a stub binary and checksum files that match them, so the installer's checks run for real.
+name="${url##*/}"
+case "$name" in
+  openshell-*.tar.gz | openshell-*checksums-sha256.txt)
+    [[ "$out" == /* ]] || out="$PWD/$out"
+    fix="$(mktemp -d)"
+    (
+      cd "$fix" || exit 1
+      arch="$(uname -m)"
+      cli="openshell-$arch-unknown-linux-musl.tar.gz"
+      gw="openshell-gateway-$arch-unknown-linux-gnu.tar.gz"
+      vm="openshell-driver-vm-$arch-unknown-linux-gnu.tar.gz"
+      for pair in "$cli:openshell" "$gw:openshell-gateway" "$vm:openshell-driver-vm"; do
+        cp "$src" "${pair#*:}"; tar czf "${pair%%:*}" "${pair#*:}"; rm "${pair#*:}"
+      done
+      sha256sum "$cli" "$vm" > openshell-checksums-sha256.txt
+      sha256sum "$gw" > openshell-gateway-checksums-sha256.txt
+      cp "$name" "$out"
+    ) || exit 1
+    rm -rf "$fix"
+    echo installer-ran >> "$STUB_LOG"
+    mkdir -p "$HOME/.installed" "$XDG_CONFIG_HOME/openshell/gateways/openshell/mtls"
+    cp "$src" "$HOME/.installed/openshell"
+    exit 0 ;;
+esac
 if [[ -n "$out" ]]; then echo "$script" > "$out"; else echo "$script"; fi
