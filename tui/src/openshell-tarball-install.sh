@@ -33,7 +33,8 @@ install -m 755 bin/openshell bin/openshell-gateway bin/openshell-driver-vm "$HOM
 u="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 mkdir -p "$u"
 # Shaped like the packaged unit, with the binaries under %h/.local/bin and no config-migration
-# helper (osh writes gateway.toml itself).
+# helper (osh writes gateway.toml itself) and no EnvironmentFile (osh writes a drop-in that points
+# it at this machine's gateway-<os>.env).
 cat > "$u/openshell-gateway.service" <<'UNIT'
 [Unit]
 Description=OpenShell Gateway (user)
@@ -44,7 +45,6 @@ Wants=podman.socket
 [Service]
 Type=exec
 Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls
-EnvironmentFile=-%E/openshell/gateway.env
 ExecStartPre=%h/.local/bin/openshell-gateway config preflight
 ExecStartPre=%h/.local/bin/openshell-gateway generate-certs --output-dir ${OPENSHELL_LOCAL_TLS_DIR} --server-san host.openshell.internal
 ExecStart=%h/.local/bin/openshell-gateway

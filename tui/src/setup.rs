@@ -2372,6 +2372,7 @@ mod tests {
             "/h/.config/openshell/gateway.toml".into(),
             crate::gwops::gateway_toml(reg.get("openshell-podman").unwrap(), Os::Linux),
         );
+        crate::envfile::with_dropin(&mut h, &gw_paths());
         let steps = plan_gateways(
             &f,
             &with_gateways(&[GwKind::Podman]),
@@ -2435,6 +2436,7 @@ mod tests {
             "/h/.config/openshell/gateway.toml".into(),
             crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
         );
+        crate::envfile::with_dropin(&mut h, &gw_paths());
         let steps = plan_gateways(
             &f,
             &with_gateways(&[GwKind::Docker, GwKind::Podman]),
@@ -2457,6 +2459,7 @@ mod tests {
             "/h/.config/openshell/gateway.toml".into(),
             crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
         );
+        crate::envfile::with_dropin(&mut h, &gw_paths());
         h.failing.insert("systemctl".into());
         let steps = plan_gateways(
             &f,
@@ -2547,7 +2550,13 @@ mod tests {
             }
             assert_eq!(
                 get(&steps, "openshell").after,
-                Some("gw-vm-config"),
+                // On Linux the config is followed by the drop-in that points the unit at its
+                // environment file; macOS has no systemd unit.
+                Some(if os == Os::Linux {
+                    "gw-vm-env"
+                } else {
+                    "gw-vm-config"
+                }),
                 "{os:?}"
             );
             // What runs after the installer still waits for it, not just for the config.
@@ -2852,6 +2861,7 @@ mod tests {
             "/h/.config/openshell/gateway.toml".into(),
             crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
         );
+        crate::envfile::with_dropin(&mut h, &gw_paths());
         // The main is known to the CLI, the extra is not; the extra's unit is active.
         let known = [("openshell-docker".to_string(), 17670u16)];
         let steps = plan_gateways(
@@ -2930,6 +2940,7 @@ mod tests {
             "/h/.config/openshell/gateway.toml".into(),
             crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
         );
+        crate::envfile::with_dropin(&mut h, &gw_paths());
         h.failing
             .insert("systemctl --user is-active --quiet openshell-gateway".into());
         let steps = plan_gateways(
@@ -3109,6 +3120,7 @@ mod tests {
             "/h/.config/openshell/gateway.toml".into(),
             crate::gwops::gateway_toml(reg.get("openshell-docker").unwrap(), Os::Linux),
         );
+        crate::envfile::with_dropin(&mut h, &gw_paths());
         h.failing.insert(
             "systemctl --user is-active --quiet osh-gateway-openshell-podman.service".into(),
         );

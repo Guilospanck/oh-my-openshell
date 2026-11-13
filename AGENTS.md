@@ -49,7 +49,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 | `scripts/publish`, `scripts/render-formula`, `scripts/brew-style`, `scripts/release-colima` | `just release`: check, bump, build, lint, tag, GitHub release, Homebrew tap push (`Guilospanck/homebrew-tap`, formula `oh-my-openshell`); `--dry-run` pushes nothing |
 | `providers/*.yaml` | OpenShell provider profiles (network policy per service). Imported with `openshell provider profile import` |
 | `images/Dockerfile-*` | Sandbox images built from the Images tab |
-| `gateway.toml` (macOS vm), `gateway-linux.toml`, `gateway-podman.toml`, `gateway-docker.toml`, `gateway.env` | Gateway configs, embedded in the binary |
+| `gateway.toml` (macOS vm), `gateway-linux.toml`, `gateway-podman.toml`, `gateway-docker.toml`, `gateway-linux.env`, `gateway-macos-arm64.env`, `gateway-macos-x86_64.env` | Gateway configs and environment files, embedded in the binary. `tui/src/envfile.rs` picks the env file by OS and architecture (a copy in `~/.config/openshell` wins over the data dir default) and writes the systemd drop-in `openshell-gateway.service.d/osh-env.conf` that resets the packaged unit's `EnvironmentFile=` (it reads `gateway.env` on every OS). `gateway.env` itself is legacy: kept for dotfiles that link it and for the Homebrew service on macOS, never read on Linux |
 | `git-hooks/check-secrets`, `.githooks/`, `.gitleaks.toml` | Pre-commit secret/PII scan (Gitleaks) |
 
 ## Platforms

@@ -22,7 +22,7 @@ fi"#;
 
 /// Removes leftover containers and volumes of a Docker or Podman driver.
 /// $1 = runtime binary (its full path when osh found it: gateway.env's PATH lists only Homebrew's
-/// folders, and osh's own PATH is kept behind it for the same reason), $2 = state dir, $3 = config dir, $4 = darwin flag, $5 = `shared` when
+/// folders, and osh's own PATH is kept behind it for the same reason), $2 = state dir, $3 = the gateway environment file (`envfile::path`), $4 = darwin flag, $5 = `shared` when
 /// another gateway drives the same runtime, $6 = the gateway's driver. OpenShell's labels do not
 /// say which gateway owns a container, so a shared runtime only loses its stopped leftovers
 /// (`sandbox delete --all` has already removed this gateway's live ones) and its volumes stay.
@@ -32,7 +32,7 @@ fi"#;
 /// and only the sandbox id (in the database this reset deletes) tells them apart. They go only
 /// when this is a Docker gateway that has the runtime to itself.
 pub(crate) const SWEEP_CONTAINERS_SCRIPT: &str = r#"osh_path="$PATH"
-[ -f "$3/gateway.env" ] && { set -a; . "$3/gateway.env"; set +a; }
+[ -f "$3" ] && { set -a; . "$3"; set +a; }
 export PATH="${PATH:+$PATH:}$osh_path"
 [ "$4" = darwin ] && export DOCKER_HOST="${DOCKER_HOST:-unix://$HOME/.colima/docker.sock}"
 if command -v "$1" >/dev/null 2>&1 && "$1" info >/dev/null 2>&1; then
@@ -201,7 +201,10 @@ pub fn plan(f: &Facts, o: &Options, h: &dyn Host, p: &Paths, force: bool) -> Vec
     let installing = !f.has_openshell;
     let installed = h.read(&target);
     let current = installed.as_deref() == Some(wanted.as_str());
-    if !force && !installing && current && service_running(f.os, h) {
+    let (dropin_path, dropin_text) =
+        crate::envfile::gateway_dropin(p, f.os, std::env::consts::ARCH);
+    let dropin_current = f.os != Os::Linux || h.read(&dropin_path).as_deref() == Some(&dropin_text);
+    if !force && !installing && current && dropin_current && service_running(f.os, h) {
         return Vec::new();
     }
     let mut steps = Vec::new();
@@ -237,6 +240,16 @@ pub fn plan(f: &Facts, o: &Options, h: &dyn Host, p: &Paths, force: bool) -> Vec
             StepKind::Manual("brew services restart openshell".into()),
         )),
         Os::Linux => {
+            if !dropin_current {
+                steps.push(step(
+                    "gateway-env",
+                    "Point the gateway service at this machine's environment file",
+                    StepKind::Write {
+                        path: dropin_path,
+                        content: dropin_text,
+                    },
+                ));
+            }
             steps.push(step(
                 "gateway-reload",
                 "Reload systemd user units",
@@ -542,7 +555,7 @@ pub fn exec_docker_service(p: &Paths, data: &Path) -> std::io::Error {
     let home = p.home.to_string_lossy().into_owned();
     let mut c = std::process::Command::new(gateway_binary());
     c.arg("--config").arg(data.join("gateway-docker.toml"));
-    if let Ok(t) = std::fs::read_to_string(p.config_home.join("gateway.env")) {
+    if let Some(t) = crate::envfile::read(p) {
         for (k, v) in parse_env_file(&t, &home) {
             c.env(k, v);
         }
@@ -722,8 +735,22 @@ mod tests {
             "/h/.config/openshell/gateway.toml".into(),
             assets::embedded("gateway-linux.toml").unwrap().into(),
         );
+        crate::envfile::with_dropin(&mut h, &paths());
         let f = facts(Os::Linux);
         assert!(plan(&f, &Options::default(), &h, &paths(), false).is_empty());
+        // A missing drop-in alone is enough to plan work: it points the unit at the right file.
+        let bare = FakeHost {
+            files: h
+                .files
+                .iter()
+                .filter(|(k, _)| !k.ends_with("osh-env.conf"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            ..FakeHost::default()
+        };
+        assert!(
+            texts(&plan(&f, &Options::default(), &bare, &paths(), false)).contains("osh-env.conf")
+        );
         assert!(!plan(&f, &Options::default(), &h, &paths(), true).is_empty());
         assert!(!stale("gateway-linux.toml", &h, &paths()));
         assert!(stale("gateway-podman.toml", &h, &paths()));
@@ -735,6 +762,7 @@ mod tests {
         let mut h = FakeHost::default();
         h.files
             .insert("/h/.config/openshell/gateway.toml".into(), wanted.into());
+        crate::envfile::with_dropin(&mut h, &paths());
         h.failing.insert("systemctl".into());
         let steps = plan(&facts(Os::Linux), &Options::default(), &h, &paths(), false);
         let t = texts(&steps);
@@ -826,7 +854,8 @@ mod tests {
         let steps = plan(&facts(Os::Linux), &Options::default(), &h, &paths(), false);
         let r = execute(&steps, &h, &Options::default(), &mut |_| Answer::Yes);
         assert!(r.iter().all(|r| r.outcome == Outcome::Done));
-        assert_eq!(h.written.borrow().len(), 1);
+        // The config and the drop-in that points the unit at this machine's environment file.
+        assert_eq!(h.written.borrow().len(), 2);
     }
 
     fn reg_with(
@@ -1010,7 +1039,7 @@ mod tests {
             (Os::Linux, _) => (false, p.state.join("gateway")),
         };
         let state = p.state.to_string_lossy().into_owned();
-        let config = p.config_home.to_string_lossy().into_owned();
+        let config = crate::envfile::path(p).to_string_lossy().into_owned();
         let (stop, start) = match (f.os, gateway) {
             (Os::Linux, _) => (
                 cmd("systemctl", &["--user", "stop", "openshell-gateway"]),

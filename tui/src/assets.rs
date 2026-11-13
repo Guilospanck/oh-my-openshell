@@ -60,7 +60,15 @@ const FILES: &[(&str, &str)] = &[
         "gateway-podman.toml",
         include_str!("../../gateway-podman.toml"),
     ),
-    ("gateway.env", include_str!("../../gateway.env")),
+    ("gateway-linux.env", include_str!("../../gateway-linux.env")),
+    (
+        "gateway-macos-arm64.env",
+        include_str!("../../gateway-macos-arm64.env"),
+    ),
+    (
+        "gateway-macos-x86_64.env",
+        include_str!("../../gateway-macos-x86_64.env"),
+    ),
     (
         "sandbox-policy.yaml",
         include_str!("../../sandbox-policy.yaml"),

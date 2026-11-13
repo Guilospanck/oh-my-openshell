@@ -7,6 +7,7 @@ mod assets;
 mod cli;
 mod clip;
 mod editor;
+mod envfile;
 mod exted;
 mod gateway;
 mod ghrepo;

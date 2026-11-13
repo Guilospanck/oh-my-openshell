@@ -353,12 +353,23 @@ pub fn systemd_unit(spec: &GatewaySpec, p: &Paths) -> String {
             format!("Environment=\"{k}={v}\"\n")
         })
         .collect();
+    // The data dir default first, so a copy in the config folder overrides it.
+    let envfile = crate::envfile::host_name();
+    let envfiles = format!(
+        "EnvironmentFile=-{}\nEnvironmentFile=-%E/openshell/{envfile}\n",
+        p.data
+            .join(envfile)
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('%', "%%")
+    );
     format!(
         "[Unit]\nDescription=OpenShell Gateway ({name})\nAfter=default.target\n\n\
          [Service]\nType=simple\n\
          Environment=OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls\n\
          {env}\
-         EnvironmentFile=-%E/openshell/gateway.env\n\
+         {envfiles}\
          ExecStart=\"{exe}\" gateway-service {name}\n\
          Restart=on-failure\nRestartSec=5s\nUMask=0077\n\n\
          [Install]\nWantedBy=default.target\n",
@@ -654,10 +665,11 @@ pub fn colima_dir(h: &dyn Host, p: &Paths) -> String {
     "${HOME}/.colima".into()
 }
 
-/// `gateway.env` for this machine: the embedded file, pointing at the Docker socket of Colima's
-/// default profile wherever Colima keeps it.
+/// `gateway.env` for this macOS machine (the Homebrew service reads that name): the embedded
+/// file for its architecture, pointing at the Docker socket of Colima's default profile wherever
+/// Colima keeps it.
 pub fn gateway_env(h: &dyn Host, p: &Paths) -> String {
-    assets::embedded("gateway.env")
+    assets::embedded(crate::envfile::name(Os::MacOs, std::env::consts::ARCH))
         .unwrap_or_default()
         .replace("${HOME}/.colima", &colima_dir(h, p))
 }
@@ -984,7 +996,12 @@ fn main_steps(
         let wanted = with_vm_size(&gateway_toml(spec, f.os), vm_size(h, p));
         let installed = h.read(&target);
         let current = installed.as_deref().map(without_header) == Some(without_header(&wanted));
-        if !force && !installing && current && gateway::service_running(f.os, h) {
+        let (dropin_path, dropin_text) =
+            crate::envfile::gateway_dropin(p, f.os, std::env::consts::ARCH);
+        // Only the systemd unit has a drop-in; launchd agents read the platform file through osh.
+        let dropin_current =
+            f.os != Os::Linux || h.read(&dropin_path).as_deref() == Some(&dropin_text);
+        if !force && !installing && current && dropin_current && gateway::service_running(f.os, h) {
             return Vec::new();
         }
         let mut steps: Vec<Step> = colima_env_step(f, p, h, spec).into_iter().collect();
@@ -1024,6 +1041,17 @@ fn main_steps(
                 StepKind::Manual("brew services restart openshell".into()),
             )),
             Os::Linux => {
+                if !dropin_current {
+                    steps.push(st(
+                        spec,
+                        "env",
+                        "Point the gateway service at this machine's environment file",
+                        StepKind::Write {
+                            path: dropin_path,
+                            content: dropin_text,
+                        },
+                    ));
+                }
                 steps.push(st(
                     spec,
                     "reload",
@@ -1208,7 +1236,7 @@ pub fn shares_runtime(reg: &Registry, spec: &GatewaySpec) -> bool {
 /// Wipes a gateway and starts it again empty, with its own service, database and runtime.
 pub fn reset_steps_for(f: &Facts, p: &Paths, spec: &GatewaySpec, shared: bool) -> Vec<Step> {
     let state = p.state.to_string_lossy().into_owned();
-    let config = p.config_home.to_string_lossy().into_owned();
+    let config = crate::envfile::path(p).to_string_lossy().into_owned();
     let (stop, start) = match (f.os, packaged(spec, f.os)) {
         (Os::Linux, true) => (
             cmd("systemctl", &["--user", "stop", "openshell-gateway"]),
@@ -1310,7 +1338,7 @@ pub fn service_exec(name: &str, p: &Paths) -> std::io::Error {
     let home = p.home.to_string_lossy().into_owned();
     let mut c = std::process::Command::new(gateway::gateway_binary());
     c.arg("--config").arg(config_path(p, name));
-    if let Ok(t) = std::fs::read_to_string(p.config_home.join("gateway.env")) {
+    if let Some(t) = crate::envfile::read(p) {
         for (k, v) in gateway::parse_env_file(&t, &home) {
             c.env(k, v);
         }
@@ -1543,7 +1571,11 @@ mod tests {
         );
         assert!(u.contains(r#"ExecStart="/usr/local/bin/osh" gateway-service openshell-podman"#));
         assert!(u.contains("OPENSHELL_LOCAL_TLS_DIR=%h/.local/state/openshell/tls"));
-        assert!(u.contains("EnvironmentFile=-%E/openshell/gateway.env"));
+        assert!(!u.contains("gateway.env"), "{u}");
+        assert!(u.contains(&format!(
+            "EnvironmentFile=-%E/openshell/{}\n",
+            crate::envfile::host_name()
+        )));
         assert!(u.contains("Restart=on-failure") && u.contains("WantedBy=default.target"));
     }
 
