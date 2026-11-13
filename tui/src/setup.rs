@@ -17,6 +17,19 @@ pub const OPENSHELL_INSTALL: &str = concat!(
     "command -v openshell >/dev/null || { echo \"openshell is not on PATH after the installer ran\" >&2; exit 1; }"
 );
 
+/// OpenShell for a Linux host without dpkg or rpm: OpenShell's installer cannot run there, so
+/// this takes the checksummed release tarballs instead (see the script's own comments).
+pub const OPENSHELL_TARBALL_INSTALL: &str = include_str!("openshell-tarball-install.sh");
+
+/// The script that installs OpenShell on this host.
+fn openshell_install_script(f: &Facts) -> &'static str {
+    if f.os == Os::Linux && !f.has_deb_or_rpm {
+        OPENSHELL_TARBALL_INSTALL
+    } else {
+        OPENSHELL_INSTALL
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Options {
     pub yes: bool,
@@ -693,7 +706,7 @@ fn plan_for_gateways(f: &Facts, o: &Options) -> (Vec<Step>, Vec<Option<&'static 
             "Install OpenShell",
             StepKind::Cmd {
                 prog: "sh".into(),
-                args: vec!["-c".into(), OPENSHELL_INSTALL.into()],
+                args: vec!["-c".into(), openshell_install_script(f).into()],
             },
             false,
         );
@@ -878,7 +891,7 @@ pub fn plan(f: &Facts, o: &Options) -> Vec<Step> {
             "Install OpenShell",
             StepKind::Cmd {
                 prog: "sh".into(),
-                args: vec!["-c".into(), OPENSHELL_INSTALL.into()],
+                args: vec!["-c".into(), openshell_install_script(f).into()],
             },
             false,
         );
@@ -1606,6 +1619,7 @@ mod tests {
             user: "ana".into(),
             wayland: false,
             has_openshell: false,
+            has_deb_or_rpm: true,
             has_curl: true,
             has_tmux: false,
             has_ssh: true,
@@ -3466,6 +3480,115 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    fn openshell_script(f: &Facts) -> String {
+        let steps = plan(f, &Options::default());
+        match &steps.iter().find(|s| s.id == "openshell").unwrap().kind {
+            StepKind::Cmd { args, .. } => args[1].clone(),
+            k => panic!("{k:?}"),
+        }
+    }
+
+    #[test]
+    fn a_linux_host_without_dpkg_or_rpm_installs_openshell_from_the_tarballs() {
+        let mut f = facts(Os::Linux, PkgMgr::Pacman);
+        f.has_openshell = false;
+        f.has_deb_or_rpm = false;
+        assert_eq!(openshell_script(&f), OPENSHELL_TARBALL_INSTALL);
+        f.has_deb_or_rpm = true;
+        assert_eq!(openshell_script(&f), OPENSHELL_INSTALL);
+        // macOS has neither tool and uses OpenShell's installer (Homebrew).
+        let mut mac = facts(Os::MacOs, PkgMgr::Brew);
+        mac.has_openshell = false;
+        mac.has_deb_or_rpm = false;
+        assert_eq!(openshell_script(&mac), OPENSHELL_INSTALL);
+    }
+
+    /// Runs the tarball installer in a throwaway HOME with a fake `curl` that serves real
+    /// tarballs and checksum files from a directory. `corrupt` flips the CLI tarball after the
+    /// checksums were made.
+    fn run_tarball_install(tag: &str, corrupt: bool) -> (std::process::Output, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("osh-tarball-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (srv, bin, home) = (d.join("srv"), d.join("stubs"), d.join("home"));
+        for p in [&srv, &bin, &home] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "aarch64",
+            _ => "x86_64",
+        };
+        let sh = |script: &str| {
+            let out = std::process::Command::new("sh")
+                .args(["-c", script])
+                .current_dir(&srv)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        let cli = format!("openshell-{arch}-unknown-linux-musl.tar.gz");
+        let gw = format!("openshell-gateway-{arch}-unknown-linux-gnu.tar.gz");
+        sh(&format!(
+            "printf '#!/bin/sh\\n' > openshell; cp openshell openshell-gateway; \\
+             tar czf {cli} openshell; tar czf {gw} openshell-gateway; rm openshell openshell-gateway; \\
+             sha256sum {cli} > openshell-checksums-sha256.txt; \\
+             sha256sum {gw} > openshell-gateway-checksums-sha256.txt"
+        ));
+        if corrupt {
+            sh(&format!("echo tampered >> {cli}"));
+        }
+        let curl = bin.join("curl");
+        std::fs::write(
+            &curl,
+            format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -o) o=\"$2\"; shift;; http*) u=\"$1\";; esac; shift; done\ncp \"{}/${{u##*/}}\" \"$o\"\n",
+                srv.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let local_bin = home.join(".local/bin");
+        let out = std::process::Command::new("sh")
+            .args(["-c", OPENSHELL_TARBALL_INSTALL])
+            .env("HOME", &home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", bin.display(), local_bin.display()),
+            )
+            .output()
+            .unwrap();
+        (out, d)
+    }
+
+    #[test]
+    fn the_tarball_install_puts_both_binaries_and_the_user_unit_in_place() {
+        let (out, d) = run_tarball_install("ok", false);
+        let err = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(out.status.success(), "{err}");
+        let home = d.join("home");
+        assert!(home.join(".local/bin/openshell").is_file());
+        assert!(home.join(".local/bin/openshell-gateway").is_file());
+        let unit =
+            std::fs::read_to_string(home.join(".config/systemd/user/openshell-gateway.service"))
+                .unwrap();
+        assert!(unit.contains("ExecStart=%h/.local/bin/openshell-gateway\n"));
+        assert!(unit.contains("WantedBy=default.target"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_tarball_install_refuses_a_download_that_does_not_match_its_checksum() {
+        let (out, d) = run_tarball_install("bad", true);
+        assert!(!out.status.success());
+        assert!(!d.join("home/.local/bin/openshell").exists());
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -361,6 +361,7 @@ mod tests {
             user: "ana".into(),
             wayland: false,
             has_openshell: true,
+            has_deb_or_rpm: true,
             has_curl: true,
             has_tmux: true,
             has_ssh: true,

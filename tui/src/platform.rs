@@ -280,6 +280,8 @@ pub struct Facts {
     pub user: String,
     pub wayland: bool,
     pub has_openshell: bool,
+    /// `dpkg` or `rpm`: OpenShell's installer needs one of them on Linux.
+    pub has_deb_or_rpm: bool,
     pub has_curl: bool,
     pub has_tmux: bool,
     /// The `ssh` client: `openshell sandbox upload` spawns it on this machine.
@@ -494,6 +496,7 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
         wayland: h.env("XDG_SESSION_TYPE").is_some_and(|t| t == "wayland")
             || h.env("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty()),
         has_openshell: h.which("openshell"),
+        has_deb_or_rpm: h.which("dpkg") || h.which("rpm"),
         has_curl: h.which("curl"),
         has_tmux: h.which("tmux"),
         has_ssh: h.which("ssh"),
@@ -559,6 +562,7 @@ pub mod testing {
             user: "ana".into(),
             wayland: false,
             has_openshell: true,
+            has_deb_or_rpm: true,
             has_curl: true,
             has_tmux: true,
             has_ssh: true,

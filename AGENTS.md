@@ -61,7 +61,10 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   service, on the Docker driver (`gateway-linux.toml`), the Podman driver
   (`gateway-podman.toml`, untested on a real host) or the vm driver (needs
   `/dev/kvm`); extras run as `osh-gateway-NAME` units. Docker Desktop is untested. `osh setup` installs a
-  runtime only when neither Docker nor Podman exists. Linux needs Zig 0.15
+  runtime only when neither Docker nor Podman exists. Without `dpkg` or `rpm` (Arch), OpenShell's installer
+  cannot run, so `osh setup` runs `tui/src/openshell-tarball-install.sh` instead: release tarballs
+  checked against the release's SHA-256 files, `openshell` and `openshell-gateway` into
+  `~/.local/bin`, and an `openshell-gateway.service` user unit that mirrors the packaged one. Linux needs Zig 0.15
   (PATH or Linuxbrew) to build and `wl-paste` or `xclip` for image paste.
 - New host-touching code goes through `Host` and returns `Step`s, so it is
   unit-tested with `FakeHost`. Gateways are named after their type
