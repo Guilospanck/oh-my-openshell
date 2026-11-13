@@ -1,6 +1,6 @@
 [package]
 name = "osh-tui"
-version = "0.6.0"
+version = "0.5.0"
 edition = "2021"
 description = "ratatui front end for the OpenShell CLI"
 license = "MIT"
