@@ -2,7 +2,8 @@ set -e
 # Installs OpenShell on a Linux host that has neither dpkg nor rpm (Arch, Alpine, NixOS...), where
 # OpenShell's own installer stops with "Linux installs require either dpkg or rpm". Takes the
 # release tarballs, checks them against the release's SHA-256 files, puts `openshell` and
-# `openshell-gateway` in ~/.local/bin and writes the `openshell-gateway` systemd user unit the
+# `openshell-gateway` and `openshell-driver-vm` (the VM driver is a separate binary the gateway
+# looks up in ~/.local/bin; the Docker and Podman drivers are built into the gateway) in ~/.local/bin and writes the `openshell-gateway` systemd user unit the
 # deb and rpm packages would have installed (gateway.toml is written by a later osh step).
 case "$(uname -m)" in
   x86_64 | amd64) a=x86_64 ;;
@@ -12,20 +13,23 @@ esac
 base=https://github.com/NVIDIA/OpenShell/releases/latest/download
 cli="openshell-$a-unknown-linux-musl.tar.gz"
 gw="openshell-gateway-$a-unknown-linux-gnu.tar.gz"
+vm="openshell-driver-vm-$a-unknown-linux-gnu.tar.gz"
 d="$(mktemp -d)"
 trap 'rm -rf "$d"' EXIT
 cd "$d"
-for f in "$cli" "$gw" openshell-checksums-sha256.txt openshell-gateway-checksums-sha256.txt; do
+for f in "$cli" "$gw" "$vm" openshell-checksums-sha256.txt openshell-gateway-checksums-sha256.txt; do
   curl -fLsS "$base/$f" -o "$f"
 done
 # An empty match makes `sha256sum -c` fail, so a missing checksum line fails the step too.
 grep -F "  $cli" openshell-checksums-sha256.txt | sha256sum -c - >/dev/null
 grep -F "  $gw" openshell-gateway-checksums-sha256.txt | sha256sum -c - >/dev/null
+grep -F "  $vm" openshell-checksums-sha256.txt | sha256sum -c - >/dev/null
 mkdir bin
 tar xzf "$cli" -C bin
 tar xzf "$gw" -C bin
+tar xzf "$vm" -C bin
 mkdir -p "$HOME/.local/bin"
-install -m 755 bin/openshell bin/openshell-gateway "$HOME/.local/bin/"
+install -m 755 bin/openshell bin/openshell-gateway bin/openshell-driver-vm "$HOME/.local/bin/"
 u="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 mkdir -p "$u"
 # Shaped like the packaged unit, with the binaries under %h/.local/bin and no config-migration

@@ -3533,11 +3533,13 @@ mod tests {
             );
         };
         let cli = format!("openshell-{arch}-unknown-linux-musl.tar.gz");
+        let vm = format!("openshell-driver-vm-{arch}-unknown-linux-gnu.tar.gz");
         let gw = format!("openshell-gateway-{arch}-unknown-linux-gnu.tar.gz");
         sh(&format!(
-            "printf '#!/bin/sh\\n' > openshell; cp openshell openshell-gateway; \\
-             tar czf {cli} openshell; tar czf {gw} openshell-gateway; rm openshell openshell-gateway; \\
-             sha256sum {cli} > openshell-checksums-sha256.txt; \\
+            "printf '#!/bin/sh\\n' > openshell; cp openshell openshell-gateway; cp openshell openshell-driver-vm; \\
+             tar czf {cli} openshell; tar czf {gw} openshell-gateway; tar czf {vm} openshell-driver-vm; \\
+             rm openshell openshell-gateway openshell-driver-vm; \\
+             sha256sum {cli} {vm} > openshell-checksums-sha256.txt; \\
              sha256sum {gw} > openshell-gateway-checksums-sha256.txt"
         ));
         if corrupt {
@@ -3575,6 +3577,7 @@ mod tests {
         let home = d.join("home");
         assert!(home.join(".local/bin/openshell").is_file());
         assert!(home.join(".local/bin/openshell-gateway").is_file());
+        assert!(home.join(".local/bin/openshell-driver-vm").is_file());
         let unit =
             std::fs::read_to_string(home.join(".config/systemd/user/openshell-gateway.service"))
                 .unwrap();
