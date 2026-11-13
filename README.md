@@ -41,8 +41,14 @@ Homebrew installs only the `osh` binary; it does not install OpenShell, a contai
 run `osh setup`. Upgrade with `brew upgrade oh-my-openshell`. To remove everything, run `osh uninstall` or `Uninstall osh and OpenShell` in the palette (it also runs `brew uninstall` for you); a bare `brew uninstall` removes only the binary and leaves OpenShell, its gateways and osh's data behind. After such a reinstall, the dashboard shows a one-time alert that it found that data and is using it. Releases ship
 macOS and Linux archives for both aarch64 (Apple Silicon, arm64) and x86_64 (Intel, AMD).
 
-Install from a release (Linux or macOS, aarch64 or x86_64): `curl -fsSL
-https://raw.githubusercontent.com/Guilospanck/oh-my-openshell/main/install.sh | sh` downloads
+Or install from a release, without Homebrew (Linux or macOS, aarch64 or x86_64; the way to go on Arch-based
+distributions such as Omarchy):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Guilospanck/oh-my-openshell/main/install.sh | sh
+```
+
+The script downloads
 `osh-VERSION-OS-ARCH.tar.gz`, checks its `.sha256`, puts `osh` in `~/.local/bin` and runs `osh setup`
 (asking before each step, on the terminal even when piped). Environment: `OSH_VERSION` (release tag; default the
 latest), `OSH_BIN_DIR`, `OSH_RELEASE_BASE` (a directory or URL holding the archives; needs `OSH_VERSION`)
