@@ -548,6 +548,69 @@ pub fn stale_agent_steps(f: &Facts, p: &Paths, h: &dyn Host, reg: &Registry) -> 
         .collect()
 }
 
+/// Linux: brings the gateways osh set up before the per-OS environment files (they read
+/// `gateway.env`, which sets Homebrew's PATH and Colima's socket on every OS) to what osh writes
+/// now: the drop-in for the packaged main's unit when it is missing or differs, and an extra's own
+/// unit when it differs. Each is followed by a reload and a restart, because a service reads its
+/// environment only when it starts. A unit that does not exist is left alone (osh did not make
+/// it), and so is a main that is not registered.
+pub fn stale_unit_steps(f: &Facts, p: &Paths, h: &dyn Host, reg: &Registry) -> Vec<Vec<Step>> {
+    if f.os != Os::Linux {
+        return Vec::new();
+    }
+    let fid = |name: &str, role: &str| -> &'static str {
+        Box::leak(format!("unit-fix-{name}-{role}").into_boxed_str())
+    };
+    reg.gateways
+        .iter()
+        .filter_map(|g| {
+            let (path, wanted, service) = if packaged(g, f.os) {
+                let (path, text) = crate::envfile::gateway_dropin(p, f.os, std::env::consts::ARCH);
+                (path, text, "openshell-gateway".to_string())
+            } else {
+                (
+                    unit_path(p, &g.name),
+                    systemd_unit(g, p),
+                    unit_name(&g.name),
+                )
+            };
+            let installed = h.read(&path);
+            // An extra osh never wrote a unit for is not ours to create here.
+            if installed.as_deref() == Some(wanted.as_str())
+                || (!packaged(g, f.os) && installed.is_none())
+            {
+                return None;
+            }
+            Some(chain(
+                vec![
+                    step(
+                        fid(&g.name, "write"),
+                        &format!(
+                            "Point the {} gateway service at this machine's environment file",
+                            g.kind.label()
+                        ),
+                        StepKind::Write {
+                            path,
+                            content: wanted,
+                        },
+                    ),
+                    step(
+                        fid(&g.name, "reload"),
+                        "Reload systemd user units",
+                        cmd("systemctl", &["--user", "daemon-reload"]),
+                    ),
+                    step(
+                        fid(&g.name, "restart"),
+                        &format!("Restart the {} gateway", g.kind.label()),
+                        cmd("systemctl", &["--user", "restart", &service]),
+                    ),
+                ],
+                None,
+            ))
+        })
+        .collect()
+}
+
 /// `steps` with the `stale_agent_steps` repairs in front, leaving out an agent `steps` already
 /// rewrites. The repairs depend on nothing in `steps`.
 pub fn with_agent_repairs(
@@ -564,6 +627,7 @@ pub fn with_agent_repairs(
     };
     let mut out: Vec<Step> = stale_agent_steps(f, p, h, reg)
         .into_iter()
+        .chain(stale_unit_steps(f, p, h, reg))
         .filter(|g| !matches!(&g[0].kind, StepKind::Write { path, .. } if writes(path)))
         .flatten()
         .collect();
@@ -1577,6 +1641,55 @@ mod tests {
             crate::envfile::host_name()
         )));
         assert!(u.contains("Restart=on-failure") && u.contains("WantedBy=default.target"));
+    }
+
+    fn two_gateways() -> Registry {
+        let mut reg = Registry::default();
+        reg.add(spec(GwKind::Vm, 17670, true));
+        reg.add(spec(GwKind::Docker, 17671, false));
+        reg
+    }
+
+    fn step_lines(groups: &[Vec<Step>]) -> Vec<String> {
+        groups.iter().flatten().map(Step::command_line).collect()
+    }
+
+    #[test]
+    fn a_gateway_set_up_before_the_per_os_env_files_is_pointed_at_the_right_one() {
+        let (p, reg) = (paths(), two_gateways());
+        let mut h = FakeHost::default();
+        // The extra has a unit written by an older osh; the packaged main has no drop-in yet.
+        let old = systemd_unit(reg.get("openshell-docker").unwrap(), &p)
+            .replace(crate::envfile::host_name(), "gateway.env");
+        h.files.insert(
+            unit_path(&p, "openshell-docker")
+                .to_string_lossy()
+                .into_owned(),
+            old,
+        );
+        let t = step_lines(&stale_unit_steps(&facts(Os::Linux), &p, &h, &reg)).join("\n");
+        assert!(t.contains("osh-gateway-openshell-docker.service"), "{t}");
+        assert!(t.contains("osh-env.conf"), "{t}");
+        assert!(t.contains("systemctl --user restart osh-gateway-openshell-docker.service"));
+        assert!(t.contains("systemctl --user restart openshell-gateway"));
+        assert_eq!(t.matches("daemon-reload").count(), 2, "{t}");
+    }
+
+    #[test]
+    fn current_units_unknown_units_and_macos_need_no_env_repair() {
+        let (p, reg) = (paths(), two_gateways());
+        let mut h = FakeHost::default();
+        crate::envfile::with_dropin(&mut h, &p);
+        // The extra has no unit at all: osh did not make one, so it makes none here.
+        assert!(stale_unit_steps(&facts(Os::Linux), &p, &h, &reg).is_empty());
+        h.files.insert(
+            unit_path(&p, "openshell-docker")
+                .to_string_lossy()
+                .into_owned(),
+            systemd_unit(reg.get("openshell-docker").unwrap(), &p),
+        );
+        assert!(stale_unit_steps(&facts(Os::Linux), &p, &h, &reg).is_empty());
+        assert!(stale_unit_steps(&facts(Os::MacOs), &p, &FakeHost::default(), &reg).is_empty());
     }
 
     #[test]
