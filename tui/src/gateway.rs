@@ -559,7 +559,18 @@ pub fn exec_docker_service(p: &Paths, data: &Path) -> std::io::Error {
     c.exec()
 }
 
-/// `openshell-gateway` from the Homebrew prefix, else from PATH.
+/// The first executable file called `name` in the `path` list of folders.
+fn find_in_path(name: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    std::env::split_paths(path).map(|d| d.join(name)).find(|c| {
+        c.metadata()
+            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    })
+}
+
+/// `openshell-gateway` from the Homebrew prefix, else from PATH as an absolute path. A bare name
+/// would be looked up again by `exec` in the child's PATH, and `gateway.env` replaces that PATH
+/// with Homebrew's folders, which hides a binary in `~/.local/bin`.
 pub(crate) fn gateway_binary() -> PathBuf {
     std::process::Command::new("brew")
         .args(["--prefix", "openshell"])
@@ -570,6 +581,7 @@ pub(crate) fn gateway_binary() -> PathBuf {
             PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("bin/openshell-gateway")
         })
         .filter(|p| p.is_file())
+        .or_else(|| find_in_path("openshell-gateway", &std::env::var_os("PATH")?))
         .unwrap_or_else(|| PathBuf::from("openshell-gateway"))
 }
 
@@ -588,6 +600,23 @@ mod tests {
     use crate::platform::testing::FakeHost;
     use crate::platform::{Kvm, PodmanMachine};
     use crate::setup::{execute, Answer, Outcome};
+
+    #[test]
+    fn find_in_path_returns_the_first_executable_and_skips_plain_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("osh-findpath-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let (a, b) = (d.join("a"), d.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("tool"), "").unwrap(); // not executable
+        std::fs::write(b.join("tool"), "").unwrap();
+        std::fs::set_permissions(b.join("tool"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths([&a, &b]).unwrap();
+        assert_eq!(find_in_path("tool", &path), Some(b.join("tool")));
+        assert_eq!(find_in_path("missing", &path), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn the_wait_gives_a_first_start_time_and_reports_the_status_at_the_end() {
