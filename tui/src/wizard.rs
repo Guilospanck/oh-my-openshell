@@ -1042,6 +1042,24 @@ pub fn needs_wizard(
     !has_openshell || pending || (cli_gateways == 0 && registry_empty)
 }
 
+/// A failed command's own words are the cause ("Linux installs require either dpkg or rpm"); the
+/// exit status alone ("sh exited with exit status: 1") hides them. Appends the last output lines
+/// of the step (`now` starts with the `$ command` line, which is skipped).
+fn with_output_tail(error: &str, now: &[String]) -> String {
+    let tail: Vec<&str> = now
+        .iter()
+        .skip(1)
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let tail = &tail[tail.len().saturating_sub(3)..];
+    if tail.is_empty() {
+        error.to_string()
+    } else {
+        format!("{error}: {}", tail.join(" / "))
+    }
+}
+
 /// Updates the progress view for one executor event.
 pub fn apply_event(p: &mut Progress, steps: &[Step], e: &SetupEvent, elapsed: Duration) {
     match e {
@@ -1063,7 +1081,7 @@ pub fn apply_event(p: &mut Progress, steps: &[Step], e: &SetupEvent, elapsed: Du
         SetupEvent::Done(i, outcome) => {
             let state = match outcome {
                 StepOutcome::Done | StepOutcome::DryRun => RowState::Done(elapsed),
-                StepOutcome::Failed(e) => RowState::Failed(e.clone()),
+                StepOutcome::Failed(e) => RowState::Failed(with_output_tail(e, &p.now)),
                 StepOutcome::Manual => {
                     RowState::Manual(steps.get(*i).map(Step::command_line).unwrap_or_default())
                 }
@@ -2211,10 +2229,51 @@ mod tests {
         apply_event(
             &mut p,
             &steps,
+            &crate::setup::Event::Start(1),
+            Duration::ZERO,
+        );
+        apply_event(
+            &mut p,
+            &steps,
             &crate::setup::Event::Done(1, StepOutcome::Failed("boom".into())),
             Duration::ZERO,
         );
         assert_eq!(p.rows[1], RowState::Failed("boom".into()));
+        // A failing command's last output lines say why; the exit status alone does not.
+        apply_event(
+            &mut p,
+            &steps,
+            &crate::setup::Event::Start(1),
+            Duration::ZERO,
+        );
+        for l in [
+            "downloading",
+            "",
+            "error: Linux installs require either dpkg or rpm",
+        ] {
+            apply_event(
+                &mut p,
+                &steps,
+                &crate::setup::Event::Line(1, l.into()),
+                Duration::ZERO,
+            );
+        }
+        apply_event(
+            &mut p,
+            &steps,
+            &crate::setup::Event::Done(
+                1,
+                StepOutcome::Failed("sh exited with exit status: 1".into()),
+            ),
+            Duration::ZERO,
+        );
+        assert_eq!(
+            p.rows[1],
+            RowState::Failed(
+                "sh exited with exit status: 1: downloading / error: Linux installs require either dpkg or rpm"
+                    .into()
+            )
+        );
         apply_event(
             &mut p,
             &steps,
