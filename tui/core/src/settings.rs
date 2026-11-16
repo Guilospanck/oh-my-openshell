@@ -586,11 +586,24 @@ fn read_text(dir: &Path) -> Result<Option<String>, String> {
     }
 }
 
-/// Temp file in the same folder, then rename, so a reader never sees half a file.
+/// Temp file next to the real file, then rename, so a reader never sees half a file. A symlinked
+/// `osh.toml` (dotfiles) stays a link and its target is what changes; the mode is kept.
 fn write_atomic(dir: &Path, text: &str) -> Result<(), String> {
-    let tmp = dir.join(format!(".{FILE}.tmp-{}", std::process::id()));
-    let r = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, dir.join(FILE)));
-    if let Err(e) = r {
+    let link = dir.join(FILE);
+    let target = std::fs::canonicalize(&link).unwrap_or(link);
+    let parent = target.parent().unwrap_or(dir);
+    let tmp = parent.join(format!(".{FILE}.tmp-{}", std::process::id()));
+    let write = || -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        if let Ok(m) = std::fs::metadata(&target) {
+            f.set_permissions(m.permissions())?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&tmp, &target)
+    };
+    if let Err(e) = write() {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("cannot write {FILE}: {e}"));
     }
@@ -651,25 +664,31 @@ pub fn ensure_file(dir: &Path) -> Result<(), String> {
             continue;
         }
         let blk = split_lines(&block(d));
-        match section(&lines, d.table()) {
+        let mut next = lines.clone();
+        match section(&next, d.table()) {
             Some((_, end)) => {
                 let mut at = end;
-                while at > 0 && lines[at - 1].trim().is_empty() {
+                while at > 0 && next[at - 1].trim().is_empty() {
                     at -= 1;
                 }
                 let mut ins = vec![String::new()];
                 ins.extend(blk);
-                lines.splice(at..at, ins);
+                next.splice(at..at, ins);
             }
             None => {
-                if lines.last().is_some_and(|l| !l.trim().is_empty()) {
-                    lines.push(String::new());
+                if next.last().is_some_and(|l| !l.trim().is_empty()) {
+                    next.push(String::new());
                 }
-                lines.push(format!("[{}]", d.table()));
-                lines.extend(blk);
+                next.push(format!("[{}]", d.table()));
+                next.extend(blk);
             }
         }
-        changed = true;
+        // A table the user wrote without a `[table]` header (dotted keys, an inline table, an
+        // array of tables) cannot take a header too: skip the block instead of breaking the file.
+        if parse_doc(&join_lines(&next)).is_ok() {
+            lines = next;
+            changed = true;
+        }
     }
     if changed {
         write_atomic(dir, &join_lines(&lines))?;
@@ -677,42 +696,93 @@ pub fn ensure_file(dir: &Path) -> Result<(), String> {
     migrate(dir)
 }
 
+/// The reason `key` cannot be changed now: an environment variable decides it.
+pub fn locked(dir: &Path, key: &str, env: Env) -> Option<String> {
+    load(dir, env)
+        .rows
+        .iter()
+        .find(|r| r.def.key == key && r.env_active)
+        .map(|r| {
+            format!(
+                "{key} is set by the environment variable {} right now; unset it to change the setting",
+                r.def.env.unwrap_or("")
+            )
+        })
+}
+
+fn to_toml(v: &Value) -> toml::Value {
+    match v {
+        Value::Bool(b) => toml::Value::Boolean(*b),
+        Value::Int(n) => toml::Value::Integer(*n as i64),
+        Value::Str(s) => toml::Value::String(s.clone()),
+        Value::List(l) => toml::Value::Array(l.iter().cloned().map(toml::Value::String).collect()),
+    }
+}
+
+/// What `old` must parse to after `d` is set to `v` (`None` removes it). A text edit that does
+/// not give exactly this touched something else (a string, a comment, another key) and is dropped.
+fn expected(old: &toml::Table, d: &Def, v: Option<&Value>) -> toml::Table {
+    let mut t = old.clone();
+    let sub = t
+        .entry(d.table())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    if let Some(sub) = sub.as_table_mut() {
+        match v {
+            Some(v) => {
+                sub.insert(d.name().into(), to_toml(v));
+            }
+            None => {
+                sub.remove(d.name());
+            }
+        }
+    }
+    t
+}
+
+fn table_of(text: &str) -> Option<toml::Table> {
+    toml::from_str(text).ok()
+}
+
 /// Write `key` into `osh.toml`, keeping everything else. Refused for unknown keys, bad values,
 /// a key an environment variable decides right now, and an invalid file.
 pub fn set(dir: &Path, key: &str, text: &str, env: Env) -> Result<(), String> {
     let d = def(key).ok_or_else(|| format!("unknown setting {key}"))?;
     let v = parse_value(d, text)?;
-    if let Some(r) = load(dir, env)
-        .rows
-        .iter()
-        .find(|r| r.def.key == key && r.env_active)
-    {
-        return Err(format!(
-            "{key} is set by the environment variable {} right now; unset it to change the setting here",
-            r.def.env.unwrap_or("")
-        ));
+    if let Some(why) = locked(dir, key, env) {
+        return Err(why);
     }
     create_if_missing(dir)?;
     let old = read_text(dir)?.unwrap_or_default();
     let mut doc = parse_doc(&old)?;
+    let old_table = table_of(&old).ok_or_else(|| format!("{FILE} is not valid TOML"))?;
     let mut lines = split_lines(&old);
-    let out = if live_idx(&lines, d.table(), d.name()).is_none() {
+    let mut out = None;
+    if live_idx(&lines, d.table(), d.name()).is_none() {
         if let Some(i) = commented_idx(&lines, d.table(), d.name()) {
             lines[i] = format!("{} = {}", d.name(), literal_text(&v));
             let mut s = join_lines(&lines);
             if !old.ends_with('\n') {
                 s.pop();
             }
-            s
-        } else {
+            // The commented line may sit inside a string; then the check below fails and the
+            // key is inserted properly instead.
+            if table_of(&s) == Some(expected(&old_table, d, Some(&v))) {
+                out = Some(s);
+            }
+        }
+    }
+    let out = match out {
+        Some(s) => s,
+        None => {
             insert(&mut doc, d, &v)?;
             doc.to_string()
         }
-    } else {
-        insert(&mut doc, d, &v)?;
-        doc.to_string()
     };
-    parse_doc(&out)?;
+    if table_of(&out) != Some(expected(&old_table, d, Some(&v))) {
+        return Err(format!(
+            "{key} is written in a form osh cannot edit safely (a dotted or quoted key, say); edit {FILE} by hand"
+        ));
+    }
     write_atomic(dir, &out)
 }
 
@@ -742,32 +812,38 @@ pub fn unset(dir: &Path, key: &str) -> Result<(), String> {
         return Ok(());
     };
     parse_doc(&old)?;
-    let mut lines = split_lines(&old);
+    let old_table = table_of(&old).ok_or_else(|| format!("{FILE} is not valid TOML"))?;
+    let present = old_table
+        .get(d.table())
+        .and_then(|t| t.as_table())
+        .is_some_and(|t| t.contains_key(d.name()));
+    let lines = split_lines(&old);
     let Some(i) = live_idx(&lines, d.table(), d.name()) else {
+        if present {
+            return Err(format!(
+                "{key} is written in a form osh cannot edit safely (a dotted or quoted key, say); edit {FILE} by hand"
+            ));
+        }
         return Ok(());
     };
-    // A value written over several lines (a list) runs until its brackets balance.
-    let mut end = i;
-    let mut depth = 0i32;
-    loop {
-        let l = &lines[end];
-        let from = if end == i {
-            l.find('=').map_or(0, |p| p + 1)
-        } else {
-            0
-        };
-        depth += l[from..].matches('[').count() as i32 - l[from..].matches(']').count() as i32;
-        if depth <= 0 || end + 1 >= lines.len() {
+    // The value may run over several lines: take the fewest lines whose replacement by the
+    // commented default leaves exactly the other settings, strings and comments as they were.
+    let want = expected(&old_table, d, None);
+    let replacement = format!("# {} = {}", d.name(), d.default);
+    let mut done = None;
+    for end in i..lines.len() {
+        let mut next = lines.clone();
+        next.splice(i..=end, [replacement.clone()]);
+        let mut s = join_lines(&next);
+        if !old.ends_with('\n') {
+            s.pop();
+        }
+        if table_of(&s) == Some(want.clone()) {
+            done = Some(s);
             break;
         }
-        end += 1;
     }
-    lines.splice(i..=end, [format!("# {} = {}", d.name(), d.default)]);
-    let mut out = join_lines(&lines);
-    if !old.ends_with('\n') {
-        out.pop();
-    }
-    parse_doc(&out)?;
+    let out = done.ok_or_else(|| format!("cannot remove {key} safely; edit {FILE} by hand"))?;
     write_atomic(dir, &out)
 }
 
@@ -1794,6 +1870,141 @@ mod tests {
             let env = d.env.map_or("none".to_string(), |e| format!("`{e}`"));
             assert_eq!(r[4], env, "{} environment variable", d.key);
         }
+    }
+
+    #[test]
+    fn append_skips_a_table_written_without_a_header() {
+        for body in [
+            "refresh.ports_secs = 4\n",
+            "refresh = { ports_secs = 4 }\n",
+            "[[general]]\nx = 1\n",
+        ] {
+            let d = tmp();
+            std::fs::write(d.join(FILE), body).unwrap();
+            ensure_file(&d).unwrap();
+            let after = read(&d);
+            assert!(
+                toml::from_str::<toml::Table>(&after).is_ok(),
+                "still valid TOML:\n{after}"
+            );
+            assert!(
+                after.starts_with(body),
+                "the user's text is untouched:\n{after}"
+            );
+            assert!(
+                after.contains("# toast_secs = 5"),
+                "other tables still get their blocks"
+            );
+            if body.starts_with("refresh") {
+                let s = load(&d, &no_env);
+                assert!(s.problems.is_empty(), "{:?}", s.problems);
+                assert_eq!(row(&s, "refresh.ports_secs").value, Value::Int(4));
+            }
+        }
+    }
+
+    #[test]
+    fn unset_never_removes_other_lines_even_with_brackets_in_strings_and_comments() {
+        let d = tmp();
+        let file =
+            "[mcp]\nshare_roots = [\"/a[\"]\nrepo_vars = [\"GH\"]\n[ui]\n# mine\ntoast_secs = 9\n";
+        std::fs::write(d.join(FILE), file).unwrap();
+        unset(&d, "mcp.share_roots").unwrap();
+        assert_eq!(
+            read(&d),
+            "[mcp]\n# share_roots = []\nrepo_vars = [\"GH\"]\n[ui]\n# mine\ntoast_secs = 9\n"
+        );
+        let file = "[mcp]\nshare_roots = [\"/a\"] # see [docs\nrepo_vars = [\"GH\"]\n";
+        std::fs::write(d.join(FILE), file).unwrap();
+        unset(&d, "mcp.share_roots").unwrap();
+        assert_eq!(
+            read(&d),
+            "[mcp]\n# share_roots = []\nrepo_vars = [\"GH\"]\n"
+        );
+    }
+
+    #[test]
+    fn unset_removes_a_list_written_over_several_lines_and_nothing_else() {
+        let d = tmp();
+        std::fs::write(
+            d.join(FILE),
+            "[mcp]\nshare_roots = [\n  \"/a\",\n  \"/b\",\n]\nrepo_vars = [\"GH\"]\n",
+        )
+        .unwrap();
+        unset(&d, "mcp.share_roots").unwrap();
+        assert_eq!(
+            read(&d),
+            "[mcp]\n# share_roots = []\nrepo_vars = [\"GH\"]\n"
+        );
+    }
+
+    #[test]
+    fn a_key_written_in_a_form_osh_cannot_edit_is_refused_not_ignored() {
+        let d = tmp();
+        let body = "refresh.ports_secs = 4\n";
+        std::fs::write(d.join(FILE), body).unwrap();
+        let e = unset(&d, "refresh.ports_secs").unwrap_err();
+        assert!(e.contains("by hand"), "{e}");
+        assert_eq!(read(&d), body);
+        // `set` can still write it properly (toml_edit follows the dotted key), and says nothing
+        // else changed.
+        set(&d, "refresh.ports_secs", "9", &no_env).unwrap();
+        let t: toml::Table = toml::from_str(&read(&d)).unwrap();
+        assert_eq!(t["refresh"]["ports_secs"].as_integer(), Some(9));
+    }
+
+    #[test]
+    fn set_does_not_edit_inside_a_multiline_string() {
+        let d = tmp();
+        let body = "[general]\nnote = \"\"\"\n# editor = \"auto\"\n\"\"\"\n";
+        std::fs::write(d.join(FILE), body).unwrap();
+        set(&d, "general.editor", "own", &no_env).unwrap();
+        let t: toml::Table = toml::from_str(&read(&d)).unwrap();
+        assert_eq!(t["general"]["editor"].as_str(), Some("own"));
+        assert_eq!(
+            t["general"]["note"].as_str(),
+            Some("# editor = \"auto\"\n"),
+            "the string is intact"
+        );
+    }
+
+    #[test]
+    fn a_write_keeps_a_symlinked_osh_toml_and_its_mode() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let d = tmp();
+        let real = d.join("real.toml");
+        std::fs::write(&real, "[refresh]\nports_secs = 4\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&real, d.join(FILE)).unwrap();
+        set(&d, "refresh.ports_secs", "8", &no_env).unwrap();
+        assert!(std::fs::symlink_metadata(d.join(FILE))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&real)
+            .unwrap()
+            .contains("ports_secs = 8"));
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn locked_names_the_variable_only_while_it_decides() {
+        let d = tmp();
+        let on = |k: &str| (k == TMUX_ENV).then(|| OsString::from("0"));
+        assert!(locked(&d, "shell.tmux_keys", &on)
+            .unwrap()
+            .contains(TMUX_ENV));
+        assert!(locked(&d, "shell.tmux_keys", &no_env).is_none());
+        assert!(locked(&d, "refresh.ports_secs", &on).is_none());
     }
 
     fn a(s: &[&str]) -> Vec<String> {

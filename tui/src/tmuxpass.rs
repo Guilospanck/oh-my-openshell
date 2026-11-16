@@ -153,8 +153,12 @@ const OFF_FILE: &str = ".tmux-passthrough-off";
 /// Read the setting (at start, and again when `osh.toml` changes). When the old marker cannot
 /// be moved into `osh.toml`, it still counts.
 pub fn load(dir: &std::path::Path) {
+    load_with(dir, &|k| std::env::var_os(k));
+}
+
+pub fn load_with(dir: &std::path::Path, env: osh_core::settings::Env) {
     let _ = osh_core::settings::migrate(dir);
-    let snap = osh_core::settings::load(dir, &|k| std::env::var_os(k));
+    let snap = osh_core::settings::load(dir, env);
     let on = snap.rows.iter().any(|r| {
         r.def.key == "shell.tmux_keys" && r.value == osh_core::settings::Value::Bool(true)
     });
@@ -166,7 +170,16 @@ pub fn load(dir: &std::path::Path) {
 
 /// Flip the choice and keep it in `osh.toml`; returns whether passing keys is now on.
 pub fn toggle(dir: &std::path::Path) -> std::io::Result<bool> {
-    use osh_core::settings::{migrate, set, unset};
+    toggle_with(dir, &|k| std::env::var_os(k))
+}
+
+/// Refused while `OSH_TMUX_PASSTHROUGH=0` forces the keys off: the file would change and the
+/// keys would stay off.
+pub fn toggle_with(dir: &std::path::Path, env: osh_core::settings::Env) -> std::io::Result<bool> {
+    use osh_core::settings::{locked, migrate, set, unset};
+    if let Some(why) = locked(dir, "shell.tmux_keys", env) {
+        return Err(std::io::Error::other(why));
+    }
     let off = !OFF.load(std::sync::atomic::Ordering::Relaxed);
     let _ = migrate(dir);
     if off {
@@ -259,13 +272,33 @@ pub fn release() {
 
 #[cfg(test)]
 mod tests {
+    /// `OFF` is process-wide: the tests that load or toggle it run one at a time.
+    static OFF_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_toggle_is_refused_while_the_environment_forces_the_keys_off() {
+        let _g = OFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = std::env::temp_dir().join(format!("osh-tp-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let forced = |k: &str| (k == "OSH_TMUX_PASSTHROUGH").then(|| std::ffi::OsString::from("0"));
+        let e = super::toggle_with(&d, &forced).unwrap_err().to_string();
+        assert!(e.contains("OSH_TMUX_PASSTHROUGH"), "{e}");
+        assert!(!d.join("osh.toml").exists(), "nothing was written");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn the_palette_switch_is_kept_in_the_data_dir() {
+        let _g = OFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = std::env::temp_dir().join(format!("osh-tp-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        super::load(&d);
-        assert!(!super::toggle(&d).unwrap(), "first press turns it off");
+        super::load_with(&d, &|_| None);
+        assert!(
+            !super::toggle_with(&d, &|_| None).unwrap(),
+            "first press turns it off"
+        );
         assert!(
             !d.join(super::OFF_FILE).exists(),
             "the marker file is gone for good"
@@ -273,24 +306,25 @@ mod tests {
         assert!(std::fs::read_to_string(d.join("osh.toml"))
             .unwrap()
             .contains("tmux_keys = false"));
-        super::load(&d);
+        super::load_with(&d, &|_| None);
         assert!(super::OFF.load(std::sync::atomic::Ordering::Relaxed));
-        assert!(super::toggle(&d).unwrap(), "and back on");
-        super::load(&d);
+        assert!(super::toggle_with(&d, &|_| None).unwrap(), "and back on");
+        super::load_with(&d, &|_| None);
         assert!(!super::OFF.load(std::sync::atomic::Ordering::Relaxed));
         let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
     fn an_old_marker_file_still_means_off_and_is_moved() {
+        let _g = OFF_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let d = std::env::temp_dir().join(format!("osh-tp-old-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(super::OFF_FILE), "").unwrap();
-        super::load(&d);
+        super::load_with(&d, &|_| None);
         assert!(super::OFF.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!d.join(super::OFF_FILE).exists());
-        super::load(&d);
+        super::load_with(&d, &|_| None);
         assert!(super::OFF.load(std::sync::atomic::Ordering::Relaxed));
         let _ = std::fs::remove_dir_all(&d);
     }

@@ -343,17 +343,6 @@ impl View {
                     None => "Wins in this order: osh.toml > default".to_string(),
                 };
                 out.push(Line::styled(order, dim));
-                for p in self
-                    .snap
-                    .problems
-                    .iter()
-                    .filter(|p| p.key.as_deref() == Some(r.def.key))
-                {
-                    out.push(Line::styled(
-                        format!("osh.toml: {}", p.msg),
-                        Style::default().fg(Color::Red),
-                    ));
-                }
             }
             Some(Entry::File(name, what)) => {
                 out.push(Line::styled(name.to_string(), bold));
@@ -377,6 +366,26 @@ impl View {
                 };
                 out.push(Line::styled(
                     format!("osh.toml{at} is not valid: {} (e opens it)", p.msg),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+        } else {
+            // Every setting the file gets wrong and every key it has that osh does not know
+            // (usually a typo), with the line to fix.
+            let shown = 3;
+            for p in self.snap.problems.iter().take(shown) {
+                let at = p.line.map_or(String::new(), |l| format!(":{l}"));
+                out.push(Line::styled(
+                    format!("osh.toml{at}: {}", p.msg),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            if self.snap.problems.len() > shown {
+                out.push(Line::styled(
+                    format!(
+                        "{} more problems in osh.toml (osh config lists them all)",
+                        self.snap.problems.len() - shown
+                    ),
                     Style::default().fg(Color::Red),
                 ));
             }
@@ -651,6 +660,23 @@ mod tests {
         let t = text(&v.detail_lines(80));
         assert!(t.contains("osh.toml:2:") && t.contains("not valid"), "{t}");
         assert_eq!(press(&mut v, &d, KeyCode::Char('e')), Act::File("osh.toml"));
+    }
+
+    #[test]
+    fn every_problem_in_the_file_is_listed_with_its_line() {
+        let d = tmp();
+        std::fs::write(
+            d.join("osh.toml"),
+            "[refresh]\nport_secs = 4\nusage_secs = 0\n[ui]\ntoast_secs = 5\n",
+        )
+        .unwrap();
+        let v = View::with_env(&d, none);
+        let t = text(&v.detail_lines(100));
+        assert!(
+            t.contains("osh.toml:2: unknown setting refresh.port_secs"),
+            "{t}"
+        );
+        assert!(t.contains("osh.toml:3:") && t.contains("outside"), "{t}");
     }
 
     #[test]
