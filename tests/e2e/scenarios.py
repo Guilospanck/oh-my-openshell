@@ -446,7 +446,7 @@ def settings_screen():
             o.press("backspace"); o.type("9"); o.press("enter")
             o.wait("refresh.ports_secs saved", 10)
             text = open(path).read()
-            assert "ports_secs = 9" in text and "# Which editor the edit actions use" in text, text
+            assert "ports_secs = 9" in text and "# How often the CPU, memory and disk meter reads." in text, text
             o.press("r"); o.wait("back to its default", 10)
             text = open(path).read()
             assert "ports_secs = 9" not in text and "# ports_secs = 3" in text, text
