@@ -5220,6 +5220,7 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.mv(1),
             KeyCode::Char('k') | KeyCode::Up => self.mv(-1),
             KeyCode::Char('g') => self.switch_gateway(),
+            KeyCode::Char('c') => self.run_command(crate::palette::Command::Settings),
             KeyCode::Char('r') => {
                 self.status = "Refreshing...".into();
                 self.refresh();
@@ -6385,6 +6386,14 @@ mod tests {
             panic!("the Settings screen is open");
         };
         v
+    }
+
+    #[test]
+    fn the_c_key_opens_the_settings_screen_from_any_tab() {
+        let mut a = settings_app("ckey");
+        press(&mut a, KeyCode::Char('2'));
+        press(&mut a, KeyCode::Char('c'));
+        assert!(matches!(a.modal, Some(Modal::Settings(_))));
     }
 
     #[test]

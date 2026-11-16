@@ -8,6 +8,7 @@ global | j | nav-move
 global | k | nav-move
 global | g | nav-gateway
 global | r | nav-refresh
+global | c | settings-screen
 global | ! | nav-alerts
 global | ? | nav-help
 global | : | nav-palette
@@ -48,7 +49,6 @@ Gateways | V | gateway-vm-size
 shell | ctrl-] menu | shell-menu
 palette | Edit toolchains.toml | editor-toolchains
 palette | Data files | data-files
-palette | Settings | settings-screen
 palette | Editor: switch auto / your own / built-in | editor-external
 external-editor | $EDITOR with arguments runs inside osh | editor-external
 external-editor | Enter/r reopen after a failed check | editor-external

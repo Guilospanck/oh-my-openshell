@@ -255,6 +255,12 @@ pub const ACTIONS: &[Action] = &[
     a(Global, "5", KeyCode::Char('5'), "Go to Gateways"),
     a(Global, "g", KeyCode::Char('g'), "Switch gateway"),
     a(Global, "r", KeyCode::Char('r'), "Refresh"),
+    a(
+        Global,
+        "c",
+        KeyCode::Char('c'),
+        "Settings: every osh setting, its value, what overrides it, and how to change it (osh.toml)",
+    ),
     a(Global, "!", KeyCode::Char('!'), "Show alerts"),
     a(Global, "?", KeyCode::Char('?'), "Show help"),
     a(Global, "q", KeyCode::Char('q'), "Quit"),
@@ -267,11 +273,6 @@ pub const ACTIONS: &[Action] = &[
         Global,
         "Editor: switch auto / your own ($VISUAL, $EDITOR) / built-in",
         Command::EditorMode,
-    ),
-    command(
-        Global,
-        "Settings: every osh setting, its value, what overrides it, and how to change it (osh.toml)",
-        Command::Settings,
     ),
     command(
         Global,

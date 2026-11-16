@@ -436,9 +436,7 @@ def settings_screen():
     path = os.path.join(data_dir(), "osh.toml")
     try:
         with dashboard() as o:
-            o.press(":"); o.wait("Commands", 10)
-            o.type("settings"); o.wait("Settings:", 5); o.press("enter")
-            o.wait("refresh.ports_secs", 10)
+            o.press("c"); o.wait("refresh.ports_secs", 10)
             assert "OSH_MCP_ALLOW_SHARE" in o.text(), o.text()
             o.press("/"); o.type("ports"); o.press("enter")
             o.wait("asked for listening ports", 5)
