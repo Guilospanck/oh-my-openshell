@@ -9148,4 +9148,44 @@ mod tests {
         a.bg_msg(|| Ok("ok".into()));
         assert!(a.modal.is_none());
     }
+
+    // `cfg!(test)` inside osh-core is false while osh-tui's tests run, so osh-core's own guards
+    // must key on `under_test()` (the `testing` feature); these fail if one of them reverts.
+    #[test]
+    fn osh_core_keeps_the_real_state_files_out_of_these_tests() {
+        assert!(osh_core::ghrepo::tracked_path().is_none());
+        assert!(osh_core::watch::never_path().is_none());
+        assert!(osh_core::watch::auto_any_path().is_none());
+    }
+
+    #[test]
+    fn checking_a_profile_never_runs_openshell_in_these_tests() {
+        use std::os::unix::fs::PermissionsExt;
+        static PATH_LOCK: Mutex<()> = Mutex::new(());
+        let _g = PATH_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = std::env::temp_dir().join(format!("osh-tui-nolint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("ran");
+        let fake = root.join("openshell");
+        std::fs::write(
+            &fake,
+            format!("#!/bin/sh\necho ran >> '{}'\nexit 0\n", marker.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let old = std::env::var_os("PATH");
+        let mut dirs = vec![root.clone()];
+        dirs.extend(std::env::split_paths(&old.clone().unwrap_or_default()));
+        std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+        let r = osh_core::cli::check_profile("id: x\n");
+        match old {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+        let ran = marker.exists();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(r.is_ok());
+        assert!(!ran, "check_profile spawned openshell under test");
+    }
 }

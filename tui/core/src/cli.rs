@@ -9,6 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
+        atomic::{AtomicU64, Ordering},
         mpsc::{Receiver, Sender},
         Arc, Mutex, OnceLock,
     },
@@ -435,6 +436,14 @@ pub fn profile_path(dir: &Path, id: &str) -> PathBuf {
     }
 }
 
+/// A temp file name for one lint run, unique per call: the dashboard and the headless commands
+/// can lint at the same moment, and a name keyed by process id alone would be shared.
+fn lint_temp_path() -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("osh-lint-{}-{n}.yaml", std::process::id()))
+}
+
 /// The editor's check for a provider profile: valid YAML with an `id`, then OpenShell's own lint
 /// (read-only) when the CLI is there. "Already exists" is not a problem for a file being edited,
 /// and a lint that cannot reach the gateway does not block the save.
@@ -448,12 +457,12 @@ pub fn check_profile(text: &str) -> Result<(), String> {
     {
         return Err("a profile needs an id: line (the name it is imported under)".into());
     }
-    if cfg!(test) || !have("openshell") {
+    if crate::testmode::under_test() || !have("openshell") {
         return Ok(());
     }
     // OpenShell does not expand the template itself; lint what osh would import.
     let body = text.replace("${FORGEJO_HOST}", "forgejo.example");
-    let tmp = std::env::temp_dir().join(format!("osh-lint-{}.yaml", std::process::id()));
+    let tmp = lint_temp_path();
     if fs::write(&tmp, body).is_err() {
         return Ok(());
     }
@@ -2070,6 +2079,17 @@ pub fn sync_check(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_lint_run_gets_its_own_temp_file() {
+        let (a, b) = (super::lint_temp_path(), super::lint_temp_path());
+        assert_ne!(a, b);
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(&format!("osh-lint-{}-", std::process::id())));
+    }
+
     #[test]
     fn credential_keys_come_from_inline_and_block_lists_and_yml_files_count() {
         let inline = "id: a\ncredentials:\n  - name: t\n    env_vars: [GITHUB_TOKEN, GH_TOKEN]\n";

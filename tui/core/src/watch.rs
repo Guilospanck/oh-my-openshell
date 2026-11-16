@@ -216,7 +216,7 @@ fn key(sandbox: &str, b: &Blocked) -> Key {
 
 /// Where the never-allow list lives: `$XDG_STATE_HOME/osh/never`, else `~/.local/state/osh/never`.
 pub fn never_path() -> Option<PathBuf> {
-    if cfg!(test) {
+    if crate::testmode::under_test() {
         return None;
     }
     let base = std::env::var_os("XDG_STATE_HOME")

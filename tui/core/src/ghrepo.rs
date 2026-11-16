@@ -830,7 +830,7 @@ fn format_tracked(all: &[Tracked]) -> String {
 
 /// Where tracked tokens live: `$XDG_STATE_HOME/osh/tokens`, else `~/.local/state/osh/tokens`.
 pub fn tracked_path() -> Option<std::path::PathBuf> {
-    if cfg!(test) {
+    if crate::testmode::under_test() {
         return None;
     }
     let base = std::env::var_os("XDG_STATE_HOME")

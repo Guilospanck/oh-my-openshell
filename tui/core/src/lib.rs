@@ -11,5 +11,6 @@ pub mod ops;
 pub mod platform;
 pub mod preload;
 pub mod sandbox;
+pub mod testmode;
 pub mod text;
 pub mod watch;
