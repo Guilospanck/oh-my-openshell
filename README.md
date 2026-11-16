@@ -666,9 +666,9 @@ The `repo` variable must be set in the environment of the process that runs `osh
 
 ### Sharing a host folder
 
-`share` mounts a host path, so it is off by default. On the command line, pass `--allow-share` to `create` or `apply`. Over MCP there is no flag and no tool argument: only the operator can enable it, by setting `OSH_MCP_ALLOW_SHARE=1` in the environment of the `osh mcp` process. A spec with `share` is refused otherwise.
+`share` mounts a host path, so it is off by default. On the command line, pass `--allow-share` to `create` or `apply`. Over MCP there is no flag and no tool argument: only the operator can enable it, by setting `OSH_MCP_ALLOW_SHARE=1` in the environment of the `osh mcp` process, and must also list the folders shares may come from in `OSH_MCP_SHARE_ROOT`: absolute paths of existing directories, separated by `:` like `PATH`. A share is accepted only when its resolved path is one of those roots or inside one (whole path components: a root `/work/proj` does not admit `/work/proj-evil`, and a symlink inside a root that points outside is refused). An entry that is not an absolute existing directory is ignored, with one line on stderr naming it; with no valid root, every share is refused, naming `OSH_MCP_SHARE_ROOT`. A spec with `share` is refused otherwise.
 
-The path is resolved through symlinks first. A risky folder (the whole disk, your home folder or a folder that contains it, a secrets or settings folder in it such as `~/.ssh`, `~/.aws` or `~/.config`, or a system folder such as `/etc`, `/var` or `/private`, which on macOS includes `/tmp`) is refused over MCP, naming the folder and why; on the command line it is shared and the answer carries a `"note"` naming the risk.
+The path is resolved through symlinks first. A risky folder (the whole disk, your home folder or a folder that contains it, a secrets or settings folder in it such as `~/.ssh`, `~/.aws` or `~/.config`, or a system folder such as `/etc`, `/var` or `/private`, which on macOS includes `/tmp`) is refused over MCP, naming the folder and why, even inside a share root: this check stays as a second layer behind the roots. On macOS temp folders resolve under `/private`, so they count as system folders and cannot be shared over MCP. On the command line there are no roots, and a risky folder is shared with a `"note"` in the answer naming the risk.
 
 ### MCP server
 
@@ -678,7 +678,7 @@ The path is resolved through symlinks first. A risky folder (the whole disk, you
 {"mcpServers":{"osh":{"command":"osh","args":["mcp"]}}}
 ```
 
-The operator controls two things through the environment of the `osh mcp` process, never through a tool argument: `OSH_MCP_ALLOW_SHARE=1` lets specs mount host folders (see above), and `OSH_MCP_REPO_VARS` lists, comma-separated, the variables a spec's `repo.env_var` may name. With `OSH_MCP_REPO_VARS` unset or empty, every repo grant is refused over MCP, so an agent cannot have osh send some other secret of the server's environment to a forge.
+The operator controls two things through the environment of the `osh mcp` process, never through a tool argument: `OSH_MCP_ALLOW_SHARE=1` lets specs mount host folders inside the roots listed in `OSH_MCP_SHARE_ROOT` (see above), and `OSH_MCP_REPO_VARS` lists, comma-separated, the variables a spec's `repo.env_var` may name. With `OSH_MCP_REPO_VARS` unset or empty, every repo grant is refused over MCP, so an agent cannot have osh send some other secret of the server's environment to a forge.
 
 What an agent reaches through it: `sandbox_exec` and `sandbox_delete` work on every sandbox of the gateway, including ones made in the dashboard, and a spec may attach any provider that exists on the gateway. Give the server a gateway that holds only what agents may use.
 

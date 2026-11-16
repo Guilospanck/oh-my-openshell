@@ -181,6 +181,7 @@ pub fn headless(args: &[String]) -> i32 {
         allow_share,
         refuse_risky_share: false,
         repo_vars: None,
+        share_roots: None,
         version: env!("CARGO_PKG_VERSION").into(),
     };
     let mut exec = false;

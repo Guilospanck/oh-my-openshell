@@ -13,7 +13,8 @@ cpu, memory, command (run once, then the sandbox is deleted; its output is not r
 leave it out for a sandbox to exec in), toolchains (array), repo {url, env_var} (env_var is \
 the NAME of an environment variable holding the access token, never the token itself, and \
 must be one the server operator allows), share {path, rw} (refused unless the server \
-operator enabled it; risky folders such as home or the disk are always refused).";
+operator enabled it; path must resolve, through symlinks, inside one of the operator's share \
+root folders; risky folders such as home, the disk or system folders are refused even there).";
 
 fn tools() -> Value {
     json!([
@@ -223,6 +224,7 @@ mod tests {
             allow_share: false,
             refuse_risky_share: true,
             repo_vars: Some(Vec::new()),
+            share_roots: Some(Vec::new()),
             version: "9.8.7-given".into(),
         }
     }
@@ -419,8 +421,10 @@ mod tests {
     #[test]
     fn over_mcp_a_risky_share_and_an_unlisted_repo_var_are_refused() {
         let f = Fake::new("mcp-guards");
+        // The disk as a root still meets the risky-folder check behind the roots.
         let c = Ctx {
             allow_share: true,
+            share_roots: Some(vec!["/".into()]),
             ..ctx()
         };
         let spec = json!({"name":"w1","share":{"path":"/","rw":true}});

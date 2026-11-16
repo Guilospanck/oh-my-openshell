@@ -23,6 +23,9 @@ pub struct Ctx {
     /// The variables `repo.env_var` may name; `None` = any (the CLI). The MCP server sets the
     /// operator's list, so an agent cannot send an unrelated secret of the server to a forge.
     pub repo_vars: Option<Vec<String>>,
+    /// The folders a share must lie in, as canonical paths; `None` = anywhere (the CLI). The
+    /// MCP server sets the operator's `OSH_MCP_SHARE_ROOT`, an empty list refusing every share.
+    pub share_roots: Option<Vec<PathBuf>>,
     /// The version of the program serving the calls (the MCP `serverInfo`).
     pub version: String,
 }
@@ -76,6 +79,9 @@ fn checked_spec(ctx: &Ctx, spec: &Value, home: &str) -> Result<Checked, String> 
             );
         }
         share.path = resolve_share_path(share)?;
+        if let Some(roots) = &ctx.share_roots {
+            check_share_root(roots, &share.path)?;
+        }
         // The home folder is resolved too, so a symlinked home still matches.
         let home = std::fs::canonicalize(home)
             .ok()
@@ -108,6 +114,23 @@ fn check_repo_var(ctx: &Ctx, var: &str) -> Result<(), String> {
             "repo.env_var {var:?} is not one of the variables the server operator allows (OSH_MCP_REPO_VARS)"
         )),
     }
+}
+
+/// The resolved share path must be one of the roots or inside one. Both sides are canonical,
+/// so a symlink or `..` cannot step out, and the comparison is by whole components: `/a/b-x`
+/// is not inside `/a/b`. The refusal names the path and the variable, not the roots.
+fn check_share_root(roots: &[PathBuf], path: &str) -> Result<(), String> {
+    if roots.is_empty() {
+        return Err(format!(
+            "sharing {path} is refused: shares are off until the server operator lists a root folder in OSH_MCP_SHARE_ROOT"
+        ));
+    }
+    if roots.iter().any(|r| Path::new(path).starts_with(r)) {
+        return Ok(());
+    }
+    Err(format!(
+        "sharing {path} is refused: it is outside the allowed share roots (OSH_MCP_SHARE_ROOT)"
+    ))
 }
 
 /// The share path as an absolute, symlink-free path of an existing directory.
@@ -449,6 +472,7 @@ pub(crate) mod tests {
                 allow_share: false,
                 refuse_risky_share: false,
                 repo_vars: None,
+                share_roots: None,
                 version: "0.0.0-test".into(),
             }
         }
@@ -1022,6 +1046,67 @@ pub(crate) mod tests {
         // The symlink is refused as what it points at.
         let e = create_in(&share_ctx(&f, true), &with_share(&to_root), true, h).unwrap_err();
         assert!(e.contains("sharing / is refused"), "{e}");
+    }
+
+    #[test]
+    fn mcp_shares_must_lie_inside_a_share_root() {
+        let f = Fake::new("roots");
+        let home = f.dir.parent().unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let h = home.to_str().unwrap();
+        let base = project_dir("roots");
+        let root = base.join("proj");
+        for d in ["proj/sub", "proj-evil", "outside"] {
+            std::fs::create_dir_all(base.join(d)).unwrap();
+        }
+        std::os::unix::fs::symlink(base.join("outside"), root.join("link")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let mcp = |roots: Vec<PathBuf>| Ctx {
+            share_roots: Some(roots),
+            ..share_ctx(&f, true)
+        };
+        let ctx = mcp(vec![root.clone()]);
+        for ok in [root.join("sub"), root.clone()] {
+            let v = create_in(&ctx, &with_share(&ok), true, h).unwrap();
+            assert!(v.get("note").is_none(), "{ok:?}: {v}");
+            apply_in(&ctx, &with_share(&ok), h).unwrap();
+        }
+        for bad in [
+            base.join("outside"),
+            base.join("proj-evil"),
+            root.join("link"),
+            root.join("../outside"),
+        ] {
+            for e in [
+                create_in(&ctx, &with_share(&bad), true, h).unwrap_err(),
+                apply_in(&ctx, &with_share(&bad), h).unwrap_err(),
+            ] {
+                let real = std::fs::canonicalize(&bad).unwrap();
+                assert!(
+                    e.contains(real.to_str().unwrap())
+                        && e.contains("outside the allowed share roots"),
+                    "{bad:?}: {e}"
+                );
+            }
+        }
+        // Shares on but no valid root: every share is refused, naming the variable.
+        let e = create_in(&mcp(Vec::new()), &with_share(&root), true, h).unwrap_err();
+        assert!(e.contains("OSH_MCP_SHARE_ROOT"), "{e}");
+        // The CLI has no roots: a folder outside them is shared as before.
+        create_in(
+            &share_ctx(&f, false),
+            &with_share(&base.join("outside")),
+            true,
+            h,
+        )
+        .unwrap();
+        // Only the accepted shares reached `sandbox create` (apply is not a dry run).
+        let calls = f.calls();
+        assert!(
+            !calls.contains("/outside") && !calls.contains("proj-evil"),
+            "{calls}"
+        );
+        let _ = std::fs::remove_dir_all(base.parent().unwrap());
     }
 
     #[test]
