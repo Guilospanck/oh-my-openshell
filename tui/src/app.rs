@@ -2833,16 +2833,7 @@ impl App {
             rebuild: plan.rebuild,
         };
         let repo = plan.gh.as_ref().map(|g| &g.repo);
-        // The dashboard offers a share only on a driver that supports it; should it ever not,
-        // the sandbox is created without the folder rather than not at all.
-        sandbox::plan_create_with(&sandbox::SandboxSpec::from(plan), &ctx, repo)
-            .or_else(|_| {
-                let mut spec = sandbox::SandboxSpec::from(plan);
-                spec.share = None;
-                sandbox::plan_create_with(&spec, &ctx, repo)
-            })
-            .map(|c| c.steps)
-            .unwrap_or_default()
+        sandbox::plan_create_with(&sandbox::SandboxSpec::from(plan), &ctx, repo).steps
     }
 
     fn on_select(&mut self, kind: SelKind, picks: Vec<String>) {

@@ -250,26 +250,34 @@ pub fn policy_for(
     }
 }
 
-/// `--driver-config-json` value mounting the host folder, keyed by the active driver.
-fn share_config(share: &Share, driver: &str) -> Result<String, String> {
-    if !matches!(driver, "vm" | "docker" | "podman") {
-        return Err(if driver.is_empty() {
-            "cannot share a folder: the gateway has not said which driver it runs".to_string()
-        } else {
-            format!("cannot share a folder on the {driver:?} driver")
-        });
-    }
-    let name = Path::new(&share.path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| format!("share path {:?} has no folder name", share.path))?;
+/// `--driver-config-json` value mounting the host folder, keyed by the active driver. Takes the
+/// driver as given and is `None` for a path without a folder name, as the dashboard always did.
+fn share_config(share: &Share, driver: &str) -> Option<String> {
+    let name = Path::new(&share.path).file_name()?.to_str()?;
     let mount = serde_json::json!({
         "type": "bind",
         "source": share.path,
         "target": format!("/sandbox/{name}"),
         "read_only": !share.rw,
     });
-    Ok(serde_json::json!({ driver: { "mounts": [mount] } }).to_string())
+    Some(serde_json::json!({ driver: { "mounts": [mount] } }).to_string())
+}
+
+/// The headless entry checks what the dashboard cannot get wrong: a share needs a known driver
+/// and a path with a folder name.
+fn check_share(share: &Share, driver: &str) -> Result<(), String> {
+    if !matches!(driver, "vm" | "docker" | "podman") {
+        return Err(if driver.is_empty() {
+            "cannot share a folder: the gateway has not said which driver it runs (driver is empty)"
+                .to_string()
+        } else {
+            format!("cannot share a folder on the {driver:?} driver")
+        });
+    }
+    if share_config(share, driver).is_none() {
+        return Err(format!("share path {:?} has no folder name", share.path));
+    }
+    Ok(())
 }
 
 /// The forge a repo URL names, from the host alone (the well-known public ones).
@@ -293,17 +301,21 @@ fn grant_repo(url: &str) -> Result<ghrepo::GhRepo, String> {
 /// The steps that create a sandbox: an image build when it is outdated, then `sandbox create`.
 /// The argument order is what the dashboard has always run.
 pub fn plan_create(spec: &SandboxSpec, ctx: &CreateCtx) -> Result<Created, String> {
+    if let Some(share) = spec.share.as_ref().filter(|s| !s.path.is_empty()) {
+        check_share(share, ctx.driver)?;
+    }
     let repo = spec.repo.as_ref().map(|g| grant_repo(&g.url)).transpose()?;
-    plan_create_with(spec, ctx, repo.as_ref())
+    Ok(plan_create_with(spec, ctx, repo.as_ref()))
 }
 
 /// `plan_create` with the granted repo already resolved (the dashboard knows its forge and host
-/// exactly); `spec.repo` is ignored.
+/// exactly); `spec.repo` is ignored. Never fails and checks nothing about the driver: a share
+/// goes under whatever driver string it is given, as before the extraction.
 pub fn plan_create_with(
     spec: &SandboxSpec,
     ctx: &CreateCtx,
     repo: Option<&ghrepo::GhRepo>,
-) -> Result<Created, String> {
+) -> Created {
     let mut steps = Vec::new();
     if let Some(img) = ctx
         .images
@@ -332,14 +344,13 @@ pub fn plan_create_with(
         args.extend(["--memory".into(), spec.memory.clone()]);
     }
     if let Some(share) = spec.share.as_ref().filter(|s| !s.path.is_empty()) {
-        args.extend([
-            "--driver-config-json".into(),
-            share_config(share, ctx.driver)?,
-        ]);
-        args.extend([
-            "--label".into(),
-            format!("{}={}", cli::SHARE_LABEL, cli::share_key(&share.path)),
-        ]);
+        if let Some(json) = share_config(share, ctx.driver) {
+            args.extend(["--driver-config-json".into(), json]);
+            args.extend([
+                "--label".into(),
+                format!("{}={}", cli::SHARE_LABEL, cli::share_key(&share.path)),
+            ]);
+        }
     }
     for p in &spec.providers {
         args.extend(["--provider".into(), p.clone()]);
@@ -363,11 +374,11 @@ pub fn plan_create_with(
         prog: "openshell".into(),
         args: cli::with_gateway(args),
     });
-    Ok(Created {
+    Created {
         steps,
         policy_note,
         toolchain_groups,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -434,8 +445,13 @@ mod tests {
         .unwrap();
         assert_eq!(s.providers, vec!["p"]);
         assert_eq!(s.toolchains, Some(vec!["rust".to_string()]));
-        assert!(s.share.unwrap().rw);
-        assert_eq!(s.repo.unwrap().url, "https://h/o/r");
+        assert!(s.share.as_ref().unwrap().rw);
+        assert_eq!(s.share.unwrap().path, "/x/y");
+        let r = s.repo.unwrap();
+        assert_eq!(
+            (r.url.as_str(), r.env_var.as_str()),
+            ("https://h/o/r", "MY_VAR")
+        );
     }
 
     #[test]
@@ -487,8 +503,34 @@ mod tests {
             }),
             ..spec()
         };
-        assert!(plan_create(&s, &ctx(&d, "", &[])).is_err());
+        let e = plan_create(&s, &ctx(&d, "", &[])).err().unwrap();
+        assert!(e.contains("driver"), "{e}");
         assert!(plan_create(&s, &ctx(&d, "lxc", &[])).is_err());
+    }
+
+    #[test]
+    fn plan_create_with_keeps_the_dashboards_share_handling() {
+        let d = seeded("parity");
+        let s = SandboxSpec {
+            share: Some(Share {
+                path: "/a/b".into(),
+                rw: true,
+            }),
+            ..spec()
+        };
+        let c = plan_create_with(&s, &ctx(&d, "", &[]), None);
+        let a = c.steps.last().unwrap().args.join(" ");
+        assert!(a.contains("--driver-config-json {\"\":{"), "{a}");
+        assert!(a.contains("--label"), "{a}");
+        let none = SandboxSpec {
+            share: Some(Share {
+                path: "/".into(),
+                rw: true,
+            }),
+            ..spec()
+        };
+        let c = plan_create_with(&none, &ctx(&d, "docker", &[]), None);
+        assert!(!c.steps.last().unwrap().args.join(" ").contains("--label"));
     }
 
     #[test]
