@@ -18,7 +18,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 
 - Build and tests need only `cargo` and Zig 0.15 (`brew install zig@0.15`).
   They do not need OpenShell, a gateway or Docker; the unit tests pass with
-  `openshell` off PATH.
+  `openshell` off PATH. `cargo test -p osh-core` (run in `tui/`) needs no Zig at all.
 - Zig must be 0.15 exactly (libghostty-vt). Use `just build` / `just test` /
   `just check`: they source `dev-env`, which finds Zig 0.15 (on PATH, else
   Homebrew or Linuxbrew `zig@0.15`) and sets `LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast`.
@@ -30,15 +30,17 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
 
 | Path | What |
 | --- | --- |
-| `tui/src/` | Rust TUI (crate `osh-tui`). `main.rs` event loop and subcommands (`doctor`, `setup`, `upgrade`, `uninstall`, `gateway add|remove|restart|vm-size`, `runtime-start`, `install clipboard|gitleaks`, `gateway-docker`, `gateway-reset`, `gateway-service`, `sync-agents`), `app.rs` state and tabs, `ui.rs` drawing, `cli.rs` wrappers around the `openshell` and container runtime CLIs, `term.rs` embedded shells (libghostty-vt + portable-pty), `watch.rs` log watcher, `ports.rs` listening-port watcher and forward offers (`sandbox exec` reads `/proc/net/tcp*`; `forward start -d`), `usage.rs` CPU/memory/disk meter of the sandbox in view (one `sandbox exec sh -c` reading `/proc/stat`, `/proc/meminfo`, `df`), `logview.rs`, `clip.rs` clipboard, `palette.rs` the one table of dashboard actions (help screen and `:` command palette; actions with an empty key are palette-only), `editor.rs` built-in full-screen text editor (pure core driven by `on_key`; runs the file's own check before saving), `exted.rs` the user's own editor (`$VISUAL`, `$EDITOR`, `nvim`, `vim`, `nano`, `vi`) run in the embedded terminal on a private temp copy, validated and written back, with the built-in editor as fallback (`<data>/editor-mode`), `alerts.rs` host-side alerts (risky shared folder, changed files in a read-write share), `tmuxpass.rs` host tmux keys passed into the sandbox shell, `ghrepo.rs` read/write access to one git repo (GitHub, GitLab, Bitbucket, Forgejo) |
-| `tui/src/platform.rs` | `Os`, `PkgMgr`, `Runtime` (Docker/Podman), the `Host` trait (the only door to the host; `FakeHost` in tests) and `Facts` |
+| `tui/src/` | Rust TUI (crate `osh-tui`). `main.rs` event loop and subcommands (`doctor`, `setup`, `upgrade`, `uninstall`, `gateway add|remove|restart|vm-size`, `runtime-start`, `install clipboard|gitleaks`, `gateway-docker`, `gateway-reset`, `gateway-service`, `sync-agents`), `app.rs` state and tabs, `ui.rs` drawing, `tui/core/src/cli.rs` wrappers around the `openshell` and container runtime CLIs, `term.rs` embedded shells (libghostty-vt + portable-pty), `tui/core/src/watch.rs` log watcher, `ports.rs` listening-port watcher and forward offers (`sandbox exec` reads `/proc/net/tcp*`; `forward start -d`), `usage.rs` CPU/memory/disk meter of the sandbox in view (one `sandbox exec sh -c` reading `/proc/stat`, `/proc/meminfo`, `df`), `logview.rs`, `clip.rs` clipboard, `palette.rs` the one table of dashboard actions (help screen and `:` command palette; actions with an empty key are palette-only), `editor.rs` built-in full-screen text editor (pure core driven by `on_key`; runs the file's own check before saving), `exted.rs` the user's own editor (`$VISUAL`, `$EDITOR`, `nvim`, `vim`, `nano`, `vi`) run in the embedded terminal on a private temp copy, validated and written back, with the built-in editor as fallback (`<data>/editor-mode`), `alerts.rs` host-side alerts (risky shared folder, changed files in a read-write share), `tmuxpass.rs` host tmux keys passed into the sandbox shell, `tui/core/src/ghrepo.rs` read/write access to one git repo (GitHub, GitLab, Bitbucket, Forgejo) |
+| `tui/core/src/platform.rs` | `Os`, `PkgMgr`, `Runtime` (Docker/Podman), the `Host` trait (the only door to the host; `FakeHost` in tests) and `Facts` |
 | `tui/src/setup.rs` | Pure planner (`plan`: Facts in, `Step`s out), `execute` with consent, `doctor`, `hint` |
 | `tui/src/gateway.rs` | Gateway config install, service restart, macOS Docker gateway (launchd), reset, upgrade, uninstall: all as `Step`s |
 | `tui/src/gwmodel.rs` | `GwKind` (vm/docker/podman, named `openshell-<kind>`), `GatewaySpec`, the registry `<data>/gateways.json` (what osh created), port allocation, `availability(Facts, kind)` (what each type needs on this machine), the wizard's pending selection |
 | `tui/src/gwops.rs` | Per-gateway config text, systemd unit / launchd agent text, and the add / main / remove / reset steps for a gateway of any kind; `osh gateway-service NAME` |
 | `tui/src/wizard.rs` | The set-up wizard: pure state machine (`Wizard::on_key`), `draw` (ratatui, measured columns; tested on `TestBackend`), and the runner that executes the plan on a thread with live progress |
-| `tui/src/assets.rs` | Files embedded with `include_str!` (providers, Dockerfiles, gateway configs, `.gitleaks.toml`) and written to the data dir; user edits are kept |
-| `tui/src/agents.rs` | The `sync-agents` logic (manifest, policy preflight, generated profile); golden fixture in `tui/fixtures/` |
+| `tui/core/src/assets.rs` | Files embedded with `include_str!` (providers, Dockerfiles, gateway configs, `.gitleaks.toml`) and written to the data dir; user edits are kept |
+| `tui/core/src/agents.rs` | The `sync-agents` logic (manifest, policy preflight, generated profile); golden fixture in `tui/fixtures/` |
+| `tui/core/` | Crate `osh-core`, a library with no TUI and no Zig: `cli.rs` (the `openshell` and container CLI wrappers), `platform.rs`, `preload.rs`, `ghrepo.rs`, `assets.rs`, `agents.rs`, `watch.rs`, `text.rs` (all moved here from `tui/src/`; the `tui/src/` descriptions above of `cli.rs`, `watch.rs`, `ghrepo.rs`, `preload.rs` and `assets.rs` now live in the files named here), plus the headless layer: `sandbox.rs` (`SandboxSpec::from_json`, `plan_create`: the one create plan the dashboard and headless share), `ops.rs` (list, create, delete, exec, apply and the JSON envelope), `mcp.rs` (MCP protocol and tool schemas); `tests/fake-openshell.sh` is the stand-in `openshell` its tests run against. `publish = false`: `scripts/publish` bumps only `tui/Cargo.toml` |
+| `tui/src/headless.rs`, `tui/src/mcpcmd.rs` | `osh sandbox list|create|delete|exec` and `osh apply` (argv to `osh_core::ops`, JSON on stdout, exit 0/1/2); `osh mcp` (stdio MCP server; `OSH_MCP_ALLOW_SHARE=1` lets specs mount host folders) |
 | `osh`, `dev-env` | Developer launcher: rebuilds `tui/` when sources are newer than the binary, sets `OSH_DIR` to the checkout, execs the binary. `dev-env` is the shared Zig 0.15 lookup |
 | `.justfile` | Developer entry points: checks and build, thin wrappers over `osh setup|upgrade|uninstall|gateway-docker`, hooks |
 | `install.sh` | Release installer (`curl ... | sh`): downloads and checksums `osh-VERSION-OS-ARCH.tar.gz`, installs `osh`, runs `osh setup`; `OSH_VERSION`, `OSH_BIN_DIR`, `OSH_RELEASE_BASE`, `OSH_NO_SETUP` |
@@ -126,7 +128,7 @@ just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before
   it boots the disposable test container and creates a sandbox only inside it, never on the host) before calling the feature done. A change that can leave
   the shell unable to start must fall back to plain `bash`.
 - Never pass credentials in argv or print them; credentials come from the
-  environment or a hidden prompt (see `cli.rs`). Never commit `.env` files or
+  environment or a hidden prompt (see `tui/core/src/cli.rs`). Never commit `.env` files or
   tokens: the pre-commit hook blocks them, and a missing `gitleaks` blocks the
   commit too. Do not bypass with `--no-verify`.
 - Ask first before running anything that changes the host or running

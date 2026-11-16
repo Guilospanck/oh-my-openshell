@@ -392,7 +392,7 @@ reinstalled from their sources (`npx skills`, `claude plugin install`,
 uploaded, after a secret scan (findings stop the upload: osh lists each file, rule and line, and
 offers to go on without the flagged items). The OpenShell skills
 and the language-server plugins are left out. Versions are pinned: the `skills`
-CLI to `SKILLS_CLI` in `tui/src/agents.rs`, graphify to the host's version, and
+CLI to `SKILLS_CLI` in `tui/core/src/agents.rs`, graphify to the host's version, and
 superpowers for pi to the commit installed on the host.
 
 If the sandbox's policy blocks an install, `K` offers to create (if needed) and attach the anonymous profiles that grant the access, then checks again. The profiles are: `npm`, `pypi`
@@ -609,6 +609,80 @@ sandbox at start), `just test-macos-vm` runs real Homebrew,
 `brew services` and launchd in a Tart macOS VM clone, and
 `just test-macos-runtimes` runs osh's real Colima and Podman machine steps in a
 throwaway HOME, leaving your own Colima untouched. Docker Desktop is not tested.
+
+## Headless use and MCP
+
+Everything below runs without the dashboard, for scripts and agents. Each command prints one JSON line on stdout.
+
+```
+osh sandbox list [--gateway G]
+osh sandbox create --spec FILE|- [--gateway G] [--dry-run] [--allow-share]
+osh sandbox delete NAME [--gateway G]
+osh sandbox exec NAME [--gateway G] -- CMD...
+osh apply -f FILE|- [--gateway G] [--allow-share]
+osh mcp [--gateway G]
+```
+
+`-` reads the spec from stdin. Without `--gateway`, the OpenShell CLI's active gateway is used.
+
+### The sandbox spec
+
+A spec is a JSON object; unknown fields and wrong types are refused. Only `name` is required.
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `name` | string | 1 to 63 lowercase letters, digits or `-`, starting with a letter or digit |
+| `image` | string | Sandbox image |
+| `providers` | array of strings | Provider names to attach |
+| `cpu`, `memory` | string | For example `"2"` and `"4Gi"` |
+| `command` | string | Command the sandbox runs |
+| `toolchains` | array of strings | Toolchain groups whose hosts the policy opens (`[]` opens none); left out, the saved default applies |
+| `share` | object `{path, rw}` | Host folder to mount; `rw` is a boolean, default false |
+| `repo` | object `{url, env_var}` | Read/write access to one git repo; `env_var` is the NAME of an environment variable that holds the access key, never the key itself |
+
+```json
+{
+  "name": "w1",
+  "image": "osh-base:latest",
+  "providers": ["npm"],
+  "cpu": "2",
+  "memory": "4Gi",
+  "command": "bash",
+  "toolchains": ["rust"],
+  "share": {"path": "/home/me/project", "rw": false},
+  "repo": {"url": "https://github.com/o/r", "env_var": "FORGE_ACCESS"}
+}
+```
+
+The `repo` variable must be set in the environment of the process that runs `osh` (or `osh mcp`); it travels through the environment, never through argv, and `--dry-run` shows no secret.
+
+### Output and exit codes
+
+- Success: one JSON line on stdout, exit 0. `list` gives `[{"name","phase","created"}]`; `create` gives `{"name","phase"}` (plus `"note"` when the policy needs one), or with `--dry-run` `{"name","steps":[{"prog","args"}]}` and nothing is created; `delete` gives `{"name","deleted":true}` and also removes the repo provider osh made for that sandbox; `apply` gives `{"action":"created"|"unchanged","name"}`.
+- Failure: `{"ok":false,"error":"..."}` on stdout, exit 1.
+- Usage errors (bad flags) print the usage on stderr, exit 2.
+- `sandbox exec` prints `{"exit_code","stdout","stderr"}` and then exits with the command's own exit code (a non-zero code is not a failure of osh).
+
+`apply` creates the sandbox when none of that name exists. An existing name returns `unchanged` and is left as it is: there is no reconcile of image, providers or any other field.
+
+### Sharing a host folder
+
+`share` mounts a host path, so it is off by default. On the command line, pass `--allow-share` to `create` or `apply`. Over MCP there is no flag and no tool argument: only the operator can enable it, by setting `OSH_MCP_ALLOW_SHARE=1` in the environment of the `osh mcp` process. A spec with `share` is refused otherwise.
+
+### MCP server
+
+`osh mcp` serves the Model Context Protocol over stdio (newline-delimited JSON-RPC; stdout carries protocol lines only). Tools: `sandbox_list`, `sandbox_create` (`spec`, optional `dry_run`), `sandbox_delete` (`name`), `sandbox_exec` (`name`, `argv` array; returns `exit_code`, `stdout`, `stderr`) and `sandbox_apply` (`spec`). Add it to an agent's `.mcp.json`:
+
+```json
+{"mcpServers":{"osh":{"command":"osh","args":["mcp"]}}}
+```
+
+### Limits
+
+- A headless create does not register the read-write share alert and does not upload config files; use the dashboard for those.
+- `sandbox exec` has a fixed 600 second timeout.
+- `exec` output is returned whole and not bounded.
+- The logic lives in `osh-core` (`tui/core/`), a library crate with no TUI; `cargo test -p osh-core` in `tui/` does not need Zig.
 
 ## Setup without the dashboard
 
