@@ -160,4 +160,68 @@ sandbox_checks() {
     && pass "the meter reads df for /sandbox or /" || fail "the meter reads df for /sandbox or /" "$out"
 
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
+
+  headless_checks "$tag"
+}
+
+# The headless path (osh sandbox/apply/mcp, tui/src/headless.rs and mcpcmd.rs): the same binary
+# the dashboard uses creates a second sandbox from a JSON spec, with the policy it generates per
+# call. The reason this is checked for real: that policy must still let the sandbox open a
+# terminal and run tmux, which no unit test can show. Uses `osh` on PATH, the machine's main
+# gateway and the image built above; the sandbox is deleted at the end, also when a check fails.
+headless_checks() {
+  local tag="$1" hn=osh-headless out rc spec="$HOME/headless-spec.json" hshare="$HOME/headless-share"
+  echo "== the headless osh path: apply, list, exec, delete, mcp, share refusal"
+  # True when the JSON on stdin has the given top-level key equal to the given JSON value.
+  jfield() { python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if d.get(sys.argv[1])==json.loads(sys.argv[2]) else 1)' "$1" "$2"; }
+  printf '{"name":"%s","image":"%s"}\n' "$hn" "$tag" >"$spec"
+
+  out="$(timeout 900 osh apply -f "$spec" --gateway "$main" 2>&1)"; rc=$?
+  [[ $rc -eq 0 ]] && jfield action '"created"' <<<"$out" \
+    && pass "osh apply creates a sandbox from a spec" || fail "osh apply creates a sandbox from a spec" "rc=$rc $out"
+
+  out="$(timeout 120 osh apply -f "$spec" --gateway "$main" 2>&1)"; rc=$?
+  [[ $rc -eq 0 ]] && jfield action '"unchanged"' <<<"$out" \
+    && pass "osh apply again reports unchanged" || fail "osh apply again reports unchanged" "rc=$rc $out"
+
+  out="$(timeout 120 osh sandbox list --gateway "$main" 2>&1)"
+  python3 -c 'import json,sys; sys.exit(0 if any(s.get("name")==sys.argv[1] for s in json.loads(sys.stdin.read())) else 1)' "$hn" <<<"$out" \
+    && pass "osh sandbox list shows the sandbox" || fail "osh sandbox list shows the sandbox" "$out"
+
+  out="$(timeout 180 osh sandbox exec "$hn" --gateway "$main" -- sh -c 'python3 -c "import os; os.openpty(); print(\"openpty-ok\")"; tmux -V' 2>&1)"; rc=$?
+  [[ $rc -eq 0 ]] && jfield exit_code 0 <<<"$out" && [[ "$out" == *openpty-ok* && "$out" == *tmux* ]] \
+    && pass "a sandbox from a spec opens a terminal and runs tmux" || fail "a sandbox from a spec opens a terminal and runs tmux" "rc=$rc $out"
+
+  out="$(timeout 120 osh sandbox exec "$hn" --gateway "$main" -- sh -c 'exit 7' 2>&1)"; rc=$?
+  [[ $rc -eq 7 ]] && jfield exit_code 7 <<<"$out" \
+    && pass "osh sandbox exec exits with the command's code" || fail "osh sandbox exec exits with the command's code" "rc=$rc $out"
+
+  # MCP over stdio: initialize, then tools/call sandbox_list; one JSON line per request.
+  out="$(printf '%s\n%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"osh-check","version":"0"}}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"sandbox_list","arguments":{}}}' \
+    | timeout 120 osh mcp --gateway "$main" 2>&1)"
+  python3 -c '
+import json,sys
+l=[json.loads(x) for x in sys.stdin.read().splitlines() if x.strip()]
+ok=len(l)==2 and l[0].get("id")==1 and l[1].get("id")==2 and sys.argv[1] in l[1]["result"]["content"][0]["text"]
+sys.exit(0 if ok else 1)' "$hn" <<<"$out" \
+    && pass "osh mcp answers initialize and a sandbox_list call" || fail "osh mcp answers initialize and a sandbox_list call" "$out"
+
+  # A share needs --allow-share: refused without it, and nothing is created.
+  mkdir -p "$hshare"
+  printf '{"name":"%s-share","image":"%s","share":{"path":"%s"}}\n' "$hn" "$tag" "$hshare" >"$HOME/headless-share-spec.json"
+  out="$(timeout 120 osh apply -f "$HOME/headless-share-spec.json" --gateway "$main" 2>&1)"; rc=$?
+  [[ $rc -eq 1 ]] && jfield ok false <<<"$out" \
+    && pass "a spec with a share is refused without --allow-share" || fail "a spec with a share is refused without --allow-share" "rc=$rc $out"
+  out="$(timeout 120 osh sandbox list --gateway "$main" 2>&1)"
+  [[ "$out" != *"$hn-share"* ]] && pass "the refused share sandbox was not created" || fail "the refused share sandbox was not created" "$out"
+
+  out="$(timeout 300 osh sandbox delete "$hn" --gateway "$main" 2>&1)"; rc=$?
+  [[ $rc -eq 0 ]] && jfield deleted true <<<"$out" \
+    && pass "osh sandbox delete removes it" || { fail "osh sandbox delete removes it" "rc=$rc $out"; openshell -g "$main" sandbox delete "$hn" >/dev/null 2>&1; }
+  out="$(timeout 120 osh sandbox list --gateway "$main" 2>&1)"
+  [[ "$out" != *"\"$hn\""* ]] && pass "a following list no longer shows it" || fail "a following list no longer shows it" "$out"
+  openshell -g "$main" sandbox delete "$hn-share" >/dev/null 2>&1
+  rm -rf "$hshare" "$spec" "$HOME/headless-share-spec.json"
 }
