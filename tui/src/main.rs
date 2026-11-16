@@ -9,6 +9,7 @@ mod exted;
 mod gateway;
 mod gwmodel;
 mod gwops;
+mod headless;
 mod logview;
 mod palette;
 mod ports;
@@ -398,6 +399,7 @@ fn subcommand(args: &[String]) -> Option<i32> {
         }
         "gateway" => Some(gateway_add_remove(&args[1..])),
         "runtime-start" | "install" => Some(host_steps(args)),
+        "sandbox" | "apply" => Some(headless::headless(args)),
         "sync-agents" => Some(agents::cli_main(&args[1..], &assets::data_dir())),
         "upgrade" | "uninstall" | "gateway-reset" | "gateway-service" => {
             Some(gateway_command(args))
