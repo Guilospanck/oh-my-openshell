@@ -18,9 +18,17 @@ pub struct Ctx {
     pub allow_share: bool,
 }
 
-/// Aim every following `openshell` call at the context's gateway.
-fn target(ctx: &Ctx) {
-    cli::set_gateway(ctx.gateway.as_deref().unwrap_or(""));
+/// Aim every following `openshell` call at the context's gateway. A name starting with `-`
+/// would be read by `openshell` as an option after `-g`, so it is refused.
+fn target(ctx: &Ctx) -> Result<(), String> {
+    let gw = ctx.gateway.as_deref().unwrap_or("");
+    if gw.starts_with('-') {
+        return Err(format!(
+            "invalid gateway name {gw:?}: a gateway name cannot start with `-`"
+        ));
+    }
+    cli::set_gateway(gw);
+    Ok(())
 }
 
 fn check_name(name: &str) -> Result<(), String> {
@@ -103,7 +111,7 @@ fn images_for(dir: &Path, image: &str) -> Vec<cli::Image> {
 
 /// `[{"name","phase","created"}]` for the sandboxes on the gateway.
 pub fn sandbox_list(ctx: &Ctx) -> Result<Value, String> {
-    target(ctx);
+    target(ctx)?;
     let list = cli::sandboxes()?;
     Ok(Value::Array(
         list.into_iter()
@@ -121,7 +129,7 @@ pub fn sandbox_create(ctx: &Ctx, spec: &Value, dry_run: bool) -> Result<Value, S
         Some(g) => Some((sandbox::grant_repo(&g.url)?, repo_secret(&g.env_var)?)),
         None => None,
     };
-    target(ctx);
+    target(ctx)?;
     let images = images_for(&ctx.dir, &s.image);
     let driver = if s.share.is_some() {
         cli::gateway_driver()
@@ -137,34 +145,69 @@ pub fn sandbox_create(ctx: &Ctx, spec: &Value, dry_run: bool) -> Result<Value, S
             rebuild: false,
         },
     )?;
-    if dry_run {
+    let mut out = if dry_run {
         let steps: Vec<Value> = plan
             .steps
             .iter()
             .map(|st| json!({"prog": st.prog, "args": st.args}))
             .collect();
-        return Ok(json!({"name": s.name, "steps": steps}));
+        Ok(json!({"name": s.name, "steps": steps}))
+    } else {
+        run_plan(
+            &s.name,
+            &plan.steps,
+            grant.as_ref().map(|(r, v)| (r, v.as_str())),
+        )
+    };
+    // The policy was written for this call alone; the gateway has read it by now.
+    if let Some(p) = &plan.policy_file {
+        let _ = std::fs::remove_file(p);
     }
-    if let Some((repo, secret)) = &grant {
-        let provider = ghrepo::provider_name(&s.name, repo);
-        cli::create_repo_provider(repo, &provider, secret)?;
+    if let (Ok(v), Some(note)) = (&mut out, plan.policy_note) {
+        v["note"] = Value::String(note);
     }
-    for st in &plan.steps {
+    out
+}
+
+/// Create the repo provider (when granted), then run the steps. When a step fails after the
+/// provider was made, the provider is deleted and untracked again (best effort), so a retry
+/// does not trip over it; one that could not be made (it may already exist) is left alone.
+fn run_plan(
+    name: &str,
+    steps: &[sandbox::Step],
+    grant: Option<(&ghrepo::GhRepo, &str)>,
+) -> Result<Value, String> {
+    let made = match grant {
+        Some((repo, secret)) => {
+            let provider = ghrepo::provider_name(name, repo);
+            cli::create_repo_provider(repo, &provider, secret)?;
+            Some(provider)
+        }
+        None => None,
+    };
+    for st in steps {
         // The plan's `openshell` args already carry the gateway, so `run`, not `exec`.
-        cli::run(&st.prog, &st.args, &[]).map_err(|e| format!("{}: {e}", st.label()))?;
+        if let Err(e) = cli::run(&st.prog, &st.args, &[]) {
+            if let Some(p) = &made {
+                if cli::os(&["provider", "delete", p]).is_ok() {
+                    ghrepo::untrack(ghrepo::tracked_path().as_deref(), &cli::gateway(), p);
+                }
+            }
+            return Err(format!("{}: {e}", st.label()));
+        }
     }
     let phase = cli::sandboxes()
         .ok()
-        .and_then(|l| l.into_iter().find(|x| x.name == s.name))
+        .and_then(|l| l.into_iter().find(|x| x.name == name))
         .map(|x| x.phase)
         .unwrap_or_default();
-    Ok(json!({"name": s.name, "phase": phase}))
+    Ok(json!({"name": name, "phase": phase}))
 }
 
 /// Delete a sandbox and, as the dashboard does, the per-sandbox repo providers osh made for it.
 pub fn sandbox_delete(ctx: &Ctx, name: &str) -> Result<Value, String> {
     check_name(name)?;
-    target(ctx);
+    target(ctx)?;
     let providers = cli::providers().unwrap_or_default();
     cli::os(&["sandbox", "delete", name])?;
     cli::drop_repo_providers(name, &providers);
@@ -178,7 +221,7 @@ pub fn sandbox_exec(ctx: &Ctx, name: &str, argv: &[String]) -> Result<Value, Str
     if argv.is_empty() {
         return Err("no command to run".into());
     }
-    target(ctx);
+    target(ctx)?;
     let mut args: Vec<String> = ["sandbox", "exec", "-n", name, "--timeout", "600", "--"]
         .map(String::from)
         .to_vec();
@@ -203,7 +246,7 @@ pub fn sandbox_exec(ctx: &Ctx, name: &str, argv: &[String]) -> Result<Value, Str
 /// Create the sandbox unless one of that name exists; an existing one is left as it is.
 pub fn apply(ctx: &Ctx, spec: &Value) -> Result<Value, String> {
     let s = checked_spec(ctx, spec)?;
-    target(ctx);
+    target(ctx)?;
     if cli::sandboxes()?.iter().any(|x| x.name == s.name) {
         return Ok(json!({"action": "unchanged", "name": s.name}));
     }
@@ -369,12 +412,120 @@ mod tests {
         let v = sandbox_create(&f.ctx(), &spec(), false).unwrap();
         assert_eq!(v["name"], "w1");
         assert!(v.get("phase").is_some(), "{v}");
-        let want = format!(
-            "sandbox create --policy {}/.sandbox-policy.generated.yaml --name w1 --from img:1 --cpu 2 --memory 4Gi --provider npm --detach",
-            f.dir.display()
-        );
         let calls = f.calls();
-        assert!(calls.lines().any(|l| l == want), "{calls}");
+        let line = calls
+            .lines()
+            .find(|l| l.starts_with("sandbox create"))
+            .unwrap_or_else(|| panic!("{calls}"));
+        let prefix = format!("sandbox create --policy {}/", f.dir.display());
+        let tail = " --name w1 --from img:1 --cpu 2 --memory 4Gi --provider npm --detach";
+        assert!(line.starts_with(&prefix) && line.ends_with(tail), "{line}");
+        let policy = &line[prefix.len() - 1..line.len() - tail.len()];
+        assert!(!policy.contains(' '), "{policy}");
+        assert_ne!(
+            policy,
+            format!("/{}", ".sandbox-policy.generated.yaml"),
+            "{line}"
+        );
+    }
+
+    /// The `--policy` path of the `sandbox create` line in `calls`.
+    fn policy_arg(calls: &str) -> PathBuf {
+        let line = calls
+            .lines()
+            .find(|l| l.starts_with("sandbox create"))
+            .unwrap_or_else(|| panic!("{calls}"));
+        let mut it = line.split(' ').skip_while(|w| *w != "--policy");
+        PathBuf::from(it.nth(1).unwrap())
+    }
+
+    #[test]
+    fn the_per_call_policy_is_removed_after_the_create() {
+        let f = Fake::new("policy-rm");
+        sandbox_create(&f.ctx(), &spec(), false).unwrap();
+        let p = policy_arg(&f.calls());
+        assert!(p.starts_with(&f.dir), "{p:?}");
+        assert!(!p.exists(), "{p:?}");
+        // And after a failed create too.
+        std::fs::write(&f.log, "").unwrap();
+        std::env::set_var("OSH_FAKE_FAIL", "sandbox create");
+        sandbox_create(&f.ctx(), &spec(), false).unwrap_err();
+        let p = policy_arg(&f.calls());
+        assert!(!p.exists(), "{p:?}");
+        assert!(f.dir.join("sandbox-policy.yaml").is_file());
+    }
+
+    #[test]
+    fn a_policy_note_is_returned_as_note() {
+        let f = Fake::new("note");
+        std::fs::write(f.dir.join("toolchains.toml"), "not [valid").unwrap();
+        for dry in [true, false] {
+            let v = sandbox_create(&f.ctx(), &spec(), dry).unwrap();
+            let note = v["note"].as_str().unwrap_or_else(|| panic!("{v}"));
+            assert!(note.contains("toolchains.toml"), "{note}");
+        }
+        std::fs::write(
+            f.dir.join("toolchains.toml"),
+            crate::assets::embedded("toolchains.toml").unwrap(),
+        )
+        .unwrap();
+        let v = sandbox_create(&f.ctx(), &spec(), true).unwrap();
+        assert!(v.get("note").is_none(), "{v}");
+    }
+
+    #[test]
+    fn a_gateway_that_looks_like_a_flag_is_refused() {
+        let f = Fake::new("gw-flag");
+        let ctx = Ctx {
+            gateway: Some("--help".into()),
+            ..f.ctx()
+        };
+        let e = sandbox_create(&ctx, &spec(), false).unwrap_err();
+        assert!(e.contains("gateway"), "{e}");
+        assert!(sandbox_list(&ctx).is_err());
+        assert!(sandbox_delete(&ctx, "w1").is_err());
+        assert!(sandbox_exec(&ctx, "w1", &["ls".into()]).is_err());
+        assert!(apply(&ctx, &spec()).is_err());
+        assert_eq!(f.calls(), "");
+    }
+
+    #[test]
+    fn a_failed_create_deletes_the_repo_provider_it_made() {
+        let f = Fake::new("repo-cleanup");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        std::env::set_var("OSH_FAKE_FAIL", "sandbox create");
+        let r = sandbox_create(&f.ctx(), &with_repo("OSH_TEST_TOK"), false);
+        std::env::remove_var("OSH_TEST_TOK");
+        let e = r.unwrap_err();
+        assert!(e.contains("fake failure"), "{e}");
+        let calls = f.calls();
+        let lines: Vec<&str> = calls.lines().collect();
+        let made = lines
+            .iter()
+            .position(|l| l.starts_with("provider create --name github-w1-r"))
+            .unwrap_or_else(|| panic!("{calls}"));
+        let failed = lines
+            .iter()
+            .position(|l| l.starts_with("sandbox create"))
+            .unwrap();
+        let gone = lines
+            .iter()
+            .position(|l| *l == "provider delete github-w1-r")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(made < failed && failed < gone, "{calls}");
+    }
+
+    #[test]
+    fn a_provider_that_could_not_be_made_is_not_deleted() {
+        let f = Fake::new("repo-exists");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        std::env::set_var("OSH_FAKE_FAIL", "provider create");
+        let r = sandbox_create(&f.ctx(), &with_repo("OSH_TEST_TOK"), false);
+        std::env::remove_var("OSH_TEST_TOK");
+        assert!(r.is_err());
+        let calls = f.calls();
+        assert!(!calls.contains("provider delete"), "{calls}");
+        assert!(!calls.contains("sandbox create"), "{calls}");
     }
 
     #[test]

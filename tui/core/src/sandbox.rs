@@ -180,6 +180,9 @@ pub struct Created {
     pub policy_note: Option<String>,
     /// The toolchain groups the policy opens; `None` when the hosts were left out.
     pub toolchain_groups: Option<Vec<String>>,
+    /// The policy file written for this call alone (`plan_create`), which the caller removes
+    /// once the create has run; `None` for the dashboard's shared generated file.
+    pub policy_file: Option<PathBuf>,
 }
 
 /// The policy file for a new sandbox: `sandbox-policy.yaml` plus the toolchain hosts of
@@ -191,8 +194,37 @@ pub fn policy_for(
     dir: &Path,
     toolchains: Option<&[String]>,
 ) -> (PathBuf, Option<String>, Option<Vec<String>>) {
+    policy_at(dir, toolchains, &dir.join(GENERATED_POLICY))
+}
+
+/// The dashboard's generated policy, rewritten on every create.
+const GENERATED_POLICY: &str = ".sandbox-policy.generated.yaml";
+
+/// A generated policy path no other `plan_create` call in any process uses, so concurrent
+/// creates cannot swap each other's toolchain hosts.
+fn unique_policy(dir: &Path, name: &str) -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(63)
+        .collect();
+    dir.join(format!(
+        ".sandbox-policy.generated.{}-{}-{n}.yaml",
+        if name.is_empty() { "unnamed" } else { &name },
+        std::process::id()
+    ))
+}
+
+/// `policy_for`, writing the generated policy to `generated`.
+fn policy_at(
+    dir: &Path,
+    toolchains: Option<&[String]>,
+    generated: &Path,
+) -> (PathBuf, Option<String>, Option<Vec<String>>) {
     let base = dir.join("sandbox-policy.yaml");
-    let generated = dir.join(".sandbox-policy.generated.yaml");
+    let generated = generated.to_path_buf();
     let mut note = None;
     let text = std::fs::read_to_string(&base).unwrap_or_else(|_| {
         note = Some(
@@ -305,7 +337,15 @@ pub fn plan_create(spec: &SandboxSpec, ctx: &CreateCtx) -> Result<Created, Strin
         check_share(share, ctx.driver)?;
     }
     let repo = spec.repo.as_ref().map(|g| grant_repo(&g.url)).transpose()?;
-    Ok(plan_create_with(spec, ctx, repo.as_ref()))
+    let own = unique_policy(ctx.dir, &spec.name);
+    let mut c = plan_steps(spec, ctx, repo.as_ref(), &own);
+    // Only a policy written to `own` is this call's to remove (never the base policy).
+    c.policy_file = c
+        .steps
+        .last()
+        .is_some_and(|s| s.args.iter().any(|a| Path::new(a) == own))
+        .then_some(own);
+    Ok(c)
 }
 
 /// `plan_create` with the granted repo already resolved (the dashboard knows its forge and host
@@ -315,6 +355,15 @@ pub fn plan_create_with(
     spec: &SandboxSpec,
     ctx: &CreateCtx,
     repo: Option<&ghrepo::GhRepo>,
+) -> Created {
+    plan_steps(spec, ctx, repo, &ctx.dir.join(GENERATED_POLICY))
+}
+
+fn plan_steps(
+    spec: &SandboxSpec,
+    ctx: &CreateCtx,
+    repo: Option<&ghrepo::GhRepo>,
+    generated: &Path,
 ) -> Created {
     let mut steps = Vec::new();
     if let Some(img) = ctx
@@ -327,7 +376,8 @@ pub fn plan_create_with(
             args: cli::build_args(ctx.dir, &img.file, &img.tag),
         });
     }
-    let (policy, policy_note, toolchain_groups) = policy_for(ctx.dir, spec.toolchains.as_deref());
+    let (policy, policy_note, toolchain_groups) =
+        policy_at(ctx.dir, spec.toolchains.as_deref(), generated);
     let mut args: Vec<String> = vec!["sandbox".into(), "create".into()];
     // The default policy denies opening a PTY, which tmux needs in the shell.
     args.extend(["--policy".into(), policy.to_string_lossy().into()]);
@@ -378,6 +428,7 @@ pub fn plan_create_with(
         steps,
         policy_note,
         toolchain_groups,
+        policy_file: None,
     }
 }
 
@@ -469,15 +520,53 @@ mod tests {
         let c = plan_create(&spec(), &ctx(&d, "docker", &[])).unwrap();
         let last = c.steps.last().unwrap();
         assert_eq!(last.prog, "openshell");
+        let file = c.policy_file.clone().unwrap();
         let want = format!(
-            "sandbox create --policy {}/.sandbox-policy.generated.yaml --name w1 --from img:1 --cpu 2 --memory 4Gi --provider npm --detach",
-            d.display()
+            "sandbox create --policy {} --name w1 --from img:1 --cpu 2 --memory 4Gi --provider npm --detach",
+            file.display()
         );
         assert!(
             last.args.join(" ").ends_with(&want),
             "{}",
             last.args.join(" ")
         );
+        assert!(file.is_file());
+    }
+
+    #[test]
+    fn plan_create_writes_a_policy_file_per_call() {
+        let d = seeded("percall");
+        let other = SandboxSpec {
+            name: "w2".into(),
+            toolchains: Some(vec![]),
+            ..spec()
+        };
+        let a = plan_create(&spec(), &ctx(&d, "docker", &[])).unwrap();
+        let b = plan_create(&other, &ctx(&d, "docker", &[])).unwrap();
+        let again = plan_create(&spec(), &ctx(&d, "docker", &[])).unwrap();
+        let policy = |c: &Created| {
+            let a = &c.steps.last().unwrap().args;
+            a[a.iter().position(|x| x == "--policy").unwrap() + 1].clone()
+        };
+        assert_ne!(policy(&a), policy(&b));
+        assert_ne!(policy(&a), policy(&again));
+        for c in [&a, &b, &again] {
+            assert_eq!(c.policy_file.as_ref().unwrap().to_string_lossy(), policy(c));
+            assert_ne!(
+                c.policy_file.as_ref().unwrap(),
+                &d.join(".sandbox-policy.generated.yaml")
+            );
+        }
+    }
+
+    #[test]
+    fn plan_create_with_keeps_the_shared_generated_file() {
+        let d = seeded("shared");
+        let c = plan_create_with(&spec(), &ctx(&d, "docker", &[]), None);
+        let a = c.steps.last().unwrap().args.join(" ");
+        let want = format!("--policy {}/.sandbox-policy.generated.yaml ", d.display());
+        assert!(a.contains(&want), "{a}");
+        assert!(c.policy_file.is_none());
     }
 
     #[test]
