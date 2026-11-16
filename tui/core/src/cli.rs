@@ -990,13 +990,7 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
     snap.gateway = gateway();
     for file in dockerfiles(dir) {
         let tag = dockerfile_tag(&file);
-        let built = Command::new(runtime_bin())
-            .args(["image", "inspect", &tag])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let built = image_built(&tag);
         let freshness = if built {
             image_freshness(&tag, &file)
         } else {
@@ -1022,46 +1016,12 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
     if !snap.gateway_ok {
         return snap;
     }
-    snap.driver = os(&["gateway", "info", "-o", "json"])
-        .and_then(|t| parse(&t))
-        .map(|v| text(&v["compute_drivers"][0]["name"]))
-        .unwrap_or_default();
-    match os(&["sandbox", "list", "--output", "json"]).and_then(|t| parse(&t)) {
-        Ok(v) => {
-            for s in v["sandboxes"].as_array().into_iter().flatten() {
-                snap.sandboxes.push(Sandbox {
-                    name: text(&s["name"]),
-                    phase: text(&s["phase"]),
-                    created: text(&s["created_at"]),
-                    conditions: s["conditions"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .map(|c| Cond {
-                            kind: text(&c["type"]),
-                            status: text(&c["status"]),
-                            message: text(&c["message"]),
-                        })
-                        .collect(),
-                });
-            }
-        }
+    snap.driver = gateway_driver();
+    match sandboxes() {
+        Ok(v) => snap.sandboxes = v,
         Err(e) => snap.error = Some(format!("sandbox list: {e}")),
     }
-    if let Ok(v) = os(&["provider", "list", "--output", "json"]).and_then(|t| parse(&t)) {
-        for p in v["providers"].as_array().into_iter().flatten() {
-            snap.providers.push(Provider {
-                name: text(&p["name"]),
-                ty: text(&p["type"]),
-                keys: p["credential_keys"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(text)
-                    .collect(),
-            });
-        }
-    }
+    snap.providers = providers().unwrap_or_default();
     if let Ok(v) = os(&["profile", "list", "--output", "json"]).and_then(|t| parse(&t)) {
         for p in v.as_array().into_iter().flatten() {
             snap.profiles.push(Profile {
@@ -1076,6 +1036,76 @@ pub fn collect(dir: &Path, selected: Option<String>) -> Snapshot {
         snap.logs = Some((name, logs));
     }
     snap
+}
+
+/// Whether the container runtime has an image tagged `tag`.
+pub fn image_built(tag: &str) -> bool {
+    Command::new(runtime_bin())
+        .args(["image", "inspect", tag])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Compute driver of the selected gateway (`vm`, `docker`, ...); empty when it does not say.
+pub fn gateway_driver() -> String {
+    os(&["gateway", "info", "-o", "json"])
+        .and_then(|t| parse(&t))
+        .map(|v| text(&v["compute_drivers"][0]["name"]))
+        .unwrap_or_default()
+}
+
+/// Parses `openshell sandbox list --output json`.
+pub fn parse_sandboxes(v: &Value) -> Vec<Sandbox> {
+    v["sandboxes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|s| Sandbox {
+            name: text(&s["name"]),
+            phase: text(&s["phase"]),
+            created: text(&s["created_at"]),
+            conditions: s["conditions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| Cond {
+                    kind: text(&c["type"]),
+                    status: text(&c["status"]),
+                    message: text(&c["message"]),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The sandboxes of the selected gateway.
+pub fn sandboxes() -> Result<Vec<Sandbox>, String> {
+    os(&["sandbox", "list", "--output", "json"])
+        .and_then(|t| parse(&t))
+        .map(|v| parse_sandboxes(&v))
+}
+
+/// The providers of the selected gateway.
+pub fn providers() -> Result<Vec<Provider>, String> {
+    let v = os(&["provider", "list", "--output", "json"]).and_then(|t| parse(&t))?;
+    Ok(v["providers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| Provider {
+            name: text(&p["name"]),
+            ty: text(&p["type"]),
+            keys: p["credential_keys"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(text)
+                .collect(),
+        })
+        .collect())
 }
 
 /// Applied CPU/memory for a sandbox: read from the Docker container's host

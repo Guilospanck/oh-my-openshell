@@ -281,7 +281,7 @@ fn check_share(share: &Share, driver: &str) -> Result<(), String> {
 }
 
 /// The forge a repo URL names, from the host alone (the well-known public ones).
-fn grant_repo(url: &str) -> Result<ghrepo::GhRepo, String> {
+pub fn grant_repo(url: &str) -> Result<ghrepo::GhRepo, String> {
     let remote = ghrepo::parse_url(url).ok_or_else(|| format!("not a git remote URL: {url:?}"))?;
     let forge = match remote.host.as_str() {
         "github.com" => ghrepo::Forge::GitHub,
