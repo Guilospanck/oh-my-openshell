@@ -220,8 +220,16 @@ sys.exit(0 if ok else 1)' "$hn" <<<"$out" \
   out="$(timeout 300 osh sandbox delete "$hn" --gateway "$main" 2>&1)"; rc=$?
   [[ $rc -eq 0 ]] && jfield deleted true <<<"$out" \
     && pass "osh sandbox delete removes it" || { fail "osh sandbox delete removes it" "rc=$rc $out"; openshell -g "$main" sandbox delete "$hn" >/dev/null 2>&1; }
-  out="$(timeout 120 osh sandbox list --gateway "$main" 2>&1)"
-  [[ "$out" != *"\"$hn\""* ]] && pass "a following list no longer shows it" || fail "a following list no longer shows it" "$out"
+  # OpenShell deletes in the background: the list shows the sandbox with phase Deleting for a
+  # while. Poll every 2 s for up to 60 s; fail with the last list only after the deadline.
+  local gone=0 deadline=$((SECONDS + 60))
+  while :; do
+    out="$(timeout 30 osh sandbox list --gateway "$main" 2>&1)"
+    if [[ "$out" != *"\"$hn\""* ]]; then gone=1; break; fi
+    ((SECONDS < deadline)) || break
+    sleep 2
+  done
+  [[ $gone -eq 1 ]] && pass "a following list no longer shows it" || fail "a following list no longer shows it" "$out"
   openshell -g "$main" sandbox delete "$hn-share" >/dev/null 2>&1
   rm -rf "$hshare" "$spec" "$HOME/headless-share-spec.json"
 }
