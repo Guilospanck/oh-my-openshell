@@ -631,13 +631,13 @@ A spec is a JSON object; unknown fields and wrong types are refused. Only `name`
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | 1 to 63 lowercase letters, digits or `-`, starting with a letter or digit |
+| `name` | string | 1 to 63 lowercase letters, digits or `-`, starting and ending with a letter or digit |
 | `image` | string | Sandbox image; a tag built from one of the Dockerfiles is built first when it does not exist yet (an outdated image is not rebuilt headless; rebuild it from the dashboard's Images tab), any other value is passed to `openshell` unchanged (`--from`) |
 | `providers` | array of strings | Provider names to attach |
 | `cpu`, `memory` | string | For example `"2"` and `"4Gi"` |
-| `command` | string | Command the sandbox runs |
+| `command` | string | Run once, then the sandbox is deleted: the sandbox runs `sh -c COMMAND` and is removed when it exits (`--no-keep`). Its output is not returned, and a repo provider made for it is removed afterwards. Leave it out for a sandbox that stays up for `exec` |
 | `toolchains` | array of strings | Toolchain groups whose hosts the policy opens (`[]` opens none); left out, the saved default applies |
-| `share` | object `{path, rw}` | Host folder to mount; `path` must be an absolute path of an existing directory with a folder name, `rw` is a boolean, default false. Refused when the gateway's driver is not `vm`, `docker` or `podman` (or is unknown) |
+| `share` | object `{path, rw}` | Host folder to mount; `path` must be an absolute path of an existing directory with a folder name, `rw` is a boolean, default false. Symlinks are resolved and the real folder is what gets mounted. Refused when the gateway's driver is not `vm`, `docker` or `podman` (or is unknown); see [Sharing a host folder](#sharing-a-host-folder) for risky folders |
 | `repo` | object `{url, env_var}` | Read/write access to one git repo; `env_var` is the NAME of an environment variable that holds the access key, never the key itself. `url` must be on github.com, gitlab.com or bitbucket.org here (the dashboard also supports Forgejo) |
 
 ```json
@@ -647,18 +647,17 @@ A spec is a JSON object; unknown fields and wrong types are refused. Only `name`
   "providers": ["npm"],
   "cpu": "2",
   "memory": "4Gi",
-  "command": "bash",
   "toolchains": ["rust"],
   "share": {"path": "/home/me/project", "rw": false},
   "repo": {"url": "https://github.com/o/r", "env_var": "FORGE_ACCESS"}
 }
 ```
 
-The `repo` variable must be set in the environment of the process that runs `osh` (or `osh mcp`); the variable named by `env_var` must be set and non-empty, also with `--dry-run`; a name containing `=` or NUL, or a value that is not valid UTF-8, is refused. It travels through the environment, never through argv, and `--dry-run` shows no secret.
+The `repo` variable must be set in the environment of the process that runs `osh` (or `osh mcp`); the variable named by `env_var` must be set and non-empty, also with `--dry-run`; a name containing `=` or NUL, or a value that is not valid UTF-8, is refused. It travels through the environment, never through argv, and `--dry-run` shows no secret. Over MCP, `env_var` must also be one of the names the operator lists in `OSH_MCP_REPO_VARS` (see [MCP server](#mcp-server)). Errors show `repo.url` without any user info, query or fragment.
 
 ### Output and exit codes
 
-- Success: one JSON line on stdout, exit 0. `list` gives `[{"name","phase","created"}]`; `create` gives `{"name","phase"}` (plus `"note"` when the policy needs one), or with `--dry-run` `{"name","steps":[{"prog","args"}]}` and nothing is created; `delete` gives `{"name","deleted":true}` and also removes the repo provider osh made for that sandbox; `apply` gives `{"action":"created"|"unchanged","name"}`.
+- Success: one JSON line on stdout, exit 0. `list` gives `[{"name","phase","created"}]`; `create` gives `{"name","phase"}` (plus `"note"` when the policy or a risky share needs one), or with `--dry-run` `{"name","steps":[{"prog","args"}]}` and nothing is created (the `--policy` path in those steps names a file that has already been removed again); `delete` gives `{"name","deleted":true}` and also removes the repo provider osh made for that sandbox, or `{"name","deleted":false,"already_gone":true}` when the sandbox is not listed any more (a one-shot `command` sandbox deletes itself), still removing its repo providers; `apply` gives `{"action":"created"|"unchanged","name"}` (plus the create's `"note"`).
 - Failure: `{"ok":false,"error":"..."}` on stdout, exit 1.
 - Usage errors (bad flags) print the usage on stderr, exit 2.
 - `sandbox exec` prints `{"exit_code","stdout","stderr"}` and then exits with the same code. The code is that of the `openshell sandbox exec` process: normally the command's own, but a missing sandbox or an `openshell` error also gives `{"exit_code":N,...}` and exit N rather than `{"ok":false,...}`. Only a failure to start `openshell` (or a bad name, an empty command or a gateway name starting with `-`) gives the `ok:false` form.
@@ -669,6 +668,8 @@ The `repo` variable must be set in the environment of the process that runs `osh
 
 `share` mounts a host path, so it is off by default. On the command line, pass `--allow-share` to `create` or `apply`. Over MCP there is no flag and no tool argument: only the operator can enable it, by setting `OSH_MCP_ALLOW_SHARE=1` in the environment of the `osh mcp` process. A spec with `share` is refused otherwise.
 
+The path is resolved through symlinks first. A risky folder (the whole disk, your home folder or a folder that contains it, a secrets or settings folder in it such as `~/.ssh`, `~/.aws` or `~/.config`, or a system folder such as `/etc`, `/var` or `/private`, which on macOS includes `/tmp`) is refused over MCP, naming the folder and why; on the command line it is shared and the answer carries a `"note"` naming the risk.
+
 ### MCP server
 
 `osh mcp` serves the Model Context Protocol over stdio (newline-delimited JSON-RPC; stdout carries protocol lines only). Tools: `sandbox_list`, `sandbox_create` (`spec`, optional `dry_run`), `sandbox_delete` (`name`), `sandbox_exec` (`name`, `argv` array; returns `exit_code`, `stdout`, `stderr`) and `sandbox_apply` (`spec`). Add it to an agent's `.mcp.json`:
@@ -676,6 +677,10 @@ The `repo` variable must be set in the environment of the process that runs `osh
 ```json
 {"mcpServers":{"osh":{"command":"osh","args":["mcp"]}}}
 ```
+
+The operator controls two things through the environment of the `osh mcp` process, never through a tool argument: `OSH_MCP_ALLOW_SHARE=1` lets specs mount host folders (see above), and `OSH_MCP_REPO_VARS` lists, comma-separated, the variables a spec's `repo.env_var` may name. With `OSH_MCP_REPO_VARS` unset or empty, every repo grant is refused over MCP, so an agent cannot have osh send some other secret of the server's environment to a forge.
+
+What an agent reaches through it: `sandbox_exec` and `sandbox_delete` work on every sandbox of the gateway, including ones made in the dashboard, and a spec may attach any provider that exists on the gateway. Give the server a gateway that holds only what agents may use.
 
 ### Limits
 
