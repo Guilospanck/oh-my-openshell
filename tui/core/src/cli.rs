@@ -1236,7 +1236,7 @@ pub fn spawn_poller(
         if tx.send(snap).is_err() {
             break;
         }
-        let _ = wake.recv_timeout(Duration::from_secs(2));
+        let _ = wake.recv_timeout(crate::settings::refresh_gateway());
         while wake.try_recv().is_ok() {}
     });
 }

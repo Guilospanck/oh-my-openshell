@@ -977,6 +977,22 @@ pub fn mcp_repo_vars() -> Vec<String> {
     list("mcp.repo_vars")
 }
 
+/// A snapshot from `osh.toml` text with no environment, for tests of the code that reads
+/// settings. Pair with `install_for_test`.
+pub fn test_snapshot(toml_text: &str) -> Snapshot {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let d = std::env::temp_dir().join(format!(
+        "osh-settings-snap-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&d).expect("temp dir");
+    std::fs::write(d.join(FILE), toml_text).expect("write osh.toml");
+    let snap = load(&d, &|_| None);
+    let _ = std::fs::remove_dir_all(&d);
+    snap
+}
+
 pub struct Out {
     pub stdout: String,
     pub stderr: String,

@@ -16,7 +16,9 @@ use std::{
 const NOISE: &[u16] = &[3128];
 
 /// How often a sandbox is asked for its listeners.
-const EVERY: Duration = Duration::from_secs(3);
+fn every() -> Duration {
+    osh_core::settings::refresh_ports()
+}
 
 /// Ports that accept TCP connections from `/proc/net/tcp` and `/proc/net/tcp6` text, bound to
 /// loopback or to every address. Listeners bound to one other interface cannot be reached by a
@@ -112,7 +114,7 @@ impl Scan {
                     }
                 }
                 let mut waited = Duration::ZERO;
-                while waited < EVERY && !s.load(Ordering::Relaxed) {
+                while waited < every() && !s.load(Ordering::Relaxed) {
                     thread::sleep(Duration::from_millis(100));
                     waited += Duration::from_millis(100);
                 }
@@ -298,6 +300,14 @@ pub fn host_port_free(port: u16) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_scan_interval_follows_the_settings() {
+        use osh_core::settings::{install_for_test, test_snapshot};
+        assert_eq!(every(), Duration::from_secs(3));
+        let _g = install_for_test(test_snapshot("[refresh]\nports_secs = 9\n"));
+        assert_eq!(every(), Duration::from_secs(9));
+    }
+
     use super::*;
 
     const TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode

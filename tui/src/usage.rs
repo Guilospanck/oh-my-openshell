@@ -17,10 +17,6 @@ use std::{
     time::Duration,
 };
 
-/// How often the sandbox in view is read.
-const EVERY: Duration = Duration::from_secs(5);
-/// The longest wait after reads keep failing (stopped sandbox, busy gateway).
-const MAX_BACKOFF: Duration = Duration::from_secs(40);
 /// A new meter waits this long before its first read, so scrolling the sandbox list does not
 /// start an exec per row.
 const SETTLE: Duration = Duration::from_millis(400);
@@ -420,9 +416,11 @@ impl Meter {
     }
 }
 
-/// The wait before the next read: the interval, doubled per failed read up to `MAX_BACKOFF`.
+/// The wait before the next read: the interval (`refresh.usage_secs`), doubled per failed read
+/// up to `refresh.usage_max_backoff_secs` (stopped sandbox, busy gateway), never below the interval.
 pub fn backoff(fails: u32) -> Duration {
-    (EVERY * 2u32.saturating_pow(fails.min(4))).min(MAX_BACKOFF)
+    let every = osh_core::settings::refresh_usage();
+    (every * 2u32.saturating_pow(fails.min(4))).min(osh_core::settings::usage_max_backoff())
 }
 
 impl Drop for Meter {
@@ -615,8 +613,26 @@ my disk            4096000  100000   3996000       3% /
 
     #[test]
     fn failed_reads_back_off_up_to_a_ceiling() {
-        assert_eq!(backoff(0), EVERY);
-        assert_eq!(backoff(1), EVERY * 2);
-        assert_eq!(backoff(9), MAX_BACKOFF);
+        assert_eq!(backoff(0), Duration::from_secs(5));
+        assert_eq!(backoff(1), Duration::from_secs(10));
+        assert_eq!(backoff(9), Duration::from_secs(40));
+    }
+
+    #[test]
+    fn backoff_follows_the_settings_and_never_undercuts_the_interval() {
+        use osh_core::settings::{install_for_test, test_snapshot};
+        {
+            let _g = install_for_test(test_snapshot(
+                "[refresh]\nusage_secs = 10\nusage_max_backoff_secs = 25\n",
+            ));
+            assert_eq!(backoff(0), Duration::from_secs(10));
+            assert_eq!(backoff(1), Duration::from_secs(20));
+            assert_eq!(backoff(9), Duration::from_secs(25));
+        }
+        let _g = install_for_test(test_snapshot(
+            "[refresh]\nusage_secs = 100\nusage_max_backoff_secs = 20\n",
+        ));
+        assert_eq!(backoff(0), Duration::from_secs(100));
+        assert_eq!(backoff(9), Duration::from_secs(100));
     }
 }

@@ -14,7 +14,7 @@ use crate::term::Session;
 /// Editors tried, in order, when neither $VISUAL nor $EDITOR names one.
 pub const FALLBACKS: [&str; 4] = ["nvim", "vim", "nano", "vi"];
 
-/// File in the data dir that remembers the choice; absent means `Auto`.
+/// The file older versions kept the choice in; `osh.toml` replaces it.
 pub const PREF_FILE: &str = "editor-mode";
 
 /// Which editor the "edit this file" actions use.
@@ -39,7 +39,19 @@ impl Pref {
     }
 }
 
+/// The choice, from `general.editor` in `osh.toml`. An older `editor-mode` file is moved into
+/// `osh.toml` first; when that cannot be written the old file is still honoured.
 pub fn load_pref(dir: &Path) -> Pref {
+    let _ = osh_core::settings::migrate(dir);
+    let snap = osh_core::settings::load(dir, &|_| None);
+    let row = snap.rows.iter().find(|r| r.def.key == "general.editor");
+    if let Some(r) = row.filter(|r| r.in_file) {
+        return match &r.value {
+            osh_core::settings::Value::Str(s) if s == "own" => Pref::External,
+            osh_core::settings::Value::Str(s) if s == "builtin" => Pref::Builtin,
+            _ => Pref::Auto,
+        };
+    }
     match std::fs::read_to_string(dir.join(PREF_FILE))
         .as_deref()
         .map(str::trim)
@@ -51,15 +63,14 @@ pub fn load_pref(dir: &Path) -> Pref {
 }
 
 pub fn save_pref(dir: &Path, p: Pref) -> std::io::Result<()> {
-    let path = dir.join(PREF_FILE);
+    use osh_core::settings::{migrate, set, unset};
+    let _ = migrate(dir);
     match p {
-        Pref::Auto => match std::fs::remove_file(&path) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
-        },
-        Pref::External => std::fs::write(path, "external\n"),
-        Pref::Builtin => std::fs::write(path, "builtin\n"),
+        Pref::Auto => unset(dir, "general.editor"),
+        Pref::External => set(dir, "general.editor", "own", &|_| None),
+        Pref::Builtin => set(dir, "general.editor", "builtin", &|_| None),
     }
+    .map_err(std::io::Error::other)
 }
 
 /// Split an $EDITOR value into words the way a POSIX shell would (quotes and backslashes), with
@@ -549,8 +560,39 @@ mod tests {
             save_pref(&d, p).unwrap();
             assert_eq!(load_pref(&d), p);
         }
-        assert!(!d.join(PREF_FILE).exists(), "auto leaves no file");
+        assert!(
+            !d.join(PREF_FILE).exists(),
+            "the old file is never written again"
+        );
         assert_eq!(Pref::Auto.next().next().next(), Pref::Auto);
+    }
+
+    #[test]
+    fn the_choice_is_written_into_osh_toml() {
+        let d = tmp("pref-toml");
+        save_pref(&d, Pref::External).unwrap();
+        assert!(std::fs::read_to_string(d.join("osh.toml"))
+            .unwrap()
+            .contains("editor = \"own\""));
+        save_pref(&d, Pref::Builtin).unwrap();
+        assert!(std::fs::read_to_string(d.join("osh.toml"))
+            .unwrap()
+            .contains("editor = \"builtin\""));
+        save_pref(&d, Pref::Auto).unwrap();
+        assert!(!std::fs::read_to_string(d.join("osh.toml"))
+            .unwrap()
+            .contains("\neditor = "));
+    }
+
+    #[test]
+    fn an_old_editor_mode_file_moves_into_osh_toml_when_read() {
+        let d = tmp("pref-migrate");
+        std::fs::write(d.join(PREF_FILE), "builtin\n").unwrap();
+        assert_eq!(load_pref(&d), Pref::Builtin);
+        assert!(!d.join(PREF_FILE).exists());
+        assert!(std::fs::read_to_string(d.join("osh.toml"))
+            .unwrap()
+            .contains("editor = \"builtin\""));
     }
 
     #[test]

@@ -47,15 +47,18 @@ def clean(*names):
         osc(f"sandbox delete {n}")
 
 def editor_mode(mode):
-    """Set osh's editor setting (the palette's `Editor: switch`): "builtin", "external" or "auto".
-    Scenarios that type into the built-in editor force it, so an editor on PATH does not open."""
-    path = os.path.join(data_dir(), "editor-mode")
+    """Set osh's editor setting (`general.editor` in osh.toml; the palette's `Editor: switch`):
+    "builtin", "external" or "auto". Scenarios that type into the built-in editor force it, so an
+    editor on PATH does not open. The file is written whole: osh adds the commented blocks of
+    every other setting back when the dashboard starts."""
+    path = os.path.join(data_dir(), "osh.toml")
     if mode == "auto":
         if os.path.exists(path):
             os.remove(path)
     else:
+        value = {"external": "own"}.get(mode, mode)
         with open(path, "w") as f:
-            f.write(mode + "\n")
+            f.write('[general]\neditor = "%s"\n' % value)
 
 def dashboard(env=None, editor="builtin"):
     editor_mode(editor)
@@ -287,7 +290,8 @@ def editor_external():
             o.press("esc"); o.wait_gone("Ctrl-S save", 10)
             o.press(":"); o.wait("Commands", 10)
             o.type("editor: switch"); o.press("enter"); o.wait("Editor: auto", 10)
-            assert not os.path.exists(os.path.join(data_dir(), "editor-mode"))
+            p = os.path.join(data_dir(), "osh.toml")
+            assert not os.path.exists(p) or not any(l.startswith("editor =") for l in open(p).read().splitlines()), "auto leaves no editor line"
     finally:
         with open(path, "w") as f:
             f.write(before)

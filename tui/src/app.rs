@@ -47,7 +47,9 @@ pub const TABS: [(Tab, &str); 5] = [
 
 /// Entry in the Providers tab's create list that starts the repo token flow.
 /// How long an alert stays top-right.
-pub const TOAST_FOR: Duration = Duration::from_secs(5);
+pub fn toast_for() -> Duration {
+    osh_core::settings::toast_for()
+}
 
 /// Why a remote gets no repo access although its host has a provider: osh supports GitHub on
 /// github.com only, Bitbucket Data Center https remotes need `/scm/` without a context path.
@@ -1306,11 +1308,11 @@ impl App {
         self.alerts.push(a);
     }
 
-    /// The alert still on screen: shown for `TOAST_FOR`, or until dismissed.
+    /// The alert still on screen: shown for `toast_for()`, or until dismissed.
     pub fn toast(&self) -> Option<&crate::alerts::Alert> {
         self.toast
             .as_ref()
-            .filter(|(a, t)| t.elapsed() < TOAST_FOR && self.alert_visible(a))
+            .filter(|(a, t)| t.elapsed() < toast_for() && self.alert_visible(a))
             .map(|(a, _)| a)
     }
 
@@ -1332,7 +1334,7 @@ impl App {
     pub fn dismiss_toast(&mut self) -> bool {
         self.toast
             .take()
-            .is_some_and(|(_, t)| t.elapsed() < TOAST_FOR)
+            .is_some_and(|(_, t)| t.elapsed() < toast_for())
     }
 
     /// Every alert as text, newest first, for the viewer behind `!`.
@@ -1401,9 +1403,9 @@ impl App {
     /// "Allowed ..." stays longer: it is the cue to retry the request that was blocked.
     pub fn flash(&self) -> Option<&str> {
         let keep = if self.status.starts_with("Allowed ") {
-            Duration::from_secs(20)
+            osh_core::settings::status_allowed_for()
         } else {
-            Duration::from_secs(6)
+            osh_core::settings::status_for()
         };
         self.status_at
             .as_ref()
@@ -6275,6 +6277,29 @@ mod tests {
         assert!(a.flash().is_none());
     }
 
+    #[test]
+    fn status_and_toast_durations_follow_the_settings() {
+        use osh_core::settings::{install_for_test, test_snapshot};
+        let _g = install_for_test(test_snapshot(
+            "[ui]\ntoast_secs = 1\nstatus_secs = 1\nstatus_allowed_secs = 3\n",
+        ));
+        let (wake, _w) = mpsc::channel();
+        let (done, _d) = mpsc::channel();
+        let mut a = App::new(PathBuf::from("."), Arc::new(Mutex::new(None)), wake, done);
+        let ago = |s: u64| Instant::now() - Duration::from_secs(s);
+        a.status = "Ignored curl -> example.com:443 this time".into();
+        a.status_at = Some((a.status.clone(), ago(2)));
+        assert!(a.flash().is_none(), "status_secs = 1");
+        a.status = "Allowed curl to reach example.com:443 in sb".into();
+        a.status_at = Some((a.status.clone(), ago(2)));
+        assert!(a.flash().is_some(), "status_allowed_secs = 3");
+        a.status_at = Some((a.status.clone(), ago(4)));
+        assert!(a.flash().is_none());
+        a.push_alert(alert("x"));
+        a.toast.as_mut().unwrap().1 = ago(2);
+        assert!(a.toast().is_none(), "toast_secs = 1");
+    }
+
     fn gw(name: &str, port: u16) -> cli::Gateway {
         cli::Gateway {
             name: name.into(),
@@ -6534,7 +6559,7 @@ mod tests {
         assert!(a.toast().is_none());
         a.push_alert(alert(".envrc appeared in app"));
         assert_eq!(a.toast().unwrap().title, ".envrc appeared in app");
-        a.toast.as_mut().unwrap().1 = Instant::now() - TOAST_FOR - Duration::from_millis(10);
+        a.toast.as_mut().unwrap().1 = Instant::now() - toast_for() - Duration::from_millis(10);
         assert!(a.toast().is_none(), "gone after 5 s");
         assert_eq!(a.alerts.len(), 1, "but still listed");
     }

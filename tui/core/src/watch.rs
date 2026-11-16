@@ -208,7 +208,9 @@ pub struct Watch {
 }
 
 /// After an allow, repeats of the same denial are in flight, not a new request.
-const SETTLE: Duration = Duration::from_secs(60);
+fn settle() -> Duration {
+    crate::settings::alerts_settle()
+}
 
 fn key(sandbox: &str, b: &Blocked) -> Key {
     (sandbox.into(), b.binary.clone(), b.host.clone(), b.port)
@@ -333,7 +335,7 @@ impl Watch {
                     || self
                         .allowed_at
                         .get(&k)
-                        .is_some_and(|t| t.elapsed() < SETTLE)
+                        .is_some_and(|t| t.elapsed() < settle())
                 {
                     return;
                 }
@@ -729,6 +731,14 @@ pub fn allow(gateway: &str, sandbox: &str, b: &Blocked, all: bool) -> Result<Str
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_settle_time_follows_the_settings() {
+        use crate::settings::{install_for_test, test_snapshot};
+        assert_eq!(settle(), Duration::from_secs(60));
+        let _g = install_for_test(test_snapshot("[alerts]\nsettle_secs = 5\n"));
+        assert_eq!(settle(), Duration::from_secs(5));
+    }
+
     use super::*;
 
     const CURL: &str = "[1792770856.781] [sandbox] [OCSF ] [ocsf] NET:OPEN [MED] DENIED /usr/bin/curl(0) -> example.com:443 [reason:transparent_tcp_policy_denied]";

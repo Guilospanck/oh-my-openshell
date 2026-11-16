@@ -3,15 +3,15 @@
 
 use osh_core::mcp;
 use osh_core::ops::Ctx;
-use std::ffi::OsStr;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 const USAGE: &str = "usage: osh mcp [--gateway G]\n\
-Serves MCP over stdio (newline-delimited JSON-RPC). Set OSH_MCP_ALLOW_SHARE=1 in the \
-server's environment to let specs mount host folders inside the directories listed, \
-separated like PATH, in OSH_MCP_SHARE_ROOT, and OSH_MCP_REPO_VARS to the comma-separated \
-names of the variables a spec's repo.env_var may name.";
+Serves MCP over stdio (newline-delimited JSON-RPC). What agents may do is set in osh.toml \
+(see `osh config`): mcp.allow_share lets specs mount host folders inside the directories in \
+mcp.share_roots, and mcp.repo_vars lists the variables a spec's repo.env_var may name. \
+OSH_MCP_ALLOW_SHARE=1, OSH_MCP_SHARE_ROOT (separated like PATH) and OSH_MCP_REPO_VARS \
+(comma-separated) in the server's environment override them.";
 
 /// The answer to a line that is not UTF-8: a parse error with no id, as for bad JSON.
 const NOT_UTF8: &str =
@@ -31,38 +31,32 @@ fn parse(args: &[String]) -> Result<Option<String>, String> {
     Ok(gateway)
 }
 
-/// Only the operator's environment can enable sharing; no flag or tool argument can.
-fn share_allowed(var: Option<&str>) -> bool {
-    var == Some("1")
+/// What the operator allows, from the resolved settings (`mcp.*` in `osh.toml`, where the
+/// `OSH_MCP_*` variables win): sharing on or off, the share roots, the repo variable names. No
+/// flag or tool argument can change any of it.
+fn limits(snap: &osh_core::settings::Snapshot) -> (bool, Vec<String>, Vec<String>) {
+    use osh_core::settings::Value;
+    let get = |k: &str| snap.rows.iter().find(|r| r.def.key == k).map(|r| &r.value);
+    let list = |k: &str| match get(k) {
+        Some(Value::List(l)) => l.clone(),
+        _ => Vec::new(),
+    };
+    (
+        matches!(get("mcp.allow_share"), Some(Value::Bool(true))),
+        list("mcp.share_roots"),
+        list("mcp.repo_vars"),
+    )
 }
 
-/// The variables a spec may name in `repo.env_var`, from `OSH_MCP_REPO_VARS`: comma-separated,
-/// trimmed, empty entries dropped. Unset or empty gives an empty list, which refuses every
-/// repo grant.
-fn repo_vars(var: Option<&str>) -> Vec<String> {
-    var.unwrap_or("")
-        .split(',')
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(String::from)
-        .collect()
-}
-
-/// The folders a share must lie in, from `OSH_MCP_SHARE_ROOT` (separated like `PATH`), each
-/// canonicalized. An entry that is not an absolute path of an existing directory is dropped,
-/// with a line saying so; empty entries are skipped. Unset gives no root, which refuses every
-/// share.
-fn share_roots(var: Option<&OsStr>) -> (Vec<PathBuf>, Vec<String>) {
+/// The folders a share must lie in, each canonicalized. An entry that is not an absolute path
+/// of an existing directory is dropped, with a line saying so. No root refuses every share.
+fn share_roots(entries: &[String]) -> (Vec<PathBuf>, Vec<String>) {
     let (mut roots, mut dropped) = (Vec::new(), Vec::new());
-    for entry in std::env::split_paths(var.unwrap_or_default()) {
-        if entry.as_os_str().is_empty() {
-            continue;
-        }
-        match root_dir(&entry) {
+    for entry in entries {
+        match root_dir(Path::new(entry)) {
             Some(real) => roots.push(real),
             None => dropped.push(format!(
-                "osh: mcp: OSH_MCP_SHARE_ROOT entry {} is not an absolute path of an existing directory; ignored",
-                entry.display()
+                "osh: mcp: mcp.share_roots entry {entry} is not an absolute path of an existing directory; ignored"
             )),
         }
     }
@@ -76,17 +70,16 @@ fn root_dir(entry: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(entry).ok().filter(|p| p.is_dir())
 }
 
-/// The server's context from the operator's two variables. An agent writes the specs, so a
-/// risky share folder is refused, not only noted, and no share root is set (`run` adds the
-/// operator's `OSH_MCP_SHARE_ROOT`). The version is this binary's (the one
-/// `osh --version` prints and the release bumps), not osh-core's.
-fn server_ctx(gateway: Option<String>, share: Option<&str>, vars: Option<&str>) -> Ctx {
+/// The server's context. An agent writes the specs, so a risky share folder is refused, not
+/// only noted, and no share root is set (`run` adds the operator's roots). The version is this
+/// binary's (the one `osh --version` prints and the release bumps), not osh-core's.
+fn server_ctx(gateway: Option<String>, allow_share: bool, repo_vars: Vec<String>) -> Ctx {
     Ctx {
         dir: osh_core::assets::data_dir(),
         gateway,
-        allow_share: share_allowed(share),
+        allow_share,
         refuse_risky_share: true,
-        repo_vars: Some(repo_vars(vars)),
+        repo_vars: Some(repo_vars),
         share_roots: Some(Vec::new()),
         version: env!("CARGO_PKG_VERSION").into(),
     }
@@ -117,17 +110,23 @@ pub fn run(args: &[String]) -> i32 {
             return 2;
         }
     };
-    let (roots, dropped) = share_roots(std::env::var_os("OSH_MCP_SHARE_ROOT").as_deref());
+    let dir = osh_core::assets::data_dir();
+    let snap = osh_core::settings::load(&dir, &|k| std::env::var_os(k));
+    for p in snap
+        .problems
+        .iter()
+        .filter(|p| p.key.as_deref().is_none_or(|k| k.starts_with("mcp.")))
+    {
+        eprintln!("osh: mcp: {}", p.msg);
+    }
+    let (allow_share, root_entries, vars) = limits(&snap);
+    let (roots, dropped) = share_roots(&root_entries);
     for line in dropped {
         eprintln!("{line}");
     }
     let ctx = Ctx {
         share_roots: Some(roots),
-        ..server_ctx(
-            gateway,
-            std::env::var("OSH_MCP_ALLOW_SHARE").ok().as_deref(),
-            std::env::var("OSH_MCP_REPO_VARS").ok().as_deref(),
-        )
+        ..server_ctx(gateway, allow_share, vars)
     };
     match serve(std::io::stdin().lock(), std::io::stdout().lock(), &ctx) {
         Ok(()) => 0,
@@ -166,26 +165,40 @@ mod tests {
         assert!(parse(&a(&["--allow-share"])).is_err());
     }
 
-    #[test]
-    fn share_only_from_env_value_one() {
-        assert!(share_allowed(Some("1")));
-        for v in [None, Some(""), Some("0"), Some("true")] {
-            assert!(!share_allowed(v));
-        }
+    fn strs(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
     }
 
     #[test]
-    fn repo_vars_from_the_operators_list() {
-        assert!(repo_vars(None).is_empty());
-        assert!(repo_vars(Some("")).is_empty());
-        assert!(repo_vars(Some(" , ,")).is_empty());
-        assert_eq!(repo_vars(Some(" A_KEY, B ,,")), ["A_KEY", "B"]);
+    fn the_servers_limits_come_from_the_resolved_settings() {
+        let d = std::env::temp_dir().join(format!("osh-mcp-set-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("osh.toml"),
+            "[mcp]\nallow_share = true\nshare_roots = [\"/from/file\"]\nrepo_vars = [\"FILE_VAR\"]\n",
+        )
+        .unwrap();
+        let none = |_: &str| None;
+        let l = limits(&osh_core::settings::load(&d, &none));
+        assert!(l.0);
+        assert_eq!((l.1, l.2), (strs(&["/from/file"]), strs(&["FILE_VAR"])));
+        let env = |k: &str| match k {
+            "OSH_MCP_SHARE_ROOT" => Some(std::ffi::OsString::from("/from/env")),
+            "OSH_MCP_REPO_VARS" => Some(std::ffi::OsString::from("ENV_VAR")),
+            _ => None,
+        };
+        let l = limits(&osh_core::settings::load(&d, &env));
+        assert_eq!(
+            (l.1, l.2),
+            (strs(&["/from/env"]), strs(&["ENV_VAR"])),
+            "env replaces the file"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
-    fn share_roots_from_the_operators_list() {
-        assert_eq!(share_roots(None), (Vec::new(), Vec::new()));
-        assert_eq!(share_roots(Some(OsStr::new(""))), (Vec::new(), Vec::new()));
+    fn share_roots_keep_only_existing_directories() {
+        assert_eq!(share_roots(&[]), (Vec::new(), Vec::new()));
         let base = std::env::temp_dir().join(format!("osh-mcp-roots-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         for d in ["a", "b"] {
@@ -193,21 +206,23 @@ mod tests {
         }
         std::fs::write(base.join("file"), "").unwrap();
         std::os::unix::fs::symlink(base.join("b"), base.join("to-b")).unwrap();
-        let entries = [
+        let entries: Vec<String> = [
             base.join("a"),
             PathBuf::from("rel/dir"),
             base.join("missing"),
             base.join("file"),
             base.join("to-b"),
-        ];
-        let var = std::env::join_paths(&entries).unwrap();
-        let (roots, dropped) = share_roots(Some(&var));
+        ]
+        .iter()
+        .map(|p| p.to_str().unwrap().to_string())
+        .collect();
+        let (roots, dropped) = share_roots(&entries);
         let real = |p: &str| std::fs::canonicalize(base.join(p)).unwrap();
         assert_eq!(roots, [real("a"), real("b")]);
         assert_eq!(dropped.len(), 3, "{dropped:?}");
         for (line, bad) in dropped.iter().zip(&entries[1..4]) {
             assert!(
-                line.contains("OSH_MCP_SHARE_ROOT") && line.contains(bad.to_str().unwrap()),
+                line.contains("mcp.share_roots") && line.contains(bad.as_str()),
                 "{line}"
             );
         }
@@ -216,11 +231,11 @@ mod tests {
 
     #[test]
     fn the_server_context_is_strict_and_carries_the_binarys_version() {
-        let c = server_ctx(None, None, None);
+        let c = server_ctx(None, false, Vec::new());
         assert!(c.refuse_risky_share && !c.allow_share);
         assert_eq!(c.repo_vars, Some(Vec::new()));
         assert_eq!(c.version, env!("CARGO_PKG_VERSION"));
-        let c = server_ctx(Some("g".into()), Some("1"), Some("A"));
+        let c = server_ctx(Some("g".into()), true, strs(&["A"]));
         assert!(c.allow_share && c.refuse_risky_share);
         assert_eq!(c.repo_vars, Some(vec!["A".to_string()]));
         let r = mcp::handle(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#, &c).unwrap();

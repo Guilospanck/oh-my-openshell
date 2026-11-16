@@ -708,6 +708,10 @@ fn main() -> io::Result<()> {
     if !first_run(&dir) {
         return Ok(());
     }
+    if let Err(e) = osh_core::settings::ensure_file(&dir) {
+        eprintln!("osh: osh.toml: {e}");
+    }
+    osh_core::settings::init(&dir);
     let (snap_tx, snap_rx) = mpsc::channel();
     let (wake_tx, wake_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel::<Done>();
@@ -715,10 +719,11 @@ fn main() -> io::Result<()> {
     cli::spawn_poller(dir.clone(), snap_tx, selected.clone(), wake_rx);
 
     let (alert_tx, alert_rx) = mpsc::channel();
-    alerts::spawn_watch(dir.clone(), alert_tx, Duration::from_secs(4));
+    alerts::spawn_watch(dir.clone(), alert_tx, osh_core::settings::refresh_alerts());
 
     tmuxpass::load(&dir);
     tmuxpass::recover();
+    let data_dir = dir.clone();
     let mut app = App::new(dir, selected, wake_tx, done_tx);
     for n in notes {
         app.data_notice(n);
@@ -765,6 +770,9 @@ fn main() -> io::Result<()> {
                 app.fit_sessions(size.width, size.height);
             }
             terminal.draw(|f| ui::draw(f, &app))?;
+            if osh_core::settings::reload_if_changed() {
+                tmuxpass::load(&data_dir);
+            }
             // A focused shell wants frames at display rate; the dashboard does not, bar a spinner.
             let wait = if focused {
                 16

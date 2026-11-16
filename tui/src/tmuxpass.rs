@@ -145,29 +145,36 @@ fn tmux(args: &[&str], stdin: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
-/// Switched off from the command palette; kept as a marker file in the data dir across runs.
+/// Switched off (`shell.tmux_keys` in `osh.toml`, from the palette or the file).
 static OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The marker file older versions used; moved into `osh.toml` on first read.
 const OFF_FILE: &str = ".tmux-passthrough-off";
 
-/// Read the palette's choice (call once at start).
+/// Read the setting (at start, and again when `osh.toml` changes). When the old marker cannot
+/// be moved into `osh.toml`, it still counts.
 pub fn load(dir: &std::path::Path) {
+    let _ = osh_core::settings::migrate(dir);
+    let snap = osh_core::settings::load(dir, &|k| std::env::var_os(k));
+    let on = snap.rows.iter().any(|r| {
+        r.def.key == "shell.tmux_keys" && r.value == osh_core::settings::Value::Bool(true)
+    });
     OFF.store(
-        dir.join(OFF_FILE).exists(),
+        !on || dir.join(OFF_FILE).exists(),
         std::sync::atomic::Ordering::Relaxed,
     );
 }
 
-/// Flip the palette's choice and keep it; returns whether passing keys is now on.
+/// Flip the choice and keep it in `osh.toml`; returns whether passing keys is now on.
 pub fn toggle(dir: &std::path::Path) -> std::io::Result<bool> {
+    use osh_core::settings::{migrate, set, unset};
     let off = !OFF.load(std::sync::atomic::Ordering::Relaxed);
+    let _ = migrate(dir);
     if off {
-        std::fs::write(dir.join(OFF_FILE), "")?;
+        set(dir, "shell.tmux_keys", "false", &|_| None)
     } else {
-        match std::fs::remove_file(dir.join(OFF_FILE)) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
-            _ => {}
-        }
+        unset(dir, "shell.tmux_keys")
     }
+    .map_err(std::io::Error::other)?;
     OFF.store(off, std::sync::atomic::Ordering::Relaxed);
     Ok(!off)
 }
@@ -259,11 +266,32 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         super::load(&d);
         assert!(!super::toggle(&d).unwrap(), "first press turns it off");
-        assert!(d.join(super::OFF_FILE).exists());
+        assert!(
+            !d.join(super::OFF_FILE).exists(),
+            "the marker file is gone for good"
+        );
+        assert!(std::fs::read_to_string(d.join("osh.toml"))
+            .unwrap()
+            .contains("tmux_keys = false"));
         super::load(&d);
         assert!(super::OFF.load(std::sync::atomic::Ordering::Relaxed));
         assert!(super::toggle(&d).unwrap(), "and back on");
+        super::load(&d);
+        assert!(!super::OFF.load(std::sync::atomic::Ordering::Relaxed));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_old_marker_file_still_means_off_and_is_moved() {
+        let d = std::env::temp_dir().join(format!("osh-tp-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(super::OFF_FILE), "").unwrap();
+        super::load(&d);
+        assert!(super::OFF.load(std::sync::atomic::Ordering::Relaxed));
         assert!(!d.join(super::OFF_FILE).exists());
+        super::load(&d);
+        assert!(super::OFF.load(std::sync::atomic::Ordering::Relaxed));
         let _ = std::fs::remove_dir_all(&d);
     }
 
