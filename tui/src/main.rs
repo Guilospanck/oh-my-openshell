@@ -11,6 +11,7 @@ mod gwmodel;
 mod gwops;
 mod headless;
 mod logview;
+mod mcpcmd;
 mod palette;
 mod ports;
 mod setup;
@@ -400,6 +401,7 @@ fn subcommand(args: &[String]) -> Option<i32> {
         "gateway" => Some(gateway_add_remove(&args[1..])),
         "runtime-start" | "install" => Some(host_steps(args)),
         "sandbox" | "apply" => Some(headless::headless(args)),
+        "mcp" => Some(mcpcmd::run(&args[1..])),
         "sync-agents" => Some(agents::cli_main(&args[1..], &assets::data_dir())),
         "upgrade" | "uninstall" | "gateway-reset" | "gateway-service" => {
             Some(gateway_command(args))

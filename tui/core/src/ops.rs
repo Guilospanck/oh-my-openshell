@@ -264,7 +264,7 @@ pub fn envelope(r: Result<Value, String>) -> (Value, i32) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ghrepo;
     use serde_json::json;
@@ -290,15 +290,15 @@ mod tests {
 
     /// The stand-in `openshell` (and a failing `curl`, so a repo grant never reaches the
     /// network) first on PATH, a seeded data dir, and the call log.
-    struct Fake {
-        dir: PathBuf,
-        log: PathBuf,
+    pub(crate) struct Fake {
+        pub(crate) dir: PathBuf,
+        pub(crate) log: PathBuf,
         path: Option<OsString>,
         _lock: MutexGuard<'static, ()>,
     }
 
     impl Fake {
-        fn new(tag: &str) -> Fake {
+        pub(crate) fn new(tag: &str) -> Fake {
             let lock = ENV.lock().unwrap_or_else(|e| e.into_inner());
             let root =
                 std::env::temp_dir().join(format!("osh-core-ops-{tag}-{}", std::process::id()));
@@ -336,7 +336,7 @@ mod tests {
             }
         }
 
-        fn ctx(&self) -> Ctx {
+        pub(crate) fn ctx(&self) -> Ctx {
             Ctx {
                 dir: self.dir.clone(),
                 gateway: None,
@@ -344,7 +344,7 @@ mod tests {
             }
         }
 
-        fn calls(&self) -> String {
+        pub(crate) fn calls(&self) -> String {
             std::fs::read_to_string(&self.log).unwrap()
         }
     }
