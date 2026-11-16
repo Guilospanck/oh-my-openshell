@@ -30,46 +30,8 @@ pub struct Alert {
     pub file: Option<String>,
 }
 
-/// Folders under `$HOME` that hold secrets or tool configuration the host trusts.
-const SECRET_DIRS: &[&str] = &[
-    ".ssh", ".aws", ".gnupg", ".config", ".kube", ".docker", ".azure", ".local", ".claude",
-    "Library",
-];
-
-/// Why sharing `path` with a sandbox is risky, or `None` when it looks like an ordinary project.
-pub fn risky_share(path: &str, home: &str) -> Option<String> {
-    let p = path.trim_end_matches('/');
-    let h = home.trim_end_matches('/');
-    if p.is_empty() {
-        return Some(
-            "it is the whole disk: every file of yours would be visible to the sandbox".into(),
-        );
-    }
-    if p == h {
-        return Some(
-            "it is your home folder: keys, tokens and shell startup files live there".into(),
-        );
-    }
-    if !h.is_empty() && h.starts_with(&format!("{p}/")) {
-        return Some(format!("it contains your home folder ({h})"));
-    }
-    if let Some(rest) = p.strip_prefix(&format!("{h}/")) {
-        let top = rest.split('/').next().unwrap_or("");
-        if SECRET_DIRS.contains(&top) {
-            return Some(format!(
-                "{top} holds credentials or settings the host trusts"
-            ));
-        }
-    }
-    for sys in [
-        "/etc", "/var", "/usr", "/root", "/bin", "/sbin", "/System", "/private",
-    ] {
-        if p == sys || p.starts_with(&format!("{sys}/")) {
-            return Some(format!("{sys} is a system folder"));
-        }
-    }
-    None
-}
+/// The check lives in osh-core so the headless front end and MCP server refuse the same folders.
+pub use osh_core::sandbox::risky_share;
 
 /// `git config` keys that make git run a program, as `key = value` lines.
 pub fn git_config_flags(text: &str) -> Vec<String> {

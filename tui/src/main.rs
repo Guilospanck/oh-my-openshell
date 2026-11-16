@@ -400,8 +400,16 @@ fn subcommand(args: &[String]) -> Option<i32> {
         }
         "gateway" => Some(gateway_add_remove(&args[1..])),
         "runtime-start" | "install" => Some(host_steps(args)),
-        "sandbox" | "apply" => Some(headless::headless(args)),
-        "mcp" => Some(mcpcmd::run(&args[1..])),
+        // These read the policy, toolchains and Dockerfiles from the data dir, so it is brought
+        // up to date first; notes go to stderr, since stdout is JSON or protocol only.
+        "sandbox" | "apply" => {
+            materialize_data();
+            Some(headless::headless(args))
+        }
+        "mcp" => {
+            materialize_data();
+            Some(mcpcmd::run(&args[1..]))
+        }
         "sync-agents" => Some(agents::cli_main(&args[1..], &assets::data_dir())),
         "upgrade" | "uninstall" | "gateway-reset" | "gateway-service" => {
             Some(gateway_command(args))
@@ -645,10 +653,16 @@ fn confirmed(word: &str) -> bool {
 /// what there is to say goes to stderr.
 fn materialize_data() -> PathBuf {
     let (dir, notes) = materialize_notes();
-    for n in notes {
-        eprintln!("osh: {}", n.replace('\n', " "));
-    }
+    let _ = write_notes(&mut io::stderr().lock(), &notes);
     dir
+}
+
+/// Each note as one `osh: ...` line, for stderr.
+fn write_notes(w: &mut impl io::Write, notes: &[String]) -> io::Result<()> {
+    for n in notes {
+        writeln!(w, "osh: {}", n.replace('\n', " "))?;
+    }
+    Ok(())
 }
 
 /// Writes the embedded files to the data dir, and returns it with what the user should be told
@@ -835,6 +849,25 @@ fn main() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn data_notes_are_one_line_each_for_stderr() {
+        let mut w = Vec::new();
+        super::write_notes(&mut w, &["a\nb".into(), "c".into()]).unwrap();
+        assert_eq!(String::from_utf8(w).unwrap(), "osh: a b\nosh: c\n");
+    }
+
+    #[test]
+    fn the_headless_commands_refresh_the_data_dir_first() {
+        // `subcommand` cannot be run here (it talks to the gateway), so check its source: each
+        // headless arm calls `materialize_data` before dispatching.
+        let src = include_str!("main.rs");
+        for call in ["headless::headless(args)", "mcpcmd::run(&args[1..])"] {
+            let at = src.find(&format!("Some({call})")).unwrap();
+            let arm = &src[src[..at].rfind("=> {").unwrap()..at];
+            assert!(arm.contains("materialize_data();"), "{call}: {arm}");
+        }
+    }
+
     #[test]
     fn the_wipe_clears_the_screen_and_its_scrollback() {
         assert!(super::WIPE.contains("\x1b[2J") && super::WIPE.contains("\x1b[3J"));

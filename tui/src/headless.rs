@@ -173,10 +173,15 @@ pub fn headless(args: &[String]) -> i32 {
         }
     };
     let dir = osh_core::assets::data_dir();
+    // The user names share folders and repo variables here, so a risky folder is only noted
+    // and any variable may be named.
     let ctx = |gateway: Option<String>, allow_share: bool| Ctx {
         dir: dir.clone(),
         gateway,
         allow_share,
+        refuse_risky_share: false,
+        repo_vars: None,
+        version: env!("CARGO_PKG_VERSION").into(),
     };
     let mut exec = false;
     let result = match cmd {

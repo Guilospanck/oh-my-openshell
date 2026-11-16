@@ -11,6 +11,8 @@
 #                         (default {"compute_drivers":[{"name":"docker"}]})
 #   OSH_FAKE_FAIL         when the joined argv contains this text, print "fake failure" on
 #                         stderr and exit 1 (the call is still logged)
+#   OSH_FAKE_FAIL_ONCE    the same, for the first matching call only (a marker file next to
+#                         the log remembers it), so a retry sees a changed gateway
 #   OSH_FAKE_EXEC_EXIT    exit code of `sandbox exec` (default 0)
 #   OSH_FAKE_EXEC_STDOUT  printed on stdout by `sandbox exec`
 #   OSH_FAKE_EXEC_STDERR  printed on stderr by `sandbox exec`
@@ -33,6 +35,12 @@ for key in ${OSH_FAKE_ENV_KEYS:-}; do
 done
 
 if [ -n "${OSH_FAKE_FAIL:-}" ] && [[ "$*" == *"$OSH_FAKE_FAIL"* ]]; then
+    echo "fake failure" >&2
+    exit 1
+fi
+if [ -n "${OSH_FAKE_FAIL_ONCE:-}" ] && [[ "$*" == *"$OSH_FAKE_FAIL_ONCE"* ]] &&
+    [ ! -e "$log.once" ]; then
+    : >"$log.once"
     echo "fake failure" >&2
     exit 1
 fi

@@ -9,9 +9,11 @@ use serde_json::{json, Map, Value};
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
 
 const SPEC_DOC: &str = "Sandbox spec. Keys: name (required), image, providers (array of names), \
-cpu, memory, command, toolchains (array), repo {url, env_var} (env_var is the NAME of an \
-environment variable holding the access token, never the token itself), share {path, rw} \
-(refused unless the server operator enabled it).";
+cpu, memory, command (run once, then the sandbox is deleted; its output is not returned; \
+leave it out for a sandbox to exec in), toolchains (array), repo {url, env_var} (env_var is \
+the NAME of an environment variable holding the access token, never the token itself, and \
+must be one the server operator allows), share {path, rw} (refused unless the server \
+operator enabled it; risky folders such as home or the disk are always refused).";
 
 fn tools() -> Value {
     json!([
@@ -199,7 +201,7 @@ pub fn handle(line: &str, ctx: &Ctx) -> Option<String> {
                 .and_then(Value::as_str)
                 .unwrap_or(DEFAULT_PROTOCOL),
             "capabilities": {"tools": {}},
-            "serverInfo": {"name": "osh", "version": env!("CARGO_PKG_VERSION")},
+            "serverInfo": {"name": "osh", "version": ctx.version},
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -219,6 +221,9 @@ mod tests {
             dir: std::path::PathBuf::from("/nonexistent"),
             gateway: None,
             allow_share: false,
+            refuse_risky_share: true,
+            repo_vars: Some(Vec::new()),
+            version: "9.8.7-given".into(),
         }
     }
 
@@ -243,10 +248,8 @@ mod tests {
         assert_eq!(r["id"], 1);
         assert_eq!(r["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(r["result"]["serverInfo"]["name"], "osh");
-        assert_eq!(
-            r["result"]["serverInfo"]["version"],
-            env!("CARGO_PKG_VERSION")
-        );
+        // The binary's version, as given in the context, not osh-core's own.
+        assert_eq!(r["result"]["serverInfo"]["version"], "9.8.7-given");
         assert!(r["result"]["capabilities"]["tools"].is_object());
         let d = ask(
             r#"{"jsonrpc":"2.0","id":"a","method":"initialize"}"#,
@@ -385,5 +388,53 @@ mod tests {
         assert_eq!(r["result"]["isError"], false, "{r}");
         let r = ask(&call_line("sandbox_apply", json!({"spec": spec})), &f.ctx());
         assert_eq!(r["result"]["isError"], true, "{r}");
+    }
+
+    #[test]
+    fn allow_share_cannot_be_smuggled_in() {
+        let f = Fake::new("mcp-smuggle");
+        let spec = json!({"name":"w1","share":{"path": f.dir.to_string_lossy(), "rw": false}});
+        for tool in ["sandbox_create", "sandbox_apply"] {
+            let r = ask(
+                &call_line(tool, json!({"spec": spec, "allow_share": true})),
+                &f.ctx(),
+            );
+            assert_eq!(r["error"]["code"], -32602, "{r}");
+            assert!(r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("allow_share"));
+            let mut inside = spec.clone();
+            inside["allow_share"] = json!(true);
+            let r = ask(&call_line(tool, json!({"spec": inside})), &f.ctx());
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(text_json(&r)["error"]
+                .as_str()
+                .unwrap()
+                .contains("allow_share"));
+        }
+        assert_eq!(f.calls(), "");
+    }
+
+    #[test]
+    fn over_mcp_a_risky_share_and_an_unlisted_repo_var_are_refused() {
+        let f = Fake::new("mcp-guards");
+        let c = Ctx {
+            allow_share: true,
+            ..ctx()
+        };
+        let spec = json!({"name":"w1","share":{"path":"/","rw":true}});
+        let r = ask(
+            &call_line("sandbox_create", json!({"spec": spec, "dry_run": true})),
+            &c,
+        );
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        assert!(text_json(&r)["error"].as_str().unwrap().contains("refused"));
+        let spec = json!({"name":"w1","repo":{"url":"https://github.com/o/r","env_var":"PATH"}});
+        let r = ask(&call_line("sandbox_apply", json!({"spec": spec})), &c);
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        let e = text_json(&r)["error"].as_str().unwrap().to_string();
+        assert!(e.contains("OSH_MCP_REPO_VARS"), "{e}");
+        assert_eq!(f.calls(), "");
     }
 }

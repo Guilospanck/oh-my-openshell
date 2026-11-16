@@ -728,18 +728,44 @@ fn track_repo(provider: &str, repo: &GhRepo, token: &str) {
     );
 }
 
+/// Write `text` to a new file only this call uses (process id and a counter, created with
+/// `create_new`, so a planted file or symlink of that name is an error, not followed).
+fn private_temp(stem: &str, text: &str) -> Result<PathBuf, String> {
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("osh-{stem}-{}-{n}.yaml", std::process::id()));
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    if let Err(e) = f.write_all(text.as_bytes()) {
+        let _ = fs::remove_file(&path);
+        return Err(e.to_string());
+    }
+    Ok(path)
+}
+
 /// Import the repo's push profile when the gateway lacks it, then create `provider` from it
-/// with `token`. The token goes through the environment, never argv.
+/// with `token`. The token goes through the environment, never argv. Two first-time creates for
+/// one repo may race on the import: when it fails but the profile is there afterwards, the
+/// other one made it, and this call carries on (and does not count the profile as its own).
 pub fn create_repo_provider(repo: &GhRepo, provider: &str, token: &str) -> Result<String, String> {
     let var = ghrepo::token_env(repo);
     let id = ghrepo::profile_id(repo);
-    let imported = os(&["profile", "describe", &id]).is_err();
+    let mut imported = os(&["profile", "describe", &id]).is_err();
     if imported {
-        let tmp = std::env::temp_dir().join(format!("osh-{id}.yaml"));
-        fs::write(&tmp, ghrepo::push_profile(repo)).map_err(|e| e.to_string())?;
+        let tmp = private_temp(&id, &ghrepo::push_profile(repo))?;
         let r = os(&["profile", "import", "--file", &tmp.to_string_lossy()]);
         let _ = fs::remove_file(&tmp);
-        r?;
+        if let Err(e) = r {
+            if os(&["profile", "describe", &id]).is_err() {
+                return Err(e);
+            }
+            imported = false;
+        }
     }
     let args: Vec<String> = [
         "provider",

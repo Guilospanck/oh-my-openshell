@@ -147,10 +147,13 @@ impl SandboxSpec {
     }
 }
 
-/// Lowercase letters, digits and `-`, 1 to 63 characters, starting with a letter or digit.
+/// Lowercase letters, digits and `-`, 1 to 63 characters, starting and ending with a letter or
+/// digit.
 pub fn validate_name(name: &str) -> Result<(), String> {
+    let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     let ok = (1..=63).contains(&name.len())
-        && name.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && name.starts_with(alnum)
+        && name.ends_with(alnum)
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
@@ -158,9 +161,51 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "invalid sandbox name {name:?}: use 1 to 63 lowercase letters, digits or `-`, starting with a letter or digit"
+            "invalid sandbox name {name:?}: use 1 to 63 lowercase letters, digits or `-`, starting and ending with a letter or digit"
         ))
     }
+}
+
+/// Folders under `$HOME` that hold secrets or tool configuration the host trusts.
+const SECRET_DIRS: &[&str] = &[
+    ".ssh", ".aws", ".gnupg", ".config", ".kube", ".docker", ".azure", ".local", ".claude",
+    "Library",
+];
+
+/// Why sharing `path` with a sandbox is risky, or `None` when it looks like an ordinary project.
+/// Pure: the caller resolves symlinks first when the path comes from someone it does not trust.
+pub fn risky_share(path: &str, home: &str) -> Option<String> {
+    let p = path.trim_end_matches('/');
+    let h = home.trim_end_matches('/');
+    if p.is_empty() {
+        return Some(
+            "it is the whole disk: every file of yours would be visible to the sandbox".into(),
+        );
+    }
+    if p == h {
+        return Some(
+            "it is your home folder: keys, tokens and shell startup files live there".into(),
+        );
+    }
+    if !h.is_empty() && h.starts_with(&format!("{p}/")) {
+        return Some(format!("it contains your home folder ({h})"));
+    }
+    if let Some(rest) = p.strip_prefix(&format!("{h}/")) {
+        let top = rest.split('/').next().unwrap_or("");
+        if SECRET_DIRS.contains(&top) {
+            return Some(format!(
+                "{top} holds credentials or settings the host trusts"
+            ));
+        }
+    }
+    for sys in [
+        "/etc", "/var", "/usr", "/root", "/bin", "/sbin", "/System", "/private",
+    ] {
+        if p == sys || p.starts_with(&format!("{sys}/")) {
+            return Some(format!("{sys} is a system folder"));
+        }
+    }
+    None
 }
 
 /// What `plan_create` needs from the host.
@@ -312,9 +357,25 @@ fn check_share(share: &Share, driver: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The forge a repo URL names, from the host alone (the well-known public ones).
+/// `url` for a message: without user info (anything up to the last `@`), query or fragment,
+/// which is where a credential pasted into a remote URL would sit.
+pub fn shown_url(url: &str) -> String {
+    let url = url.trim().split(['?', '#']).next().unwrap_or("");
+    let (scheme, rest) = url.split_once("://").unwrap_or(("", url));
+    let rest = rest.rsplit_once('@').map_or(rest, |(_, r)| r);
+    if scheme.is_empty() {
+        rest.to_string()
+    } else {
+        format!("{scheme}://{rest}")
+    }
+}
+
+/// The forge a repo URL names, from the host alone (the well-known public ones). Errors show
+/// the URL through `shown_url`.
 pub fn grant_repo(url: &str) -> Result<ghrepo::GhRepo, String> {
-    let remote = ghrepo::parse_url(url).ok_or_else(|| format!("not a git remote URL: {url:?}"))?;
+    let shown = shown_url(url);
+    let remote =
+        ghrepo::parse_url(url).ok_or_else(|| format!("not a git remote URL: {shown:?}"))?;
     let forge = match remote.host.as_str() {
         "github.com" => ghrepo::Forge::GitHub,
         "gitlab.com" => ghrepo::Forge::GitLab,
@@ -327,7 +388,7 @@ pub fn grant_repo(url: &str) -> Result<ghrepo::GhRepo, String> {
     };
     remote
         .repo(forge)
-        .ok_or_else(|| format!("{url:?} does not name a repository"))
+        .ok_or_else(|| format!("{shown:?} does not name a repository"))
 }
 
 /// The steps that create a sandbox: an image build when it is outdated, then `sandbox create`.
@@ -507,11 +568,35 @@ mod tests {
 
     #[test]
     fn validate_name_rejects_path_and_long() {
-        for bad in ["", "a b", "../x", &"a".repeat(64), "-a", "A"] {
+        for bad in ["", "a b", "../x", &"a".repeat(64), "-a", "A", "a-", "-"] {
             assert!(validate_name(bad).is_err(), "{bad:?}");
         }
         assert!(validate_name("factory-1").is_ok());
+        assert!(validate_name("a").is_ok());
         assert!(validate_name(&"a".repeat(63)).is_ok());
+    }
+
+    #[test]
+    fn repo_url_errors_never_show_user_info() {
+        // Built at run time, so no credential-shaped literal sits in the source.
+        let secret = format!("pw-{}", "placeholder");
+        let auth = format!("user:{secret}@");
+        for url in [
+            format!("https://{auth}github.com/o"),
+            format!("https://{auth}example.org/o/r"),
+            format!("https://{auth}github.com"),
+            format!("{auth}github.com:o"),
+            format!("https://github.com/o?key={secret}"),
+        ] {
+            let e = grant_repo(&url).err().unwrap_or_else(|| panic!("{url}"));
+            assert!(!e.contains(&secret), "{e}");
+        }
+        let e = grant_repo(&format!("https://{auth}github.com/o")).unwrap_err();
+        assert!(e.contains("https://github.com/o"), "{e}");
+        assert_eq!(
+            shown_url(&format!("https://{auth}gitlab.com/g/p")),
+            "https://gitlab.com/g/p"
+        );
     }
 
     #[test]

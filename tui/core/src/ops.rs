@@ -16,6 +16,15 @@ pub struct Ctx {
     pub gateway: Option<String>,
     /// A spec may mount a host folder only when the caller opted in.
     pub allow_share: bool,
+    /// Refuse a share of a risky folder (`sandbox::risky_share`: the disk, the home folder, a
+    /// secrets folder, a system folder) instead of only noting it. True for `osh mcp`, whose
+    /// specs come from an agent; false for the CLI, whose user names the folder.
+    pub refuse_risky_share: bool,
+    /// The variables `repo.env_var` may name; `None` = any (the CLI). The MCP server sets the
+    /// operator's list, so an agent cannot send an unrelated secret of the server to a forge.
+    pub repo_vars: Option<Vec<String>>,
+    /// The version of the program serving the calls (the MCP `serverInfo`).
+    pub version: String,
 }
 
 /// Aim every following `openshell` call at the context's gateway. A name starting with `-`
@@ -38,24 +47,71 @@ fn check_name(name: &str) -> Result<(), String> {
     sandbox::validate_name(name)
 }
 
-/// The spec, checked before anything runs: a valid name, and a share only when allowed and only
-/// of a folder that is really there.
-fn checked_spec(ctx: &Ctx, spec: &Value) -> Result<SandboxSpec, String> {
-    let s = SandboxSpec::from_json(spec)?;
+/// A spec that passed every check, with the share path resolved, and what the caller should
+/// be told about it.
+struct Checked {
+    spec: SandboxSpec,
+    note: Option<String>,
+}
+
+fn home() -> String {
+    std::env::var("HOME").unwrap_or_default()
+}
+
+/// The spec, checked before anything runs: a valid name, a repo variable the caller allows, and
+/// a share only when allowed, only of a folder that is really there, resolved through symlinks
+/// (the resolved path is what gets mounted) and, when the context says so, not a risky one.
+fn checked_spec(ctx: &Ctx, spec: &Value, home: &str) -> Result<Checked, String> {
+    let mut s = SandboxSpec::from_json(spec)?;
     check_name(&s.name)?;
-    if let Some(share) = &s.share {
+    if let Some(g) = &s.repo {
+        check_repo_var(ctx, &g.env_var)?;
+    }
+    let mut note = None;
+    if let Some(share) = &mut s.share {
         if !ctx.allow_share {
             return Err(
                 "the spec shares a host folder (`share`), which needs the allow-share option"
                     .into(),
             );
         }
-        check_share_path(share)?;
+        share.path = resolve_share_path(share)?;
+        // The home folder is resolved too, so a symlinked home still matches.
+        let home = std::fs::canonicalize(home)
+            .ok()
+            .and_then(|h| h.to_str().map(String::from))
+            .unwrap_or_else(|| home.to_string());
+        if let Some(why) = sandbox::risky_share(&share.path, &home) {
+            if ctx.refuse_risky_share {
+                return Err(format!(
+                    "sharing {} is refused: {why}; share a project folder instead",
+                    share.path
+                ));
+            }
+            note = Some(format!("sharing {} is risky: {why}", share.path));
+        }
     }
-    Ok(s)
+    Ok(Checked { spec: s, note })
 }
 
-fn check_share_path(share: &Share) -> Result<(), String> {
+/// `repo.env_var` must be one the caller allows (`Ctx::repo_vars`). The refusal names the
+/// variable only, never a value.
+fn check_repo_var(ctx: &Ctx, var: &str) -> Result<(), String> {
+    match &ctx.repo_vars {
+        None => Ok(()),
+        Some(list) if list.is_empty() => Err(
+            "repo grants are off: the server operator has not listed any variable in OSH_MCP_REPO_VARS"
+                .into(),
+        ),
+        Some(list) if list.iter().any(|v| v == var) => Ok(()),
+        Some(_) => Err(format!(
+            "repo.env_var {var:?} is not one of the variables the server operator allows (OSH_MCP_REPO_VARS)"
+        )),
+    }
+}
+
+/// The share path as an absolute, symlink-free path of an existing directory.
+fn resolve_share_path(share: &Share) -> Result<String, String> {
     let p = Path::new(&share.path);
     if !p.is_absolute() {
         return Err(format!(
@@ -63,13 +119,22 @@ fn check_share_path(share: &Share) -> Result<(), String> {
             share.path
         ));
     }
-    if !p.exists() {
-        return Err(format!("share.path {:?} does not exist", share.path));
-    }
-    if !p.is_dir() {
+    let real = std::fs::canonicalize(p)
+        .map_err(|e| format!("share.path {:?} cannot be resolved: {e}", share.path))?;
+    if !real.is_dir() {
         return Err(format!("share.path {:?} is not a directory", share.path));
     }
-    Ok(())
+    real.into_os_string()
+        .into_string()
+        .map_err(|_| format!("share.path {:?} is not valid UTF-8", share.path))
+}
+
+/// Two notes as one string; either may be absent.
+fn join_notes(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    }
 }
 
 /// The secret named by `repo.env_var`, read from this process's environment. Errors name the
@@ -124,7 +189,14 @@ pub fn sandbox_list(ctx: &Ctx) -> Result<Value, String> {
 /// (secrets travel through the environment, so the argv shown holds none). Otherwise the repo
 /// provider first (when the spec grants a repo), then the plan's steps: `{"name","phase"}`.
 pub fn sandbox_create(ctx: &Ctx, spec: &Value, dry_run: bool) -> Result<Value, String> {
-    let s = checked_spec(ctx, spec)?;
+    create_in(ctx, spec, dry_run, &home())
+}
+
+fn create_in(ctx: &Ctx, spec: &Value, dry_run: bool, home: &str) -> Result<Value, String> {
+    let Checked {
+        spec: s,
+        note: share_note,
+    } = checked_spec(ctx, spec, home)?;
     let grant = match &s.repo {
         Some(g) => Some((sandbox::grant_repo(&g.url)?, repo_secret(&g.env_var)?)),
         None => None,
@@ -157,25 +229,36 @@ pub fn sandbox_create(ctx: &Ctx, spec: &Value, dry_run: bool) -> Result<Value, S
             &s.name,
             &plan.steps,
             grant.as_ref().map(|(r, v)| (r, v.as_str())),
+            !s.command.is_empty(),
         )
     };
     // The policy was written for this call alone; the gateway has read it by now.
     if let Some(p) = &plan.policy_file {
         let _ = std::fs::remove_file(p);
     }
-    if let (Ok(v), Some(note)) = (&mut out, plan.policy_note) {
+    if let (Ok(v), Some(note)) = (&mut out, join_notes(share_note, plan.policy_note)) {
         v["note"] = Value::String(note);
     }
     out
 }
 
+/// Delete and untrack a repo provider this call made (best effort).
+fn drop_made(provider: &str) {
+    if cli::os(&["provider", "delete", provider]).is_ok() {
+        ghrepo::untrack(ghrepo::tracked_path().as_deref(), &cli::gateway(), provider);
+    }
+}
+
 /// Create the repo provider (when granted), then run the steps. When a step fails after the
 /// provider was made, the provider is deleted and untracked again (best effort), so a retry
 /// does not trip over it; one that could not be made (it may already exist) is left alone.
+/// A `one_shot` create (`--no-keep`) has deleted its sandbox by the time it returns, so the
+/// provider made for it is dropped the same way whether the command succeeded or not.
 fn run_plan(
     name: &str,
     steps: &[sandbox::Step],
     grant: Option<(&ghrepo::GhRepo, &str)>,
+    one_shot: bool,
 ) -> Result<Value, String> {
     let made = match grant {
         Some((repo, secret)) => {
@@ -189,11 +272,14 @@ fn run_plan(
         // The plan's `openshell` args already carry the gateway, so `run`, not `exec`.
         if let Err(e) = cli::run(&st.prog, &st.args, &[]) {
             if let Some(p) = &made {
-                if cli::os(&["provider", "delete", p]).is_ok() {
-                    ghrepo::untrack(ghrepo::tracked_path().as_deref(), &cli::gateway(), p);
-                }
+                drop_made(p);
             }
             return Err(format!("{}: {e}", st.label()));
+        }
+    }
+    if one_shot {
+        if let Some(p) = &made {
+            drop_made(p);
         }
     }
     let phase = cli::sandboxes()
@@ -205,10 +291,18 @@ fn run_plan(
 }
 
 /// Delete a sandbox and, as the dashboard does, the per-sandbox repo providers osh made for it.
+/// A sandbox that is no longer listed (a one-shot create deletes its own) is not an error: its
+/// repo providers are still dropped and the answer says `already_gone`. When the list cannot be
+/// read, the delete is tried as usual.
 pub fn sandbox_delete(ctx: &Ctx, name: &str) -> Result<Value, String> {
     check_name(name)?;
     target(ctx)?;
+    let listed = cli::sandboxes().map_or(true, |l| l.iter().any(|x| x.name == name));
     let providers = cli::providers().unwrap_or_default();
+    if !listed {
+        cli::drop_repo_providers(name, &providers);
+        return Ok(json!({"name": name, "deleted": false, "already_gone": true}));
+    }
     cli::os(&["sandbox", "delete", name])?;
     cli::drop_repo_providers(name, &providers);
     Ok(json!({"name": name, "deleted": true}))
@@ -226,6 +320,8 @@ pub fn sandbox_exec(ctx: &Ctx, name: &str, argv: &[String]) -> Result<Value, Str
         .map(String::from)
         .to_vec();
     args.extend(argv.iter().cloned());
+    // Not `cli::exec`: it turns a non-zero exit into `Err` and drops the code, while the
+    // command's own exit code and both streams are the answer here.
     let out = Command::new("openshell")
         .args(cli::with_gateway(args))
         .stdin(Stdio::null())
@@ -243,15 +339,24 @@ pub fn sandbox_exec(ctx: &Ctx, name: &str, argv: &[String]) -> Result<Value, Str
     }))
 }
 
-/// Create the sandbox unless one of that name exists; an existing one is left as it is.
+/// Create the sandbox unless one of that name exists; an existing one is left as it is. A
+/// `note` from the create (risky share, policy) is passed on.
 pub fn apply(ctx: &Ctx, spec: &Value) -> Result<Value, String> {
-    let s = checked_spec(ctx, spec)?;
+    apply_in(ctx, spec, &home())
+}
+
+fn apply_in(ctx: &Ctx, spec: &Value, home: &str) -> Result<Value, String> {
+    let s = checked_spec(ctx, spec, home)?.spec;
     target(ctx)?;
     if cli::sandboxes()?.iter().any(|x| x.name == s.name) {
         return Ok(json!({"action": "unchanged", "name": s.name}));
     }
-    sandbox_create(ctx, spec, false)?;
-    Ok(json!({"action": "created", "name": s.name}))
+    let made = create_in(ctx, spec, false, home)?;
+    let mut out = json!({"action": "created", "name": s.name});
+    if let Some(n) = made.get("note") {
+        out["note"] = n.clone();
+    }
+    Ok(out)
 }
 
 /// The output contract: `Ok(v)` prints `v` and exits 0; `Err(e)` prints
@@ -282,6 +387,7 @@ pub(crate) mod tests {
         "OSH_FAKE_GATEWAYS",
         "OSH_FAKE_GATEWAY_INFO",
         "OSH_FAKE_FAIL",
+        "OSH_FAKE_FAIL_ONCE",
         "OSH_FAKE_EXEC_EXIT",
         "OSH_FAKE_EXEC_STDOUT",
         "OSH_FAKE_EXEC_STDERR",
@@ -341,6 +447,9 @@ pub(crate) mod tests {
                 dir: self.dir.clone(),
                 gateway: None,
                 allow_share: false,
+                refuse_risky_share: false,
+                repo_vars: None,
+                version: "0.0.0-test".into(),
             }
         }
 
@@ -725,9 +834,271 @@ pub(crate) mod tests {
     #[test]
     fn delete_runs_sandbox_delete() {
         let f = Fake::new("delete");
+        std::env::set_var(
+            "OSH_FAKE_SANDBOXES",
+            r#"{"sandboxes":[{"name":"w1","phase":"Ready","created_at":"t"}]}"#,
+        );
         let v = sandbox_delete(&f.ctx(), "w1").unwrap();
         assert_eq!(v, json!({"name":"w1","deleted":true}));
         assert!(f.calls().lines().any(|l| l == "sandbox delete w1"));
+    }
+
+    #[test]
+    fn delete_of_a_sandbox_already_gone_is_ok_and_still_drops_providers() {
+        let f = Fake::new("delete-gone");
+        let v = sandbox_delete(&f.ctx(), "w1").unwrap();
+        assert_eq!(v, json!({"name":"w1","deleted":false,"already_gone":true}));
+        let calls = f.calls();
+        assert!(!calls.contains("sandbox delete"), "{calls}");
+        // The provider list is read only for `drop_repo_providers`.
+        assert!(
+            calls.lines().any(|l| l.starts_with("provider list")),
+            "{calls}"
+        );
+    }
+
+    #[test]
+    fn delete_tries_anyway_when_the_list_fails() {
+        let f = Fake::new("delete-nolist");
+        std::env::set_var("OSH_FAKE_FAIL", "sandbox list");
+        let v = sandbox_delete(&f.ctx(), "w1").unwrap();
+        assert_eq!(v, json!({"name":"w1","deleted":true}));
+        assert!(f.calls().lines().any(|l| l == "sandbox delete w1"));
+    }
+
+    fn one_shot_with_repo() -> Value {
+        let mut s = with_repo("OSH_TEST_TOK");
+        s["command"] = json!("make test");
+        s
+    }
+
+    #[test]
+    fn a_one_shot_create_drops_its_repo_provider_after_it_ran() {
+        for fail in [false, true] {
+            let f = Fake::new(if fail { "oneshot-fail" } else { "oneshot-ok" });
+            if fail {
+                std::env::set_var("OSH_FAKE_FAIL", "sandbox create");
+            }
+            std::env::set_var("OSH_TEST_TOK", secret_value());
+            let r = sandbox_create(&f.ctx(), &one_shot_with_repo(), false);
+            std::env::remove_var("OSH_TEST_TOK");
+            assert_eq!(r.is_err(), fail, "{r:?}");
+            let calls = f.calls();
+            let lines: Vec<&str> = calls.lines().collect();
+            let create = lines
+                .iter()
+                .position(|l| l.starts_with("sandbox create"))
+                .unwrap_or_else(|| panic!("{calls}"));
+            assert!(
+                lines[create].contains("--no-keep -- sh -c make test"),
+                "{calls}"
+            );
+            let gone = lines
+                .iter()
+                .position(|l| *l == "provider delete github-w1-r")
+                .unwrap_or_else(|| panic!("{calls}"));
+            assert!(create < gone, "{calls}");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|l| l.starts_with("provider delete"))
+                    .count(),
+                1,
+                "{calls}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_kept_create_keeps_its_repo_provider() {
+        let f = Fake::new("kept");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        let r = sandbox_create(&f.ctx(), &with_repo("OSH_TEST_TOK"), false);
+        std::env::remove_var("OSH_TEST_TOK");
+        r.unwrap();
+        assert!(!f.calls().contains("provider delete"), "{}", f.calls());
+    }
+
+    #[test]
+    fn a_profile_import_that_lost_a_race_carries_on() {
+        let f = Fake::new("import-race");
+        // The first describe says "missing", the import then fails ("already exists": the other
+        // create made it), and the second describe finds it.
+        std::env::set_var("OSH_FAKE_FAIL_ONCE", "profile describe");
+        std::env::set_var("OSH_FAKE_FAIL", "profile import");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        let r = sandbox_create(&f.ctx(), &with_repo("OSH_TEST_TOK"), false);
+        std::env::remove_var("OSH_TEST_TOK");
+        r.unwrap();
+        let calls = f.calls();
+        let lines: Vec<&str> = calls.lines().collect();
+        let import = lines
+            .iter()
+            .find(|l| l.starts_with("profile import --file "))
+            .unwrap_or_else(|| panic!("{calls}"));
+        let file = Path::new(import.trim_start_matches("profile import --file "));
+        assert!(!file.exists(), "{file:?}");
+        let name = file.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.contains(&std::process::id().to_string()), "{name}");
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|l| l.starts_with("profile describe"))
+                .count(),
+            2,
+            "{calls}"
+        );
+        assert!(
+            calls.contains("provider create --name github-w1-r"),
+            "{calls}"
+        );
+        assert!(calls.contains("sandbox create"), "{calls}");
+        // Not this call's profile: never deleted by it.
+        assert!(!calls.contains("profile delete"), "{calls}");
+    }
+
+    #[test]
+    fn a_failed_import_without_the_profile_is_err() {
+        let f = Fake::new("import-fail");
+        std::env::set_var("OSH_FAKE_FAIL", "profile ");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        let r = sandbox_create(&f.ctx(), &with_repo("OSH_TEST_TOK"), false);
+        std::env::remove_var("OSH_TEST_TOK");
+        assert!(r.is_err());
+        let calls = f.calls();
+        assert!(calls.contains("profile import"), "{calls}");
+        assert!(!calls.contains("provider create"), "{calls}");
+        assert!(!calls.contains("sandbox create"), "{calls}");
+    }
+
+    /// A folder that is not under a system folder on any test host (macOS temp dirs resolve
+    /// to `/private/var/...`, which is one).
+    fn project_dir(tag: &str) -> PathBuf {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../target")
+            .join(format!("osh-share-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("app")).unwrap();
+        d.join("app")
+    }
+
+    fn share_ctx(f: &Fake, refuse: bool) -> Ctx {
+        Ctx {
+            allow_share: true,
+            refuse_risky_share: refuse,
+            ..f.ctx()
+        }
+    }
+
+    #[test]
+    fn risky_shares_are_refused_over_mcp_and_noted_on_the_cli() {
+        let f = Fake::new("risky");
+        let home = f.dir.parent().unwrap().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let to_root = f.dir.parent().unwrap().join("to-root");
+        std::os::unix::fs::symlink("/", &to_root).unwrap();
+        let h = home.to_str().unwrap();
+        for p in [
+            PathBuf::from("/"),
+            to_root.clone(),
+            home.clone(),
+            home.join(".ssh"),
+        ] {
+            let e = create_in(&share_ctx(&f, true), &with_share(&p), true, h).unwrap_err();
+            assert!(e.contains("refused"), "{p:?}: {e}");
+            let e = apply_in(&share_ctx(&f, true), &with_share(&p), h).unwrap_err();
+            assert!(e.contains("refused"), "{p:?}: {e}");
+            let cli = create_in(&share_ctx(&f, false), &with_share(&p), true, h);
+            if std::fs::canonicalize(&p).unwrap() == Path::new("/") {
+                // The disk has no folder name to mount under, so the CLI cannot share it either.
+                assert!(cli.unwrap_err().contains("no folder name"), "{p:?}");
+                continue;
+            }
+            let v = cli.unwrap();
+            let note = v["note"].as_str().unwrap_or_else(|| panic!("{p:?}: {v}"));
+            assert!(note.contains("risky"), "{note}");
+        }
+        assert!(!f.calls().contains("sandbox create"), "{}", f.calls());
+        // The symlink is refused as what it points at.
+        let e = create_in(&share_ctx(&f, true), &with_share(&to_root), true, h).unwrap_err();
+        assert!(e.contains("sharing / is refused"), "{e}");
+    }
+
+    #[test]
+    fn a_project_folder_is_shared_by_its_real_path() {
+        let f = Fake::new("project");
+        let home = f.dir.parent().unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let project = project_dir("real");
+        let real = std::fs::canonicalize(&project).unwrap();
+        let link = f.dir.parent().unwrap().join("app");
+        std::os::unix::fs::symlink(&project, &link).unwrap();
+        let h = home.to_str().unwrap();
+        let v = create_in(&share_ctx(&f, true), &with_share(&link), false, h).unwrap();
+        assert!(v.get("note").is_none(), "{v}");
+        let calls = f.calls();
+        let line = calls
+            .lines()
+            .find(|l| l.starts_with("sandbox create"))
+            .unwrap();
+        let real = real.to_str().unwrap();
+        assert!(line.contains(&format!("\"source\":\"{real}\"")), "{line}");
+        let label = format!("{}={}", cli::SHARE_LABEL, cli::share_key(real));
+        assert!(line.contains(&label), "{line}");
+        let _ = std::fs::remove_dir_all(project.parent().unwrap());
+    }
+
+    #[test]
+    fn a_risky_note_joins_the_policy_note() {
+        let f = Fake::new("two-notes");
+        std::fs::write(f.dir.join("toolchains.toml"), "not [valid").unwrap();
+        let home = f.dir.parent().unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let v = create_in(
+            &share_ctx(&f, false),
+            &with_share(&home),
+            true,
+            home.to_str().unwrap(),
+        )
+        .unwrap();
+        let note = v["note"].as_str().unwrap();
+        assert!(
+            note.contains("risky") && note.contains("toolchains.toml"),
+            "{note}"
+        );
+    }
+
+    #[test]
+    fn repo_vars_limit_what_env_var_may_name() {
+        let f = Fake::new("repo-vars");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        let with = |list: Option<&[&str]>| Ctx {
+            repo_vars: list.map(|l| l.iter().map(|s| s.to_string()).collect()),
+            ..f.ctx()
+        };
+        let none = sandbox_create(&with(Some(&[])), &with_repo("OSH_TEST_TOK"), true);
+        let other = sandbox_create(&with(Some(&["OTHER"])), &with_repo("OSH_TEST_TOK"), true);
+        let ok = sandbox_create(
+            &with(Some(&["OTHER", "OSH_TEST_TOK"])),
+            &with_repo("OSH_TEST_TOK"),
+            true,
+        );
+        let cli_any = sandbox_create(&with(None), &with_repo("OSH_TEST_TOK"), true);
+        let applied = apply(&with(Some(&[])), &with_repo("OSH_TEST_TOK"));
+        std::env::remove_var("OSH_TEST_TOK");
+        let e = none.unwrap_err();
+        assert!(e.contains("OSH_MCP_REPO_VARS"), "{e}");
+        let e = other.unwrap_err();
+        assert!(
+            e.contains("OSH_TEST_TOK") && e.contains("OSH_MCP_REPO_VARS"),
+            "{e}"
+        );
+        for e in [&e, &applied.unwrap_err()] {
+            assert!(!e.contains(&secret_value()), "{e}");
+        }
+        ok.unwrap();
+        cli_any.unwrap();
+        assert_eq!(f.calls(), "");
     }
 
     #[test]
