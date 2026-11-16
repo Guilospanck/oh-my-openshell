@@ -632,7 +632,7 @@ A spec is a JSON object; unknown fields and wrong types are refused. Only `name`
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `name` | string | 1 to 63 lowercase letters, digits or `-`, starting with a letter or digit |
-| `image` | string | Sandbox image; a tag built from one of the Dockerfiles is built first when outdated, any other value is passed to `openshell` unchanged (`--from`) |
+| `image` | string | Sandbox image; a tag built from one of the Dockerfiles is built first when it does not exist yet (an outdated image is not rebuilt headless; rebuild it from the dashboard's Images tab), any other value is passed to `openshell` unchanged (`--from`) |
 | `providers` | array of strings | Provider names to attach |
 | `cpu`, `memory` | string | For example `"2"` and `"4Gi"` |
 | `command` | string | Command the sandbox runs |
@@ -654,14 +654,14 @@ A spec is a JSON object; unknown fields and wrong types are refused. Only `name`
 }
 ```
 
-The `repo` variable must be set in the environment of the process that runs `osh` (or `osh mcp`); the variable named by `env_var` must be set and non-empty, also with `--dry-run`. It travels through the environment, never through argv, and `--dry-run` shows no secret.
+The `repo` variable must be set in the environment of the process that runs `osh` (or `osh mcp`); the variable named by `env_var` must be set and non-empty, also with `--dry-run`; a name containing `=` or NUL, or a value that is not valid UTF-8, is refused. It travels through the environment, never through argv, and `--dry-run` shows no secret.
 
 ### Output and exit codes
 
 - Success: one JSON line on stdout, exit 0. `list` gives `[{"name","phase","created"}]`; `create` gives `{"name","phase"}` (plus `"note"` when the policy needs one), or with `--dry-run` `{"name","steps":[{"prog","args"}]}` and nothing is created; `delete` gives `{"name","deleted":true}` and also removes the repo provider osh made for that sandbox; `apply` gives `{"action":"created"|"unchanged","name"}`.
 - Failure: `{"ok":false,"error":"..."}` on stdout, exit 1.
 - Usage errors (bad flags) print the usage on stderr, exit 2.
-- `sandbox exec` prints `{"exit_code","stdout","stderr"}` and then exits with the same code. The code is that of the `openshell sandbox exec` process: normally the command's own, but a missing sandbox or an `openshell` error also gives `{"exit_code":N,...}` and exit N rather than `{"ok":false,...}`. Only a failure to start `openshell` (or a bad name or empty command) gives the `ok:false` form.
+- `sandbox exec` prints `{"exit_code","stdout","stderr"}` and then exits with the same code. The code is that of the `openshell sandbox exec` process: normally the command's own, but a missing sandbox or an `openshell` error also gives `{"exit_code":N,...}` and exit N rather than `{"ok":false,...}`. Only a failure to start `openshell` (or a bad name, an empty command or a gateway name starting with `-`) gives the `ok:false` form.
 
 `apply` creates the sandbox when none of that name exists. An existing name returns `unchanged` and is left as it is: there is no reconcile of image, providers or any other field.
 
