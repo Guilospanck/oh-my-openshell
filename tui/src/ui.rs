@@ -2203,6 +2203,38 @@ mod tests {
     }
 
     #[test]
+    fn permissions_render_endpoints_rules_and_binaries() {
+        let p = cli::ProviderPerm {
+            binaries: vec!["/usr/bin/x".into()],
+            endpoints: vec![
+                cli::EndpointPerm {
+                    host: "h.io".into(),
+                    port: 443,
+                    protocol: "rest".into(),
+                    access: "read-only".into(),
+                    enforcement: "enforce".into(),
+                    rules: vec![],
+                },
+                cli::EndpointPerm {
+                    host: "g.com".into(),
+                    port: 443,
+                    protocol: "rest".into(),
+                    access: String::new(),
+                    enforcement: "enforce".into(),
+                    rules: vec!["POST /a/git-receive-pack".into()],
+                },
+            ],
+            ..Default::default()
+        };
+        let text: String = perm_lines(&[p])
+            .iter()
+            .map(|l| l.to_string() + "\n")
+            .collect();
+        assert!(text.contains("h.io:443") && text.contains("custom rules"));
+        assert!(text.contains("POST /a/git-receive-pack") && text.contains("/usr/bin/x"));
+    }
+
+    #[test]
     fn wrapping_breaks_at_words_and_keeps_the_indent() {
         let out = wrap_line(&Line::raw("    alpha beta gamma delta"), 16);
         let rows: Vec<String> = out.iter().map(plain).collect();

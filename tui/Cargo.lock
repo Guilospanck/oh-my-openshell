@@ -828,14 +828,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "osh-core"
+version = "0.6.0"
+dependencies = [
+ "psl",
+ "saphyr",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "osh-tui"
 version = "0.6.0"
 dependencies = [
  "libghostty-vt",
+ "osh-core",
  "portable-pty",
- "psl",
  "ratatui",
- "saphyr",
  "serde_json",
  "toml",
  "unicode-segmentation",

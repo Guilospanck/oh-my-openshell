@@ -22,7 +22,7 @@ const INDENT: usize = 2;
 const UNDO_MAX: usize = 1000;
 
 /// Checks the text before it is written; Err holds the reason (its first line is shown).
-pub type Check = fn(&str) -> Result<(), String>;
+pub use osh_core::text::Check;
 
 /// A place in the text: `col` is a byte offset into the line, always on a grapheme boundary.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Default)]
@@ -187,22 +187,7 @@ pub fn error_at(msg: &str) -> Option<(usize, usize)> {
     Some((line, col))
 }
 
-/// The line of an error to show: the first one, plus the last one when it says what was wrong
-/// (TOML puts the location first and the reason after a code excerpt).
-pub fn error_summary(msg: &str) -> String {
-    let lines: Vec<&str> = msg
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    match (lines.first(), lines.last()) {
-        (Some(f), Some(l)) if lines.len() > 1 && !l.starts_with('|') && !l.contains('^') => {
-            format!("{f}: {l}")
-        }
-        (Some(f), _) => f.to_string(),
-        _ => "invalid".into(),
-    }
-}
+pub use osh_core::text::error_summary;
 
 impl Editor {
     pub fn new(name: &str, path: PathBuf, text: &str, check: Option<Check>) -> Self {

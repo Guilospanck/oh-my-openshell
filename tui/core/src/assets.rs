@@ -15,69 +15,78 @@ pub const OPT_IN_PROFILES: &[&str] = &["go", "js", "rust"];
 const FILES: &[(&str, &str)] = &[
     (
         "providers/claude-code.yaml",
-        include_str!("../../providers/claude-code.yaml"),
+        include_str!("../../../providers/claude-code.yaml"),
     ),
     (
         "providers/claude-marketplace.yaml",
-        include_str!("../../providers/claude-marketplace.yaml"),
+        include_str!("../../../providers/claude-marketplace.yaml"),
     ),
     (
         "providers/forgejo.yaml",
-        include_str!("../../providers/forgejo.yaml"),
+        include_str!("../../../providers/forgejo.yaml"),
     ),
     (
         "providers/github.yaml",
-        include_str!("../../providers/github.yaml"),
+        include_str!("../../../providers/github.yaml"),
     ),
-    ("providers/go.yaml", include_str!("../../providers/go.yaml")),
-    ("providers/js.yaml", include_str!("../../providers/js.yaml")),
+    (
+        "providers/go.yaml",
+        include_str!("../../../providers/go.yaml"),
+    ),
+    (
+        "providers/js.yaml",
+        include_str!("../../../providers/js.yaml"),
+    ),
     (
         "providers/rust.yaml",
-        include_str!("../../providers/rust.yaml"),
+        include_str!("../../../providers/rust.yaml"),
     ),
     (
         "providers/npm.yaml",
-        include_str!("../../providers/npm.yaml"),
+        include_str!("../../../providers/npm.yaml"),
     ),
     (
         "providers/pypi.yaml",
-        include_str!("../../providers/pypi.yaml"),
+        include_str!("../../../providers/pypi.yaml"),
     ),
     (
         "images/Dockerfile-claude_code",
-        include_str!("../../images/Dockerfile-claude_code"),
+        include_str!("../../../images/Dockerfile-claude_code"),
     ),
     (
         "images/Dockerfile-pi",
-        include_str!("../../images/Dockerfile-pi"),
+        include_str!("../../../images/Dockerfile-pi"),
     ),
-    ("gateway.toml", include_str!("../../gateway.toml")),
+    ("gateway.toml", include_str!("../../../gateway.toml")),
     (
         "gateway-linux.toml",
-        include_str!("../../gateway-linux.toml"),
+        include_str!("../../../gateway-linux.toml"),
     ),
     (
         "gateway-podman.toml",
-        include_str!("../../gateway-podman.toml"),
+        include_str!("../../../gateway-podman.toml"),
     ),
-    ("gateway-linux.env", include_str!("../../gateway-linux.env")),
+    (
+        "gateway-linux.env",
+        include_str!("../../../gateway-linux.env"),
+    ),
     (
         "gateway-macos-arm64.env",
-        include_str!("../../gateway-macos-arm64.env"),
+        include_str!("../../../gateway-macos-arm64.env"),
     ),
     (
         "gateway-macos-x86_64.env",
-        include_str!("../../gateway-macos-x86_64.env"),
+        include_str!("../../../gateway-macos-x86_64.env"),
     ),
     (
         "sandbox-policy.yaml",
-        include_str!("../../sandbox-policy.yaml"),
+        include_str!("../../../sandbox-policy.yaml"),
     ),
-    ("toolchains.toml", include_str!("../../toolchains.toml")),
-    (".gitleaks.toml", include_str!("../../.gitleaks.toml")),
+    ("toolchains.toml", include_str!("../../../toolchains.toml")),
+    (".gitleaks.toml", include_str!("../../../.gitleaks.toml")),
     (
         "gateway-docker.toml",
-        include_str!("../../gateway-docker.toml"),
+        include_str!("../../../gateway-docker.toml"),
     ),
 ];
 
@@ -305,7 +314,7 @@ fn check_toml(text: &str) -> Result<(), String> {
 }
 
 /// The check the editor runs before saving `rel`, so a broken file is never written.
-pub fn check_for(rel: &str) -> Option<crate::editor::Check> {
+pub fn check_for(rel: &str) -> Option<crate::text::Check> {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     Some(match rel {
         "toolchains.toml" => crate::preload::check,

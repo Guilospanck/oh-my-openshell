@@ -521,7 +521,8 @@ pub fn gather_for(h: &dyn Host, os: Os) -> Facts {
     }
 }
 
-#[cfg(test)]
+/// Test doubles; the binary's own tests reach them through the `testing` feature.
+#[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use super::*;
     use std::cell::RefCell;

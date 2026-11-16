@@ -38,7 +38,7 @@ test:
 	set -euo pipefail
 	source "{{justfile_directory()}}/dev-env"
 	osh_use_zig || { echo "Zig 0.15 is required; run: just doctor" >&2; exit 1; }
-	cargo test --manifest-path "{{justfile_directory()}}/tui/Cargo.toml"
+	cargo test --workspace --manifest-path "{{justfile_directory()}}/tui/Cargo.toml"
 
 # Format check, clippy, and tests: run before every commit
 check:
@@ -47,9 +47,9 @@ check:
 	source "{{justfile_directory()}}/dev-env"
 	osh_use_zig || { echo "Zig 0.15 is required; run: just doctor" >&2; exit 1; }
 	manifest="{{justfile_directory()}}/tui/Cargo.toml"
-	cargo fmt --check --manifest-path "$manifest"
-	cargo clippy --all-targets --manifest-path "$manifest" -- -D warnings
-	cargo test --manifest-path "$manifest"
+	cargo fmt --all --check --manifest-path "$manifest"
+	cargo clippy --workspace --all-targets --manifest-path "$manifest" -- -D warnings
+	cargo test --workspace --manifest-path "$manifest"
 
 # Runs the Linux test suite in Docker on Debian, Ubuntu, Fedora and Arch (--distro NAME for one); real build, checks and package installs, stubbed OpenShell and systemd
 test-linux *args:

@@ -1,32 +1,26 @@
 //! osh: ratatui front end for OpenShell. Dashboard of sandboxes with live
 //! status, embedded sandbox shells, plus creating, providers, profiles and images.
-mod agents;
 mod alerts;
 mod app;
-mod assets;
-mod cli;
 mod clip;
 mod editor;
 mod envfile;
 mod exted;
 mod gateway;
-mod ghrepo;
 mod gwmodel;
 mod gwops;
 mod logview;
 mod palette;
-mod platform;
 mod ports;
-mod preload;
 mod setup;
 mod term;
 mod tmuxpass;
 mod ui;
 mod usage;
-mod watch;
 mod wizard;
 
 use app::{App, Done, Failed, Step};
+use osh_core::{agents, assets, cli, ghrepo, platform, preload, watch};
 use ratatui::crossterm::{
     event::{
         self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,

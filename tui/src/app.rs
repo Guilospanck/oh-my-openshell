@@ -5140,8 +5140,8 @@ impl App {
                     let mut other = Vec::new();
                     for d in gone {
                         match d.page {
-                            Some((label, page)) => other.push((label, d.token, page)),
-                            None => github.push(d.token),
+                            Some((label, page)) => other.push((label, d.key_name, page)),
+                            None => github.push(d.key_name),
                         }
                     }
                     let any = !github.is_empty() || !other.is_empty();

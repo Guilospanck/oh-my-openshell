@@ -7,7 +7,7 @@ SELF=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]
 DIR=$(dirname "$SELF")
 BIN="$DIR/tui/target/release/osh-tui"
 
-if [[ ! -x "$BIN" || -n "$(find "$DIR/tui/src" "$DIR/tui/Cargo.toml" -newer "$BIN" -print -quit)" ]]; then
+if [[ ! -x "$BIN" || -n "$(find "$DIR/tui/src" "$DIR/tui/core" "$DIR/tui/Cargo.toml" -newer "$BIN" -print -quit)" ]]; then
   command -v cargo >/dev/null 2>&1 || { echo "osh: cargo is required to build the TUI (rustup)" >&2; exit 1; }
   # shellcheck source=dev-env
   source "$DIR/dev-env"

@@ -789,7 +789,7 @@ pub fn restart_sandbox(sandbox: &str) -> Result<(), String> {
 pub struct Dropped {
     pub provider: String,
     /// The token name osh asked for, to find it in the token list.
-    pub token: String,
+    pub key_name: String,
     /// Where a non-GitHub token is revoked, as (provider, page); `None` for GitHub, whose
     /// token list osh offers to open.
     pub page: Option<(String, String)>,
@@ -864,7 +864,7 @@ fn drop_owned(
             let repo = t.repo.rsplit('/').next().unwrap_or(&t.repo);
             removed.push(Dropped {
                 provider: t.provider.clone(),
-                token: ghrepo::token_name(&format!("{sandbox}-{repo}")),
+                key_name: ghrepo::token_name(&format!("{sandbox}-{repo}")),
                 page: GhRepo::from_spec(&t.repo)
                     .filter(|r| !r.is_github())
                     .map(|r| (r.forge.label().to_string(), ghrepo::tokens_page(&r))),
@@ -878,7 +878,7 @@ fn drop_owned(
                 .unwrap_or(name);
             removed.push(Dropped {
                 provider: name.clone(),
-                token: ghrepo::token_name(&format!("{sandbox}-{repo}")),
+                key_name: ghrepo::token_name(&format!("{sandbox}-{repo}")),
                 page: Some((
                     Forge::Forgejo.label().to_string(),
                     ghrepo::forgejo_tokens_page(host),
@@ -2123,12 +2123,6 @@ mod tests {
         assert_eq!(p.binaries, ["/usr/bin/x"]);
         assert_eq!(p.endpoints[0].access, "read-only");
         assert_eq!(p.endpoints[1].rules, ["POST /a/git-receive-pack"]);
-        let text: String = crate::ui::perm_lines(&[p])
-            .iter()
-            .map(|l| l.to_string() + "\n")
-            .collect();
-        assert!(text.contains("h.io:443") && text.contains("custom rules"));
-        assert!(text.contains("POST /a/git-receive-pack") && text.contains("/usr/bin/x"));
     }
 
     fn r(forge: Forge, host: &str, owner: &str) -> GhRepo {
@@ -2236,7 +2230,7 @@ mod tests {
                 "https://example.org/user/settings/applications".to_string()
             ))
         );
-        assert_eq!(gone[0].token, "osh-dev-app");
+        assert_eq!(gone[0].key_name, "osh-dev-app");
         // the app profile is still used by two other providers; the lib one is not
         assert!(calls.contains(&"profile delete fj-example-org-acme-lib".to_string()));
         assert!(!calls
@@ -2276,7 +2270,7 @@ mod tests {
             &mut |p| untracked.push(p.into()),
         );
         assert_eq!(untracked, ["gitlab-dev-app", "github-dev-app"]);
-        assert_eq!(gone[0].token, "osh-dev-app");
+        assert_eq!(gone[0].key_name, "osh-dev-app");
         assert_eq!(
             gone[0].page,
             Some((
@@ -2291,7 +2285,7 @@ mod tests {
 
     #[test]
     fn repo_profiles_answer_for_their_hosts_without_credentials() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         assert_eq!(profiles_for_host(&dir, "registry.npmjs.org"), ["npm"]);
         let git = profiles_for_host(&dir, "github.com");
         assert!(git.contains(&"claude-marketplace".to_string()));
@@ -2308,7 +2302,7 @@ mod tests {
 
     #[test]
     fn every_opt_in_profile_exists_and_is_anonymous() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for id in crate::assets::OPT_IN_PROFILES {
             assert!(profile_ids(&dir).contains(&id.to_string()), "{id}");
             assert!(

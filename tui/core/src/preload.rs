@@ -1322,7 +1322,7 @@ enabled = true"
             &g("[one]\nhosts = [\"example.com\", \"www.example.org\"]\n[two]\nhosts = [\"www.example.org\"]\ngit_hosts = [\"codeberg.org\"]\n"),
             &names(&["one", "two"]),
         );
-        let fixture = include_str!("../../tests/sandbox/toolchains-close.yaml");
+        let fixture = include_str!("../../../tests/sandbox/toolchains-close.yaml");
         assert_eq!(
             creation_policy(base, &groups).unwrap(),
             format!("{}\n\n{fixture}", base.trim_end()),

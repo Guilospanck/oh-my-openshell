@@ -1534,7 +1534,8 @@ mod tests {
 
     fn repo() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
+            .ancestors()
+            .nth(2)
             .unwrap()
             .to_path_buf()
     }
