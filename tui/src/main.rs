@@ -3,6 +3,7 @@
 mod alerts;
 mod app;
 mod clip;
+mod configcmd;
 mod editor;
 mod envfile;
 mod exted;
@@ -406,6 +407,9 @@ fn subcommand(args: &[String]) -> Option<i32> {
             materialize_data();
             Some(headless::headless(args))
         }
+        // No materialize: the read-only forms must not write, and `set` and friends create
+        // only osh.toml themselves.
+        "config" => Some(configcmd::run(&args[1..])),
         "mcp" => {
             materialize_data();
             Some(mcpcmd::run(&args[1..]))

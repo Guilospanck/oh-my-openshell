@@ -785,6 +785,396 @@ pub fn migrate(dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+use std::sync::Arc;
+use std::time::Duration;
+
+/// The current settings of this process, with the file's modification time so a running
+/// dashboard can notice an edit.
+pub struct Store {
+    dir: PathBuf,
+    mtime: Option<std::time::SystemTime>,
+    snap: Arc<Snapshot>,
+}
+
+fn mtime_of(dir: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(dir.join(FILE))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
+fn real_env(k: &str) -> Option<OsString> {
+    std::env::var_os(k)
+}
+
+impl Store {
+    pub fn open(dir: &Path, env: Env) -> Store {
+        Store {
+            dir: dir.to_path_buf(),
+            mtime: mtime_of(dir),
+            snap: Arc::new(load(dir, env)),
+        }
+    }
+    /// Re-read `osh.toml` when it changed. An invalid file keeps the last good values and
+    /// replaces only the problems. True when anything changed.
+    pub fn reload(&mut self, env: Env) -> bool {
+        let m = mtime_of(&self.dir);
+        if m == self.mtime {
+            return false;
+        }
+        self.mtime = m;
+        let fresh = load(&self.dir, env);
+        if fresh.file_valid {
+            self.snap = Arc::new(fresh);
+        } else {
+            let mut kept = (*self.snap).clone();
+            kept.problems = fresh.problems;
+            kept.file_valid = false;
+            self.snap = Arc::new(kept);
+        }
+        true
+    }
+    pub fn snapshot(&self) -> Arc<Snapshot> {
+        self.snap.clone()
+    }
+}
+
+static STORE: std::sync::Mutex<Option<Store>> = std::sync::Mutex::new(None);
+static DEFAULTS: std::sync::OnceLock<Arc<Snapshot>> = std::sync::OnceLock::new();
+
+thread_local! {
+    static TEST_SNAPSHOT: std::cell::RefCell<Option<Arc<Snapshot>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Load the process-wide settings once, with the real environment. Call at start.
+pub fn init(dir: &Path) {
+    if let Ok(mut g) = STORE.lock() {
+        *g = Some(Store::open(dir, &real_env));
+    }
+}
+
+/// Re-read `osh.toml` if it changed; cheap (one `stat`). True when the values changed.
+pub fn reload_if_changed() -> bool {
+    STORE
+        .lock()
+        .ok()
+        .and_then(|mut g| g.as_mut().map(|s| s.reload(&real_env)))
+        .unwrap_or(false)
+}
+
+/// The process-wide settings. Under a test: the snapshot installed on this thread, else
+/// defaults, so a test never reads the real data folder or its neighbours' settings.
+pub fn snapshot() -> Arc<Snapshot> {
+    if let Some(s) = TEST_SNAPSHOT.with(|t| t.borrow().clone()) {
+        return s;
+    }
+    if !crate::testmode::under_test() {
+        if let Some(s) = STORE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(Store::snapshot))
+        {
+            return s;
+        }
+    }
+    DEFAULTS
+        .get_or_init(|| Arc::new(load(Path::new("/nonexistent-osh-settings"), &|_| None)))
+        .clone()
+}
+
+/// Make `snapshot()` return `snap` on this thread until the guard drops. Tests only.
+pub fn install_for_test(snap: Snapshot) -> TestGuard {
+    let prev = TEST_SNAPSHOT.with(|t| t.replace(Some(Arc::new(snap))));
+    TestGuard(prev)
+}
+
+pub struct TestGuard(Option<Arc<Snapshot>>);
+
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        TEST_SNAPSHOT.with(|t| *t.borrow_mut() = prev);
+    }
+}
+
+fn value_of(key: &str) -> Value {
+    snapshot()
+        .rows
+        .iter()
+        .find(|r| r.def.key == key)
+        .map(|r| r.value.clone())
+        .unwrap_or_else(|| default_value(def(key).expect("registry key")))
+}
+
+fn int(key: &str) -> u64 {
+    match value_of(key) {
+        Value::Int(n) => n,
+        _ => 0,
+    }
+}
+fn flag(key: &str) -> bool {
+    matches!(value_of(key), Value::Bool(true))
+}
+fn text(key: &str) -> String {
+    match value_of(key) {
+        Value::Str(s) => s,
+        _ => String::new(),
+    }
+}
+fn list(key: &str) -> Vec<String> {
+    match value_of(key) {
+        Value::List(l) => l,
+        _ => Vec::new(),
+    }
+}
+
+pub fn refresh_gateway() -> Duration {
+    Duration::from_secs(int("refresh.gateway_secs"))
+}
+pub fn refresh_ports() -> Duration {
+    Duration::from_secs(int("refresh.ports_secs"))
+}
+pub fn refresh_usage() -> Duration {
+    Duration::from_secs(int("refresh.usage_secs"))
+}
+pub fn usage_max_backoff() -> Duration {
+    Duration::from_secs(effective_backoff(
+        int("refresh.usage_secs"),
+        int("refresh.usage_max_backoff_secs"),
+    ))
+}
+pub fn refresh_alerts() -> Duration {
+    Duration::from_secs(int("refresh.alerts_secs"))
+}
+pub fn alerts_settle() -> Duration {
+    Duration::from_secs(int("alerts.settle_secs"))
+}
+pub fn toast_for() -> Duration {
+    Duration::from_secs(int("ui.toast_secs"))
+}
+pub fn status_for() -> Duration {
+    Duration::from_secs(int("ui.status_secs"))
+}
+pub fn status_allowed_for() -> Duration {
+    Duration::from_secs(int("ui.status_allowed_secs"))
+}
+/// `auto`, `own` or `builtin`.
+pub fn editor_pref() -> String {
+    text("general.editor")
+}
+pub fn tmux_keys() -> bool {
+    flag("shell.tmux_keys")
+}
+pub fn mcp_allow_share() -> bool {
+    flag("mcp.allow_share")
+}
+pub fn mcp_share_roots() -> Vec<PathBuf> {
+    list("mcp.share_roots")
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
+pub fn mcp_repo_vars() -> Vec<String> {
+    list("mcp.repo_vars")
+}
+
+pub struct Out {
+    pub stdout: String,
+    pub stderr: String,
+    pub code: i32,
+}
+
+const CONFIG_USAGE: &str = "\
+usage:
+  osh config [--json]            every setting: value, source, default, environment variable, description
+  osh config get KEY [--json]
+  osh config set KEY VALUE [--json]   lists are comma-separated
+  osh config unset KEY [--json]       back to the default
+  osh config path                the osh.toml file
+  osh config edit                open osh.toml in your editor";
+
+fn value_json(v: &Value) -> serde_json::Value {
+    match v {
+        Value::Bool(b) => (*b).into(),
+        Value::Int(n) => (*n).into(),
+        Value::Str(s) => s.as_str().into(),
+        Value::List(l) => l.iter().map(String::as_str).collect::<Vec<_>>().into(),
+    }
+}
+
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::Bool(b) => b.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::Str(s) => s.clone(),
+        Value::List(l) => l.join(","),
+    }
+}
+
+fn source_name(s: Source) -> &'static str {
+    match s {
+        Source::Default => "default",
+        Source::File => "file",
+        Source::Env => "env",
+    }
+}
+
+fn effect_name(e: Effect) -> &'static str {
+    match e {
+        Effect::Live => "live",
+        Effect::Restart => "restart",
+        Effect::RestartMcp => "restart of osh mcp",
+    }
+}
+
+/// One row as the JSON contract shows it (also used by the Settings screen's tests).
+pub fn row_json(r: &Row) -> serde_json::Value {
+    serde_json::json!({
+        "key": r.def.key,
+        "value": value_json(&r.value),
+        "source": source_name(r.source),
+        "default": value_json(&default_value(r.def)),
+        "env": r.def.env,
+        "env_active": r.env_active,
+        "takes_effect": effect_name(r.def.effect),
+        "description": r.def.desc,
+    })
+}
+
+fn problem_json(p: &Problem) -> serde_json::Value {
+    serde_json::json!({"key": p.key, "line": p.line, "col": p.col, "message": p.msg})
+}
+
+fn table_text(s: &Snapshot) -> String {
+    let head = ["KEY", "VALUE", "SOURCE", "DEFAULT", "ENV", "DESCRIPTION"];
+    let mut rows: Vec<[String; 6]> = vec![head.map(String::from)];
+    for r in &s.rows {
+        rows.push([
+            r.def.key.into(),
+            value_text(&r.value),
+            source_name(r.source).into(),
+            value_text(&default_value(r.def)),
+            r.def.env.unwrap_or("").into(),
+            r.def.desc.into(),
+        ]);
+    }
+    let w: Vec<usize> = (0..5)
+        .map(|c| rows.iter().map(|r| r[c].chars().count()).max().unwrap_or(0))
+        .collect();
+    let mut out = String::new();
+    for r in &rows {
+        for (c, cell) in r.iter().enumerate().take(5) {
+            out.push_str(&format!("{cell:<width$}  ", width = w[c]));
+        }
+        out.push_str(&r[5]);
+        out.push('\n');
+    }
+    out.push_str(&format!("\nData folder: {}\n", s.data_dir.display()));
+    for p in &s.problems {
+        let at = match (p.line, p.col) {
+            (Some(l), Some(c)) => format!(":{l}:{c}"),
+            (Some(l), None) => format!(":{l}"),
+            _ => String::new(),
+        };
+        out.push_str(&format!("problem: {FILE}{at}: {}\n", p.msg));
+    }
+    out
+}
+
+/// `osh config ...`. `edit` opens a path in the user's editor and waits. Only `set`, `unset`,
+/// `edit` and `path` may create or extend `osh.toml`.
+pub fn run_cli(
+    args: &[String],
+    dir: &Path,
+    env: Env,
+    edit: &dyn Fn(&Path) -> Result<(), String>,
+) -> Out {
+    let json = args.iter().any(|a| a == "--json");
+    let pos: Vec<&str> = args
+        .iter()
+        .filter(|a| *a != "--json")
+        .map(String::as_str)
+        .collect();
+    let usage = || Out {
+        stdout: String::new(),
+        stderr: format!("{CONFIG_USAGE}\n"),
+        code: 2,
+    };
+    let done = |r: Result<serde_json::Value, String>, plain: String| match r {
+        Ok(v) if json => Out {
+            stdout: format!("{v}\n"),
+            stderr: String::new(),
+            code: 0,
+        },
+        Ok(_) => Out {
+            stdout: plain,
+            stderr: String::new(),
+            code: 0,
+        },
+        Err(e) if json => Out {
+            stdout: format!("{}\n", serde_json::json!({"ok": false, "error": e})),
+            stderr: String::new(),
+            code: 1,
+        },
+        Err(e) => Out {
+            stdout: String::new(),
+            stderr: format!("osh: config: {e}\n"),
+            code: 1,
+        },
+    };
+    let row_of = |key: &str| -> Result<Row, String> {
+        load(dir, env)
+            .rows
+            .into_iter()
+            .find(|r| r.def.key == key)
+            .ok_or_else(|| format!("unknown setting {key}"))
+    };
+    let show = |r: Result<Row, String>| {
+        let plain = r
+            .as_ref()
+            .map(|r| {
+                format!(
+                    "{} = {} ({})\n",
+                    r.def.key,
+                    value_text(&r.value),
+                    source_name(r.source)
+                )
+            })
+            .unwrap_or_default();
+        done(r.map(|r| row_json(&r)), plain)
+    };
+    match pos.as_slice() {
+        [] => {
+            let s = load(dir, env);
+            let v = serde_json::json!({
+                "settings": s.rows.iter().map(row_json).collect::<Vec<_>>(),
+                "problems": s.problems.iter().map(problem_json).collect::<Vec<_>>(),
+                "data_dir": s.data_dir,
+            });
+            done(Ok(v), table_text(&s))
+        }
+        ["get", key] => {
+            let r = row_of(key);
+            let plain = r
+                .as_ref()
+                .map(|r| format!("{}\n", value_text(&r.value)))
+                .unwrap_or_default();
+            done(r.map(|r| row_json(&r)), plain)
+        }
+        ["set", key, value] => show(set(dir, key, value, env).and_then(|_| row_of(key))),
+        ["unset", key] => show(unset(dir, key).and_then(|_| row_of(key))),
+        ["path"] => {
+            let r = ensure_file(dir).map(|_| dir.join(FILE).display().to_string());
+            let plain = r.as_ref().map(|p| format!("{p}\n")).unwrap_or_default();
+            done(r.map(|p| serde_json::json!({"path": p})), plain)
+        }
+        ["edit"] => {
+            let r = ensure_file(dir).and_then(|_| edit(&dir.join(FILE)));
+            done(r.map(|_| serde_json::json!({"ok": true})), String::new())
+        }
+        _ => usage(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1293,5 +1683,177 @@ mod tests {
             return;
         }
         assert!(d.join("editor-mode").exists());
+    }
+
+    fn a(s: &[&str]) -> Vec<String> {
+        s.iter().map(|x| x.to_string()).collect()
+    }
+
+    fn cli(dir: &Path, args: &[&str]) -> Out {
+        run_cli(&a(args), dir, &no_env, &|_| Ok(()))
+    }
+
+    #[test]
+    fn accessors_default_under_test() {
+        assert_eq!(refresh_ports(), Duration::from_secs(3));
+        assert_eq!(refresh_gateway(), Duration::from_secs(2));
+        assert_eq!(status_allowed_for(), Duration::from_secs(20));
+        assert_eq!(usage_max_backoff(), Duration::from_secs(40));
+        assert!(tmux_keys() && !mcp_allow_share());
+        assert_eq!(editor_pref(), "auto");
+        assert!(mcp_share_roots().is_empty() && mcp_repo_vars().is_empty());
+    }
+
+    #[test]
+    fn installed_snapshot_is_per_thread_and_ends_with_its_guard() {
+        let d = tmp();
+        std::fs::write(d.join(FILE), "[refresh]\nports_secs = 9\n").unwrap();
+        {
+            let _g = install_for_test(load(&d, &no_env));
+            assert_eq!(refresh_ports(), Duration::from_secs(9));
+            assert_eq!(
+                std::thread::spawn(refresh_ports).join().unwrap(),
+                Duration::from_secs(3)
+            );
+        }
+        assert_eq!(refresh_ports(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn backoff_accessor_is_clamped_to_the_meter_interval() {
+        let d = tmp();
+        std::fs::write(
+            d.join(FILE),
+            "[refresh]\nusage_secs = 100\nusage_max_backoff_secs = 20\n",
+        )
+        .unwrap();
+        let _g = install_for_test(load(&d, &no_env));
+        assert_eq!(usage_max_backoff(), Duration::from_secs(100));
+    }
+
+    #[test]
+    fn store_reloads_on_change_and_survives_an_invalid_file() {
+        let d = tmp();
+        let mut st = Store::open(&d, &no_env);
+        assert!(!st.reload(&no_env), "nothing changed yet");
+        std::fs::write(d.join(FILE), "[refresh]\nports_secs = 8\n").unwrap();
+        assert!(st.reload(&no_env));
+        assert_eq!(
+            row(&st.snapshot(), "refresh.ports_secs").value,
+            Value::Int(8)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(d.join(FILE), "[refresh\nports_secs = 8\n").unwrap();
+        assert!(st.reload(&no_env));
+        let s = st.snapshot();
+        assert!(!s.file_valid, "the screen can show the parse error");
+        assert_eq!(
+            row(&s, "refresh.ports_secs").value,
+            Value::Int(8),
+            "last good values stay"
+        );
+        assert!(!s.problems.is_empty());
+    }
+
+    #[test]
+    fn config_json_lists_every_registry_key_with_env_fields() {
+        let d = tmp();
+        let env = |k: &str| (k == MCP_SHARE_ENV).then(|| OsString::from("1"));
+        let out = run_cli(&a(&["--json"]), &d, &env, &|_| Ok(()));
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let v: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+        let rows = v["settings"].as_array().unwrap();
+        assert_eq!(rows.len(), registry().len());
+        let m = rows.iter().find(|r| r["key"] == "mcp.allow_share").unwrap();
+        assert_eq!(m["value"], true);
+        assert_eq!(m["source"], "env");
+        assert_eq!(m["env"], MCP_SHARE_ENV);
+        assert_eq!(m["env_active"], true);
+        assert_eq!(m["default"], false);
+        assert_eq!(m["takes_effect"], "restart of osh mcp");
+        let g = rows.iter().find(|r| r["key"] == "general.editor").unwrap();
+        assert_eq!(g["env"], serde_json::Value::Null);
+        assert!(v["problems"].as_array().unwrap().is_empty());
+        assert!(v["data_dir"].is_string());
+    }
+
+    #[test]
+    fn config_table_shows_key_value_source_env_and_description() {
+        let out = cli(&tmp(), &[]);
+        assert_eq!(out.code, 0);
+        assert!(out.stdout.contains("refresh.ports_secs") && out.stdout.contains("default"));
+        assert!(out.stdout.contains(TMUX_ENV) && out.stdout.contains("Pass the host tmux keys"));
+    }
+
+    #[test]
+    fn config_get_prints_value() {
+        let d = tmp();
+        assert_eq!(cli(&d, &["get", "refresh.ports_secs"]).stdout.trim(), "3");
+        assert_eq!(cli(&d, &["get", "nope.x"]).code, 1);
+    }
+
+    #[test]
+    fn config_set_then_get_roundtrip_in_temp_dir() {
+        let d = tmp();
+        let o = cli(&d, &["set", "refresh.ports_secs", "7"]);
+        assert_eq!(o.code, 0, "{}", o.stderr);
+        assert_eq!(cli(&d, &["get", "refresh.ports_secs"]).stdout.trim(), "7");
+        assert!(read(&d).contains("ports_secs = 7"));
+        assert_eq!(cli(&d, &["unset", "refresh.ports_secs"]).code, 0);
+        assert_eq!(cli(&d, &["get", "refresh.ports_secs"]).stdout.trim(), "3");
+    }
+
+    #[test]
+    fn config_set_refused_by_env_exits_1_names_variable() {
+        let d = tmp();
+        let env = |k: &str| (k == MCP_SHARE_ENV).then(|| OsString::from("1"));
+        let o = run_cli(
+            &a(&["set", "mcp.allow_share", "false", "--json"]),
+            &d,
+            &env,
+            &|_| Ok(()),
+        );
+        assert_eq!(o.code, 1);
+        let v: serde_json::Value = serde_json::from_str(o.stdout.trim()).unwrap();
+        assert_eq!(v["ok"], false);
+        assert!(v["error"].as_str().unwrap().contains(MCP_SHARE_ENV));
+    }
+
+    #[test]
+    fn config_missing_args_and_unknown_subcommand_exit_2() {
+        let d = tmp();
+        assert_eq!(cli(&d, &["get"]).code, 2);
+        assert_eq!(cli(&d, &["set", "refresh.ports_secs"]).code, 2);
+        assert_eq!(cli(&d, &["frobnicate"]).code, 2);
+        assert!(cli(&d, &["frobnicate"]).stderr.contains("usage"));
+    }
+
+    #[test]
+    fn read_only_commands_do_not_create_the_file() {
+        let d = tmp();
+        cli(&d, &[]);
+        cli(&d, &["--json"]);
+        cli(&d, &["get", "refresh.ports_secs"]);
+        assert!(!d.join(FILE).exists());
+        let o = cli(&d, &["path"]);
+        assert_eq!(o.stdout.trim(), d.join(FILE).display().to_string());
+        assert!(d.join(FILE).exists(), "path is a write command");
+    }
+
+    #[test]
+    fn config_edit_opens_the_file_in_the_editor() {
+        let d = tmp();
+        let seen = std::cell::RefCell::new(None);
+        let o = run_cli(&a(&["edit"]), &d, &no_env, &|p| {
+            *seen.borrow_mut() = Some(p.to_path_buf());
+            Ok(())
+        });
+        assert_eq!(o.code, 0);
+        assert_eq!(seen.borrow().clone(), Some(d.join(FILE)));
+        let o = run_cli(&a(&["edit"]), &d, &no_env, &|_| {
+            Err("no editor found".into())
+        });
+        assert_eq!(o.code, 1);
+        assert!(o.stderr.contains("no editor found"));
     }
 }
