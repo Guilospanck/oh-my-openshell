@@ -451,6 +451,340 @@ pub fn load(dir: &Path, env: Env) -> Snapshot {
     }
 }
 
+const HEADER: &str = "# osh settings. Every setting is listed below with its default, commented out.\n# Remove the leading # of a line to change it, or use `osh config set` or the Settings\n# screen in the dashboard; both keep your comments.\n";
+
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for w in text.split_whitespace() {
+        if !cur.is_empty() && cur.len() + 1 + w.len() > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push(' ');
+        }
+        cur.push_str(w);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn block(d: &Def) -> String {
+    let mut o = String::new();
+    for l in wrap(d.desc, 88) {
+        o.push_str(&format!("# {l}\n"));
+    }
+    if let Some(v) = d.env {
+        o.push_str(&format!("# Overridden by the environment variable {v}.\n"));
+    }
+    o.push_str(&format!("# {} = {}\n", d.name(), d.default));
+    o
+}
+
+/// The documented `osh.toml`: every setting as a comment block with its key commented out at the
+/// default.
+pub fn template() -> String {
+    let mut tables: Vec<&str> = Vec::new();
+    for d in registry() {
+        if !tables.contains(&d.table()) {
+            tables.push(d.table());
+        }
+    }
+    let mut out = String::from(HEADER);
+    for t in tables {
+        out.push_str(&format!("\n[{t}]\n"));
+        let blocks: Vec<String> = registry()
+            .iter()
+            .filter(|d| d.table() == t)
+            .map(block)
+            .collect();
+        out.push_str(&blocks.join("\n"));
+    }
+    out
+}
+
+fn header_of(line: &str) -> Option<String> {
+    let t = line.trim();
+    (t.starts_with('[') && !t.starts_with("[["))
+        .then(|| t.find(']').map(|e| t[1..e].trim().to_string()))
+        .flatten()
+}
+
+/// Header line index and the end (exclusive) of `[table]`.
+fn section(lines: &[String], table: &str) -> Option<(usize, usize)> {
+    let h = lines
+        .iter()
+        .position(|l| header_of(l).as_deref() == Some(table))?;
+    let end = lines[h + 1..]
+        .iter()
+        .position(|l| l.trim().starts_with('['))
+        .map_or(lines.len(), |p| h + 1 + p);
+    Some((h, end))
+}
+
+fn key_line(line: &str, name: &str) -> bool {
+    line.trim()
+        .strip_prefix(name)
+        .is_some_and(|r| r.trim_start().starts_with('='))
+}
+
+fn live_idx(lines: &[String], table: &str, name: &str) -> Option<usize> {
+    let (h, e) = section(lines, table)?;
+    (h + 1..e).find(|&i| key_line(&lines[i], name))
+}
+
+fn commented_idx(lines: &[String], table: &str, name: &str) -> Option<usize> {
+    let (h, e) = section(lines, table)?;
+    (h + 1..e).find(|&i| {
+        lines[i]
+            .trim()
+            .strip_prefix('#')
+            .is_some_and(|r| key_line(r.trim_start(), name))
+    })
+}
+
+fn split_lines(text: &str) -> Vec<String> {
+    text.lines().map(String::from).collect()
+}
+
+fn join_lines(lines: &[String]) -> String {
+    let mut s = lines.join("\n");
+    s.push('\n');
+    s
+}
+
+fn read_text(dir: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(dir.join(FILE)) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("cannot read {FILE}: {e}")),
+    }
+}
+
+/// Temp file in the same folder, then rename, so a reader never sees half a file.
+fn write_atomic(dir: &Path, text: &str) -> Result<(), String> {
+    let tmp = dir.join(format!(".{FILE}.tmp-{}", std::process::id()));
+    let r = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, dir.join(FILE)));
+    if let Err(e) = r {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot write {FILE}: {e}"));
+    }
+    Ok(())
+}
+
+fn parse_doc(text: &str) -> Result<toml_edit::DocumentMut, String> {
+    text.parse::<toml_edit::DocumentMut>().map_err(|e| {
+        let at = e.span().map_or(String::new(), |r| {
+            let (l, c) = line_col(text, r.start);
+            format!(" at line {l}, column {c}")
+        });
+        format!("{FILE} is not valid TOML{at}: {}", e.message())
+    })
+}
+
+fn create_if_missing(dir: &Path) -> Result<(), String> {
+    if dir.join(FILE).exists() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    write_atomic(dir, &template())
+}
+
+fn literal(v: &Value) -> toml_edit::Value {
+    match v {
+        Value::Bool(b) => (*b).into(),
+        Value::Int(n) => (*n as i64).into(),
+        Value::Str(s) => s.as_str().into(),
+        Value::List(l) => l
+            .iter()
+            .map(String::as_str)
+            .collect::<toml_edit::Array>()
+            .into(),
+    }
+}
+
+fn literal_text(v: &Value) -> String {
+    literal(v).to_string().trim().to_string()
+}
+
+/// Create `osh.toml` when missing, migrate the two older files, and append blocks for settings
+/// added since. Never changes a value; does nothing to an invalid file.
+pub fn ensure_file(dir: &Path) -> Result<(), String> {
+    create_if_missing(dir)?;
+    let Some(text) = read_text(dir)? else {
+        return Ok(());
+    };
+    if parse_doc(&text).is_err() {
+        return Ok(());
+    }
+    let mut lines = split_lines(&text);
+    let mut changed = false;
+    for d in registry() {
+        if live_idx(&lines, d.table(), d.name()).is_some()
+            || commented_idx(&lines, d.table(), d.name()).is_some()
+        {
+            continue;
+        }
+        let blk = split_lines(&block(d));
+        match section(&lines, d.table()) {
+            Some((_, end)) => {
+                let mut at = end;
+                while at > 0 && lines[at - 1].trim().is_empty() {
+                    at -= 1;
+                }
+                let mut ins = vec![String::new()];
+                ins.extend(blk);
+                lines.splice(at..at, ins);
+            }
+            None => {
+                if lines.last().is_some_and(|l| !l.trim().is_empty()) {
+                    lines.push(String::new());
+                }
+                lines.push(format!("[{}]", d.table()));
+                lines.extend(blk);
+            }
+        }
+        changed = true;
+    }
+    if changed {
+        write_atomic(dir, &join_lines(&lines))?;
+    }
+    migrate(dir)
+}
+
+/// Write `key` into `osh.toml`, keeping everything else. Refused for unknown keys, bad values,
+/// a key an environment variable decides right now, and an invalid file.
+pub fn set(dir: &Path, key: &str, text: &str, env: Env) -> Result<(), String> {
+    let d = def(key).ok_or_else(|| format!("unknown setting {key}"))?;
+    let v = parse_value(d, text)?;
+    if let Some(r) = load(dir, env)
+        .rows
+        .iter()
+        .find(|r| r.def.key == key && r.env_active)
+    {
+        return Err(format!(
+            "{key} is set by the environment variable {} right now; unset it to change the setting here",
+            r.def.env.unwrap_or("")
+        ));
+    }
+    create_if_missing(dir)?;
+    let old = read_text(dir)?.unwrap_or_default();
+    let mut doc = parse_doc(&old)?;
+    let mut lines = split_lines(&old);
+    let out = if live_idx(&lines, d.table(), d.name()).is_none() {
+        if let Some(i) = commented_idx(&lines, d.table(), d.name()) {
+            lines[i] = format!("{} = {}", d.name(), literal_text(&v));
+            let mut s = join_lines(&lines);
+            if !old.ends_with('\n') {
+                s.pop();
+            }
+            s
+        } else {
+            insert(&mut doc, d, &v)?;
+            doc.to_string()
+        }
+    } else {
+        insert(&mut doc, d, &v)?;
+        doc.to_string()
+    };
+    parse_doc(&out)?;
+    write_atomic(dir, &out)
+}
+
+fn insert(doc: &mut toml_edit::DocumentMut, d: &Def, v: &Value) -> Result<(), String> {
+    let mut t = toml_edit::Table::new();
+    t.set_implicit(false);
+    let tbl = doc
+        .as_table_mut()
+        .entry(d.table())
+        .or_insert(toml_edit::Item::Table(t))
+        .as_table_mut()
+        .ok_or_else(|| format!("[{}] in {FILE} is not a table", d.table()))?;
+    let mut nv = literal(v);
+    if let Some(toml_edit::Item::Value(old)) = tbl.get_mut(d.name()) {
+        *nv.decor_mut() = old.decor().clone();
+        *old = nv;
+    } else {
+        tbl.insert(d.name(), toml_edit::Item::Value(nv));
+    }
+    Ok(())
+}
+
+/// Put `key` back to its default by commenting its line out. A key not in the file is fine.
+pub fn unset(dir: &Path, key: &str) -> Result<(), String> {
+    let d = def(key).ok_or_else(|| format!("unknown setting {key}"))?;
+    let Some(old) = read_text(dir)? else {
+        return Ok(());
+    };
+    parse_doc(&old)?;
+    let mut lines = split_lines(&old);
+    let Some(i) = live_idx(&lines, d.table(), d.name()) else {
+        return Ok(());
+    };
+    // A value written over several lines (a list) runs until its brackets balance.
+    let mut end = i;
+    let mut depth = 0i32;
+    loop {
+        let l = &lines[end];
+        let from = if end == i {
+            l.find('=').map_or(0, |p| p + 1)
+        } else {
+            0
+        };
+        depth += l[from..].matches('[').count() as i32 - l[from..].matches(']').count() as i32;
+        if depth <= 0 || end + 1 >= lines.len() {
+            break;
+        }
+        end += 1;
+    }
+    lines.splice(i..=end, [format!("# {} = {}", d.name(), d.default)]);
+    let mut out = join_lines(&lines);
+    if !old.ends_with('\n') {
+        out.pop();
+    }
+    parse_doc(&out)?;
+    write_atomic(dir, &out)
+}
+
+/// Move `editor-mode` and `.tmux-passthrough-off` into `osh.toml`, then delete them. A value
+/// already in `osh.toml` wins; the old file is still removed. Nothing is deleted unless the
+/// write succeeded.
+pub fn migrate(dir: &Path) -> Result<(), String> {
+    let em = dir.join("editor-mode");
+    let tm = dir.join(".tmux-passthrough-off");
+    if !em.exists() && !tm.exists() {
+        return Ok(());
+    }
+    create_if_missing(dir)?;
+    let none = |_: &str| None;
+    let snap = load(dir, &none);
+    if !snap.file_valid {
+        return Err(format!("{FILE} is not valid TOML; the old files stay"));
+    }
+    let in_file = |k: &str| snap.rows.iter().any(|r| r.def.key == k && r.in_file);
+    if em.exists() {
+        let v = match std::fs::read_to_string(&em).unwrap_or_default().trim() {
+            "external" => Some("own"),
+            "builtin" => Some("builtin"),
+            _ => None,
+        };
+        if let (Some(v), false) = (v, in_file("general.editor")) {
+            set(dir, "general.editor", v, &none)?;
+        }
+        std::fs::remove_file(&em).map_err(|e| format!("cannot remove editor-mode: {e}"))?;
+    }
+    if tm.exists() {
+        if !in_file("shell.tmux_keys") {
+            set(dir, "shell.tmux_keys", "false", &none)?;
+        }
+        std::fs::remove_file(&tm)
+            .map_err(|e| format!("cannot remove .tmux-passthrough-off: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +1025,273 @@ mod tests {
             load(&tmp(), &home).data_dir,
             PathBuf::from("/h/.local/share/osh")
         );
+    }
+
+    fn read(d: &Path) -> String {
+        std::fs::read_to_string(d.join(FILE)).unwrap()
+    }
+
+    #[test]
+    fn template_parses_and_lists_every_key_commented() {
+        let t = template();
+        let table: toml::Table = toml::from_str(&t).unwrap();
+        assert!(
+            table.is_empty()
+                || table
+                    .values()
+                    .all(|v| v.as_table().is_some_and(|x| x.is_empty()))
+        );
+        for d in registry() {
+            assert!(
+                t.contains(&format!("# {} = {}", d.name(), d.default)),
+                "{}",
+                d.key
+            );
+            assert!(t.contains(&format!("[{}]", d.table())));
+        }
+    }
+
+    #[test]
+    fn template_names_env_variables() {
+        let t = template();
+        for d in registry().iter().filter(|d| d.env.is_some()) {
+            assert!(
+                t.contains(&format!("environment variable {}", d.env.unwrap())),
+                "{}",
+                d.key
+            );
+        }
+    }
+
+    #[test]
+    fn set_uncomments_in_place_and_keeps_comments_blank_lines_unknown_keys() {
+        let d = tmp();
+        let mine = "# my own note\n\n[custom]\nthing = 1 # keep\n\n".to_string() + &template();
+        std::fs::write(d.join(FILE), &mine).unwrap();
+        set(&d, "refresh.ports_secs", "7", &no_env).unwrap();
+        let after = read(&d);
+        assert_eq!(after, mine.replace("# ports_secs = 3", "ports_secs = 7"));
+        assert_eq!(
+            load(&d, &no_env)
+                .rows
+                .iter()
+                .find(|r| r.def.key == "refresh.ports_secs")
+                .unwrap()
+                .value,
+            Value::Int(7)
+        );
+    }
+
+    #[test]
+    fn set_replaces_a_live_value_keeping_its_trailing_comment() {
+        let d = tmp();
+        std::fs::write(d.join(FILE), "[refresh]\nports_secs = 4 # slow link\n").unwrap();
+        set(&d, "refresh.ports_secs", "9", &no_env).unwrap();
+        assert_eq!(read(&d), "[refresh]\nports_secs = 9 # slow link\n");
+    }
+
+    #[test]
+    fn set_inserts_under_existing_table_or_creates_table() {
+        let d = tmp();
+        std::fs::write(d.join(FILE), "[refresh]\n# nothing here\n").unwrap();
+        set(&d, "refresh.usage_secs", "10", &no_env).unwrap();
+        set(&d, "ui.toast_secs", "8", &no_env).unwrap();
+        let s = load(&d, &no_env);
+        assert_eq!(
+            s.rows
+                .iter()
+                .find(|r| r.def.key == "refresh.usage_secs")
+                .unwrap()
+                .value,
+            Value::Int(10)
+        );
+        assert_eq!(
+            s.rows
+                .iter()
+                .find(|r| r.def.key == "ui.toast_secs")
+                .unwrap()
+                .value,
+            Value::Int(8)
+        );
+        assert!(read(&d).contains("# nothing here"));
+    }
+
+    #[test]
+    fn set_creates_the_file_when_missing_and_writes_lists_and_text() {
+        let d = tmp();
+        set(&d, "general.editor", "builtin", &no_env).unwrap();
+        set(&d, "mcp.share_roots", "/a,/b", &no_env).unwrap();
+        let s = load(&d, &no_env);
+        assert_eq!(
+            s.rows
+                .iter()
+                .find(|r| r.def.key == "general.editor")
+                .unwrap()
+                .value,
+            Value::Str("builtin".into())
+        );
+        assert_eq!(
+            s.rows
+                .iter()
+                .find(|r| r.def.key == "mcp.share_roots")
+                .unwrap()
+                .value,
+            Value::List(vec!["/a".into(), "/b".into()])
+        );
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+    }
+
+    #[test]
+    fn set_refuses_invalid_toml_with_line_col_and_leaves_file_byte_identical() {
+        let d = tmp();
+        let bad = "[refresh]\nports_secs = = 4\n";
+        std::fs::write(d.join(FILE), bad).unwrap();
+        let e = set(&d, "refresh.usage_secs", "10", &no_env).unwrap_err();
+        assert!(e.contains("line 2"), "{e}");
+        assert_eq!(read(&d), bad);
+        assert!(unset(&d, "refresh.usage_secs").is_err());
+        assert_eq!(read(&d), bad);
+    }
+
+    #[test]
+    fn set_refuses_env_forced_key_naming_variable() {
+        let d = tmp();
+        let env = |k: &str| (k == MCP_SHARE_ENV).then(|| OsString::from("1"));
+        let e = set(&d, "mcp.allow_share", "false", &env).unwrap_err();
+        assert!(e.contains(MCP_SHARE_ENV), "{e}");
+        assert!(!d.join(FILE).exists());
+        // Not forcing: the same variable set to something else is no obstacle.
+        let env = |k: &str| (k == MCP_SHARE_ENV).then(|| OsString::from("0"));
+        set(&d, "mcp.allow_share", "true", &env).unwrap();
+    }
+
+    #[test]
+    fn set_rejects_bad_value_and_unknown_key() {
+        let d = tmp();
+        assert!(set(&d, "refresh.ports_secs", "0", &no_env)
+            .unwrap_err()
+            .contains("outside"));
+        assert!(set(&d, "nope.nothing", "1", &no_env)
+            .unwrap_err()
+            .contains("unknown"));
+    }
+
+    #[test]
+    fn unset_comments_out_only_that_line_and_missing_is_ok() {
+        let d = tmp();
+        std::fs::write(d.join(FILE), "[refresh]\nports_secs = 7\nusage_secs = 9\n").unwrap();
+        unset(&d, "refresh.ports_secs").unwrap();
+        assert_eq!(read(&d), "[refresh]\n# ports_secs = 3\nusage_secs = 9\n");
+        unset(&d, "refresh.ports_secs").unwrap();
+        unset(&d, "ui.toast_secs").unwrap();
+        assert_eq!(read(&d), "[refresh]\n# ports_secs = 3\nusage_secs = 9\n");
+        let empty = tmp();
+        unset(&empty, "ui.toast_secs").unwrap();
+    }
+
+    #[test]
+    fn append_adds_only_new_commented_blocks_and_never_values() {
+        let d = tmp();
+        let old = "# mine\n[refresh]\nports_secs = 7\n\n[ui]\ntoast_secs = 8\n";
+        std::fs::write(d.join(FILE), old).unwrap();
+        ensure_file(&d).unwrap();
+        let after = read(&d);
+        assert!(after.starts_with("# mine\n[refresh]\nports_secs = 7\n"));
+        let s = load(&d, &no_env);
+        assert!(s.problems.is_empty(), "{:?}", s.problems);
+        let val = |k: &str| s.rows.iter().find(|r| r.def.key == k).unwrap().clone();
+        assert_eq!(val("refresh.ports_secs").value, Value::Int(7));
+        assert_eq!(val("ui.toast_secs").value, Value::Int(8));
+        assert!(after.contains("# usage_secs = 5") && after.contains("# editor = \"auto\""));
+        assert_eq!(
+            after.matches("# ports_secs").count(),
+            0,
+            "a live key gets no second block"
+        );
+        let again = read(&d);
+        ensure_file(&d).unwrap();
+        assert_eq!(read(&d), again, "a second run changes nothing");
+    }
+
+    #[test]
+    fn ensure_file_creates_the_template_and_skips_an_invalid_file() {
+        let d = tmp();
+        ensure_file(&d).unwrap();
+        assert_eq!(read(&d), template());
+        let bad = tmp();
+        std::fs::write(bad.join(FILE), "[x\n").unwrap();
+        std::fs::write(bad.join("editor-mode"), "builtin\n").unwrap();
+        ensure_file(&bad).unwrap();
+        assert_eq!(read(&bad), "[x\n");
+        assert!(
+            bad.join("editor-mode").exists(),
+            "an invalid osh.toml leaves the old files alone"
+        );
+    }
+
+    #[test]
+    fn migrate_editor_mode_and_tmux_marker() {
+        let d = tmp();
+        std::fs::write(d.join("editor-mode"), "external\n").unwrap();
+        std::fs::write(d.join(".tmux-passthrough-off"), "").unwrap();
+        ensure_file(&d).unwrap();
+        let s = load(&d, &no_env);
+        let val = |k: &str| {
+            s.rows
+                .iter()
+                .find(|r| r.def.key == k)
+                .unwrap()
+                .value
+                .clone()
+        };
+        assert_eq!(val("general.editor"), Value::Str("own".into()));
+        assert_eq!(val("shell.tmux_keys"), Value::Bool(false));
+        assert!(!d.join("editor-mode").exists() && !d.join(".tmux-passthrough-off").exists());
+        let b = tmp();
+        std::fs::write(b.join("editor-mode"), "builtin\n").unwrap();
+        ensure_file(&b).unwrap();
+        let s = load(&b, &no_env);
+        assert_eq!(
+            s.rows
+                .iter()
+                .find(|r| r.def.key == "general.editor")
+                .unwrap()
+                .value,
+            Value::Str("builtin".into())
+        );
+    }
+
+    #[test]
+    fn migrate_idempotent_and_osh_toml_wins_when_both() {
+        let d = tmp();
+        std::fs::write(d.join(FILE), "[general]\neditor = \"builtin\"\n").unwrap();
+        std::fs::write(d.join("editor-mode"), "external\n").unwrap();
+        migrate(&d).unwrap();
+        migrate(&d).unwrap();
+        let s = load(&d, &no_env);
+        assert_eq!(
+            s.rows
+                .iter()
+                .find(|r| r.def.key == "general.editor")
+                .unwrap()
+                .value,
+            Value::Str("builtin".into())
+        );
+        assert!(!d.join("editor-mode").exists());
+    }
+
+    #[test]
+    fn migrate_unwritable_dir_keeps_old_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp();
+        std::fs::write(d.join("editor-mode"), "builtin\n").unwrap();
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = migrate(&d);
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if r.is_ok() {
+            // Running as a user the mode does not bind (root): nothing to prove here.
+            return;
+        }
+        assert!(d.join("editor-mode").exists());
     }
 }
