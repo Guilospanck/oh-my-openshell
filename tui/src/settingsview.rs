@@ -66,7 +66,7 @@ impl View {
     pub fn with_env(dir: &Path, env: fn(&str) -> Option<OsString>) -> View {
         View {
             env,
-            snap: settings::load(dir, &env),
+            snap: Self::read(dir, env),
             started: settings::started(),
             cursor: 0,
             filter: String::new(),
@@ -122,8 +122,26 @@ impl View {
         }
     }
 
+    /// The file as it is now; when it is not valid TOML, the values the running process still
+    /// uses with the new problems, not a screen of defaults that are not in effect.
+    fn read(dir: &Path, env: fn(&str) -> Option<OsString>) -> Snapshot {
+        let fresh = settings::load(dir, &env);
+        if fresh.file_valid {
+            return fresh;
+        }
+        let mut kept = (*settings::snapshot()).clone();
+        kept.problems = fresh.problems;
+        kept.file_valid = false;
+        kept
+    }
+
     fn refresh(&mut self, dir: &Path) {
-        self.snap = settings::load(dir, &self.env);
+        self.snap = Self::read(dir, self.env);
+    }
+
+    /// The setting under the cursor, if the cursor is on one.
+    pub fn selected_key(&self) -> Option<&'static str> {
+        self.row().map(|r| r.def.key)
     }
 
     /// Write `text` as the value of `key` and say what happened.
@@ -146,6 +164,8 @@ impl View {
     }
 
     pub fn on_key(&mut self, key: KeyEvent, dir: &Path) -> Act {
+        // The file may have been edited since the last key (another window, `osh config`).
+        self.refresh(dir);
         if self.filtering {
             match key.code {
                 KeyCode::Esc => {
@@ -220,14 +240,14 @@ impl View {
                 Act::None
             }
             Kind::Choice(all) => {
-                let now = settings::value_text(&row.value);
+                let now = settings::text_of(row.def, &row.value);
                 let at = all.iter().position(|c| *c == now).unwrap_or(0);
                 self.apply(dir, key, all[(at + 1) % all.len()]);
                 Act::None
             }
             _ => Act::Prompt {
                 key,
-                current: settings::value_text(&row.value),
+                current: settings::text_of(row.def, &row.value),
             },
         }
     }
@@ -266,7 +286,7 @@ impl View {
                     };
                     spans.push(Span::styled(format!("{:<key_w$}  ", r.def.key), base));
                     spans.push(Span::styled(
-                        format!("{:<22}  ", clip(&settings::value_text(&r.value), 22)),
+                        format!("{:<22}  ", clip(&settings::text_of(r.def, &r.value), 22)),
                         base,
                     ));
                     spans.push(Span::styled(
@@ -433,7 +453,29 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn tmp() -> PathBuf {
+    /// A scratch folder that goes away with the test.
+    struct Tmp(PathBuf);
+
+    impl std::ops::Deref for Tmp {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Tmp {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp() -> Tmp {
         static N: AtomicU32 = AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
             "osh-sview-{}-{}",
@@ -441,7 +483,7 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Tmp(d)
     }
 
     fn none(_: &str) -> Option<OsString> {
@@ -677,6 +719,37 @@ mod tests {
             "{t}"
         );
         assert!(t.contains("osh.toml:3:") && t.contains("outside"), "{t}");
+    }
+
+    #[test]
+    fn an_invalid_file_shows_the_values_in_effect_not_the_defaults() {
+        let d = tmp();
+        let _g = settings::install_for_test(settings::test_snapshot("[refresh]\nports_secs = 8\n"));
+        std::fs::write(d.join("osh.toml"), "[refresh\n").unwrap();
+        let v = View::with_env(&d, none);
+        assert!(!v.snap.file_valid);
+        let r = v
+            .snap
+            .rows
+            .iter()
+            .find(|r| r.def.key == "refresh.ports_secs")
+            .unwrap();
+        assert_eq!(r.value, Value::Int(8), "the running process still uses it");
+    }
+
+    #[test]
+    fn the_screen_follows_the_file_while_it_is_open() {
+        let d = tmp();
+        let mut v = View::with_env(&d, none);
+        std::fs::write(d.join("osh.toml"), "[refresh]\nports_secs = 8\n").unwrap();
+        press(&mut v, &d, KeyCode::Char('j'));
+        let r = v
+            .snap
+            .rows
+            .iter()
+            .find(|r| r.def.key == "refresh.ports_secs")
+            .unwrap();
+        assert_eq!(r.value, Value::Int(8));
     }
 
     #[test]

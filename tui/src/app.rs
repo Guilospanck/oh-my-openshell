@@ -739,6 +739,9 @@ pub struct App {
     pub awaiting_snapshot: bool,
     /// When `status` last changed; a shell's status bar shows it for a few seconds.
     status_at: Option<(String, Instant)>,
+    /// The Settings screen's filter and selected setting, kept while a prompt or the editor
+    /// replaces it.
+    settings_memo: (String, Option<&'static str>),
     /// Everything raised since osh started, newest last, and the one shown top-right for 5 s.
     pub alerts: Vec<crate::alerts::Alert>,
     toast: Option<(crate::alerts::Alert, Instant)>,
@@ -1105,6 +1108,7 @@ impl App {
             snap_status: String::new(),
             awaiting_snapshot: true,
             status_at: None,
+            settings_memo: (String::new(), None),
             alerts: Vec::new(),
             toast: None,
             born: Instant::now(),
@@ -3952,7 +3956,10 @@ impl App {
         use crate::palette::Command as C;
         match cmd {
             C::EditToolchains => self.edit_toolchains(EditThen::ToolchainList),
-            C::Settings => self.open_settings(None),
+            C::Settings => {
+                self.settings_memo = (String::new(), None);
+                self.open_settings(None)
+            }
             C::EditorMode => {
                 use crate::exted::Pref;
                 let next = crate::exted::load_pref(&self.dir).next();
@@ -4042,6 +4049,10 @@ impl App {
     /// it is saved first, and the screen comes back with the result on its cursor.
     fn open_settings(&mut self, edited: Option<(&'static str, String)>) {
         let mut v = crate::settingsview::View::new(&self.dir);
+        v.filter = self.settings_memo.0.clone();
+        if let Some(key) = self.settings_memo.1 {
+            v.select_key(key);
+        }
         if let Some((key, text)) = edited {
             v.apply(&self.dir, key, &text);
             v.select_key(key);
@@ -4080,7 +4091,7 @@ impl App {
     fn file_menu(&mut self, rel: String) {
         use crate::assets::{self, FileState};
         let state = assets::state(&self.dir, &rel);
-        let shipped = assets::embedded(&rel).is_some();
+        let shipped = assets::shipped_text(&rel).is_some();
         let exists = self.dir.join(&rel).is_file();
         let mut items: Vec<&str> = Vec::new();
         if exists {
@@ -4138,8 +4149,10 @@ impl App {
             }
             FA_DIFF => {
                 let mine = std::fs::read_to_string(&path).unwrap_or_default();
-                let text =
-                    crate::assets::diff(crate::assets::embedded(&rel).unwrap_or_default(), &mine);
+                let text = crate::assets::diff(
+                    &crate::assets::shipped_text(&rel).unwrap_or_default(),
+                    &mine,
+                );
                 let back = self.file_menu_modal(&rel);
                 self.open_viewer(&format!("{rel}: shipped default vs your copy"), text, back);
             }
@@ -4155,7 +4168,7 @@ impl App {
                 });
             }
             FA_DELETE => {
-                let back = if crate::assets::embedded(&rel).is_some() {
+                let back = if crate::assets::shipped_text(&rel).is_some() {
                     " The shipped default stays available under Data files (Restore)."
                 } else {
                     " It cannot be brought back."
@@ -6015,29 +6028,35 @@ impl App {
                     scroll,
                 });
             }
-            Modal::Settings(mut v) => match v.on_key(key, &self.dir) {
-                Act::None => self.modal = Some(Modal::Settings(v)),
-                Act::Close => {}
-                Act::Prompt { key, current } => {
-                    self.input(
-                        &format!("{key}: new value (lists are comma-separated)"),
-                        false,
-                        InKind::Setting(key),
-                    );
-                    if let Some(Modal::Input { buf, .. }) = &mut self.modal {
-                        *buf = current;
+            Modal::Settings(mut v) => {
+                let act = v.on_key(key, &self.dir);
+                // Remember the filter and selection: the screen is rebuilt after a prompt or
+                // the editor, and should come back as it was.
+                self.settings_memo = (v.filter.clone(), v.selected_key());
+                match act {
+                    Act::None => self.modal = Some(Modal::Settings(v)),
+                    Act::Close => {}
+                    Act::Prompt { key, current } => {
+                        self.input(
+                            &format!("{key}: new value (paths separated by :, names by ,)"),
+                            false,
+                            InKind::Setting(key),
+                        );
+                        if let Some(Modal::Input { buf, .. }) = &mut self.modal {
+                            *buf = current;
+                        }
                     }
-                }
-                Act::File(name) => {
-                    let path = self.dir.join(name);
-                    if name == osh_core::settings::FILE {
-                        let _ = osh_core::settings::ensure_file(&self.dir);
+                    Act::File(name) => {
+                        let path = self.dir.join(name);
+                        if name == osh_core::settings::FILE {
+                            let _ = osh_core::settings::ensure_file(&self.dir);
+                        }
+                        let check = crate::assets::check_for(name);
+                        self.open_editor(name, path, None, check, EditThen::Settings);
                     }
-                    let check = crate::assets::check_for(name);
-                    self.open_editor(name, path, None, check, EditThen::Settings);
+                    Act::DataFiles => self.data_files(),
                 }
-                Act::DataFiles => self.data_files(),
-            },
+            }
             Modal::Editor { mut ed, then } => {
                 let out = ed.on_key(key);
                 self.editor_done(ed, then, out);
@@ -6398,6 +6417,33 @@ mod tests {
         assert!(std::fs::read_to_string(a.dir.join("osh.toml"))
             .unwrap()
             .contains("ports_secs = 7"));
+    }
+
+    #[test]
+    fn the_filter_and_selection_survive_a_prompt_and_the_editor() {
+        let mut a = settings_app("memo");
+        crate::exted::save_pref(&a.dir, crate::exted::Pref::Builtin).unwrap();
+        a.run_command(crate::palette::Command::Settings);
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "ports");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        let v = settings_view(&a);
+        assert_eq!(v.filter, "ports");
+        assert!(
+            matches!(v.selected(), Some(crate::settingsview::Entry::Setting(i)) if v.snap.rows[i].def.key == "refresh.ports_secs")
+        );
+        press(&mut a, KeyCode::Char('e'));
+        press(&mut a, KeyCode::Esc);
+        let v = settings_view(&a);
+        assert_eq!(
+            v.filter, "ports",
+            "the filter is still there after the editor"
+        );
+        assert!(
+            matches!(v.selected(), Some(crate::settingsview::Entry::Setting(i)) if v.snap.rows[i].def.key == "refresh.ports_secs")
+        );
     }
 
     #[test]

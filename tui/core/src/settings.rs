@@ -240,7 +240,8 @@ pub(crate) fn from_toml(d: &Def, v: &toml::Value) -> Result<Value, String> {
     }
 }
 
-/// Parse text typed by a person (`osh config set`, the Settings screen); lists are comma-separated.
+/// Parse text typed by a person (`osh config set`, the Settings screen). A list of paths is
+/// separated by `:` like `PATH` (a comma can be part of a path); a list of names by `,`.
 pub fn parse_value(d: &Def, text: &str) -> Result<Value, String> {
     let t = text.trim();
     let v = match d.kind {
@@ -255,7 +256,7 @@ pub fn parse_value(d: &Def, text: &str) -> Result<Value, String> {
         ),
         Kind::Choice(_) => toml::Value::String(t.into()),
         Kind::PathList | Kind::NameList => toml::Value::Array(
-            t.split(',')
+            t.split(if d.kind == Kind::PathList { ':' } else { ',' })
                 .map(str::trim)
                 .filter(|x| !x.is_empty())
                 .map(|x| toml::Value::String(x.into()))
@@ -572,9 +573,14 @@ fn split_lines(text: &str) -> Vec<String> {
     text.lines().map(String::from).collect()
 }
 
-fn join_lines(lines: &[String]) -> String {
-    let mut s = lines.join("\n");
-    s.push('\n');
+/// Join with the line ending `like` uses (CRLF stays CRLF), ending the text with one unless
+/// `like` is a non-empty text that did not.
+fn join_lines(lines: &[String], like: &str) -> String {
+    let eol = if like.contains("\r\n") { "\r\n" } else { "\n" };
+    let mut s = lines.join(eol);
+    if like.is_empty() || like.ends_with('\n') {
+        s.push_str(eol);
+    }
     s
 }
 
@@ -673,7 +679,12 @@ pub fn ensure_file(dir: &Path) -> Result<(), String> {
                 }
                 let mut ins = vec![String::new()];
                 ins.extend(blk);
+                let after = at + ins.len();
                 next.splice(at..at, ins);
+                // Keep the block apart from a table that follows it directly.
+                if after < next.len() && !next[after].trim().is_empty() {
+                    next.insert(after, String::new());
+                }
             }
             None => {
                 if next.last().is_some_and(|l| !l.trim().is_empty()) {
@@ -685,15 +696,21 @@ pub fn ensure_file(dir: &Path) -> Result<(), String> {
         }
         // A table the user wrote without a `[table]` header (dotted keys, an inline table, an
         // array of tables) cannot take a header too: skip the block instead of breaking the file.
-        if parse_doc(&join_lines(&next)).is_ok() {
+        if parse_doc(&join_lines(&next, &text)).is_ok() {
             lines = next;
             changed = true;
         }
     }
     if changed {
-        write_atomic(dir, &join_lines(&lines))?;
+        write_atomic(dir, &join_lines(&lines, &text))?;
     }
     migrate(dir)
+}
+
+/// Write the documented template over `osh.toml` (Data files: restore).
+pub fn restore_template(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    write_atomic(dir, &template())
 }
 
 /// The reason `key` cannot be changed now: an environment variable decides it.
@@ -760,10 +777,7 @@ pub fn set(dir: &Path, key: &str, text: &str, env: Env) -> Result<(), String> {
     if live_idx(&lines, d.table(), d.name()).is_none() {
         if let Some(i) = commented_idx(&lines, d.table(), d.name()) {
             lines[i] = format!("{} = {}", d.name(), literal_text(&v));
-            let mut s = join_lines(&lines);
-            if !old.ends_with('\n') {
-                s.pop();
-            }
+            let s = join_lines(&lines, &old);
             // The commented line may sit inside a string; then the check below fails and the
             // key is inserted properly instead.
             if table_of(&s) == Some(expected(&old_table, d, Some(&v))) {
@@ -834,10 +848,7 @@ pub fn unset(dir: &Path, key: &str) -> Result<(), String> {
     for end in i..lines.len() {
         let mut next = lines.clone();
         next.splice(i..=end, [replacement.clone()]);
-        let mut s = join_lines(&next);
-        if !old.ends_with('\n') {
-            s.pop();
-        }
+        let s = join_lines(&next, &old);
         if table_of(&s) == Some(want.clone()) {
             done = Some(s);
             break;
@@ -1120,7 +1131,7 @@ const CONFIG_USAGE: &str = "\
 usage:
   osh config [--json]            every setting: value, source, default, environment variable, description
   osh config get KEY [--json]
-  osh config set KEY VALUE [--json]   lists are comma-separated
+  osh config set KEY VALUE [--json]   path lists are separated by : like PATH, name lists by ,
   osh config unset KEY [--json]       back to the default
   osh config path                the osh.toml file
   osh config edit                open osh.toml in your editor";
@@ -1131,6 +1142,14 @@ fn value_json(v: &Value) -> serde_json::Value {
         Value::Int(n) => (*n).into(),
         Value::Str(s) => s.as_str().into(),
         Value::List(l) => l.iter().map(String::as_str).collect::<Vec<_>>().into(),
+    }
+}
+
+/// The value as a person types and reads it (see `parse_value` for the list separators).
+pub fn text_of(d: &Def, v: &Value) -> String {
+    match v {
+        Value::List(l) => l.join(if d.kind == Kind::PathList { ":" } else { "," }),
+        other => value_text(other),
     }
 }
 
@@ -1183,9 +1202,9 @@ fn table_text(s: &Snapshot) -> String {
     for r in &s.rows {
         rows.push([
             r.def.key.into(),
-            value_text(&r.value),
+            text_of(r.def, &r.value),
             source_name(r.source).into(),
-            value_text(&default_value(r.def)),
+            text_of(r.def, &default_value(r.def)),
             r.def.env.unwrap_or("").into(),
             r.def.desc.into(),
         ]);
@@ -1289,7 +1308,7 @@ pub fn run_cli(
             let r = row_of(key);
             let plain = r
                 .as_ref()
-                .map(|r| format!("{}\n", value_text(&r.value)))
+                .map(|r| format!("{}\n", text_of(r.def, &r.value)))
                 .unwrap_or_default();
             done(r.map(|r| row_json(&r)), plain)
         }
@@ -1313,7 +1332,29 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
 
-    fn tmp() -> PathBuf {
+    /// A scratch folder that goes away with the test.
+    struct Tmp(PathBuf);
+
+    impl std::ops::Deref for Tmp {
+        type Target = PathBuf;
+        fn deref(&self) -> &PathBuf {
+            &self.0
+        }
+    }
+
+    impl AsRef<Path> for Tmp {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp() -> Tmp {
         static N: AtomicU32 = AtomicU32::new(0);
         let d = std::env::temp_dir().join(format!(
             "osh-settings-{}-{}",
@@ -1321,7 +1362,7 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&d).unwrap();
-        d
+        Tmp(d)
     }
 
     fn no_env(_: &str) -> Option<OsString> {
@@ -1520,8 +1561,13 @@ mod tests {
         assert!(parse_value(b, "yes").is_err());
         let r = def("mcp.share_roots").unwrap();
         assert_eq!(
-            parse_value(r, "/a, /b"),
+            parse_value(r, "/a:/b"),
             Ok(Value::List(vec!["/a".into(), "/b".into()]))
+        );
+        assert_eq!(
+            parse_value(r, "/with,comma"),
+            Ok(Value::List(vec!["/with,comma".into()])),
+            "paths split on : like PATH"
         );
         assert_eq!(parse_value(r, ""), Ok(Value::List(vec![])));
         assert!(parse_value(r, "rel").is_err());
@@ -1643,7 +1689,7 @@ mod tests {
     fn set_creates_the_file_when_missing_and_writes_lists_and_text() {
         let d = tmp();
         set(&d, "general.editor", "builtin", &no_env).unwrap();
-        set(&d, "mcp.share_roots", "/a,/b", &no_env).unwrap();
+        set(&d, "mcp.share_roots", "/a:/b", &no_env).unwrap();
         let s = load(&d, &no_env);
         assert_eq!(
             s.rows
@@ -2005,6 +2051,52 @@ mod tests {
             .contains(TMUX_ENV));
         assert!(locked(&d, "shell.tmux_keys", &no_env).is_none());
         assert!(locked(&d, "refresh.ports_secs", &on).is_none());
+    }
+
+    #[test]
+    fn crlf_files_keep_their_line_endings() {
+        let d = tmp();
+        std::fs::write(d.join(FILE), "[refresh]\r\nports_secs = 4\r\n# note\r\n").unwrap();
+        let only_crlf = |t: &str| t.matches('\n').count() == t.matches("\r\n").count();
+        ensure_file(&d).unwrap();
+        assert!(only_crlf(&read(&d)), "{:?}", read(&d));
+        set(&d, "refresh.usage_secs", "9", &no_env).unwrap();
+        assert!(only_crlf(&read(&d)));
+        set(&d, "ui.toast_secs", "8", &no_env).unwrap();
+        unset(&d, "refresh.ports_secs").unwrap();
+        let t = read(&d);
+        assert!(only_crlf(&t), "{t:?}");
+        assert!(t.contains("# note\r\n") && t.contains("usage_secs = 9"));
+    }
+
+    #[test]
+    fn an_appended_block_is_set_off_from_the_next_table() {
+        let d = tmp();
+        std::fs::write(
+            d.join(FILE),
+            "[refresh]\nports_secs = 7\n[ui]\ntoast_secs = 8\n",
+        )
+        .unwrap();
+        ensure_file(&d).unwrap();
+        let t = read(&d);
+        let lines: Vec<&str> = t.lines().collect();
+        for (i, l) in lines.iter().enumerate().skip(1) {
+            if l.starts_with('[') {
+                assert!(
+                    lines[i - 1].trim().is_empty(),
+                    "a blank line before {l:?}:\n{t}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn path_lists_are_shown_and_edited_with_colons() {
+        let d = tmp();
+        assert_eq!(cli(&d, &["set", "mcp.share_roots", "/a:/b"]).code, 0);
+        assert_eq!(cli(&d, &["get", "mcp.share_roots"]).stdout.trim(), "/a:/b");
+        assert_eq!(cli(&d, &["set", "mcp.repo_vars", "A,B"]).code, 0);
+        assert_eq!(cli(&d, &["get", "mcp.repo_vars"]).stdout.trim(), "A,B");
     }
 
     fn a(s: &[&str]) -> Vec<String> {

@@ -54,6 +54,9 @@ fn share_roots(entries: &[String]) -> (Vec<PathBuf>, Vec<String>) {
     let (mut roots, mut dropped) = (Vec::new(), Vec::new());
     for entry in entries {
         match root_dir(Path::new(entry)) {
+            Some(real) if real == Path::new("/") => dropped.push(format!(
+                "osh: mcp: mcp.share_roots entry {entry} is the whole disk, which would allow every folder; ignored"
+            )),
             Some(real) => roots.push(real),
             None => dropped.push(format!(
                 "osh: mcp: mcp.share_roots entry {entry} is not an absolute path of an existing directory; ignored"
@@ -85,6 +88,26 @@ fn server_ctx(gateway: Option<String>, allow_share: bool, repo_vars: Vec<String>
     }
 }
 
+/// The context `osh mcp` serves with, from the resolved settings, and what to say on stderr
+/// about entries that were dropped. Shares and repo variables are always `Some`: `None` would
+/// mean no check at all.
+fn build_ctx(gateway: Option<String>, snap: &osh_core::settings::Snapshot) -> (Ctx, Vec<String>) {
+    let mut warnings: Vec<String> = snap
+        .problems
+        .iter()
+        .filter(|p| p.key.as_deref().is_none_or(|k| k.starts_with("mcp.")))
+        .map(|p| format!("osh: mcp: {}", p.msg))
+        .collect();
+    let (allow_share, root_entries, vars) = limits(snap);
+    let (roots, dropped) = share_roots(&root_entries);
+    warnings.extend(dropped);
+    let ctx = Ctx {
+        share_roots: Some(roots),
+        ..server_ctx(gateway, allow_share, vars)
+    };
+    (ctx, warnings)
+}
+
 /// Answer each line until EOF. A line that is not UTF-8 is answered with a parse error (never
 /// altered and run), and the loop goes on.
 pub fn serve(input: impl BufRead, mut out: impl Write, ctx: &Ctx) -> std::io::Result<()> {
@@ -112,22 +135,10 @@ pub fn run(args: &[String]) -> i32 {
     };
     let dir = osh_core::assets::data_dir();
     let snap = osh_core::settings::load(&dir, &|k| std::env::var_os(k));
-    for p in snap
-        .problems
-        .iter()
-        .filter(|p| p.key.as_deref().is_none_or(|k| k.starts_with("mcp.")))
-    {
-        eprintln!("osh: mcp: {}", p.msg);
-    }
-    let (allow_share, root_entries, vars) = limits(&snap);
-    let (roots, dropped) = share_roots(&root_entries);
-    for line in dropped {
+    let (ctx, warnings) = build_ctx(gateway, &snap);
+    for line in warnings {
         eprintln!("{line}");
     }
-    let ctx = Ctx {
-        share_roots: Some(roots),
-        ..server_ctx(gateway, allow_share, vars)
-    };
     match serve(std::io::stdin().lock(), std::io::stdout().lock(), &ctx) {
         Ok(()) => 0,
         Err(e) => {
@@ -227,6 +238,32 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn the_filesystem_root_is_not_a_share_root() {
+        let (roots, dropped) = share_roots(&strs(&["/"]));
+        assert!(roots.is_empty(), "{roots:?}");
+        assert!(
+            dropped[0].contains("mcp.share_roots") && dropped[0].contains("whole disk"),
+            "{dropped:?}"
+        );
+    }
+
+    #[test]
+    fn the_context_osh_mcp_runs_with_never_leaves_shares_or_repo_vars_unchecked() {
+        let d = std::env::temp_dir().join(format!("osh-mcp-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let snap = osh_core::settings::load(&d, &|_| None);
+        let (c, _) = build_ctx(None, &snap);
+        assert_eq!(
+            c.share_roots,
+            Some(Vec::new()),
+            "None would mean every folder is allowed"
+        );
+        assert_eq!(c.repo_vars, Some(Vec::new()));
+        assert!(!c.allow_share && c.refuse_risky_share);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

@@ -190,8 +190,23 @@ fn load_manifest(dir: &Path) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// The text osh would ship for `rel`: an embedded file, or the generated `osh.toml` template.
+pub fn shipped_text(rel: &str) -> Option<String> {
+    if rel == crate::settings::FILE {
+        return Some(crate::settings::template());
+    }
+    embedded(rel).map(String::from)
+}
+
 /// Where `rel` stands against the shipped copy.
 pub fn state(dir: &Path, rel: &str) -> FileState {
+    if rel == crate::settings::FILE {
+        return match fs::read_to_string(dir.join(rel)) {
+            Err(_) => FileState::Missing,
+            Ok(t) if t == crate::settings::template() => FileState::Shipped,
+            Ok(_) => FileState::Edited { newer: false },
+        };
+    }
     let on_disk = fs::read(dir.join(rel)).ok().map(|b| hash(&b));
     let Some(body) = embedded(rel) else {
         return if on_disk.is_some() {
@@ -243,13 +258,19 @@ pub fn files(dir: &Path) -> Vec<(String, FileState)> {
     own.sort_by(|a, b| a.0.cmp(&b.0));
     out.extend(own);
     if dir.join(crate::settings::FILE).is_file() {
-        out.push((crate::settings::FILE.into(), FileState::Own));
+        out.push((
+            crate::settings::FILE.into(),
+            state(dir, crate::settings::FILE),
+        ));
     }
     out
 }
 
 /// Write the shipped default of `rel` back and record it, so later upgrades update it again.
 pub fn restore(dir: &Path, rel: &str) -> io::Result<()> {
+    if rel == crate::settings::FILE {
+        return crate::settings::restore_template(dir).map_err(io::Error::other);
+    }
     let body = embedded(rel)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "osh ships no such file"))?;
     let path = dir.join(rel);
@@ -510,6 +531,27 @@ mod tests {
         // A pathologically nested file must give an error or pass, never overflow the stack.
         let deep = format!("{}1{}", "[".repeat(100_000), "]".repeat(100_000));
         let _ = check_yaml(&deep);
+    }
+
+    #[test]
+    fn osh_toml_can_be_compared_with_and_restored_to_the_template() {
+        let d = tmp("osh-toml-restore");
+        fs::create_dir_all(&d).unwrap();
+        assert_eq!(state(&d, "osh.toml"), FileState::Missing);
+        fs::write(d.join("osh.toml"), crate::settings::template()).unwrap();
+        assert_eq!(state(&d, "osh.toml"), FileState::Shipped);
+        fs::write(d.join("osh.toml"), "[refresh]\nports_secs = 4\n").unwrap();
+        assert!(state(&d, "osh.toml").restorable());
+        assert_eq!(
+            shipped_text("osh.toml").as_deref(),
+            Some(crate::settings::template().as_str())
+        );
+        restore(&d, "osh.toml").unwrap();
+        assert_eq!(
+            fs::read_to_string(d.join("osh.toml")).unwrap(),
+            crate::settings::template()
+        );
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]

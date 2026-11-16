@@ -1239,7 +1239,6 @@ fn fit_lines(screen: Rect, w: u16, lines: Vec<Line<'static>>) -> (Rect, Vec<Line
     (area, lines, cut)
 }
 
-/// A scrolling popup: wrapped lines inside the frame, with the position in the corner.
 /// The Settings screen: one line per entry with the cursor, then the selected entry's meaning,
 /// what overrides it and the last message. Rows that do not fit are cut, never wrapped.
 fn draw_settings(f: &mut Frame, v: &crate::settingsview::View) {
@@ -1277,6 +1276,7 @@ fn draw_settings(f: &mut Frame, v: &crate::settingsview::View) {
     );
 }
 
+/// A scrolling popup: wrapped lines inside the frame, with the position in the corner.
 fn draw_scroller(f: &mut Frame, title: &str, lines: Vec<Line<'static>>, scroll: u16, hint: &str) {
     let area = centered(
         f.area(),
