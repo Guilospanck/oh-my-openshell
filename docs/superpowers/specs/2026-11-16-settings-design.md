@@ -120,13 +120,13 @@ The dashboard re-reads `osh.toml` when its modification time changes (checked in
 
 ### `osh config` *call*
 
-- `osh config`: a table of key, value, source, default, description. `--json` prints the same as a JSON array (for factory apps), following the existing headless output contract (exit 0 with JSON; `{"ok":false,"error":...}` and exit 1 on failure; exit 2 for usage errors).
+- `osh config`: a table of key, value, source, default, **environment variable**, description. The environment column always names the variable that overrides the setting (blank when it has none), and the source column says `env` when that variable is the one currently winning. `--json` prints the same as a JSON array (fields include `env`: the variable name or `null`, and `env_active`: bool) (for factory apps), following the existing headless output contract (exit 0 with JSON; `{"ok":false,"error":...}` and exit 1 on failure; exit 2 for usage errors).
 - `osh config get KEY`, `osh config set KEY VALUE`, `osh config unset KEY`, `osh config path` (prints the `osh.toml` path), `osh config edit` (opens it in the user's editor, else the built-in one).
 - `set` validates the value against the registry type and range and refuses with the reason; it refuses keys that an environment variable currently overrides, naming the variable.
 
 ### Dashboard Settings screen *call*
 
-A full-screen view opened from the command palette (`Settings`), plus a key if a free one exists. Rows show key, value, source and description. Enter edits the selected row (bool toggles, enum chooses from a list, numbers and lists take typed input with the same validation as `set`). `r` resets the row, `e` opens `osh.toml` in the editor, `/` filters rows by key or description. Rows that an environment variable controls are marked and cannot be edited. The file-based settings that live elsewhere (`toolchains.toml`, policy, gateway configs) appear in a short "Other files" list that opens each in the editor. The layout details (column widths, narrow-terminal fallback, colours) are the builder's, following the existing views.
+A full-screen view opened from the command palette (`Settings`), plus a key if a free one exists. Rows show key, value, source, the environment variable that overrides it (when it has one, shown whether or not it is set, and highlighted when it is the active source) and description. The detail line of a selected row spells out the precedence: `<VAR> (if set) > osh.toml > default`. Enter edits the selected row (bool toggles, enum chooses from a list, numbers and lists take typed input with the same validation as `set`). `r` resets the row, `e` opens `osh.toml` in the editor, `/` filters rows by key or description. Rows that an environment variable controls are marked and cannot be edited. The file-based settings that live elsewhere (`toolchains.toml`, policy, gateway configs) appear in a short "Other files" list that opens each in the editor. The layout details (column widths, narrow-terminal fallback, colours) are the builder's, following the existing views.
 
 ### Where the code goes
 
@@ -134,7 +134,11 @@ A full-screen view opened from the command palette (`Settings`), plus a key if a
 - `exted.rs` (`PREF_FILE`) and `tmuxpass.rs` (`OFF_FILE`) read and write through the settings module.
 - `tui/src/mcpcmd.rs` builds its share and repo settings from the resolved settings (environment still wins).
 - `tui/src/` gets the Settings view and its wiring; `tui/src/main.rs` gets the `config` subcommand arm and, for the headless commands, calls the same loader.
-- Docs: a README "Settings" section whose table lists every registry entry, with a unit test that fails when the README table and the registry disagree (like the footer-key test). `AGENTS.md` layout rows. `tests/e2e/scenarios.py` gets a scenario for the Settings screen and `actions.txt` its entries.
+- Docs: a README "Settings" section whose table lists every registry entry with its default, takes-effect value and environment variable, with a unit test that fails when the README table and the registry disagree (like the footer-key test). `AGENTS.md` layout rows. `tests/e2e/scenarios.py` gets a scenario for the Settings screen and `actions.txt` its entries.
+
+### Environment variables are visible *call* (asked for by the user)
+
+The environment variable that can supersede a setting is part of the registry entry and is shown everywhere the setting is: the `osh.toml` template (an extra comment line, for example `# Overridden by the environment variable OSH_MCP_ALLOW_SHARE=1.`), `osh config` and `--json`, the Settings screen, and the README table. Today only `shell.tmux_keys`, the three `mcp.*` settings and the data folder (`OSH_DIR`) have one. This change adds no new environment variables; a setting gets one only by a later decision.
 
 ### Further calls (from the builder check; all *call*, the author's)
 
