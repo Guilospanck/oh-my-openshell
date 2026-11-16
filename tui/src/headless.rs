@@ -15,13 +15,51 @@ usage:
 A spec is JSON, e.g. {\"name\":\"w1\",\"repo\":{\"url\":\"https://github.com/o/r\",\"env_var\":\"GH_TOKEN_NAME\"}}.
 Output is one JSON line on stdout; failures print {\"ok\":false,\"error\":...} and exit 1.";
 
+/// Where a spec comes from; read after parsing so a bad file is a runtime error, not usage.
+#[derive(Debug, PartialEq)]
+enum SpecSrc {
+    File(String),
+    Stdin,
+}
+
+impl SpecSrc {
+    fn of(arg: &str) -> Self {
+        if arg == "-" {
+            SpecSrc::Stdin
+        } else {
+            SpecSrc::File(arg.into())
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            SpecSrc::File(p) => p,
+            SpecSrc::Stdin => "stdin",
+        }
+    }
+
+    /// Read and parse the spec; errors name the source and never echo its contents.
+    fn load(&self, stdin: &dyn Fn() -> Result<String, String>) -> Result<Value, String> {
+        let text = match self {
+            SpecSrc::Stdin => stdin()?,
+            SpecSrc::File(p) => {
+                std::fs::read_to_string(p).map_err(|e| format!("cannot read {p}: {e}"))?
+            }
+        };
+        if text.trim().is_empty() {
+            return Err(format!("{} is empty: expected a JSON spec", self.label()));
+        }
+        serde_json::from_str(&text).map_err(|e| format!("invalid JSON in {}: {e}", self.label()))
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum Command {
     List {
         gateway: Option<String>,
     },
     Create {
-        spec: Value,
+        spec: SpecSrc,
         gateway: Option<String>,
         dry_run: bool,
         allow_share: bool,
@@ -36,40 +74,18 @@ enum Command {
         argv: Vec<String>,
     },
     Apply {
-        spec: Value,
+        spec: SpecSrc,
         gateway: Option<String>,
         allow_share: bool,
     },
-}
-
-/// Read a spec from a file, or from `stdin` for `-`.
-fn read_spec(path: &str, stdin: &dyn Fn() -> Result<String, String>) -> Result<Value, String> {
-    let text = if path == "-" {
-        stdin()?
-    } else {
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?
-    };
-    serde_json::from_str(&text).map_err(|e| format!("invalid JSON in {path}: {e}"))
 }
 
 fn value<'a>(it: &mut std::slice::Iter<'a, String>, flag: &str) -> Result<&'a String, String> {
     it.next().ok_or_else(|| format!("{flag} needs a value"))
 }
 
+/// Parse argv; every error here is a usage mistake (stderr, exit 2).
 fn parse(args: &[String]) -> Result<Command, String> {
-    parse_with(args, &|| {
-        let mut s = String::new();
-        std::io::stdin()
-            .read_to_string(&mut s)
-            .map_err(|e| format!("cannot read stdin: {e}"))?;
-        Ok(s)
-    })
-}
-
-fn parse_with(
-    args: &[String],
-    stdin: &dyn Fn() -> Result<String, String>,
-) -> Result<Command, String> {
     let (verb, rest) = match args.first().map(String::as_str) {
         Some("sandbox") => match args.get(1) {
             Some(v) => (v.as_str(), &args[2..]),
@@ -79,7 +95,7 @@ fn parse_with(
         _ => return Err("expected sandbox or apply".into()),
     };
     let mut gateway = None;
-    let mut spec_path: Option<String> = None;
+    let mut spec: Option<SpecSrc> = None;
     let (mut dry_run, mut allow_share) = (false, false);
     let mut name: Option<String> = None;
     let mut argv: Option<Vec<String>> = None;
@@ -87,8 +103,8 @@ fn parse_with(
     while let Some(a) = it.next() {
         match a.as_str() {
             "--gateway" => gateway = Some(value(&mut it, "--gateway")?.clone()),
-            "--spec" if verb == "create" => spec_path = Some(value(&mut it, "--spec")?.clone()),
-            "-f" if verb == "apply" => spec_path = Some(value(&mut it, "-f")?.clone()),
+            "--spec" if verb == "create" => spec = Some(SpecSrc::of(value(&mut it, "--spec")?)),
+            "-f" if verb == "apply" => spec = Some(SpecSrc::of(value(&mut it, "-f")?)),
             "--dry-run" if verb == "create" => dry_run = true,
             "--allow-share" if verb == "create" || verb == "apply" => allow_share = true,
             "--" if verb == "exec" => argv = Some(it.by_ref().cloned().collect()),
@@ -99,23 +115,17 @@ fn parse_with(
     }
     match verb {
         "list" => Ok(Command::List { gateway }),
-        "create" => {
-            let p = spec_path.ok_or("create needs --spec FILE|-")?;
-            Ok(Command::Create {
-                spec: read_spec(&p, stdin)?,
-                gateway,
-                dry_run,
-                allow_share,
-            })
-        }
-        "apply" => {
-            let p = spec_path.ok_or("apply needs -f FILE|-")?;
-            Ok(Command::Apply {
-                spec: read_spec(&p, stdin)?,
-                gateway,
-                allow_share,
-            })
-        }
+        "create" => Ok(Command::Create {
+            spec: spec.ok_or("create needs --spec FILE|-")?,
+            gateway,
+            dry_run,
+            allow_share,
+        }),
+        "apply" => Ok(Command::Apply {
+            spec: spec.ok_or("apply needs -f FILE|-")?,
+            gateway,
+            allow_share,
+        }),
         "delete" => Ok(Command::Delete {
             name: name.ok_or("delete needs a NAME")?,
             gateway,
@@ -135,8 +145,25 @@ fn parse_with(
     }
 }
 
-/// Run the headless command; 0 ok, 1 the operation failed, 2 usage error. For `exec` the
-/// process exit code is the command's own when the call ran.
+/// The process exit code: `exec` reports the command's own code when the call ran (1 if the
+/// reply carries none); every other operation, and a failed call, uses the envelope's code.
+fn exit_for(exec: bool, out: &Value, code: i32) -> i32 {
+    if exec && code == 0 {
+        return out["exit_code"].as_i64().map_or(1, |c| c as i32);
+    }
+    code
+}
+
+fn real_stdin() -> Result<String, String> {
+    let mut s = String::new();
+    std::io::stdin()
+        .read_to_string(&mut s)
+        .map_err(|e| format!("cannot read stdin: {e}"))?;
+    Ok(s)
+}
+
+/// Run the headless command; 0 ok, 1 the operation failed (JSON on stdout), 2 usage error
+/// (message on stderr). For `exec` the process exit code is the command's own when the call ran.
 pub fn headless(args: &[String]) -> i32 {
     let cmd = match parse(args) {
         Ok(c) => c,
@@ -159,7 +186,9 @@ pub fn headless(args: &[String]) -> i32 {
             gateway,
             dry_run,
             allow_share,
-        } => ops::sandbox_create(&ctx(gateway, allow_share), &spec, dry_run),
+        } => spec
+            .load(&real_stdin)
+            .and_then(|v| ops::sandbox_create(&ctx(gateway, allow_share), &v, dry_run)),
         Command::Delete { name, gateway } => ops::sandbox_delete(&ctx(gateway, false), &name),
         Command::Exec {
             name,
@@ -173,25 +202,28 @@ pub fn headless(args: &[String]) -> i32 {
             spec,
             gateway,
             allow_share,
-        } => ops::apply(&ctx(gateway, allow_share), &spec),
+        } => spec
+            .load(&real_stdin)
+            .and_then(|v| ops::apply(&ctx(gateway, allow_share), &v)),
     };
     let (out, code) = ops::envelope(result);
     println!("{out}");
-    if exec && code == 0 {
-        return out["exit_code"].as_i64().map_or(1, |c| c as i32);
-    }
-    code
+    exit_for(exec, &out, code)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn a(s: &str) -> Vec<String> {
         s.split_whitespace().map(String::from).collect()
     }
     fn p(s: &str) -> Result<Command, String> {
-        parse_with(&a(s), &|| Ok(r#"{"name":"x"}"#.to_string()))
+        parse(&a(s))
+    }
+    fn err(s: &str) -> String {
+        p(s).unwrap_err()
     }
 
     #[test]
@@ -210,24 +242,32 @@ mod tests {
                 gateway: Some("g".into())
             })
         );
-        assert!(p("sandbox delete").is_err());
+        assert!(err("sandbox delete").contains("needs a NAME"));
     }
 
     #[test]
-    fn create_reads_stdin_and_flags() {
-        let c = p("sandbox create --spec - --dry-run --allow-share --gateway g").unwrap();
+    fn create_flags_and_spec_sources() {
         assert_eq!(
-            c,
-            Command::Create {
-                spec: serde_json::json!({"name":"x"}),
+            p("sandbox create --spec - --dry-run --allow-share --gateway g"),
+            Ok(Command::Create {
+                spec: SpecSrc::Stdin,
                 gateway: Some("g".into()),
                 dry_run: true,
                 allow_share: true
-            }
+            })
         );
-        assert!(p("sandbox create --spec").is_err());
-        assert!(p("sandbox create").is_err());
-        assert!(p("sandbox create --spec - --bogus").is_err());
+        assert_eq!(
+            p("sandbox create --spec a.json"),
+            Ok(Command::Create {
+                spec: SpecSrc::File("a.json".into()),
+                gateway: None,
+                dry_run: false,
+                allow_share: false
+            })
+        );
+        assert!(err("sandbox create --spec").contains("--spec needs a value"));
+        assert!(err("sandbox create").contains("needs --spec"));
+        assert!(err("sandbox create --spec - --bogus").contains("unknown option --bogus"));
     }
 
     #[test]
@@ -235,17 +275,17 @@ mod tests {
         assert_eq!(
             p("apply -f - --allow-share"),
             Ok(Command::Apply {
-                spec: serde_json::json!({"name":"x"}),
+                spec: SpecSrc::Stdin,
                 gateway: None,
                 allow_share: true
             })
         );
-        assert!(p("apply").is_err());
-        assert!(p("apply --dry-run -f -").is_err());
+        assert!(err("apply").contains("needs -f"));
+        assert!(err("apply --dry-run -f -").contains("unknown option --dry-run"));
     }
 
     #[test]
-    fn exec_needs_double_dash() {
+    fn exec_needs_double_dash_and_keeps_later_flags() {
         assert_eq!(
             p("sandbox exec w1 -- ls -la --color"),
             Ok(Command::Exec {
@@ -254,21 +294,51 @@ mod tests {
                 argv: a("ls -la --color")
             })
         );
-        assert!(p("sandbox exec w1 ls").is_err());
-        assert!(p("sandbox exec w1 --").is_err());
-        assert!(p("sandbox exec -- ls").is_err());
+        assert_eq!(
+            p("sandbox exec w1 -- cmd --gateway x"),
+            Ok(Command::Exec {
+                name: "w1".into(),
+                gateway: None,
+                argv: a("cmd --gateway x")
+            })
+        );
+        assert!(err("sandbox exec w1 ls").contains("unexpected argument ls"));
+        assert!(err("sandbox exec w1 --").contains("needs `-- CMD...`"));
+        assert!(err("sandbox exec -- ls").contains("needs a NAME"));
     }
 
     #[test]
-    fn unknown_verb_and_bad_spec() {
-        assert!(p("sandbox frob").is_err());
-        assert!(p("sandbox").is_err());
-        assert!(
-            parse_with(&a("sandbox create --spec /nonexistent/zz.json"), &|| Ok(
-                String::new()
-            ))
-            .is_err()
+    fn usage_errors_for_verbs() {
+        assert!(err("sandbox frob").contains("unknown sandbox command frob"));
+        assert!(err("sandbox").contains("sandbox needs"));
+    }
+
+    #[test]
+    fn spec_read_failures_are_runtime_errors_naming_the_source() {
+        let no = || Ok(String::new());
+        let e = SpecSrc::File("/nonexistent/zz.json".into())
+            .load(&no)
+            .unwrap_err();
+        assert!(e.starts_with("cannot read /nonexistent/zz.json"), "{e}");
+        let e = SpecSrc::Stdin
+            .load(&|| Ok("not json LEAKCHECK".into()))
+            .unwrap_err();
+        assert!(e.starts_with("invalid JSON in stdin"), "{e}");
+        assert!(!e.contains("LEAKCHECK"), "{e}");
+        let e = SpecSrc::Stdin.load(&no).unwrap_err();
+        assert_eq!(e, "stdin is empty: expected a JSON spec");
+        assert_eq!(
+            SpecSrc::Stdin.load(&|| Ok(r#"{"name":"x"}"#.into())),
+            Ok(json!({"name":"x"}))
         );
-        assert!(parse_with(&a("apply -f -"), &|| Ok("not json".into())).is_err());
+    }
+
+    #[test]
+    fn exit_codes() {
+        assert_eq!(exit_for(true, &json!({"exit_code":0}), 0), 0);
+        assert_eq!(exit_for(true, &json!({"exit_code":7}), 0), 7);
+        assert_eq!(exit_for(true, &json!({"stdout":""}), 0), 1);
+        assert_eq!(exit_for(true, &json!({"ok":false,"error":"x"}), 1), 1);
+        assert_eq!(exit_for(false, &json!({"exit_code":7}), 0), 0);
     }
 }
