@@ -400,7 +400,7 @@ pub fn data_dir() -> PathBuf {
     )
 }
 
-fn resolve(
+pub(crate) fn resolve(
     osh_dir: Option<std::ffi::OsString>,
     xdg: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,

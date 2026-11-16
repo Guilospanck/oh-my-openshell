@@ -14,3 +14,4 @@ psl = "2.1.250"
 saphyr = { version = "0.3.3", default-features = false }
 serde_json = "1.0.154"
 toml = "1.2.1"
+toml_edit = "=0.25.17"
