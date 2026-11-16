@@ -12,6 +12,8 @@ use crate::ports::{self, Ports, Scan};
 use crate::preload;
 use crate::term::{self, Session};
 use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
+pub use osh_core::sandbox::Step;
+use osh_core::sandbox::{self, SANDBOX_PATH};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::{
     io::Write,
@@ -191,6 +193,27 @@ pub struct Plan {
     /// Toolchain groups (`toolchains.toml`) switched on for this sandbox; `None` = the file's
     /// own `enabled` flags (not asked yet, or the list is unusable).
     pub toolchains: Option<Vec<String>>,
+}
+
+impl From<&Plan> for sandbox::SandboxSpec {
+    /// The creation fields of a plan; the repo grant is passed to `plan_create_with` already
+    /// resolved, since the dashboard knows its forge exactly.
+    fn from(p: &Plan) -> Self {
+        sandbox::SandboxSpec {
+            name: p.name.clone(),
+            image: p.image.clone(),
+            providers: p.providers.clone(),
+            cpu: p.cpu.clone(),
+            memory: p.memory.clone(),
+            command: p.command.clone(),
+            toolchains: p.toolchains.clone(),
+            share: (!p.share.is_empty()).then(|| sandbox::Share {
+                path: p.share.clone(),
+                rw: p.share_rw,
+            }),
+            repo: None,
+        }
+    }
 }
 
 /// A repo token pasted for a new sandbox; kept in memory only until the provider is created.
@@ -542,24 +565,6 @@ fn modal_last(rows: usize) -> u16 {
     (rows as u16).saturating_sub(modal_rows())
 }
 
-/// A command run with the terminal handed back to it (build, create, setup-token).
-pub struct Step {
-    pub prog: String,
-    pub args: Vec<String>,
-}
-
-impl Step {
-    /// What the step does, for messages: the in-sandbox command without its PATH prefix.
-    pub fn label(&self) -> String {
-        match self.args.last() {
-            Some(c) if self.args.iter().any(|a| a == "-c") => {
-                c.strip_prefix(SANDBOX_PATH).unwrap_or(c).to_string()
-            }
-            _ => format!("{} {}", self.prog, self.args.join(" ")),
-        }
-    }
-}
-
 /// The step a terminal job stopped at, and the end of its output when it was recorded.
 pub struct Failed {
     /// Position among the steps that ran.
@@ -841,8 +846,6 @@ fn sync_label(i: &cli::SyncItem) -> String {
     };
     format!("{:<11} {}  [{}]{tag}", i.group, i.name, agents.join(", "))
 }
-
-const SANDBOX_PATH: &str = "export PATH=\"$HOME/.local/bin:$PATH\"; ";
 
 /// Commands run in the sandbox with `~/.local/bin` on PATH: uv installs there and the
 /// sandbox PATH lacks it.
@@ -2819,129 +2822,27 @@ impl App {
         &self,
         plan: &Plan,
     ) -> (PathBuf, Option<String>, Option<Vec<String>>) {
-        let base = self.dir.join("sandbox-policy.yaml");
-        let generated = self.dir.join(".sandbox-policy.generated.yaml");
-        let mut note = None;
-        let text = std::fs::read_to_string(&base).unwrap_or_else(|_| {
-            note = Some(
-                "sandbox-policy.yaml is missing, so the shipped default is used (Data files in the command palette restores the file)".to_string(),
-            );
-            crate::assets::embedded("sandbox-policy.yaml")
-                .unwrap_or_default()
-                .to_string()
-        });
-        let groups = match std::fs::read_to_string(self.dir.join(TOOLCHAINS_FILE)) {
-            Ok(list) => preload::parse(&list).unwrap_or_else(|e| {
-                note = Some(format!(
-                    "toolchains.toml is not valid TOML ({}), so no toolchain hosts are added",
-                    crate::editor::error_summary(&e)
-                ));
-                Vec::new()
-            }),
-            Err(_) => {
-                note = note.clone().or(Some(
-                    "toolchains.toml is missing, so no toolchain hosts are added".to_string(),
-                ));
-                Vec::new()
-            }
-        };
-        let groups = match &plan.toolchains {
-            Some(picks) => preload::select(&groups, picks),
-            None => groups,
-        };
-        let mut opened: Option<Vec<String>> = Some(
-            groups
-                .iter()
-                .filter(|g| g.on)
-                .map(|g| g.name.clone())
-                .collect(),
-        );
-        let policy = preload::creation_policy(&text, &groups).unwrap_or_else(|e| {
-            note = Some(e);
-            opened = None;
-            preload::creation_policy(&text, &[]).unwrap_or_else(|_| text.clone())
-        });
-        match std::fs::write(&generated, policy) {
-            Ok(()) => (generated, note, opened),
-            Err(e) if base.is_file() => (
-                base,
-                Some(format!(
-                    "Could not write the generated policy ({e}), so the plain sandbox-policy.yaml is used without toolchain hosts"
-                )),
-                None,
-            ),
-            Err(e) => (
-                generated,
-                Some(format!("Could not write the sandbox policy: {e}")),
-                None,
-            ),
-        }
+        sandbox::policy_for(&self.dir, plan.toolchains.as_deref())
     }
 
     fn sandbox_steps(&self, plan: &Plan) -> Vec<Step> {
-        let mut steps = Vec::new();
-        if let Some(img) = self
-            .snap
-            .images
-            .iter()
-            .find(|i| i.tag == plan.image && (!i.built || plan.rebuild))
-        {
-            steps.push(Step {
-                prog: cli::runtime_bin().into(),
-                args: cli::build_args(&self.dir, &img.file, &img.tag),
-            });
-        }
-        let mut args: Vec<String> = vec!["sandbox".into(), "create".into()];
-        // The default policy denies opening a PTY, which tmux needs in the shell.
-        args.extend([
-            "--policy".into(),
-            self.creation_policy(plan).0.to_string_lossy().into(),
-        ]);
-        if !plan.name.is_empty() {
-            args.extend(["--name".into(), plan.name.clone()]);
-        }
-        if !plan.image.is_empty() {
-            args.extend(["--from".into(), plan.image.clone()]);
-        }
-        if !plan.cpu.is_empty() {
-            args.extend(["--cpu".into(), plan.cpu.clone()]);
-        }
-        if !plan.memory.is_empty() {
-            args.extend(["--memory".into(), plan.memory.clone()]);
-        }
-        if let Some(json) = self.share_config(plan) {
-            args.extend(["--driver-config-json".into(), json]);
-            args.extend([
-                "--label".into(),
-                format!("{}={}", cli::SHARE_LABEL, cli::share_key(&plan.share)),
-            ]);
-        }
-        for p in &plan.providers {
-            args.extend(["--provider".into(), p.clone()]);
-        }
-        if let Some(g) = &plan.gh {
-            args.extend([
-                "--provider".into(),
-                ghrepo::provider_name(&plan.name, &g.repo),
-            ]);
-        }
-        if plan.command.is_empty() {
-            // The detached shell stays the main process; sessions come from `exec`.
-            args.push("--detach".into());
-        } else {
-            args.extend([
-                "--no-keep".into(),
-                "--".into(),
-                "sh".into(),
-                "-c".into(),
-                plan.command.clone(),
-            ]);
-        }
-        steps.push(Step {
-            prog: "openshell".into(),
-            args: cli::with_gateway(args),
-        });
-        steps
+        let ctx = sandbox::CreateCtx {
+            dir: &self.dir,
+            driver: &self.snap.driver,
+            images: &self.snap.images,
+            rebuild: plan.rebuild,
+        };
+        let repo = plan.gh.as_ref().map(|g| &g.repo);
+        // The dashboard offers a share only on a driver that supports it; should it ever not,
+        // the sandbox is created without the folder rather than not at all.
+        sandbox::plan_create_with(&sandbox::SandboxSpec::from(plan), &ctx, repo)
+            .or_else(|_| {
+                let mut spec = sandbox::SandboxSpec::from(plan);
+                spec.share = None;
+                sandbox::plan_create_with(&spec, &ctx, repo)
+            })
+            .map(|c| c.steps)
+            .unwrap_or_default()
     }
 
     fn on_select(&mut self, kind: SelKind, picks: Vec<String>) {
@@ -5019,21 +4920,6 @@ impl App {
             false,
             SelKind::ShareAccess(plan),
         );
-    }
-
-    /// `--driver-config-json` value mounting the plan's host folder, keyed by the active driver.
-    fn share_config(&self, plan: &Plan) -> Option<String> {
-        if plan.share.is_empty() {
-            return None;
-        }
-        let name = std::path::Path::new(&plan.share).file_name()?.to_str()?;
-        let mount = serde_json::json!({
-            "type": "bind",
-            "source": plan.share,
-            "target": format!("/sandbox/{name}"),
-            "read_only": !plan.share_rw,
-        });
-        Some(serde_json::json!({ self.snap.driver.as_str(): { "mounts": [mount] } }).to_string())
     }
 
     fn ask_command(&mut self, plan: Plan) {

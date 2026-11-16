@@ -8,5 +8,6 @@ pub mod cli;
 pub mod ghrepo;
 pub mod platform;
 pub mod preload;
+pub mod sandbox;
 pub mod text;
 pub mod watch;
