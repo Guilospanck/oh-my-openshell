@@ -242,6 +242,9 @@ pub fn files(dir: &Path) -> Vec<(String, FileState)> {
     }
     own.sort_by(|a, b| a.0.cmp(&b.0));
     out.extend(own);
+    if dir.join(crate::settings::FILE).is_file() {
+        out.push((crate::settings::FILE.into(), FileState::Own));
+    }
     out
 }
 
@@ -318,6 +321,7 @@ pub fn check_for(rel: &str) -> Option<crate::text::Check> {
     let name = rel.rsplit('/').next().unwrap_or(rel);
     Some(match rel {
         "toolchains.toml" => crate::preload::check,
+        crate::settings::FILE => crate::settings::check,
         "sandbox-policy.yaml" => check_policy,
         _ if rel.starts_with("providers/") => crate::cli::check_profile,
         _ if rel.starts_with("images/") => check_dockerfile,
@@ -506,6 +510,24 @@ mod tests {
         // A pathologically nested file must give an error or pass, never overflow the stack.
         let deep = format!("{}1{}", "[".repeat(100_000), "]".repeat(100_000));
         let _ = check_yaml(&deep);
+    }
+
+    #[test]
+    fn osh_toml_is_a_data_file_with_the_settings_check() {
+        let d = tmp("osh-toml");
+        fs::create_dir_all(&d).unwrap();
+        assert!(
+            !files(&d).iter().any(|(r, _)| r == "osh.toml"),
+            "listed once it exists"
+        );
+        fs::write(d.join("osh.toml"), "[refresh]\nports_secs = 4\n").unwrap();
+        assert!(files(&d).iter().any(|(r, _)| r == "osh.toml"));
+        let check = check_for("osh.toml").unwrap();
+        assert!(check("[refresh]\nports_secs = 4\n").is_ok());
+        assert!(check("[refresh]\nports_secs = 0\n")
+            .unwrap_err()
+            .contains("osh.toml:2"));
+        let _ = fs::remove_dir_all(&d);
     }
 
     fn tmp(name: &str) -> PathBuf {

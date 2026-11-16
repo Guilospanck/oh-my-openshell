@@ -429,6 +429,31 @@ def data_files():
         if os.path.exists(path + ".osh-bak"):
             os.remove(path + ".osh-bak")
 
+@scenario("settings-screen")
+def settings_screen():
+    """The palette's Settings: every setting is listed with the variable that overrides it, one is
+    changed from the screen and lands in osh.toml with the file's comments kept, then reset."""
+    path = os.path.join(data_dir(), "osh.toml")
+    try:
+        with dashboard() as o:
+            o.press(":"); o.wait("Commands", 10)
+            o.type("settings"); o.wait("Settings:", 5); o.press("enter")
+            o.wait("refresh.ports_secs", 10)
+            assert "OSH_MCP_ALLOW_SHARE" in o.text(), o.text()
+            o.press("/"); o.type("ports"); o.press("enter")
+            o.wait("asked for listening ports", 5)
+            o.press("enter"); o.wait("new value", 5)
+            o.press("backspace"); o.type("9"); o.press("enter")
+            o.wait("refresh.ports_secs saved", 10)
+            text = open(path).read()
+            assert "ports_secs = 9" in text and "# Which editor the edit actions use" in text, text
+            o.press("r"); o.wait("back to its default", 10)
+            text = open(path).read()
+            assert "ports_secs = 9" not in text and "# ports_secs = 3" in text, text
+            o.press("esc"); o.press("esc"); o.wait_gone("refresh.ports_secs", 5)
+    finally:
+        editor_mode("builtin")
+
 @scenario("palette-doctor")
 def palette_doctor():
     with dashboard() as o:

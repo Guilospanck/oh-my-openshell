@@ -116,7 +116,8 @@ A few actions have no key and live only in the palette:
 | Palette action | What it does |
 | --- | --- |
 | `Edit toolchains.toml` | opens the list of toolchain hosts and the defaults for all new sandboxes in your editor, or the built-in one (below) |
-| `Editor: switch auto / your own / built-in` | which editor the edit actions use: `auto` (yours when one is found, else the built-in one), always yours, or always the built-in one (kept across runs in `editor-mode` in the data folder) |
+| `Editor: switch auto / your own / built-in` | which editor the edit actions use: `auto` (yours when one is found, else the built-in one), always yours, or always the built-in one (kept across runs as `general.editor` in `osh.toml`) |
+| `Settings` | every osh setting with its value, source, the environment variable that overrides it and a description; change one, reset it, or open `osh.toml` (see [Settings](#settings)) |
 | `Data files` | every file osh keeps in its data folder: view, edit, compare with the shipped default, restore it, delete; new profile or Dockerfile |
 | `Sandbox policy` | the same actions for `sandbox-policy.yaml`, the filesystem policy every new sandbox gets (checked as YAML with a `version` on save) |
 | `Resume or repair set-up` | the set-up wizard from its first screen: carries on a stopped install, installs what is missing |
@@ -223,7 +224,7 @@ shell, host tmux shortcuts included: when osh runs in tmux, the host's prefix an
 pane, else run the original", so they reach the tmux inside the sandbox only in that window and the rest
 of the host session keeps its shortcuts (needs tmux 3.2+; `Ctrl-]` still leaves the shell). While osh runs, the host's global `prefix` is `None` and the
 prefix key is a wrapped root binding; osh puts it back when it quits. `Host tmux keys in sandbox shells`
-in the palette (or `OSH_TMUX_PASSTHROUGH=0`) turns this off. After a crash, the next start of osh gives the prefix back. A new sandbox gets your host `tmux.conf` automatically when its image has tmux (secret-scanned first when gitleaks is installed; the status line says when it was copied unscanned, and `Install gitleaks` is in the palette), and a filtered copy of your global git config (only aliases, colours and a few behaviour keys such as `init.defaultBranch`, `push.default`, `pull.rebase`; never credentials, URLs rewrites, signing, editor or hook settings) in `~/.config/osh/gitconfig`, included from the sandbox's `~/.gitconfig` (an existing one is kept; osh's own git identity and credentials still win); resend the tmux one later with `K` (sync agents); when the image has `workmux` it also gets your `~/.config/workmux/config.yaml` (`sandbox`, `remotes`, `bubblewrap` and `hook_shell` commented out; an agent pane, `agent: claude` and `nerdfont: false` added when missing, or just those when you have no config) at `~/.config/workmux/config.yaml`, so `workmux add -P` and `/orchestrate` work in the sandbox (also resent with `K`); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
+in the palette (`shell.tmux_keys` in `osh.toml`, or `OSH_TMUX_PASSTHROUGH=0`) turns this off. After a crash, the next start of osh gives the prefix back. A new sandbox gets your host `tmux.conf` automatically when its image has tmux (secret-scanned first when gitleaks is installed; the status line says when it was copied unscanned, and `Install gitleaks` is in the palette), and a filtered copy of your global git config (only aliases, colours and a few behaviour keys such as `init.defaultBranch`, `push.default`, `pull.rebase`; never credentials, URLs rewrites, signing, editor or hook settings) in `~/.config/osh/gitconfig`, included from the sandbox's `~/.gitconfig` (an existing one is kept; osh's own git identity and credentials still win); resend the tmux one later with `K` (sync agents); when the image has `workmux` it also gets your `~/.config/workmux/config.yaml` (`sandbox`, `remotes`, `bubblewrap` and `hook_shell` commented out; an agent pane, `agent: claude` and `nerdfont: false` added when missing, or just those when you have no config) at `~/.config/workmux/config.yaml`, so `workmux add -P` and `/orchestrate` work in the sandbox (also resent with `K`); `Ctrl-]` opens a menu: back to the session, the providers attached to the sandbox and what
 each allows (credentials, hosts and access level, binaries; scroll with `j`/`k`), the blocked requests
 seen in the sandbox (same list as `p`, below), dashboard (the shell keeps
 running, marked `●`; `Enter` on it returns), or close it. Shells keep their
@@ -584,6 +585,36 @@ and Forgejo, `x-token-auth` for Bitbucket). Only GitHub's git-over-HTTPS path
 has been tested through the gateway; GitLab, Bitbucket and Forgejo follow their
 documentation and are untested against live services.
 
+## Settings
+
+Every general osh setting lives in one file, `osh.toml` in the data folder, and nothing is hidden: each setting is listed there with a description and its default, commented out. Change one by removing the `#` in front of it, or let osh edit it and keep your comments:
+
+- `osh config` lists every setting with its value, where the value comes from (`default`, `file`, or `env`), the default, the environment variable that can override it, and what it does (`--json` for programs). `osh config get KEY`, `set KEY VALUE`, `unset KEY` (back to the default), `path` and `edit` (opens the file in your editor).
+- `Settings` in the command palette shows the same list in the dashboard: `Enter` changes the selected setting (a switch flips, a choice cycles, a number or list asks for the value), `r` puts it back to its default, `e` opens `osh.toml` in your editor (or the built-in one, per `general.editor`), `/` filters by name or description. A setting that needs a restart says `applies after restart` until you restart osh.
+- The first match wins: an environment variable (when the setting has one) over `osh.toml` over the default. A setting an environment variable is deciding right now cannot be changed from `osh config` or the screen; the message names the variable. The variables only push in one direction, as shown in the table: `OSH_TMUX_PASSTHROUGH=0` forces the tmux keys off and `OSH_MCP_ALLOW_SHARE=1` forces sharing on; any other value leaves the file in charge.
+- A wrong value (a number out of range, the wrong type) is shown with its line and column and the setting keeps its default; a file that is not valid TOML keeps the last good values in a running dashboard. Saving `osh.toml` in the editor runs the same check.
+- Where osh keeps its files is not a setting (the file lives there): `OSH_DIR`, else `$XDG_DATA_HOME/osh`, else `~/.local/share/osh`.
+- `editor-mode` and `.tmux-passthrough-off`, which older versions kept in the data folder, are moved into `osh.toml` the first time it is read.
+
+Other configuration keeps its own file and editor: `toolchains.toml`, `sandbox-policy.yaml`, the gateway configs, provider profiles and Dockerfiles (see `Data files` in the palette; the Settings screen links to them).
+
+| Setting | Type | Default | Takes effect | Environment variable | What it does |
+| --- | --- | --- | --- | --- | --- |
+| `general.editor` | `auto`, `own`, `builtin` | `"auto"` | live | none | Which editor the edit actions use: `auto` (yours when found, else the built-in one), `own` (always yours), `builtin`. |
+| `shell.tmux_keys` | bool | `true` | live | `OSH_TMUX_PASSTHROUGH` | Pass the host tmux keys into sandbox shells. The variable set to `0` forces this off. |
+| `refresh.gateway_secs` | 1 to 60 seconds | `2` | live | none | How often gateway, sandbox and provider state is read. |
+| `refresh.ports_secs` | 1 to 60 seconds | `3` | live | none | How often the sandbox in view is asked for listening ports. |
+| `refresh.usage_secs` | 1 to 300 seconds | `5` | live | none | How often the CPU, memory and disk meter reads. |
+| `refresh.usage_max_backoff_secs` | 5 to 600 seconds | `40` | live | none | Longest wait after meter reads keep failing (never below `refresh.usage_secs`). |
+| `refresh.alerts_secs` | 1 to 60 seconds | `4` | restart | none | How often shared folders are scanned for risky or changed files. |
+| `alerts.settle_secs` | 0 to 3600 seconds | `60` | live | none | After an allow, repeats of the same denial within this time count as in flight, not a new request. |
+| `ui.toast_secs` | 1 to 60 seconds | `5` | live | none | How long an alert toast stays on screen. |
+| `ui.status_secs` | 1 to 120 seconds | `6` | live | none | How long a status message shows over a shell. |
+| `ui.status_allowed_secs` | 1 to 300 seconds | `20` | live | none | How long an `Allowed ...` message shows (the cue to retry the blocked request). |
+| `mcp.allow_share` | bool | `false` | restart of osh mcp | `OSH_MCP_ALLOW_SHARE` | Let agents mount host folders through `osh mcp`. The variable set to `1` forces this on. |
+| `mcp.share_roots` | list of absolute paths | `[]` | restart of osh mcp | `OSH_MCP_SHARE_ROOT` | Folders agents may share from. The variable (separated like `PATH`) replaces the list. |
+| `mcp.repo_vars` | list of variable names | `[]` | restart of osh mcp | `OSH_MCP_REPO_VARS` | Variables agents may name as a git credential. The variable (comma-separated) replaces the list. |
+
 ## Development and agents
 
 `AGENTS.md` (also `CLAUDE.md`, a symlink) tells coding agents how to build,
@@ -678,7 +709,7 @@ The path is resolved through symlinks first. A risky folder (the whole disk, you
 {"mcpServers":{"osh":{"command":"osh","args":["mcp"]}}}
 ```
 
-The operator controls two things through the environment of the `osh mcp` process, never through a tool argument: `OSH_MCP_ALLOW_SHARE=1` lets specs mount host folders inside the roots listed in `OSH_MCP_SHARE_ROOT` (see above), and `OSH_MCP_REPO_VARS` lists, comma-separated, the variables a spec's `repo.env_var` may name. With `OSH_MCP_REPO_VARS` unset or empty, every repo grant is refused over MCP, so an agent cannot have osh send some other secret of the server's environment to a forge.
+The operator controls two things through `osh.toml` (`mcp.allow_share`, `mcp.share_roots`, `mcp.repo_vars`; see [Settings](#settings)) or the environment of the `osh mcp` process, never through a tool argument. The environment variables win over the file: `OSH_MCP_ALLOW_SHARE=1` lets specs mount host folders inside the roots listed in `OSH_MCP_SHARE_ROOT` (see above), and `OSH_MCP_REPO_VARS` lists, comma-separated, the variables a spec's `repo.env_var` may name. With `OSH_MCP_REPO_VARS` unset or empty, every repo grant is refused over MCP, so an agent cannot have osh send some other secret of the server's environment to a forge.
 
 What an agent reaches through it: `sandbox_exec` and `sandbox_delete` work on every sandbox of the gateway, including ones made in the dashboard, and a spec may attach any provider that exists on the gateway. Give the server a gateway that holds only what agents may use.
 

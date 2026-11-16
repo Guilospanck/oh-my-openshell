@@ -19,3 +19,4 @@ __pycache__/
 /.tmux-passthrough-off
 
 .claude
+/osh.toml

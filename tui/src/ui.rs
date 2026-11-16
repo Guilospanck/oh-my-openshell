@@ -1240,6 +1240,43 @@ fn fit_lines(screen: Rect, w: u16, lines: Vec<Line<'static>>) -> (Rect, Vec<Line
 }
 
 /// A scrolling popup: wrapped lines inside the frame, with the position in the corner.
+/// The Settings screen: one line per entry with the cursor, then the selected entry's meaning,
+/// what overrides it and the last message. Rows that do not fit are cut, never wrapped.
+fn draw_settings(f: &mut Frame, v: &crate::settingsview::View) {
+    let area = centered(
+        f.area(),
+        tall_width(f.area().width),
+        f.area().height.saturating_sub(2),
+    );
+    f.render_widget(Clear, area);
+    let hint = if v.filtering {
+        format!("filter: {}█ · Enter keep · Esc clear", v.filter)
+    } else if v.filter.is_empty() {
+        "↑↓ move · Enter change · r reset · e osh.toml · / filter · Esc close".to_string()
+    } else {
+        format!("filter: {} · / edit · Esc clear", v.filter)
+    };
+    let block = frame("Settings", &hint, Color::Cyan);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let cols = usize::from(inner.width);
+    let detail = v.detail_lines(cols);
+    let detail_h = (detail.len() as u16 + 1).min(inner.height.saturating_sub(2));
+    let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(detail_h)]).split(inner);
+    f.render_widget(
+        Paragraph::new(v.list_lines(usize::from(parts[0].height), cols)),
+        parts[0],
+    );
+    f.render_widget(
+        Paragraph::new(detail).block(
+            Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        ),
+        parts[1],
+    );
+}
+
 fn draw_scroller(f: &mut Frame, title: &str, lines: Vec<Line<'static>>, scroll: u16, hint: &str) {
     let area = centered(
         f.area(),
@@ -1600,6 +1637,7 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
                 "j/k PgUp/PgDn g/G scroll · Esc close",
             );
         }
+        Modal::Settings(v) => draw_settings(f, v),
         Modal::Editor { ed, .. } => crate::editor::draw(f, screen, ed),
         // Drawn by `draw_ext_edit`, over the whole screen.
         Modal::ExtEdit { .. } => {}
@@ -2273,6 +2311,38 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(all.contains("1/4") && all.contains("pypi.org") && all.contains("Opening"));
+    }
+
+    #[test]
+    fn the_settings_screen_draws_rows_detail_and_hints_at_any_size() {
+        let d = std::env::temp_dir().join(format!("osh-ui-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let none = |_: &str| None;
+        let mut v = crate::settingsview::View::with_env(&d, none);
+        v.select_key("mcp.allow_share");
+        let m = Modal::Settings(Box::new(v));
+        for (w, h) in [(100, 30), (60, 16), (30, 8), (10, 3)] {
+            let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+            term.draw(|f| draw_modal(f, &m, Tab::Sandboxes)).unwrap();
+            if w < 100 {
+                continue;
+            }
+            let all: String = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            for needle in [
+                "Settings",
+                "refresh.ports_secs",
+                "OSH_MCP_ALLOW_SHARE (if set) > osh.toml > default",
+                "Enter change",
+            ] {
+                assert!(all.contains(needle), "missing {needle:?} in {all}");
+            }
+        }
     }
 
     #[test]

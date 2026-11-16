@@ -10,6 +10,7 @@ use crate::ghrepo::{self, GhRepo};
 use crate::logview::LogView;
 use crate::ports::{self, Ports, Scan};
 use crate::preload;
+use crate::settingsview::Act;
 use crate::term::{self, Session};
 use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
 pub use osh_core::sandbox::Step;
@@ -369,6 +370,8 @@ pub enum EditThen {
     CustomProvider(String),
     /// `toolchains.toml` from the palette: say what the defaults are after a save.
     ToolchainList,
+    /// A file opened from the Settings screen: back to the screen.
+    Settings,
 }
 
 #[derive(Clone)]
@@ -392,6 +395,8 @@ pub enum InKind {
     GenName(SyncPlan),
     /// Name of a new data file: a provider profile (true) or a Dockerfile (false).
     NewFile(bool),
+    /// The new value of one setting in `osh.toml`.
+    Setting(&'static str),
     /// Name of a custom provider: its profile is written in the editor, then its credential asked.
     CustomProvider,
     /// vCPUs, then memory, for every sandbox of a VM gateway.
@@ -522,6 +527,8 @@ pub enum Modal {
         kind: ConfKind,
     },
     Info(String),
+    /// Every osh setting with its value, source and the variable that overrides it.
+    Settings(Box<crate::settingsview::View>),
     /// What the providers attached to a sandbox allow; read-only, scrollable.
     Providers {
         sandbox: String,
@@ -3945,6 +3952,7 @@ impl App {
         use crate::palette::Command as C;
         match cmd {
             C::EditToolchains => self.edit_toolchains(EditThen::ToolchainList),
+            C::Settings => self.open_settings(None),
             C::EditorMode => {
                 use crate::exted::Pref;
                 let next = crate::exted::load_pref(&self.dir).next();
@@ -4028,6 +4036,17 @@ impl App {
             sandbox: None,
             file: None,
         });
+    }
+
+    /// The Settings screen. After a prompt, `edited` is the setting and the text typed for it:
+    /// it is saved first, and the screen comes back with the result on its cursor.
+    fn open_settings(&mut self, edited: Option<(&'static str, String)>) {
+        let mut v = crate::settingsview::View::new(&self.dir);
+        if let Some((key, text)) = edited {
+            v.apply(&self.dir, key, &text);
+            v.select_key(key);
+        }
+        self.modal = Some(Modal::Settings(Box::new(v)));
     }
 
     /// The Data files list: every file osh ships or the user added, with how it stands against
@@ -4339,6 +4358,7 @@ impl App {
         let said = self.status.clone();
         match then {
             EditThen::DataFile(rel) => self.file_menu(rel),
+            EditThen::Settings => self.open_settings(None),
             EditThen::CustomProvider(name) => {
                 if saved {
                     self.custom_provider_saved(name);
@@ -4636,6 +4656,7 @@ impl App {
     fn on_input(&mut self, kind: InKind, text: String) {
         match kind {
             InKind::NewFile(profile) => self.create_file(profile, &text),
+            InKind::Setting(key) => self.open_settings(Some((key, text))),
             InKind::CustomProvider => self.new_custom_provider(&text),
             InKind::VmCpus(name) => match text.trim().parse::<u32>() {
                 Ok(n) if (1..=64).contains(&n) => {
@@ -5994,6 +6015,29 @@ impl App {
                     scroll,
                 });
             }
+            Modal::Settings(mut v) => match v.on_key(key, &self.dir) {
+                Act::None => self.modal = Some(Modal::Settings(v)),
+                Act::Close => {}
+                Act::Prompt { key, current } => {
+                    self.input(
+                        &format!("{key}: new value (lists are comma-separated)"),
+                        false,
+                        InKind::Setting(key),
+                    );
+                    if let Some(Modal::Input { buf, .. }) = &mut self.modal {
+                        *buf = current;
+                    }
+                }
+                Act::File(name) => {
+                    let path = self.dir.join(name);
+                    if name == osh_core::settings::FILE {
+                        let _ = osh_core::settings::ensure_file(&self.dir);
+                    }
+                    let check = crate::assets::check_for(name);
+                    self.open_editor(name, path, None, check, EditThen::Settings);
+                }
+                Act::DataFiles => self.data_files(),
+            },
             Modal::Editor { mut ed, then } => {
                 let out = ed.on_key(key);
                 self.editor_done(ed, then, out);
@@ -6068,6 +6112,13 @@ impl App {
                 mask,
                 kind,
             } => match key.code {
+                KeyCode::Esc if matches!(kind, InKind::Setting(_)) => {
+                    let InKind::Setting(key) = kind else { return };
+                    self.open_settings(None);
+                    if let Some(Modal::Settings(v)) = &mut self.modal {
+                        v.select_key(key);
+                    }
+                }
                 KeyCode::Esc => self.cleanup_sync_stage(),
                 KeyCode::Enter => self.on_input(kind, buf),
                 code => {
@@ -6298,6 +6349,112 @@ mod tests {
         a.push_alert(alert("x"));
         a.toast.as_mut().unwrap().1 = ago(2);
         assert!(a.toast().is_none(), "toast_secs = 1");
+    }
+
+    fn settings_app(tag: &str) -> App {
+        let dir =
+            std::env::temp_dir().join(format!("osh-app-settings-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut a = app();
+        a.dir = dir;
+        a
+    }
+
+    fn settings_view(a: &App) -> &crate::settingsview::View {
+        let Some(Modal::Settings(v)) = &a.modal else {
+            panic!("the Settings screen is open");
+        };
+        v
+    }
+
+    #[test]
+    fn a_number_is_edited_in_a_prompt_and_the_screen_comes_back() {
+        let mut a = settings_app("number");
+        a.run_command(crate::palette::Command::Settings);
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Down);
+        }
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Input {
+            title,
+            buf,
+            kind: InKind::Setting(k),
+            ..
+        }) = &a.modal
+        else {
+            panic!("a prompt opens");
+        };
+        assert_eq!((*k, buf.as_str()), ("refresh.ports_secs", "3"));
+        assert!(title.contains("refresh.ports_secs"));
+        press(&mut a, KeyCode::Backspace);
+        type_text(&mut a, "7");
+        press(&mut a, KeyCode::Enter);
+        let v = settings_view(&a);
+        assert_eq!(v.msg, "refresh.ports_secs saved");
+        assert!(
+            matches!(v.selected(), Some(crate::settingsview::Entry::Setting(i)) if v.snap.rows[i].def.key == "refresh.ports_secs")
+        );
+        assert!(std::fs::read_to_string(a.dir.join("osh.toml"))
+            .unwrap()
+            .contains("ports_secs = 7"));
+    }
+
+    #[test]
+    fn a_bad_number_says_why_and_esc_in_the_prompt_returns_to_the_screen() {
+        let mut a = settings_app("bad");
+        a.run_command(crate::palette::Command::Settings);
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Down);
+        }
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Backspace);
+        type_text(&mut a, "0");
+        press(&mut a, KeyCode::Enter);
+        assert!(settings_view(&a).msg.contains("outside"));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Esc);
+        assert!(
+            matches!(a.modal, Some(Modal::Settings(_))),
+            "Esc cancels only the prompt"
+        );
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none(), "Esc closes the screen");
+    }
+
+    #[test]
+    fn e_opens_osh_toml_in_the_editor_and_closing_it_returns_to_the_screen() {
+        let mut a = settings_app("edit");
+        crate::exted::save_pref(&a.dir, crate::exted::Pref::Builtin).unwrap();
+        a.run_command(crate::palette::Command::Settings);
+        press(&mut a, KeyCode::Char('e'));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Editor {
+                then: EditThen::Settings,
+                ..
+            })
+        ));
+        press(&mut a, KeyCode::Esc);
+        assert!(
+            matches!(a.modal, Some(Modal::Settings(_))),
+            "back on the screen"
+        );
+    }
+
+    #[test]
+    fn data_files_opens_from_the_settings_list() {
+        let mut a = settings_app("data");
+        a.run_command(crate::palette::Command::Settings);
+        press(&mut a, KeyCode::Char('G'));
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            &a.modal,
+            Some(Modal::Select {
+                kind: SelKind::DataFiles(_),
+                ..
+            })
+        ));
     }
 
     fn gw(name: &str, port: u16) -> cli::Gateway {

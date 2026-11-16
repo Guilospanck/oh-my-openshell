@@ -19,6 +19,7 @@ pub enum Command {
     EditorMode,
     /// Every data file: view, edit, compare with or restore the shipped default, add, delete.
     DataFiles,
+    Settings,
     /// The filesystem policy every new sandbox gets (`sandbox-policy.yaml`).
     EditPolicy,
     /// The set-up wizard from its first screen: resumes a stopped install, repairs what is missing.
@@ -266,6 +267,11 @@ pub const ACTIONS: &[Action] = &[
         Global,
         "Editor: switch auto / your own ($VISUAL, $EDITOR) / built-in",
         Command::EditorMode,
+    ),
+    command(
+        Global,
+        "Settings: every osh setting, its value, what overrides it, and how to change it (osh.toml)",
+        Command::Settings,
     ),
     command(
         Global,

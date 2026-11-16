@@ -162,6 +162,7 @@ sandbox_checks() {
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
 
   headless_checks "$tag"
+  settings_checks
 }
 
 # The headless path (osh sandbox/apply/mcp, tui/src/headless.rs and mcpcmd.rs): the same binary
@@ -232,4 +233,32 @@ sys.exit(0 if ok else 1)' "$hn" <<<"$out" \
   [[ $gone -eq 1 ]] && pass "a following list no longer shows it" || fail "a following list no longer shows it" "$out"
   openshell -g "$main" sandbox delete "$hn-share" >/dev/null 2>&1
   rm -rf "$hshare" "$spec" "$HOME/headless-share-spec.json"
+}
+
+# `osh config` (tui/core/src/settings.rs): the settings registry and osh.toml, edited from the
+# command line on the real machine. Nothing here needs a gateway; it runs against the data
+# folder of the user the suite runs as. A comment planted in the file must survive the edits,
+# and an environment variable that decides a setting must refuse the edit, naming itself.
+settings_checks() {
+  local f out rc
+  echo "== osh config: every setting, a comment-keeping edit, the environment variable wins"
+  f="$(osh config path 2>&1)"
+  check "osh config path creates osh.toml" test -f "$f"
+  out="$(osh config --json 2>&1)"
+  python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); k={r["key"]:r for r in d["settings"]}; sys.exit(0 if len(k)>=14 and k["mcp.allow_share"]["env"]=="OSH_MCP_ALLOW_SHARE" and k["general.editor"]["env"] is None else 1)' <<<"$out" \
+    && pass "osh config --json lists every setting with its environment variable" || fail "osh config --json lists every setting with its environment variable" "$out"
+  { echo "# planted comment"; cat "$f"; } >"$f.new" && mv "$f.new" "$f"
+  out="$(osh config set refresh.ports_secs 7 2>&1)"; rc=$?
+  [[ $rc -eq 0 && "$(osh config get refresh.ports_secs)" == 7 ]] \
+    && pass "osh config set changes a setting" || fail "osh config set changes a setting" "rc=$rc $out"
+  grep -q '^# planted comment$' "$f" && grep -q '^ports_secs = 7$' "$f" \
+    && pass "the edit keeps the comments in osh.toml" || fail "the edit keeps the comments in osh.toml" "$(head -20 "$f")"
+  out="$(OSH_MCP_ALLOW_SHARE=1 osh config set mcp.allow_share false --json 2>&1)"; rc=$?
+  [[ $rc -eq 1 && "$out" == *OSH_MCP_ALLOW_SHARE* ]] \
+    && pass "an environment variable that decides a setting refuses the edit" || fail "an environment variable that decides a setting refuses the edit" "rc=$rc $out"
+  out="$(osh config set refresh.ports_secs 0 2>&1)"; rc=$?
+  [[ $rc -eq 1 ]] && pass "a value out of range is refused" || fail "a value out of range is refused" "rc=$rc $out"
+  osh config unset refresh.ports_secs >/dev/null 2>&1
+  [[ "$(osh config get refresh.ports_secs)" == 3 ]] && grep -q '^# ports_secs = 3$' "$f" \
+    && pass "osh config unset puts the default back" || fail "osh config unset puts the default back" "$(grep ports_secs "$f")"
 }

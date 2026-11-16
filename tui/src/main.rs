@@ -15,6 +15,7 @@ mod logview;
 mod mcpcmd;
 mod palette;
 mod ports;
+mod settingsview;
 mod setup;
 mod term;
 mod tmuxpass;

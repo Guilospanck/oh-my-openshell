@@ -352,13 +352,36 @@ fn line_col(text: &str, offset: usize) -> (usize, usize) {
 /// Resolve every setting: environment variable, then `osh.toml` in `dir`, then the default.
 /// Never writes; a missing file means all defaults, an invalid one too (with the parse error).
 pub fn load(dir: &Path, env: Env) -> Snapshot {
+    build(read_text(dir), env)
+}
+
+/// What the editor's save check says about the text of `osh.toml`: invalid TOML and values that
+/// do not fit their setting are refused, with line and column. Keys osh does not know are kept
+/// (a newer osh may add them), so they do not block a save.
+pub fn check(text: &str) -> Result<(), String> {
+    let snap = build(Ok(Some(text.to_string())), &|_| None);
+    let bad = snap
+        .problems
+        .iter()
+        .find(|p| !p.msg.starts_with("unknown setting"));
+    match bad {
+        None => Ok(()),
+        Some(p) => Err(match (p.line, p.col) {
+            (Some(l), Some(c)) => format!("{FILE}:{l}:{c}: {}", p.msg),
+            (Some(l), None) => format!("{FILE}:{l}: {}", p.msg),
+            _ => format!("{FILE}: {}", p.msg),
+        }),
+    }
+}
+
+fn build(src: Result<Option<String>, String>, env: Env) -> Snapshot {
     let data_dir = crate::assets::resolve(env("OSH_DIR"), env("XDG_DATA_HOME"), env("HOME"));
     let mut problems = Vec::new();
     let mut file_valid = true;
     let mut table = toml::Table::new();
     let mut text = String::new();
-    match std::fs::read_to_string(dir.join(FILE)) {
-        Ok(t) => {
+    match src {
+        Ok(Some(t)) => {
             text = t;
             match toml::from_str::<toml::Table>(&text) {
                 Ok(tb) => table = tb,
@@ -377,14 +400,14 @@ pub fn load(dir: &Path, env: Env) -> Snapshot {
                 }
             }
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
+        Ok(None) => {}
+        Err(msg) => {
             file_valid = false;
             problems.push(Problem {
                 key: None,
                 line: None,
                 col: None,
-                msg: format!("cannot read {FILE}: {e}"),
+                msg,
             });
         }
     }
@@ -794,6 +817,8 @@ pub struct Store {
     dir: PathBuf,
     mtime: Option<std::time::SystemTime>,
     snap: Arc<Snapshot>,
+    /// What this process started with, to tell which edits still wait for a restart.
+    start: Arc<Snapshot>,
 }
 
 fn mtime_of(dir: &Path) -> Option<std::time::SystemTime> {
@@ -808,10 +833,12 @@ fn real_env(k: &str) -> Option<OsString> {
 
 impl Store {
     pub fn open(dir: &Path, env: Env) -> Store {
+        let snap = Arc::new(load(dir, env));
         Store {
             dir: dir.to_path_buf(),
             mtime: mtime_of(dir),
-            snap: Arc::new(load(dir, env)),
+            start: snap.clone(),
+            snap,
         }
     }
     /// Re-read `osh.toml` when it changed. An invalid file keeps the last good values and
@@ -879,6 +906,20 @@ pub fn snapshot() -> Arc<Snapshot> {
     DEFAULTS
         .get_or_init(|| Arc::new(load(Path::new("/nonexistent-osh-settings"), &|_| None)))
         .clone()
+}
+
+/// The settings this process started with (what a setting that needs a restart still runs on).
+pub fn started() -> Arc<Snapshot> {
+    if !crate::testmode::under_test() {
+        if let Some(s) = STORE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|s| s.start.clone()))
+        {
+            return s;
+        }
+    }
+    snapshot()
 }
 
 /// Make `snapshot()` return `snap` on this thread until the guard drops. Tests only.
@@ -1017,7 +1058,7 @@ fn value_json(v: &Value) -> serde_json::Value {
     }
 }
 
-fn value_text(v: &Value) -> String {
+pub fn value_text(v: &Value) -> String {
     match v {
         Value::Bool(b) => b.to_string(),
         Value::Int(n) => n.to_string(),
@@ -1699,6 +1740,60 @@ mod tests {
             return;
         }
         assert!(d.join("editor-mode").exists());
+    }
+
+    #[test]
+    fn check_accepts_valid_and_unknown_keys_and_refuses_the_rest_with_line_and_column() {
+        assert!(check(&template()).is_ok());
+        assert!(check("[refresh]\nports_secs = 4\nfuture_key = 1\n").is_ok());
+        let e = check("[refresh]\nports_secs = 0\n").unwrap_err();
+        assert!(e.starts_with("osh.toml:2:") && e.contains("outside"), "{e}");
+        let e = check("[refresh]\nports_secs = = 1\n").unwrap_err();
+        assert!(e.starts_with("osh.toml:2:"), "{e}");
+    }
+
+    #[test]
+    fn readme_settings_table_matches_the_registry() {
+        let readme =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../README.md"))
+                .unwrap();
+        let sec = readme
+            .split("\n## Settings\n")
+            .nth(1)
+            .expect("README has a `## Settings` section");
+        let sec = sec.split("\n## ").next().unwrap();
+        let rows: Vec<Vec<&str>> = sec
+            .lines()
+            .filter(|l| l.starts_with("| `"))
+            .map(|l| {
+                l.trim()
+                    .trim_matches('|')
+                    .split('|')
+                    .map(str::trim)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            rows.len(),
+            registry().len(),
+            "one README row per setting: {rows:?}"
+        );
+        for d in registry() {
+            let r = rows
+                .iter()
+                .find(|r| r[0] == format!("`{}`", d.key))
+                .unwrap_or_else(|| panic!("README lacks {}", d.key));
+            assert_eq!(
+                r.len(),
+                6,
+                "{}: Setting | Type | Default | Takes effect | Environment variable | What it does",
+                d.key
+            );
+            assert_eq!(r[2], format!("`{}`", d.default), "{} default", d.key);
+            assert_eq!(r[3], effect_name(d.effect), "{} takes effect", d.key);
+            let env = d.env.map_or("none".to_string(), |e| format!("`{e}`"));
+            assert_eq!(r[4], env, "{} environment variable", d.key);
+        }
     }
 
     fn a(s: &[&str]) -> Vec<String> {
