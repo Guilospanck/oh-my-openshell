@@ -59,10 +59,11 @@ pub struct McpView {
 }
 
 impl McpView {
-    /// The jobs the tab shows: newest first, at most 50.
+    /// The jobs the tab lists: newest first.
     pub fn read_jobs(dir: &std::path::Path) -> Vec<osh_core::jobs::Job> {
         let mut jobs = osh_core::jobs::list(dir);
-        jobs.truncate(50);
+        // Only a guard: jobs are pruned after a week, and the tab pages through the rest.
+        jobs.truncate(2000);
         jobs
     }
 }
@@ -1285,7 +1286,7 @@ impl App {
             Tab::Profiles => self.profile_rows().len(),
             Tab::Images => self.snap.images.len(),
             Tab::Gateways => self.snap.gateways.len(),
-            Tab::Mcp => self.mcp.state.as_ref().map_or(0, |s| s.clients.len()),
+            Tab::Mcp => self.mcp_clients() + self.mcp.jobs.len(),
         }
     }
 
@@ -5416,7 +5417,17 @@ impl App {
         self.mcp.state = osh_core::mcpserver::state::read(&self.dir);
         self.mcp.jobs = McpView::read_jobs(&self.dir);
         self.mcp.checked = Some(Instant::now());
-        let n = self.mcp.state.as_ref().map_or(0, |s| s.clients.len());
+        self.clamp_mcp_cursor();
+    }
+
+    /// The connected clients, listed above the jobs.
+    pub fn mcp_clients(&self) -> usize {
+        self.mcp.state.as_ref().map_or(0, |s| s.clients.len())
+    }
+
+    /// The MCP tab's cursor walks the clients, then the jobs, as one list.
+    fn clamp_mcp_cursor(&mut self) {
+        let n = self.mcp_clients() + self.mcp.jobs.len();
         self.cursor[5] = self.cursor[5].min(n.saturating_sub(1));
     }
 
@@ -6514,7 +6525,7 @@ mod tests {
     }
 
     #[test]
-    fn the_mcp_view_reads_the_jobs_folder_newest_first_and_no_more_than_fifty() {
+    fn the_mcp_view_reads_the_jobs_folder_newest_first_without_a_small_cut() {
         let dir = std::env::temp_dir().join(format!("osh-app-jobs-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         assert!(McpView::read_jobs(&dir).is_empty(), "no folder, no jobs");
@@ -6534,9 +6545,87 @@ mod tests {
             osh_core::jobs::save(&dir, &j).unwrap();
         }
         let read = McpView::read_jobs(&dir);
-        assert_eq!(read.len(), 50);
+        assert_eq!(read.len(), 60, "paging replaces the old cut at fifty");
         assert_eq!(read[0].id, format!("j{:016x}", 59u64), "newest first");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn job(n: u64) -> osh_core::jobs::Job {
+        osh_core::jobs::Job {
+            id: format!("j{n:016x}"),
+            gateway: "".into(),
+            sandbox: "w1".into(),
+            command: "sleep".into(),
+            started: 1000 + n,
+            state: "running".into(),
+            exit_code: None,
+            checked: 100,
+        }
+    }
+
+    fn client(name: &str) -> osh_core::mcpserver::state::Client {
+        osh_core::mcpserver::state::Client {
+            session: name.into(),
+            peer: "127.0.0.1".into(),
+            name: name.into(),
+            version: "1".into(),
+            first_seen: 0,
+            last_seen: 0,
+        }
+    }
+
+    fn mcp_app(clients: usize, jobs: u64) -> App {
+        let mut a = app();
+        a.tab = Tab::Mcp;
+        a.mcp.state = Some(osh_core::mcpserver::state::State {
+            pid: 1,
+            listen: "127.0.0.1:17800".into(),
+            started: 0,
+            version: "v".into(),
+            clients: (0..clients).map(|i| client(&format!("c{i}"))).collect(),
+        });
+        a.mcp.jobs = (0..jobs).map(job).collect();
+        a
+    }
+
+    #[test]
+    fn j_and_k_walk_the_clients_then_the_jobs_as_one_list() {
+        let mut a = mcp_app(2, 3);
+        assert_eq!(a.cursor[5], 0);
+        for _ in 0..4 {
+            press(&mut a, KeyCode::Char('j'));
+        }
+        assert_eq!(a.cursor[5], 4, "past the clients, into the jobs");
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.cursor[5], 4, "stops at the last job");
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Char('k'));
+        assert_eq!(a.cursor[5], 2);
+        for _ in 0..9 {
+            press(&mut a, KeyCode::Char('k'));
+        }
+        assert_eq!(a.cursor[5], 0, "stops at the first client");
+    }
+
+    #[test]
+    fn without_clients_the_cursor_walks_the_jobs() {
+        let mut a = mcp_app(0, 3);
+        press(&mut a, KeyCode::Char('j'));
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.cursor[5], 2);
+    }
+
+    #[test]
+    fn the_mcp_cursor_stays_in_range_when_jobs_and_clients_disappear() {
+        let mut a = mcp_app(1, 5);
+        a.cursor[5] = 5;
+        a.mcp.jobs.truncate(2);
+        a.clamp_mcp_cursor();
+        assert_eq!(a.cursor[5], 2);
+        a.mcp.jobs.clear();
+        a.mcp.state = None;
+        a.clamp_mcp_cursor();
+        assert_eq!(a.cursor[5], 0);
     }
 
     #[test]

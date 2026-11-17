@@ -203,7 +203,8 @@ fn draw_table(
     elsewhere: bool,
 ) {
     let n = cells.len();
-    let block = panel(title, Some((cursor, n)));
+    // A table the cursor is not in shows no highlighted row and no position.
+    let block = panel(title, (!elsewhere).then_some((cursor, n)));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = usize::from(inner.width);
@@ -252,7 +253,11 @@ fn draw_table(
         .column_spacing(1)
         .header(head(&names))
         .row_highlight_style(row_highlight());
-    f.render_stateful_widget(t, parts[0], &mut table_state(cursor));
+    let mut state = table_state(cursor);
+    if elsewhere {
+        state = TableState::default();
+    }
+    f.render_stateful_widget(t, parts[0], &mut state);
     f.render_widget(Paragraph::new(strip), parts[1]);
 }
 
@@ -945,12 +950,11 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
     let (clients_area, jobs_area) = if app.mcp.jobs.is_empty() {
         (rows[1], None)
     } else {
-        let h = (app.mcp.jobs.len() as u16 + 4)
-            .min(rows[1].height / 2)
-            .max(5);
+        // The clients need a few lines; the jobs, which grow, get the rest.
+        let h = (app.mcp_clients() as u16 + 4).clamp(5, 8);
         let split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Min(3), Constraint::Length(h)])
+            .constraints([Constraint::Length(h), Constraint::Min(5)])
             .split(rows[1]);
         (split[0], Some(split[1]))
     };
@@ -1019,7 +1023,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
                 MCP_COLS,
                 cells,
                 app.cursor[5],
-                false,
+                app.cursor[5] >= list.len(),
             );
         }
         _ => {
@@ -1064,7 +1068,16 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
                 ]
             })
             .collect();
-        draw_table(f, area, "Jobs", JOB_COLS, cells, 0, true);
+        let at = app.cursor[5].saturating_sub(app.mcp_clients());
+        draw_table(
+            f,
+            area,
+            "Jobs",
+            JOB_COLS,
+            cells,
+            at,
+            app.cursor[5] < app.mcp_clients(),
+        );
     }
 }
 
@@ -2666,6 +2679,33 @@ mod tests {
         ] {
             assert!(all.contains(want), "{want}: {all}");
         }
+    }
+
+    #[test]
+    fn a_long_jobs_list_scrolls_to_the_row_the_cursor_is_on() {
+        use crate::mcpsvc::Svc;
+        let mut app = usage_app("vm");
+        app.tab = Tab::Mcp;
+        app.mcp.svc = Svc::NotInstalled;
+        app.mcp.jobs = (0..30u64)
+            .map(|n| osh_core::jobs::Job {
+                id: format!("j{n:016x}"),
+                gateway: "".into(),
+                sandbox: format!("box{n:02}"),
+                command: "sleep".into(),
+                started: 100,
+                state: "running".into(),
+                exit_code: None,
+                checked: 100,
+            })
+            .collect();
+        let (all, _) = screen(&app, 120, 24);
+        assert!(all.contains("box00") && !all.contains("box25"), "{all}");
+        assert!(all.contains("1/30"), "the position of the cursor: {all}");
+        app.cursor[5] = 25;
+        let (all, _) = screen(&app, 120, 24);
+        assert!(all.contains("box25") && !all.contains("box00"), "{all}");
+        assert!(all.contains("26/30"), "{all}");
     }
 
     #[test]
