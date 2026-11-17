@@ -728,7 +728,7 @@ What an agent reaches through it: `sandbox_exec` and `sandbox_delete` work on ev
 
 #### Give an agent a git token
 
-An agent cannot be handed a token through a chat and never sees one: a spec's `repo.env_var` names a token, and the server reads its value itself. To allow a name, store the token yourself, in a terminal of your own (not in the agent's session):
+An agent is never handed a token through a chat and cannot read one through the tools: a spec's `repo.env_var` names a token, and the server reads its value itself. To allow a name, store the token yourself, in a terminal of your own (not in the agent's session):
 
 ```sh
 osh mcp secret set MILLHOUSE_TOKEN     # asks for the token with a hidden prompt
@@ -736,7 +736,7 @@ osh mcp secret list                    # the names stored (never the values)
 osh mcp secret remove MILLHOUSE_TOKEN
 ```
 
-The token goes to `mcp-secrets/NAME` in the data folder (owner-only, like `mcp-token`; it is not committed and nothing is printed or logged), and storing a name is what allows it, with no restart and no `mcp.repo_vars` entry. A variable in the server's own environment with that name wins over the file, and `mcp.repo_vars` still allows names that come from the environment. Use a fine-grained token limited to the one repository (Contents read, and write if the sandbox must push): an agent that may name a token can attach it to any repository the token reaches. A refused `sandbox_create` tells the agent to ask you to run this command, so it can show you the exact line. The value can also be piped (`printf %s "$T" | osh mcp secret set NAME`), though a pipe from a shell variable is only as private as that variable.
+The token goes to `mcp-secrets/NAME` in the data folder (owner-only, like `mcp-token`; it is not committed and nothing is printed or logged), and storing a name is what allows it, with no restart and no `mcp.repo_vars` entry. A variable in the server's own environment with that name wins over the file, and `mcp.repo_vars` still allows names that come from the environment. Use a fine-grained token limited to the one repository (Contents read, and write if the sandbox must push): an agent that may name a token can attach it to any repository the token reaches. A refused `sandbox_create` tells the agent to ask you to run this command; type it yourself rather than pasting a line an agent wrote. A name you stored takes its token from the store only, never from the server's environment, and a share of osh's data folder (or a folder around it) is refused over MCP, since it holds the tokens. The value can also be piped (`printf %s "$T" | osh mcp secret set NAME`), though a pipe from a shell variable is only as private as that variable.
 
 #### Connect Claude Code
 

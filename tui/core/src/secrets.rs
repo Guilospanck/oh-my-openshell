@@ -37,6 +37,9 @@ pub fn set(data: &Path, name: &str, value: &str) -> Result<(), String> {
         return Err("the value has a line break in it".into());
     }
     let d = dir(data);
+    if std::fs::symlink_metadata(&d).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(format!("{} is a symlink; remove it first", d.display()));
+    }
     std::fs::create_dir_all(&d).map_err(|e| format!("cannot create {}: {e}", d.display()))?;
     std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o700))
         .map_err(|e| format!("cannot protect {}: {e}", d.display()))?;
@@ -49,34 +52,56 @@ pub fn set(data: &Path, name: &str, value: &str) -> Result<(), String> {
         .mode(0o600)
         .open(&tmp)
         .map_err(|e| format!("cannot write the secret: {e}"))?;
-    f.write_all(value.as_bytes())
+    let written = f
+        .write_all(value.as_bytes())
         .and_then(|_| f.write_all(b"\n"))
         .and_then(|_| f.sync_all())
-        .map_err(|e| format!("cannot write the secret: {e}"))?;
-    std::fs::rename(&tmp, d.join(name)).map_err(|e| format!("cannot store the secret: {e}"))
+        .map_err(|e| format!("cannot write the secret: {e}"))
+        .and_then(|_| {
+            std::fs::rename(&tmp, d.join(name)).map_err(|e| format!("cannot store the secret: {e}"))
+        });
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+/// The folder is a real folder: a symlink there would send the tokens, and a chmod, elsewhere.
+fn folder_ok(data: &Path) -> bool {
+    std::fs::symlink_metadata(dir(data)).is_ok_and(|m| m.is_dir())
 }
 
 /// The stored value, trimmed. `None` when there is none, the name is not valid, the entry is
 /// not a plain file (a symlink is refused) or it is empty. A loose mode is tightened first.
+/// The file is opened once and judged by that handle, so it cannot be swapped for a link
+/// between the check and the read.
 pub fn get(data: &Path, name: &str) -> Option<String> {
-    if !valid_name(name) {
+    use std::io::Read;
+    use std::os::unix::fs::MetadataExt;
+    if !valid_name(name) || !folder_ok(data) {
         return None;
     }
     let p = dir(data).join(name);
-    let meta = std::fs::symlink_metadata(&p).ok()?;
-    if !meta.is_file() {
+    let link = std::fs::symlink_metadata(&p).ok()?;
+    let mut f = std::fs::File::open(&p).ok()?;
+    let meta = f.metadata().ok()?;
+    if !link.is_file() || !meta.is_file() || (link.dev(), link.ino()) != (meta.dev(), meta.ino()) {
         return None;
     }
     if meta.permissions().mode() & 0o077 != 0 {
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
-    let v = std::fs::read_to_string(&p).ok()?;
+    let mut v = String::new();
+    f.read_to_string(&mut v).ok()?;
     let v = v.trim();
     (!v.is_empty()).then(|| v.to_string())
 }
 
 /// The stored names, sorted. Never the values.
 pub fn list(data: &Path) -> Vec<String> {
+    if !folder_ok(data) {
+        return Vec::new();
+    }
     let mut names: Vec<String> = std::fs::read_dir(dir(data))
         .into_iter()
         .flatten()
@@ -168,6 +193,22 @@ mod tests {
         assert_eq!(remove(&d, "A_TOK"), Ok(false));
         assert_eq!(list(&d), ["B_TOK"]);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_symlinked_secrets_folder_is_neither_read_nor_written() {
+        let d = tmp("dirlink");
+        let elsewhere = tmp("dirlink-target");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("TOK"), "stolen\n").unwrap();
+        std::fs::create_dir_all(&d).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, dir(&d)).unwrap();
+        assert_eq!(get(&d, "TOK"), None);
+        assert!(list(&d).is_empty());
+        assert!(set(&d, "NEW", "v").is_err());
+        assert!(!elsewhere.join("NEW").exists());
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&elsewhere);
     }
 
     #[test]
