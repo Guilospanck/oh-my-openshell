@@ -72,7 +72,10 @@ fn checked_spec(ctx: &Ctx, spec: &Value, home: &str) -> Result<Checked, String> 
     let mut s = SandboxSpec::from_json(spec)?;
     check_name(&s.name)?;
     if let Some(g) = &s.repo {
-        check_repo_var(ctx, &g.env_var)?;
+        check_repo_var(ctx, &g.env_var).map_err(|why| match sandbox::grant_repo(&g.url) {
+            Ok(r) => token_guidance(&r, &g.env_var, &why, &s.name, false),
+            Err(_) => why,
+        })?;
     }
     let mut note = None;
     if let Some(share) = &mut s.share {
@@ -357,6 +360,128 @@ fn run_plan(
         .map(|x| x.phase)
         .unwrap_or_default();
     Ok(json!({"name": name, "phase": phase}))
+}
+
+/// What to tell the agent when it asks for a repo grant the user has not prepared: the page that
+/// creates the token, the steps there, the one command the user runs in a terminal of their own,
+/// and how to take it away again. Written for the user to read out of the agent's answer.
+fn token_guidance(
+    repo: &ghrepo::GhRepo,
+    var: &str,
+    why: &str,
+    sandbox: &str,
+    running: bool,
+) -> String {
+    let name = if crate::secrets::valid_name(var) {
+        var
+    } else {
+        "NAME"
+    };
+    format!(
+        "Access to {repo} needs a token that only the user can create ({why}). Tell the user, in this order:\n\
+         A. {steps}\n\
+         B. When they have it, in a terminal of their own (outside this chat) they run `osh mcp secret set {name}`; it asks for the token with a hidden prompt, so it never appears in this session or in their shell history.\n\
+         C. {then}\n\
+         D. To remove it later: call sandbox_repo_revoke, then the user runs `osh mcp secret remove {name}` (and may delete the token on the forge's token page).",
+        then = if running {
+            format!("They tell you it is done, and you call this tool again with env_var \"{name}\". No sandbox restart or recreation is needed: the grant is added to the running sandbox.")
+        } else {
+            format!("They tell you it is done, and you create the sandbox again with env_var \"{name}\"; for a sandbox that already exists, call sandbox_repo_grant instead, which adds the access to the running sandbox with no recreation.")
+        },
+        repo = repo.shown(),
+        steps = ghrepo::steps_for(repo, &ghrepo::token_url(repo, sandbox), sandbox).replace('\n', "\n   "),
+    )
+}
+
+/// Give the running sandbox `name` access to one git repo: create (or refresh) the repo provider
+/// from the token the operator stored under `env_var` (or the server's allowed variable), attach
+/// it to the sandbox and, for GitHub, point the sandbox's git at it. The sandbox is neither
+/// stopped nor recreated. Without a usable token the answer is an error that says what the user
+/// has to do (`token_guidance`).
+pub fn repo_grant(ctx: &Ctx, name: &str, url: &str, env_var: &str) -> Result<Value, String> {
+    check_name(name)?;
+    target(ctx)?;
+    let repo = sandbox::grant_repo(url)?;
+    let credential = check_repo_var(ctx, env_var)
+        .and_then(|_| repo_secret(ctx, env_var))
+        .map_err(|why| token_guidance(&repo, env_var, &why, name, true))?;
+    if !sandbox_exists(ctx, name)? {
+        return Err(format!("no sandbox named {name}"));
+    }
+    let provider = ghrepo::provider_name(name, &repo);
+    let existed = cli::os(&["provider", "get", &provider]).is_ok();
+    if existed {
+        cli::renew_repo_token(&repo, &provider, &credential)?;
+    } else {
+        cli::create_repo_provider(&repo, &provider, &credential)?;
+    }
+    if !cli::attached_providers(name).contains(&provider) {
+        let attached = cli::os(&[
+            "sandbox",
+            "provider",
+            "attach",
+            name,
+            &provider,
+            "--wait",
+            "--timeout",
+            "30",
+        ]);
+        if let Err(e) = attached {
+            if !existed {
+                drop_made(&provider);
+            }
+            return Err(format!("attaching {provider} to {name}: {e}"));
+        }
+    }
+    let mut out = json!({
+        "name": name, "provider": provider, "repo": repo.shown(), "attached": true,
+        "remove": "sandbox_repo_revoke removes the grant; the user then runs `osh mcp secret remove NAME`",
+    });
+    if repo.is_github() {
+        let argv: Vec<String> = ["sh", "-c", ghrepo::GITHUB_GIT_CONFIG]
+            .map(String::from)
+            .to_vec();
+        let ok = run_in_sandbox(ctx, name, &argv, 60, true).is_ok_and(|(code, _, _)| code == 0);
+        out["git_configured"] = json!(ok);
+        if !ok {
+            out["note"] = json!("the grant is attached, but git in the sandbox could not be configured for it; run git with the credential helper by hand");
+        }
+    } else {
+        out["note"] = json!("attached; git in the sandbox is not configured for this host: it needs the provider's token as a Basic credential (see the dashboard's shell)");
+    }
+    Ok(out)
+}
+
+/// Take the repo grant away from a sandbox: detach its provider and delete it. The stored token
+/// (`osh mcp secret remove`) and the token on the forge are the user's to remove.
+pub fn repo_revoke(ctx: &Ctx, name: &str, url: &str) -> Result<Value, String> {
+    check_name(name)?;
+    target(ctx)?;
+    let repo = sandbox::grant_repo(url)?;
+    let provider = ghrepo::provider_name(name, &repo);
+    let was_attached = cli::attached_providers(name).contains(&provider);
+    if was_attached {
+        cli::os(&[
+            "sandbox",
+            "provider",
+            "detach",
+            name,
+            &provider,
+            "--wait",
+            "--timeout",
+            "30",
+        ])?;
+    }
+    let existed = cli::os(&["provider", "get", &provider]).is_ok();
+    if existed {
+        cli::os(&["provider", "delete", &provider])?;
+        ghrepo::untrack(
+            ghrepo::tracked_path().as_deref(),
+            &cli::gateway(),
+            &provider,
+        );
+    }
+    Ok(json!({"name": name, "provider": provider, "detached": was_attached, "deleted": existed}))
 }
 
 /// Delete a sandbox and, as the dashboard does, the per-sandbox repo providers osh made for it.
@@ -1427,6 +1552,129 @@ pub(crate) mod tests {
         let cli = share_ctx(&f, false);
         let r = create_in(&cli, &with_share(&f.dir), true, "/nonexistent-home").unwrap();
         assert!(r.to_string().contains("osh's own data"), "{r}");
+    }
+
+    const URL: &str = "https://github.com/o/r";
+
+    #[test]
+    fn a_grant_without_a_token_tells_the_user_every_step() {
+        let f = Fake::new("grant-guide");
+        std::env::set_var(
+            "OSH_FAKE_SANDBOXES",
+            r#"{"sandboxes":[{"name":"w1","phase":"Ready","created_at":"t"}]}"#,
+        );
+        let ctx = Ctx {
+            repo_vars: Some(Vec::new()),
+            ..f.ctx()
+        };
+        let e = repo_grant(&ctx, "w1", URL, "OSH_TEST_GRANT_TOK").unwrap_err();
+        // a) the page that creates a token for this repo
+        assert!(
+            e.contains("https://github.com/settings/personal-access-tokens/new?"),
+            "{e}"
+        );
+        assert!(e.contains("o/r"), "{e}");
+        // b) the command, run outside the chat
+        assert!(e.contains("osh mcp secret set OSH_TEST_GRANT_TOK"), "{e}");
+        assert!(e.contains("outside this chat"), "{e}");
+        // c) no recreation
+        assert!(e.contains("No sandbox restart or recreation"), "{e}");
+        // d) how to remove it again
+        assert!(
+            e.contains("osh mcp secret remove OSH_TEST_GRANT_TOK"),
+            "{e}"
+        );
+        assert!(e.contains("sandbox_repo_revoke"), "{e}");
+        let calls = f.calls();
+        assert!(
+            !calls.contains("provider create") && !calls.contains("attach"),
+            "{calls}"
+        );
+        std::env::remove_var("OSH_FAKE_SANDBOXES");
+    }
+
+    #[test]
+    fn a_grant_with_a_stored_token_attaches_to_the_running_sandbox_without_recreating_it() {
+        let f = Fake::new("grant-ok");
+        std::env::set_var(
+            "OSH_FAKE_SANDBOXES",
+            r#"{"sandboxes":[{"name":"w1","phase":"Ready","created_at":"t"}]}"#,
+        );
+        std::env::set_var("OSH_FAKE_FAIL", "provider get");
+        std::env::set_var("OSH_FAKE_EXEC_RUN", "1");
+        let ctx = Ctx {
+            repo_vars: Some(Vec::new()),
+            ..f.ctx()
+        };
+        crate::secrets::set(&ctx.dir, "OSH_TEST_GRANT_OK", &secret_value()).unwrap();
+        let out = repo_grant(&ctx, "w1", URL, "OSH_TEST_GRANT_OK");
+        for k in ["OSH_FAKE_SANDBOXES", "OSH_FAKE_FAIL", "OSH_FAKE_EXEC_RUN"] {
+            std::env::remove_var(k);
+        }
+        let out = out.unwrap();
+        assert_eq!(out["attached"], true, "{out}");
+        assert_eq!(out["repo"], "o/r");
+        let calls = f.calls();
+        assert!(
+            calls.contains("provider create --name github-w1-r"),
+            "{calls}"
+        );
+        assert!(
+            calls.contains("sandbox provider attach w1 github-w1-r"),
+            "{calls}"
+        );
+        assert!(
+            !calls.contains("sandbox create") && !calls.contains("sandbox delete"),
+            "{calls}"
+        );
+        assert!(!calls.contains("sandbox stop"), "{calls}");
+        assert!(!calls.contains(&secret_value()) && !out.to_string().contains(&secret_value()));
+    }
+
+    #[test]
+    fn a_grant_refuses_a_missing_sandbox_and_a_failed_attach_drops_the_provider() {
+        let f = Fake::new("grant-fail");
+        let ctx = Ctx {
+            repo_vars: Some(Vec::new()),
+            ..f.ctx()
+        };
+        crate::secrets::set(&ctx.dir, "OSH_TEST_GRANT_F", &secret_value()).unwrap();
+        let e = repo_grant(&ctx, "w1", URL, "OSH_TEST_GRANT_F").unwrap_err();
+        assert!(e.contains("no sandbox named w1"), "{e}");
+        std::env::set_var(
+            "OSH_FAKE_SANDBOXES",
+            r#"{"sandboxes":[{"name":"w1","phase":"Ready","created_at":"t"}]}"#,
+        );
+        std::env::set_var("OSH_FAKE_FAIL", "provider get");
+        let f2 = f.calls();
+        std::env::set_var("OSH_FAKE_FAIL_ONCE", "sandbox provider attach");
+        let e = repo_grant(&ctx, "w1", URL, "OSH_TEST_GRANT_F").unwrap_err();
+        for k in ["OSH_FAKE_SANDBOXES", "OSH_FAKE_FAIL", "OSH_FAKE_FAIL_ONCE"] {
+            std::env::remove_var(k);
+        }
+        assert!(e.contains("attaching"), "{e}");
+        assert!(f.calls().len() > f2.len());
+        assert!(
+            f.calls().contains("provider delete github-w1-r"),
+            "{}",
+            f.calls()
+        );
+    }
+
+    #[test]
+    fn a_revoke_detaches_and_deletes_the_provider() {
+        let f = Fake::new("revoke");
+        std::env::set_var(
+            "OSH_FAKE_PROVIDERS",
+            r#"{"providers":[{"name":"github-w1-r","type":"x"}]}"#,
+        );
+        let out = repo_revoke(&f.ctx(), "w1", URL);
+        std::env::remove_var("OSH_FAKE_PROVIDERS");
+        let out = out.unwrap();
+        assert_eq!(out["deleted"], true, "{out}");
+        let calls = f.calls();
+        assert!(calls.contains("provider delete github-w1-r"), "{calls}");
+        assert!(repo_revoke(&f.ctx(), "../x", URL).is_err());
     }
 
     #[test]

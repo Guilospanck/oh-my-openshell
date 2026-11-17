@@ -736,6 +736,8 @@ osh mcp secret list                    # the names stored (never the values)
 osh mcp secret remove MILLHOUSE_TOKEN
 ```
 
+For a sandbox that is already running, ask the agent for access to the repo: `sandbox_repo_grant {name, repo: {url, env_var}}` creates the repo provider from the stored token, attaches it to the running sandbox (no restart, no recreation) and, for GitHub, points the sandbox's git at it. With no stored token it answers with the steps for you, in order: the page that creates a fine-grained token for that repo, the `osh mcp secret set NAME` command to run in a terminal of your own, and how to take the access away again (`sandbox_repo_revoke`, then `osh mcp secret remove NAME`). `sandbox_repo_revoke {name, repo: {url}}` detaches and deletes the provider; the token you stored and the one on the forge stay yours to remove.
+
 The token goes to `mcp-secrets/NAME` in the data folder (owner-only, like `mcp-token`; it is not committed and nothing is printed or logged), and storing a name is what allows it, with no restart and no `mcp.repo_vars` entry. A variable in the server's own environment with that name wins over the file, and `mcp.repo_vars` still allows names that come from the environment. Use a fine-grained token limited to the one repository (Contents read, and write if the sandbox must push): an agent that may name a token can attach it to any repository the token reaches. A refused `sandbox_create` tells the agent to ask you to run this command; type it yourself rather than pasting a line an agent wrote. A name you stored takes its token from the store only, never from the server's environment, and a share of osh's data folder (or a folder around it) is refused over MCP, since it holds the tokens. The value can also be piped (`printf %s "$T" | osh mcp secret set NAME`), though a pipe from a shell variable is only as private as that variable.
 
 #### Connect Claude Code
@@ -753,9 +755,9 @@ By hand, from any shell that starts `claude`: `export OSH_MCP_TOKEN="$(osh mcp t
 claude mcp add-json osh '{"type":"http","url":"http://127.0.0.1:17800/mcp","headers":{"Authorization":"Bearer ${OSH_MCP_TOKEN}"}}'
 ```
 
-`claude mcp list` shows `osh` as connected, and `/mcp` inside Claude Code lists the eight tools. The URL uses `mcp.server_port` (17800 by default). To check that everything works, ask Claude Code, in a throwaway sandbox (replace `mcp-try`):
+`claude mcp list` shows `osh` as connected, and `/mcp` inside Claude Code lists the ten tools. The URL uses `mcp.server_port` (17800 by default). To check that everything works, ask Claude Code, in a throwaway sandbox (replace `mcp-try`):
 
-1. "List the tools the osh MCP server gives you." (the connection and the eight tools)
+1. "List the tools the osh MCP server gives you." (the connection and the ten tools)
 2. "Using osh, create a sandbox named mcp-try, run `uname -a` in it and show me the output." (`sandbox_create`, then a quick `sandbox_exec` that returns its result)
 3. "In mcp-try, start a job that prints a line every 2 seconds for 20 seconds and then exits with code 3. Do not wait for it: start it with wait_secs 0, then check on it every few seconds and tell me each new line and the final exit code." (`wait_secs`, `job_status`, `job_output` with offsets)
 4. "Start `sleep 600` as a job in mcp-try, cancel it, and confirm it was cancelled." (`job_cancel`)

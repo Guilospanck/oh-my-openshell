@@ -1050,6 +1050,11 @@ GIT_CONFIG_VALUE_2='!f() {{ [ "$1" = get ] || exit 0; t=${{GITHUB_TOKEN:-$GH_TOK
     )
 }
 
+/// A script that makes `git` in a sandbox use the provider's token for GitHub, for every later
+/// process (`git config --global`, run once through `sandbox exec`): the same helper and
+/// rewrites as `git_exports` sets per shell. Idempotent.
+pub const GITHUB_GIT_CONFIG: &str = r#"git config --global --replace-all credential.https://github.com.helper '!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN}; [ -n "$t" ] && echo username=x-access-token && echo password=$t; }; f' && git config --global --replace-all 'url.https://github.com/.insteadOf' 'git@github.com:' && git config --global --add 'url.https://github.com/.insteadOf' 'ssh://git@github.com/'"#;
+
 /// Environment for sandbox git, set per process so no repo config changes. Remotes of GitHub
 /// and of every host remembered as GitLab, Bitbucket or Forgejo use HTTPS whichever way
 /// `origin` is spelled (the providers only reach port 443; a Data Center ssh remote

@@ -254,6 +254,31 @@ jobs_checks() {
   out="$(stat -c %a "$data"/mcp-jobs/*.json 2>/dev/null | sort -u)"
   [[ "$out" == 600 ]] && pass "every job index file is owner-only" || fail "every job index file is owner-only" "$out"
   check "no job index file holds an argument" bash -c "! grep -rqE 'sleep 600|sleep 30|echo hi' '$data/mcp-jobs'"
+
+  echo "== MCP repo grant: a running sandbox gets git access with no recreation"
+  local url=https://github.com/osh-test/grant-demo var=OSH_GRANT_TOK
+  out="$(mcpcall sandbox_repo_grant "{\"name\":\"$hn\",\"repo\":{\"url\":\"$url\",\"env_var\":\"$var\"}}")"
+  [[ "$out" == *"personal-access-tokens/new"* && "$out" == *"osh mcp secret set $var"* && "$out" == *"osh mcp secret remove $var"* ]] \
+    && pass "without a stored token the answer says how to make one, how to store it and how to remove it" \
+    || fail "without a stored token the answer says what the user does" "$(why "$out")"
+  printf '%s\n' "github_pat_dummy_for_the_test" | osh mcp secret set "$var" >/dev/null 2>&1
+  [[ "$(stat -c %a "$data/mcp-secrets/$var" 2>/dev/null)" == 600 ]] \
+    && pass "the stored token file is owner-only" || fail "the stored token file is owner-only" "$(ls -l "$data/mcp-secrets" 2>&1)"
+  out="$(mcpcall sandbox_repo_grant "{\"name\":\"$hn\",\"repo\":{\"url\":\"$url\",\"env_var\":\"$var\"}}")"
+  [[ "$(jf attached <<<"$out")" == True ]] \
+    && pass "the grant is attached to the running sandbox" || fail "the grant is attached to the running sandbox" "$(why "$out")"
+  [[ "$(jf git_configured <<<"$out")" == True ]] \
+    && pass "git in the sandbox is configured for it" || fail "git in the sandbox is configured for it" "$(why "$out")"
+  out="$(timeout 60 openshell -g "$main" sandbox exec -n "$hn" --no-tty -- sh -c 'git config --global --get credential.https://github.com.helper; env | grep -c "^GITHUB_TOKEN=" || true' 2>&1)"
+  [[ "$out" == *GITHUB_TOKEN* ]] \
+    && pass "the credential helper is set in the sandbox" || fail "the credential helper is set in the sandbox" "$out"
+  [[ "$out" == *github_pat_dummy_for_the_test* ]] \
+    && fail "the sandbox never sees the real token" "$out" || pass "the sandbox never sees the real token"
+  out="$(mcpcall sandbox_repo_revoke "{\"name\":\"$hn\",\"repo\":{\"url\":\"$url\"}}")"
+  [[ "$(jf deleted <<<"$out")" == True ]] \
+    && pass "revoke removes the grant" || fail "revoke removes the grant" "$(why "$out")"
+  osh mcp secret remove "$var" >/dev/null 2>&1
+  [[ ! -e "$data/mcp-secrets/$var" ]] && pass "the stored token is gone after secret remove" || fail "the stored token is gone after secret remove"
 }
 
 # The headless path (osh sandbox/apply/mcp, tui/src/headless.rs and mcpcmd.rs): the same binary

@@ -16,7 +16,8 @@ leave it out for a sandbox to exec in), toolchains (array), repo {url, env_var} 
 the NAME of an environment variable holding the access token, never the token itself, and \
 must be one the server operator allows or stored with `osh mcp secret set NAME`; when a call is \
 refused for that, tell the user to run that command themselves in a terminal outside this chat, \
-and never ask them to paste a token to you), share {path, rw} (refused unless the server \
+and never ask them to paste a token to you; for a sandbox that already exists use \
+sandbox_repo_grant instead, which needs no recreation), share {path, rw} (refused unless the server \
 operator enabled it; path must resolve, through symlinks, inside one of the operator's share \
 root folders; risky folders such as home, the disk or system folders are refused even there).";
 
@@ -121,6 +122,32 @@ fn base_tools() -> Value {
                 "type": "object",
                 "properties": {"job": {"type": "string"}},
                 "required": ["job"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "sandbox_repo_grant",
+            "description": "Give a RUNNING sandbox access to one git repo (no recreation or restart): attaches the repo provider and configures git in the sandbox. env_var is the NAME of the token (never the token). It needs a token the user stored with `osh mcp secret set NAME` in a terminal of their own; when there is none, the error is the exact set of steps to read to the user (create the token at the given page, run that command, tell you), and you must not ask for the token in the chat.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The sandbox."},
+                    "repo": {"type": "object", "properties": {"url": {"type": "string"}, "env_var": {"type": "string"}}, "required": ["url", "env_var"], "additionalProperties": false}
+                },
+                "required": ["name", "repo"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "sandbox_repo_revoke",
+            "description": "Take a repo grant away from a sandbox: detach and delete its repo provider. Afterwards the user can run `osh mcp secret remove NAME` to forget the stored token.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "repo": {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"], "additionalProperties": false}
+                },
+                "required": ["name", "repo"],
                 "additionalProperties": false
             }
         }
@@ -291,6 +318,28 @@ fn call(p: &Value, ctx: &Ctx) -> Result<Value, Fault> {
             let a = args_of(p, &["spec"])?;
             ops::apply(ctx, &req_spec(&a)?)
         }
+        "sandbox_repo_grant" | "sandbox_repo_revoke" => {
+            let a = args_of(p, &["name", "repo"])?;
+            let n = req_str(&a, "name")?;
+            let Some(Value::Object(r)) = a.get("repo") else {
+                return Err(invalid("argument `repo` must be an object"));
+            };
+            let field = |k: &str| match r.get(k) {
+                Some(Value::String(s)) => Ok(s.clone()),
+                _ => Err(invalid(format!("`repo.{k}` must be a string"))),
+            };
+            let grant = name == "sandbox_repo_grant";
+            for k in r.keys() {
+                if k != "url" && !(grant && k == "env_var") {
+                    return Err(invalid(format!("unknown field `repo.{k}`")));
+                }
+            }
+            if grant {
+                ops::repo_grant(ctx, &n, &field("url")?, &field("env_var")?)
+            } else {
+                ops::repo_revoke(ctx, &n, &field("url")?)
+            }
+        }
         other => return Err(invalid(format!("unknown tool `{other}`"))),
     };
     let is_error = result.is_err();
@@ -403,7 +452,9 @@ mod tests {
                 "sandbox_apply",
                 "job_status",
                 "job_output",
-                "job_cancel"
+                "job_cancel",
+                "sandbox_repo_grant",
+                "sandbox_repo_revoke"
             ]
         );
         for x in t {
@@ -540,8 +591,8 @@ mod tests {
         let r = ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &ctx());
         let t = r["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = t.iter().map(|x| x["name"].as_str().unwrap()).collect();
-        assert_eq!(&names[5..], ["job_status", "job_output", "job_cancel"]);
-        for x in &t[5..] {
+        assert_eq!(&names[5..8], ["job_status", "job_output", "job_cancel"]);
+        for x in &t[5..8] {
             assert_eq!(x["inputSchema"]["additionalProperties"], false, "{x}");
             assert_eq!(x["inputSchema"]["required"], json!(["job"]), "{x}");
         }
@@ -640,7 +691,7 @@ mod tests {
     #[test]
     fn the_job_tools_say_the_jobs_own_gateway_is_used() {
         let r = ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &ctx());
-        for t in &r["result"]["tools"].as_array().unwrap()[5..] {
+        for t in &r["result"]["tools"].as_array().unwrap()[5..8] {
             let d = t["description"].as_str().unwrap();
             assert!(d.contains("started on"), "{d}");
         }
