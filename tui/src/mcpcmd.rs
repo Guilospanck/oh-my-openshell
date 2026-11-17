@@ -294,6 +294,13 @@ fn status_line(svc: crate::mcpsvc::Svc, st: Option<&state::State>) -> String {
             if s.clients.len() == 1 { "" } else { "s" }
         ),
         (Svc::Running, None) => "MCP server: on".into(),
+        (Svc::External, Some(s)) => format!(
+            "MCP server: on, listening on {}, {} client{} (started outside the service: stop it where it runs)",
+            s.listen,
+            s.clients.len(),
+            if s.clients.len() == 1 { "" } else { "s" }
+        ),
+        (Svc::External, None) => "MCP server: on (started outside the service)".into(),
         (Svc::Stopped, _) => {
             "MCP server: off (the service is installed; `osh mcp start` turns it on)".into()
         }
@@ -320,9 +327,15 @@ fn service_cmd(m: &Mode) -> i32 {
         _ => return 2,
     };
     let steps = match (verb, svc) {
-        (Verb::Start, Svc::Running) => {
+        (Verb::Start, Svc::Running | Svc::External) => {
             println!("The MCP server is already on.");
             return 0;
+        }
+        (Verb::Stop, Svc::External) => {
+            eprintln!(
+                "The MCP server was started outside the service (osh mcp serve): stop it where it runs."
+            );
+            return 1;
         }
         (Verb::Start, Svc::NotInstalled) => mcpsvc::install_steps(&f, &p),
         (Verb::Start, Svc::Stopped) => mcpsvc::start_steps(&f, &p),
@@ -331,7 +344,7 @@ fn service_cmd(m: &Mode) -> i32 {
             return 0;
         }
         (Verb::Stop, _) => mcpsvc::stop_steps(&f, &p),
-        (Verb::Remove, Svc::NotInstalled) => {
+        (Verb::Remove, Svc::NotInstalled | Svc::External) => {
             println!("The MCP server is not installed.");
             return 0;
         }
@@ -470,6 +483,10 @@ mod tests {
         assert_eq!(
             status_line(Svc::Running, Some(&st)),
             "MCP server: on, listening on 127.0.0.1:17800, 0 clients"
+        );
+        assert_eq!(
+            status_line(Svc::External, Some(&st)),
+            "MCP server: on, listening on 127.0.0.1:17800, 0 clients (started outside the service: stop it where it runs)"
         );
         assert_eq!(
             status_line(Svc::Stopped, None),

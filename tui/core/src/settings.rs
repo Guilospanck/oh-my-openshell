@@ -43,8 +43,11 @@ pub enum Effect {
     Live,
     /// After the dashboard restarts.
     Restart,
-    /// At the next start of `osh mcp`.
+    /// At the next start of `osh mcp serve`.
     RestartMcp,
+    /// On the HTTP server: the next request (it reads `osh.toml` each time). Over stdio: the
+    /// next start of `osh mcp`.
+    McpRequest,
 }
 
 #[derive(Debug)]
@@ -124,7 +127,7 @@ static REGISTRY: [Def; 18] = [
         key: "mcp.allow_share",
         kind: Kind::Bool,
         default: "false",
-        effect: Effect::RestartMcp,
+        effect: Effect::McpRequest,
         env: Some(MCP_SHARE_ENV),
         desc: "Let agents mount host folders into sandboxes through osh mcp. Setting the environment variable to 1 forces this on.",
     },
@@ -132,7 +135,7 @@ static REGISTRY: [Def; 18] = [
         key: "mcp.share_roots",
         kind: Kind::PathList,
         default: "[]",
-        effect: Effect::RestartMcp,
+        effect: Effect::McpRequest,
         env: Some(MCP_ROOTS_ENV),
         desc: "Absolute folders agents may share; a share must lie inside one. The environment variable (separated like PATH) replaces this list.",
     },
@@ -140,7 +143,7 @@ static REGISTRY: [Def; 18] = [
         key: "mcp.repo_vars",
         kind: Kind::NameList,
         default: "[]",
-        effect: Effect::RestartMcp,
+        effect: Effect::McpRequest,
         env: Some(MCP_VARS_ENV),
         desc: "Environment variable names agents may name as a git credential. The environment variable (comma-separated) replaces this list.",
     },
@@ -164,7 +167,7 @@ static REGISTRY: [Def; 18] = [
         key: "mcp.server_gateway",
         kind: Kind::Text(TextRule::GatewayName),
         default: "\"\"",
-        effect: Effect::RestartMcp,
+        effect: Effect::McpRequest,
         env: None,
         desc: "The gateway the MCP server uses when a call names none. Empty means OpenShell's active gateway.",
     },
@@ -1257,6 +1260,7 @@ fn effect_name(e: Effect) -> &'static str {
         Effect::Live => "live",
         Effect::Restart => "restart",
         Effect::RestartMcp => "restart of osh mcp",
+        Effect::McpRequest => "next request (osh mcp over stdio: restart)",
     }
 }
 
@@ -1957,6 +1961,29 @@ mod tests {
     }
 
     #[test]
+    fn only_the_listening_address_needs_a_restart_of_the_http_server() {
+        for key in [
+            "mcp.allow_share",
+            "mcp.share_roots",
+            "mcp.repo_vars",
+            "mcp.server_gateway",
+        ] {
+            assert_eq!(
+                effect_name(def(key).unwrap().effect),
+                "next request (osh mcp over stdio: restart)",
+                "{key}"
+            );
+        }
+        for key in ["mcp.server_bind", "mcp.server_port"] {
+            assert_eq!(
+                effect_name(def(key).unwrap().effect),
+                "restart of osh mcp",
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
     fn the_server_settings_have_defaults_and_refuse_bad_values() {
         let s = load(&tmp(), &no_env);
         assert_eq!(
@@ -2326,7 +2353,10 @@ mod tests {
         assert_eq!(m["env"], MCP_SHARE_ENV);
         assert_eq!(m["env_active"], true);
         assert_eq!(m["default"], false);
-        assert_eq!(m["takes_effect"], "restart of osh mcp");
+        assert_eq!(
+            m["takes_effect"],
+            "next request (osh mcp over stdio: restart)"
+        );
         let g = rows.iter().find(|r| r["key"] == "general.editor").unwrap();
         assert_eq!(g["env"], serde_json::Value::Null);
         assert!(v["problems"].as_array().unwrap().is_empty());

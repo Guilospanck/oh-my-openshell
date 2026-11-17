@@ -67,8 +67,28 @@ impl Default for McpView {
 }
 
 /// The address MCP clients connect to, from the server's `listen` (`127.0.0.1:17800`).
+/// An address that listens on every interface (`0.0.0.0`, `::`) is no address a client can
+/// connect to: the copied URL then names this machine's loopback.
 pub(crate) fn mcp_url(listen: &str) -> String {
-    format!("http://{listen}/mcp")
+    match listen.parse::<std::net::SocketAddr>() {
+        Ok(a) if a.ip().is_unspecified() => {
+            let lo: std::net::IpAddr = if a.is_ipv6() {
+                std::net::Ipv6Addr::LOCALHOST.into()
+            } else {
+                std::net::Ipv4Addr::LOCALHOST.into()
+            };
+            format!("http://{}/mcp", std::net::SocketAddr::new(lo, a.port()))
+        }
+        _ => format!("http://{listen}/mcp"),
+    }
+}
+
+/// Whether the server listens on every interface, so remote clients need this machine's own
+/// address, not the one copied.
+pub(crate) fn mcp_all_interfaces(listen: &str) -> bool {
+    listen
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.ip().is_unspecified())
 }
 
 /// Entry in the Providers tab's create list that starts the repo token flow.
@@ -5391,9 +5411,19 @@ impl App {
     fn mcp_key(&mut self, code: KeyCode) {
         use crate::mcpsvc::Svc;
         match code {
+            KeyCode::Enter if self.mcp.svc == Svc::External => {
+                let pid = self
+                    .mcp
+                    .state
+                    .as_ref()
+                    .map_or(String::new(), |s| format!(", pid {}", s.pid));
+                self.modal = Some(Modal::Info(format!(
+                    "This MCP server was started outside the service (osh mcp serve{pid}).\n\nStop it where it runs: the dashboard only turns the service on and off."
+                )));
+            }
             KeyCode::Enter => {
                 let (text, verb) = match self.mcp.svc {
-                    Svc::Running => (
+                    Svc::Running | Svc::External => (
                         "Turn the MCP server off?\n\nClients lose their connection, and it stays off after the next login.",
                         "stop",
                     ),
@@ -5412,10 +5442,15 @@ impl App {
                 });
             }
             KeyCode::Char('t') => match (&self.mcp.state, self.mcp.svc) {
-                (Some(s), crate::mcpsvc::Svc::Running) => {
+                (Some(s), Svc::Running | Svc::External) => {
                     let url = mcp_url(&s.listen);
+                    let all = mcp_all_interfaces(&s.listen);
                     self.copy(&url, "copied");
-                    self.status = format!("Copied {url}");
+                    self.status = if all {
+                        format!("Copied {url} (it listens on every address: remote clients use this machine's own)")
+                    } else {
+                        format!("Copied {url}")
+                    };
                 }
                 _ => {
                     self.status = "The MCP server is off: there is no address to copy".into();
@@ -6503,6 +6538,28 @@ mod tests {
         a.mcp.svc = Svc::Running;
         press(&mut a, KeyCode::Enter);
         assert_eq!(job(&a).1, ["mcp", "stop", "--yes"]);
+    }
+
+    #[test]
+    fn enter_on_a_server_started_by_hand_says_where_to_stop_it() {
+        use crate::mcpsvc::Svc;
+        let mut a = app();
+        a.tab = Tab::Mcp;
+        a.mcp.svc = Svc::External;
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Info(text)) = &a.modal else {
+            panic!("an explanation, not a question that would run a command");
+        };
+        assert!(text.contains("outside the service"), "{text}");
+    }
+
+    #[test]
+    fn the_copied_address_is_one_a_client_can_use() {
+        assert_eq!(mcp_url("0.0.0.0:17800"), "http://127.0.0.1:17800/mcp");
+        assert_eq!(mcp_url("[::]:17800"), "http://[::1]:17800/mcp");
+        assert_eq!(mcp_url("10.1.2.3:17800"), "http://10.1.2.3:17800/mcp");
+        assert!(mcp_all_interfaces("0.0.0.0:17800"));
+        assert!(!mcp_all_interfaces("127.0.0.1:17800"));
     }
 
     #[test]

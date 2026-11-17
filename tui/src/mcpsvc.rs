@@ -225,20 +225,27 @@ pub enum Svc {
     NotInstalled,
     /// Installed, and no server is answering.
     Stopped,
-    /// A server is running (installed by osh or started by hand).
+    /// The service is installed and its server is running.
     Running,
+    /// A server is running that the service did not start (`osh mcp serve` by hand): the
+    /// dashboard and `osh mcp stop` cannot stop it.
+    External,
 }
 
 /// What the dashboard and `osh mcp status` show. A live state file wins: whoever started the
-/// server, it is on.
+/// server, it is on; `External` when no service is installed to have started it.
 pub fn status(os: Os, h: &dyn Host, p: &Paths) -> Svc {
-    if state::read(&p.data).is_some() {
-        return Svc::Running;
-    }
     let installed = match os {
         Os::Linux => h.exists(&unit_path(p)),
         Os::MacOs => h.exists(&plist_path(p)),
     };
+    if state::read(&p.data).is_some() {
+        return if installed {
+            Svc::Running
+        } else {
+            Svc::External
+        };
+    }
     if installed {
         Svc::Stopped
     } else {
@@ -450,11 +457,13 @@ mod tests {
             Svc::NotInstalled,
             "the agent is another file"
         );
-        // A live server (this process owns the state file) is running whatever installed it.
+        // A live server (this process owns the state file): running through the service when
+        // there is one, else it was started by hand.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         state::claim(&p.data, &listener.local_addr().unwrap().to_string()).unwrap();
         assert_eq!(status(Os::Linux, &h, &p), Svc::Running);
-        assert_eq!(status(Os::MacOs, &FakeHost::default(), &p), Svc::Running);
+        assert_eq!(status(Os::MacOs, &FakeHost::default(), &p), Svc::External);
+        assert_eq!(status(Os::Linux, &FakeHost::default(), &p), Svc::External);
         let _ = std::fs::remove_dir_all(&p.data);
     }
 }

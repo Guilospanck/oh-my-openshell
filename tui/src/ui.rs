@@ -942,6 +942,17 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
             ),
         ),
         (Svc::Running, None) => (dot("on", ok), String::new()),
+        (Svc::External, Some(s)) => (
+            dot(
+                &format!(
+                    "on, listening on {} (started outside the service)",
+                    s.listen
+                ),
+                ok,
+            ),
+            "Stop it where it runs: the dashboard only turns the service on and off.".to_string(),
+        ),
+        (Svc::External, None) => (dot("on (started outside the service)", ok), String::new()),
         (Svc::Stopped, _) => (
             dot("off (the service is installed)", role::dim()),
             "Enter  turn it on".to_string(),
@@ -982,7 +993,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
             draw_table(f, rows[1], "Clients", MCP_COLS, cells, app.cursor[5], false);
         }
         _ => {
-            let (what, hint) = if app.mcp.svc == Svc::Running {
+            let (what, hint) = if matches!(app.mcp.svc, Svc::Running | Svc::External) {
                 (
                     "No clients connected",
                     "A client shows up here when it calls the server.",
@@ -2533,6 +2544,25 @@ mod tests {
         ] {
             assert!(all.contains(want), "{want}: {all}");
         }
+    }
+
+    #[test]
+    fn the_mcp_tab_says_when_the_server_was_started_outside_the_service() {
+        use crate::mcpsvc::Svc;
+        use osh_core::mcpserver::state::State;
+        let mut app = usage_app("vm");
+        app.tab = Tab::Mcp;
+        app.mcp.svc = Svc::External;
+        app.mcp.state = Some(State {
+            pid: 7,
+            listen: "127.0.0.1:17800".into(),
+            started: 0,
+            version: "v".into(),
+            clients: vec![],
+        });
+        let (all, _) = screen(&app, 120, 30);
+        assert!(all.contains("outside the service"), "{all}");
+        assert!(all.contains("127.0.0.1:17800"), "{all}");
     }
 
     #[test]

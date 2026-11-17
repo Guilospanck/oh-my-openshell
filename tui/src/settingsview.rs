@@ -352,7 +352,10 @@ impl View {
                 let effect = match r.def.effect {
                     Effect::Live => "applies at once",
                     Effect::Restart => "applies after the dashboard restarts",
-                    Effect::RestartMcp => "applies at the next start of osh mcp",
+                    Effect::RestartMcp => "applies at the next start of osh mcp serve",
+                    Effect::McpRequest => {
+                        "applies to the next MCP request (osh mcp over stdio: at its next start)"
+                    }
                 };
                 out.push(Line::styled(
                     format!("Default {} · {effect}", r.def.default),
