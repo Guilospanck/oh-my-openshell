@@ -910,6 +910,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
 
 const JOB_COLS: Cols = &[
     ("JOB", 9),
+    ("GATEWAY", 8),
     ("SANDBOX", 8),
     ("COMMAND", 8),
     ("STATE", 10),
@@ -1048,6 +1049,14 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
                 };
                 vec![
                     Line::from(j.id.chars().take(8).collect::<String>()),
+                    Line::styled(
+                        if j.gateway.is_empty() {
+                            "default".to_string()
+                        } else {
+                            j.gateway.clone()
+                        },
+                        role::dim(),
+                    ),
                     Line::styled(j.sandbox.clone(), role::dim()),
                     Line::styled(j.command.clone(), role::dim()),
                     Line::from(state),
@@ -2652,7 +2661,8 @@ mod tests {
         ];
         let (all, _) = screen(&app, 120, 30);
         for want in [
-            "Jobs", "j0123456", "w1", "sleep", "running", "exited 3", "j0000000",
+            "Jobs", "GATEWAY", "default", "j0123456", "w1", "sleep", "running", "exited 3",
+            "j0000000",
         ] {
             assert!(all.contains(want), "{want}: {all}");
         }

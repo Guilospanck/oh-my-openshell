@@ -165,22 +165,20 @@ sandbox_checks() {
   settings_checks
 }
 
-# The headless path (osh sandbox/apply/mcp, tui/src/headless.rs and mcpcmd.rs): the same binary
-# the dashboard uses creates a second sandbox from a JSON spec, with the policy it generates per
-# call. The reason this is checked for real: that policy must still let the sandbox open a
-# terminal and run tmux, which no unit test can show. Uses `osh` on PATH, the machine's main
-# gateway and the image built above; the sandbox is deleted at the end, also when a check fails.
 # MCP jobs (tui/core/src/jobs.rs): a command that outlives the request that started it. Every
 # call below is a fresh `osh mcp` process, so finding a job again by its id also proves that a
 # restarted server still has it. Runs in the sandbox $1 that headless_checks made.
 jobs_checks() {
   local hn="$1" out id st o c i code
   echo "== MCP jobs: wait_secs, a job found again by id, output offsets, cancel, max_secs"
+  : >"$HOME/jobs-mcp.err"
+  # What went wrong, for a failure line: the answer, then the tail of what osh mcp said on stderr.
+  why() { printf '%s | stderr: %s' "$1" "$(tail -c 300 "$HOME/jobs-mcp.err" 2>/dev/null | tr '\n' ' ')"; }
   # One tools/call through a fresh `osh mcp`; prints the tool's JSON text.
   mcpcall() {
     printf '%s\n%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize"}' \
       "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" \
-      | timeout 120 osh mcp --gateway "$main" 2>/dev/null \
+      | timeout 120 osh mcp --gateway "$main" 2>>"$HOME/jobs-mcp.err" \
       | python3 -c 'import json,sys; l=[json.loads(x) for x in sys.stdin.read().splitlines() if x.strip()]; print(l[1]["result"]["content"][0]["text"])'
   }
   # A top-level field of the JSON on stdin.
@@ -197,18 +195,18 @@ jobs_checks() {
 
   out="$(mcpcall sandbox_exec "{\"name\":\"$hn\",\"argv\":[\"echo\",\"fast\"],\"wait_secs\":30}")"
   [[ "$(jf exit_code <<<"$out")" == 0 && "$(jf stdout <<<"$out")" == fast ]] \
-    && pass "a quick command returns its result within wait_secs" || fail "a quick command returns its result within wait_secs" "$out"
+    && pass "a quick command returns its result within wait_secs" || fail "a quick command returns its result within wait_secs" "$(why "$out")"
 
   out="$(mcpcall sandbox_exec "{\"name\":\"$hn\",\"argv\":[\"sh\",\"-c\",\"sleep 2; echo hi; exit 3\"],\"wait_secs\":0}")"
   id="$(jf job <<<"$out")"
   [[ "$id" == j* && "$(jf status <<<"$out")" == running ]] \
-    && pass "wait_secs 0 returns a job at once" || fail "wait_secs 0 returns a job at once" "$out"
+    && pass "wait_secs 0 returns a job at once" || fail "wait_secs 0 returns a job at once" "$(why "$out")"
   jobwait "$id"
   [[ "$(jf state <<<"$st")" == exited && "$(jf exit_code <<<"$st")" == 3 ]] \
-    && pass "the job ends exited with its exit code, found again by id" || fail "the job ends exited with its exit code" "$st"
+    && pass "the job ends exited with its exit code, found again by id" || fail "the job ends exited with its exit code" "$(why "$st")"
   o="$(mcpcall job_output "{\"job\":\"$id\"}")"
   [[ "$(jf stdout <<<"$o")" == hi && "$(jf stdout_offset <<<"$o")" == 3 ]] \
-    && pass "job_output returns the text and the next offset" || fail "job_output returns the text and the next offset" "$o"
+    && pass "job_output returns the text and the next offset" || fail "job_output returns the text and the next offset" "$(why "$o")"
   o="$(mcpcall job_output "{\"job\":\"$id\",\"stdout_offset\":3}")"
   [[ -z "$(jf stdout <<<"$o")" && "$(jf more <<<"$o")" == False ]] \
     && pass "reading from the next offset returns nothing more" || fail "reading from the next offset returns nothing more" "$o"
@@ -218,7 +216,7 @@ jobs_checks() {
   out="$(mcpcall sandbox_exec "{\"name\":\"$hn\",\"argv\":[\"sleep\",\"600\"],\"wait_secs\":0}")"
   id="$(jf job <<<"$out")"
   c="$(mcpcall job_cancel "{\"job\":\"$id\"}")"
-  [[ "$(jf state <<<"$c")" == cancelled ]] && pass "job_cancel ends a running job" || fail "job_cancel ends a running job" "$c"
+  [[ "$(jf state <<<"$c")" == cancelled ]] && pass "job_cancel ends a running job" || fail "job_cancel ends a running job" "$(why "$c")"
   # /proc is read instead of `ps` (not in every image); [s]leep keeps this check from matching itself.
   code=1
   for i in 1 2 3 4 5; do
@@ -228,12 +226,29 @@ jobs_checks() {
   done
   [[ $code -eq 0 ]] && pass "no process of the cancelled job is left in the sandbox" || fail "no process of the cancelled job is left in the sandbox" "still running: $out"
 
+  # The whole process group goes, not only the program: a command with children of its own. With
+  # no cap (mcp.job_max_secs 0) there is no `timeout` between the job and its children either.
+  osh config set mcp.job_max_secs 0 >/dev/null 2>&1
+  out="$(mcpcall sandbox_exec "{\"name\":\"$hn\",\"argv\":[\"sh\",\"-c\",\"sleep 601 & sleep 602 & wait\"],\"wait_secs\":0}")"
+  id="$(jf job <<<"$out")"
+  sleep 1
+  c="$(mcpcall job_cancel "{\"job\":\"$id\"}")"
+  code=1
+  for i in 1 2 3 4 5; do
+    out="$(timeout 60 openshell -g "$main" sandbox exec -n "$hn" --no-tty -- sh -c 'for p in /proc/[0-9]*/cmdline; do tr "\0" " " < "$p" 2>/dev/null; echo; done | grep -c "[s]leep 60[12]"' 2>&1)"
+    [[ "$out" == 0 ]] && { code=0; break; }
+    sleep 1
+  done
+  [[ "$(jf state <<<"$c")" == cancelled && $code -eq 0 ]] \
+    && pass "cancel ends the grandchildren of a job with no cap too" || fail "cancel ends the grandchildren of a job with no cap too" "state=$(jf state <<<"$c") left=$out"
+  osh config unset mcp.job_max_secs >/dev/null 2>&1
+
   out="$(mcpcall sandbox_exec "{\"name\":\"$hn\",\"argv\":[\"sleep\",\"30\"],\"wait_secs\":0,\"max_secs\":2}")"
   id="$(jf job <<<"$out")"
   jobwait "$id"
   code="$(jf exit_code <<<"$st")"
   [[ "$(jf state <<<"$st")" == exited && ( "$code" == 124 || "$code" == 137 ) ]] \
-    && pass "max_secs ends a job that runs too long" || fail "max_secs ends a job that runs too long" "$st"
+    && pass "max_secs ends a job that runs too long" || fail "max_secs ends a job that runs too long" "$(why "$st")"
 
   check "the job index folder exists" test -d "$data/mcp-jobs"
   out="$(stat -c %a "$data"/mcp-jobs/*.json 2>/dev/null | sort -u)"
@@ -241,6 +256,11 @@ jobs_checks() {
   check "no job index file holds an argument" bash -c "! grep -rqE 'sleep 600|sleep 30|echo hi' '$data/mcp-jobs'"
 }
 
+# The headless path (osh sandbox/apply/mcp, tui/src/headless.rs and mcpcmd.rs): the same binary
+# the dashboard uses creates a second sandbox from a JSON spec, with the policy it generates per
+# call. The reason this is checked for real: that policy must still let the sandbox open a
+# terminal and run tmux, which no unit test can show. Uses `osh` on PATH, the machine's main
+# gateway and the image built above; the sandbox is deleted at the end, also when a check fails.
 headless_checks() {
   local tag="$1" hn=osh-headless out rc spec="$HOME/headless-spec.json" hshare="$HOME/headless-share"
   echo "== the headless osh path: apply, list, exec, delete, mcp, share refusal"

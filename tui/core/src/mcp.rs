@@ -89,7 +89,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "job_status",
-            "description": "State of a job started by sandbox_exec: running, exited (with exit_code), cancelled or lost (its process or sandbox is gone).",
+            "description": "State of a job started by sandbox_exec: running, exited (with exit_code), cancelled or lost (its process or sandbox is gone). Job calls use the gateway the job was started on; a gateway argument is ignored.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"job": {"type": "string"}},
@@ -99,7 +99,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "job_output",
-            "description": "New output of a job from the given offsets: stdout, stderr, the offsets to pass next time, and more (true when output remains beyond them). Offsets count bytes and start at 0; a reply holds at most max_bytes (default and limit 65536) of each stream.",
+            "description": "New output of a job from the given offsets: stdout, stderr, the offsets to pass next time, and more (true when output remains beyond them). Offsets count bytes and start at 0; a reply holds at most max_bytes (default and limit 65536) of each stream. Uses the gateway the job was started on.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -114,7 +114,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "job_cancel",
-            "description": "End a running job (its whole process group). A job that already exited stays exited.",
+            "description": "End a running job (its whole process group). A job that already exited stays exited. Uses the gateway the job was started on.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"job": {"type": "string"}},
@@ -265,8 +265,17 @@ fn call(p: &Value, ctx: &Ctx) -> Result<Value, Fault> {
         "job_output" => {
             let a = args_of(p, &["job", "stdout_offset", "stderr_offset", "max_bytes"])?;
             let id = req_str(&a, "job")?;
-            let so = opt_u64(&a, "stdout_offset")?.unwrap_or(0);
-            let eo = opt_u64(&a, "stderr_offset")?.unwrap_or(0);
+            let offset = |k: &str| -> Result<u64, Fault> {
+                match opt_u64(&a, k)? {
+                    Some(v) if v > jobs::MAX_OFFSET => Err(invalid(format!(
+                        "argument `{k}` must be at most {}",
+                        jobs::MAX_OFFSET
+                    ))),
+                    v => Ok(v.unwrap_or(0)),
+                }
+            };
+            let so = offset("stdout_offset")?;
+            let eo = offset("stderr_offset")?;
             let limit = opt_u64(&a, "max_bytes")?
                 .map_or(jobs::CHUNK as u64, |m| m.min(jobs::CHUNK as u64))
                 as usize;
@@ -516,7 +525,7 @@ mod tests {
     /// Remove the job folders a test left in the "sandbox" (a folder on this machine).
     fn forget_jobs(f: &Fake) {
         for j in crate::jobs::list(&f.dir) {
-            let _ = std::fs::remove_dir_all(format!("{}/{}", crate::jobs::SANDBOX_DIR, j.id));
+            let _ = std::fs::remove_dir_all(format!("{}/{}", crate::jobs::sandbox_dir(), j.id));
         }
     }
 
@@ -612,6 +621,30 @@ mod tests {
     }
 
     #[test]
+    fn job_output_offsets_above_the_ceiling_are_invalid_params() {
+        let c = ctx();
+        for bad in [4_611_686_018_427_387_905u64, u64::MAX] {
+            let r = ask(
+                &call_line(
+                    "job_output",
+                    json!({"job":"j0123456789abcdef","stdout_offset":bad}),
+                ),
+                &c,
+            );
+            assert_eq!(r["error"]["code"], -32602, "{bad}: {r}");
+        }
+    }
+
+    #[test]
+    fn the_job_tools_say_the_jobs_own_gateway_is_used() {
+        let r = ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &ctx());
+        for t in &r["result"]["tools"].as_array().unwrap()[5..] {
+            let d = t["description"].as_str().unwrap();
+            assert!(d.contains("started on"), "{d}");
+        }
+    }
+
+    #[test]
     fn job_output_offsets_must_be_non_negative_integers() {
         let c = ctx();
         for bad in [
@@ -661,7 +694,7 @@ mod tests {
         let modest = ask_for(json!(50));
         let none = ask_for(Value::Null);
         let calls = f.calls();
-        let dir = crate::jobs::SANDBOX_DIR;
+        let dir = crate::jobs::sandbox_dir();
         assert!(calls.contains(&format!("{dir}/{greedy} 100 ")), "{calls}");
         assert!(calls.contains(&format!("{dir}/{modest} 50 ")), "{calls}");
         assert!(calls.contains(&format!("{dir}/{none} 100 ")), "{calls}");

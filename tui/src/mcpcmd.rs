@@ -164,7 +164,8 @@ fn build_ctx(gateway: Option<String>, snap: &osh_core::settings::Snapshot) -> (C
             settings::Value::Int(n) => Some(n),
             _ => None,
         })
-        .unwrap_or(0);
+        // A row that is missing means the default, never "no limit".
+        .unwrap_or(14_400);
     let ctx = Ctx {
         share_roots: Some(roots),
         job_max_secs,
@@ -424,6 +425,8 @@ pub fn run(args: &[String]) -> i32 {
     let dir = osh_core::assets::data_dir();
     let snap = osh_core::settings::load(&dir, &|k| std::env::var_os(k));
     let (ctx, warnings) = build_ctx(gateway, &snap);
+    // Old jobs are forgotten here as well as by `osh mcp serve`.
+    osh_core::jobs::prune(&dir, osh_core::jobs::now());
     for line in warnings {
         eprintln!("{line}");
     }

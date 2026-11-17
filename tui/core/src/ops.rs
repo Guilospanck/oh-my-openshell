@@ -343,6 +343,7 @@ pub(crate) fn run_in_sandbox(
     name: &str,
     argv: &[String],
     timeout_secs: u64,
+    no_login_shell: bool,
 ) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
     check_name(name)?;
     if argv.is_empty() {
@@ -353,15 +354,20 @@ pub(crate) fn run_in_sandbox(
         .map(String::from)
         .to_vec();
     args.push(timeout_secs.to_string());
+    if no_login_shell {
+        args.push("--no-login-shell".into());
+    }
     args.push("--".into());
     args.extend(argv.iter().cloned());
     // Not `cli::exec`: it turns a non-zero exit into `Err` and drops the code, while the
     // command's own exit code and both streams are the answer here.
-    let out = Command::new("openshell")
-        .args(cli::with_gateway(args))
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("openshell: {e}"))?;
+    let mut cmd = Command::new("openshell");
+    cmd.args(cli::with_gateway(args));
+    // `--timeout` times the command, not the connection to a gateway that has stopped answering.
+    let out = output_within(
+        cmd,
+        std::time::Duration::from_secs(timeout_secs.saturating_add(15)),
+    )?;
     let code = out
         .status
         .code()
@@ -370,10 +376,85 @@ pub(crate) fn run_in_sandbox(
     Ok((code, out.stdout, out.stderr))
 }
 
+/// Run a prepared `openshell` command and wait at most `limit` for it, then kill it. Output is
+/// read as it comes, so a command that writes a lot cannot stall on a full pipe.
+pub(crate) fn output_within(
+    mut cmd: Command,
+    limit: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::io::Read;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("openshell: {e}"))?;
+    fn slurp<R: Read>(pipe: Option<R>) -> Vec<u8> {
+        let mut v = Vec::new();
+        if let Some(mut p) = pipe {
+            let _ = p.read_to_end(&mut v);
+        }
+        v
+    }
+    let (so, se) = (child.stdout.take(), child.stderr.take());
+    let t_out = std::thread::spawn(move || slurp(so));
+    let t_err = std::thread::spawn(move || slurp(se));
+    let end = std::time::Instant::now() + limit;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(std::process::Output {
+                    status,
+                    stdout: t_out.join().unwrap_or_default(),
+                    stderr: t_err.join().unwrap_or_default(),
+                })
+            }
+            Ok(None) if std::time::Instant::now() >= end => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("openshell did not answer within {limit:?}"));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => return Err(format!("openshell: {e}")),
+        }
+    }
+}
+
+/// Whether the gateway the context aims at lists a sandbox of this name. `Err` when the list
+/// could not be had: not knowing is not "gone".
+pub(crate) fn sandbox_exists(ctx: &Ctx, name: &str) -> Result<bool, String> {
+    target(ctx)?;
+    let mut cmd = Command::new("openshell");
+    cmd.args(cli::with_gateway(
+        ["sandbox", "list", "--output", "json"]
+            .map(String::from)
+            .to_vec(),
+    ));
+    let out = output_within(cmd, std::time::Duration::from_secs(30))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    Ok(cli::parse_sandboxes(&v).iter().any(|s| s.name == name))
+}
+
+/// The name of the gateway the OpenShell CLI uses by default, when it names one.
+pub(crate) fn active_gateway() -> Result<Option<String>, String> {
+    let mut cmd = Command::new("openshell");
+    cmd.args(["gateway", "list", "-o", "json"]);
+    let out = output_within(cmd, std::time::Duration::from_secs(30))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    }
+    let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| e.to_string())?;
+    Ok(cli::parse_gateways(&v)
+        .into_iter()
+        .find(|g| g.active)
+        .map(|g| g.name))
+}
+
 /// Run `argv` in a sandbox. The command's own exit code, non-zero included, is `Ok`; only
 /// failing to run `openshell` is `Err`.
 pub fn sandbox_exec(ctx: &Ctx, name: &str, argv: &[String]) -> Result<Value, String> {
-    let (code, stdout, stderr) = run_in_sandbox(ctx, name, argv, 600)?;
+    let (code, stdout, stderr) = run_in_sandbox(ctx, name, argv, 600, false)?;
     Ok(json!({
         "exit_code": code,
         "stdout": String::from_utf8_lossy(&stdout),
@@ -473,6 +554,7 @@ pub(crate) mod tests {
             dirs.extend(std::env::split_paths(path.as_deref().unwrap_or_default()));
             std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
             std::env::set_var("OSH_FAKE_LOG", &log);
+            std::env::set_var("OSH_JOBS_SANDBOX_DIR", root.join("jobs"));
             for v in FAKE_VARS {
                 std::env::remove_var(v);
             }
@@ -1271,5 +1353,53 @@ pub(crate) mod tests {
             envelope(Err("boom".into())),
             (json!({"ok":false,"error":"boom"}), 1)
         );
+    }
+
+    #[test]
+    fn output_within_returns_a_quick_commands_output_even_when_it_is_large() {
+        let mut c = Command::new("sh");
+        c.args(["-c", "head -c 3000000 /dev/zero; echo done >&2; exit 3"]);
+        let t = std::time::Instant::now();
+        let out = output_within(c, std::time::Duration::from_secs(30)).unwrap();
+        assert!(t.elapsed() < std::time::Duration::from_secs(10));
+        assert_eq!((out.stdout.len(), out.status.code()), (3_000_000, Some(3)));
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "done");
+    }
+
+    #[test]
+    fn output_within_gives_up_on_a_command_that_never_answers() {
+        let mut c = Command::new("sleep");
+        c.arg("30");
+        let t = std::time::Instant::now();
+        let e = output_within(c, std::time::Duration::from_millis(700)).unwrap_err();
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(e.contains("did not answer"), "{e}");
+    }
+
+    #[test]
+    fn sandbox_exists_and_the_active_gateway_come_from_the_cli_lists() {
+        let f = Fake::new("ops-exists");
+        std::env::set_var(
+            "OSH_FAKE_SANDBOXES",
+            r#"{"sandboxes":[{"name":"w1","phase":"Ready","created_at":"t"}]}"#,
+        );
+        assert_eq!(sandbox_exists(&f.ctx(), "w1"), Ok(true));
+        assert_eq!(sandbox_exists(&f.ctx(), "w2"), Ok(false));
+        std::env::set_var("OSH_FAKE_FAIL", "sandbox list");
+        assert!(
+            sandbox_exists(&f.ctx(), "w1").is_err(),
+            "a failed list is not 'gone'"
+        );
+        std::env::remove_var("OSH_FAKE_FAIL");
+        assert_eq!(active_gateway(), Ok(None));
+        std::env::set_var(
+            "OSH_FAKE_GATEWAYS",
+            r#"[{"name":"a","endpoint":"e","active":false},{"name":"b","endpoint":"e","active":true}]"#,
+        );
+        assert_eq!(active_gateway(), Ok(Some("b".to_string())));
     }
 }

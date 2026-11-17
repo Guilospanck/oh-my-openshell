@@ -123,7 +123,13 @@ pub fn save(data: &Path, job: &Job) -> std::io::Result<()> {
         return Err(std::io::Error::other("invalid job id"));
     }
     std::fs::create_dir_all(dir(data))?;
-    let tmp = dir(data).join(format!("{}.json.tmp-{}", job.id, std::process::id()));
+    static SAVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp = dir(data).join(format!(
+        "{}.json.tmp-{}-{}",
+        job.id,
+        std::process::id(),
+        SAVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let _ = std::fs::remove_file(&tmp);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -180,32 +186,42 @@ pub enum Status {
     Exited(i64),
     Cancelled,
     Lost,
+    /// The script said the job's folder does not exist.
     Unknown,
+    /// Not an answer to the question (output from somewhere else).
+    Garbled,
 }
 
 /// What `STATUS` printed.
 pub fn parse_status(out: &str) -> Status {
     let out = out.trim();
     match out.split_once(' ') {
-        Some(("exited", code)) => code.trim().parse().map_or(Status::Unknown, Status::Exited),
+        Some(("exited", code)) => code.trim().parse().map_or(Status::Garbled, Status::Exited),
         _ => match out {
             "running" => Status::Running,
             "cancelled" => Status::Cancelled,
             "lost" => Status::Lost,
-            _ => Status::Unknown,
+            "unknown" => Status::Unknown,
+            _ => Status::Garbled,
         },
     }
 }
 
 /// `$1` the job directory, `$2` the longest run in seconds (`0`: no limit), then the command.
 /// Starts it detached (its own session when `setsid` exists) with output in `out` and `err`, and
-/// prints `started` once its pid is recorded. The command runs as the script's own arguments:
-/// they reach the inner shell as `"$@"`, never as text of the script.
+/// prints `started` once its pid is recorded (`started nocap` when a limit was asked for and the
+/// sandbox has no `timeout` to enforce it). The command runs as the script's own arguments: they
+/// reach the inner shell as `"$@"`, never as text of the script. The `pid` file holds the pid and,
+/// where `/proc` exists, the process's start time, so a pid handed to another process later is
+/// not mistaken for the job. Job folders more than a week old are removed first.
 pub const LAUNCH: &str = r#"set -u
 d=$1; max=$2; shift 2
+base=$(dirname "$d")
+mkdir -p "$base" 2>/dev/null
+find "$base" -mindepth 1 -maxdepth 1 -type d -mtime +7 -exec rm -rf {} + 2>/dev/null
 mkdir -p "$d" || exit 1
 : > "$d/out"; : > "$d/err"
-inner='echo $$ > "$D/pid"; if [ "$MAX" != 0 ] && command -v timeout >/dev/null 2>&1; then timeout -k 5 "$MAX" "$@"; else "$@"; fi; echo $? > "$D/exit"'
+inner='echo "$$ $(sed "s/^[^)]*) //" /proc/$$/stat 2>/dev/null | cut -d" " -f20)" > "$D/pid" || exit 1; if [ "$MAX" != 0 ] && command -v timeout >/dev/null 2>&1; then timeout -k 5 "$MAX" "$@"; else "$@"; fi; echo $? > "$D/exit"'
 if command -v setsid >/dev/null 2>&1; then
   D="$d" MAX="$max" setsid sh -c "$inner" sh "$@" >"$d/out" 2>"$d/err" </dev/null &
 elif command -v nohup >/dev/null 2>&1; then
@@ -216,11 +232,13 @@ else
 fi
 i=0
 while [ ! -s "$d/pid" ] && [ "$i" -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
-if [ -s "$d/pid" ]; then echo started; else echo "the job did not start" >&2; exit 1; fi
+if [ ! -s "$d/pid" ]; then echo "the job did not start" >&2; exit 1; fi
+if [ "$max" != 0 ] && ! command -v timeout >/dev/null 2>&1; then echo "started nocap"; else echo started; fi
 "#;
 
 /// `$1` the job directory. Prints one word: `exited N`, `cancelled`, `running`, `lost` (the
-/// process is gone or a zombie, with no exit recorded) or `unknown` (no such job).
+/// process is gone, a zombie, or its pid now belongs to another process, with no exit recorded)
+/// or `unknown` (no such job).
 pub const STATUS: &str = r#"set -u
 d=$1
 [ -d "$d" ] || { echo unknown; exit 0; }
@@ -228,11 +246,13 @@ d=$1
 # even when ending the command made the wrapper record an exit code a moment later.
 if [ -e "$d/cancelled" ]; then echo cancelled; exit 0; fi
 if [ -s "$d/exit" ]; then echo "exited $(cat "$d/exit")"; exit 0; fi
-pid=$(cat "$d/pid" 2>/dev/null)
+pid=; st=
+if [ -s "$d/pid" ]; then read -r pid st < "$d/pid"; fi
 if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
   if [ -r "/proc/$pid/stat" ]; then
-    st=$(sed 's/^[^)]*) //' "/proc/$pid/stat" | cut -c1)
-    if [ "$st" = Z ]; then echo lost; exit 0; fi
+    rest=$(sed 's/^[^)]*) //' "/proc/$pid/stat")
+    cur=$(echo "$rest" | cut -d' ' -f20)
+    if [ "${rest%% *}" = Z ] || { [ -n "$st" ] && [ "$cur" != "$st" ]; }; then echo lost; exit 0; fi
   fi
   echo running
 else
@@ -249,21 +269,27 @@ tail -c +$((o + 1)) "$f" 2>/dev/null | head -c "$l"
 "#;
 
 /// `$1` the job directory. Marks the job cancelled (unless it already exited), ends its process
-/// group (else the process), waits up to 3 seconds, then kills.
+/// group (else the process and its children), waits up to 3 seconds, then kills. A pid that now
+/// belongs to another process is left alone. `kill -TERM "-$pid"` and not `kill -TERM -- ...`:
+/// dash, the usual `sh` of the sandbox images, does not take `--`.
 pub const CANCEL: &str = r#"set -u
 d=$1
 [ -d "$d" ] || { echo unknown; exit 0; }
 [ -s "$d/exit" ] || echo cancelled > "$d/cancelled"
-pid=$(cat "$d/pid" 2>/dev/null)
+pid=; st=
+if [ -s "$d/pid" ]; then read -r pid st < "$d/pid"; fi
 [ -n "$pid" ] || { echo done; exit 0; }
-# Its own session when setsid started it; otherwise its children are ended along with it.
+if [ -n "$st" ] && [ -r "/proc/$pid/stat" ]; then
+  cur=$(sed 's/^[^)]*) //' "/proc/$pid/stat" | cut -d' ' -f20)
+  if [ "$cur" != "$st" ]; then echo done; exit 0; fi
+fi
 if command -v pkill >/dev/null 2>&1; then pkill -TERM -P "$pid" 2>/dev/null; fi
-kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
 i=0
 while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
 if kill -0 "$pid" 2>/dev/null; then
   if command -v pkill >/dev/null 2>&1; then pkill -KILL -P "$pid" 2>/dev/null; fi
-  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+  kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
 fi
 echo done
 "#;
@@ -275,8 +301,13 @@ pub const DEFAULT_WAIT: u64 = 30;
 pub const MAX_WAIT: u64 = 900;
 /// The most one `output` call returns.
 pub const CHUNK: usize = 64 * 1024;
-/// `exec` reads at most this much of each stream when it hands back a finished command.
-const EXEC_READ_CAP: usize = 8 * 1024 * 1024;
+/// `exec` reads at most this much of each stream when it hands back a finished command; the rest
+/// is for `job_output` (the job id comes with the reply).
+const EXEC_READ_CAP: usize = 1024 * 1024;
+/// The longest run a caller can ask for (the setting's own ceiling).
+const MAX_RUN_SECS: u64 = 604_800;
+/// Offsets are refused above this: the shell adds one to them and must not wrap.
+pub const MAX_OFFSET: u64 = 1 << 62;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stream {
@@ -293,24 +324,42 @@ pub struct Chunk {
     pub more: bool,
 }
 
+/// Where a job's files live in the sandbox. Tests point it at a folder of their own
+/// (`OSH_JOBS_SANDBOX_DIR`), since the fake `openshell` runs the scripts on this machine.
+pub fn sandbox_dir() -> String {
+    if crate::testmode::under_test() {
+        if let Ok(d) = std::env::var("OSH_JOBS_SANDBOX_DIR") {
+            return d;
+        }
+    }
+    SANDBOX_DIR.to_string()
+}
+
 fn unknown(id: &str) -> String {
     format!("unknown job {id:?}: it was never started here, or it has been forgotten")
 }
 
 fn job_dir(id: &str) -> String {
-    format!("{SANDBOX_DIR}/{id}")
+    format!("{}/{id}", sandbox_dir())
 }
 
-/// Run one of the fixed scripts in the job's sandbox, on the gateway the job was started on.
-/// `Err` when the call did not get through or the script failed.
-fn run_script(ctx: &Ctx, job: &Job, body: &str, args: &[&str]) -> Result<Vec<u8>, String> {
+/// Run one of the fixed scripts in the job's sandbox, on the gateway the job was started on,
+/// without the login shell (its profile files could print into the answer being parsed). `Err`
+/// when the call did not get through or the script failed.
+fn run_script(
+    ctx: &Ctx,
+    job: &Job,
+    body: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<Vec<u8>, String> {
     let ctx = Ctx {
         gateway: (!job.gateway.is_empty()).then(|| job.gateway.clone()),
         ..ctx.clone()
     };
     let mut argv: Vec<String> = ["sh", "-c", body, "sh"].map(String::from).to_vec();
     argv.extend(args.iter().map(|a| a.to_string()));
-    let (code, out, err) = ops::run_in_sandbox(&ctx, &job.sandbox, &argv, 60)?;
+    let (code, out, err) = ops::run_in_sandbox(&ctx, &job.sandbox, &argv, timeout_secs, true)?;
     if code == 0 {
         Ok(out)
     } else {
@@ -325,6 +374,16 @@ fn run_script(ctx: &Ctx, job: &Job, body: &str, args: &[&str]) -> Result<Vec<u8>
 
 /// Start `argv` in the sandbox as a job that runs for at most `max_secs` (`0`: no limit).
 pub fn start(ctx: &Ctx, name: &str, argv: &[String], max_secs: u64) -> Result<Job, String> {
+    start_noted(ctx, name, argv, max_secs).map(|(job, _)| job)
+}
+
+/// `start`, and a note when the sandbox cannot enforce the time limit that was asked for.
+fn start_noted(
+    ctx: &Ctx,
+    name: &str,
+    argv: &[String],
+    max_secs: u64,
+) -> Result<(Job, Option<String>), String> {
     ops::check_name(name)?;
     let Some(first) = argv.first() else {
         return Err("no command to run".into());
@@ -334,21 +393,37 @@ pub fn start(ctx: &Ctx, name: &str, argv: &[String], max_secs: u64) -> Result<Jo
             "the command cannot start with `-` ({first:?}): give the program first"
         ));
     }
-    let job = Job::new(ctx.gateway.as_deref().unwrap_or(""), name, argv);
+    // A job names the gateway it runs on, the default one included: the CLI's default can change
+    // later, and the job must not follow it.
+    let gateway = match ctx.gateway.as_deref().filter(|g| !g.is_empty()) {
+        Some(g) => g.to_string(),
+        None => ops::active_gateway().ok().flatten().unwrap_or_default(),
+    };
+    let job = Job::new(&gateway, name, argv);
     let mut args = vec![job_dir(&job.id), max_secs.to_string()];
     args.extend(argv.iter().cloned());
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run_script(ctx, &job, LAUNCH, &refs)
-        .map_err(|e| format!("could not start the job in sandbox {name}: {e}"))?;
-    if !String::from_utf8_lossy(&out).contains("started") {
-        return Err(format!("could not start the job in sandbox {name}"));
-    }
+    let started = run_script(ctx, &job, LAUNCH, &refs, 60);
+    let out = match started {
+        Ok(out) if String::from_utf8_lossy(&out).contains("started") => out,
+        other => {
+            // Whatever is half-started goes, so nothing is left running unrecorded.
+            let _ = run_script(ctx, &job, CANCEL, &[&job_dir(&job.id)], 60);
+            return Err(match other {
+                Err(e) => format!("could not start the job in sandbox {name}: {e}"),
+                Ok(_) => format!("could not start the job in sandbox {name}"),
+            });
+        }
+    };
+    let note = String::from_utf8_lossy(&out)
+        .contains("nocap")
+        .then(|| "max_secs is not enforced: this sandbox has no `timeout` command".to_string());
     if let Err(e) = save(&ctx.dir, &job) {
         // Running with no record nobody could follow: stop it rather than leave it behind.
-        let _ = run_script(ctx, &job, CANCEL, &[&job_dir(&job.id)]);
+        let _ = run_script(ctx, &job, CANCEL, &[&job_dir(&job.id)], 60);
         return Err(format!("could not record the job: {e}"));
     }
-    Ok(job)
+    Ok((job, note))
 }
 
 fn load_job(ctx: &Ctx, id: &str) -> Result<Job, String> {
@@ -360,28 +435,39 @@ fn refresh(ctx: &Ctx, mut job: Job) -> Result<Job, String> {
     if job.state != "running" {
         return Ok(job);
     }
-    match run_script(ctx, &job, STATUS, &[&job_dir(&job.id)]) {
-        Ok(out) => match parse_status(&String::from_utf8_lossy(&out)) {
-            Status::Running => {}
-            Status::Exited(n) => {
-                job.state = "exited".into();
-                job.exit_code = Some(n);
+    let asked = run_script(ctx, &job, STATUS, &[&job_dir(&job.id)], 30);
+    match asked {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out).into_owned();
+            match parse_status(&text) {
+                Status::Running => {}
+                Status::Exited(n) => {
+                    job.state = "exited".into();
+                    job.exit_code = Some(n);
+                }
+                Status::Cancelled => job.state = "cancelled".into(),
+                Status::Lost | Status::Unknown => job.state = "lost".into(),
+                // Not an answer to the question: no verdict, and nothing written down.
+                Status::Garbled => {
+                    let shown: String = text.trim().chars().take(80).collect();
+                    return Err(format!("unexpected answer from the sandbox: {shown:?}"));
+                }
             }
-            Status::Cancelled => job.state = "cancelled".into(),
-            Status::Lost | Status::Unknown => job.state = "lost".into(),
-        },
+        }
         Err(e) => {
             // A call that did not get through is not a verdict. Only a sandbox that is no
-            // longer listed means the job is gone.
+            // longer listed on the job's own gateway means the job is gone; a job whose
+            // gateway was never recorded cannot be judged at all.
+            if job.gateway.is_empty() {
+                return Err(format!(
+                    "cannot reach the job's sandbox, and its gateway was not recorded: {e}"
+                ));
+            }
             let gateway = Ctx {
-                gateway: (!job.gateway.is_empty()).then(|| job.gateway.clone()),
+                gateway: Some(job.gateway.clone()),
                 ..ctx.clone()
             };
-            let gone = ops::sandbox_list(&gateway).is_ok_and(|v| {
-                !v.as_array()
-                    .is_some_and(|a| a.iter().any(|s| s["name"] == job.sandbox.as_str()))
-            });
-            if !gone {
+            if ops::sandbox_exists(&gateway, &job.sandbox) != Ok(false) {
                 return Err(format!("cannot reach the job's sandbox: {e}"));
             }
             job.state = "lost".into();
@@ -405,6 +491,9 @@ pub fn output(
     offset: u64,
     limit: usize,
 ) -> Result<Chunk, String> {
+    if offset > MAX_OFFSET {
+        return Err(format!("the offset must be at most {MAX_OFFSET}"));
+    }
     let job = load_job(ctx, id)?;
     let limit = limit.clamp(16, CHUNK);
     let name = match stream {
@@ -417,6 +506,7 @@ pub fn output(
         &job,
         READ,
         &[&path, &offset.to_string(), &limit.to_string()],
+        30,
     )?;
     let split = raw.iter().position(|b| *b == b'\n').unwrap_or(raw.len());
     let size: u64 = String::from_utf8_lossy(&raw[..split])
@@ -433,14 +523,14 @@ pub fn output(
     }
     let mut keep = data.len();
     if let Err(e) = std::str::from_utf8(data) {
-        let at_end = offset + data.len() as u64 >= size;
+        let at_end = offset.saturating_add(data.len() as u64) >= size;
         // A character cut by the limit, or by a job still writing, waits for the next call;
         // at the end of a finished job's output it is all there will ever be.
         if e.error_len().is_none() && !(at_end && job.state != "running") {
             keep = e.valid_up_to();
         }
     }
-    let next = offset + keep as u64;
+    let next = offset.saturating_add(keep as u64);
     Ok(Chunk {
         text: String::from_utf8_lossy(&data[..keep]).into_owned(),
         next,
@@ -454,16 +544,15 @@ pub fn cancel(ctx: &Ctx, id: &str) -> Result<Job, String> {
     if job.state != "running" {
         return Ok(job);
     }
-    run_script(ctx, &job, CANCEL, &[&job_dir(id)])?;
-    let after = refresh(ctx, job)?;
-    // A job that is still listed as running after the kill has left no trace of itself.
-    Ok(after)
+    run_script(ctx, &job, CANCEL, &[&job_dir(id)], 90)?;
+    refresh(ctx, job)
 }
 
 /// How long a job may run: the operator's cap, which the caller may lower and never raise. `0`
-/// is no limit, which only an operator who set no cap can allow.
+/// is no limit, which only an operator who set no cap can allow; a caller's figure is held to the
+/// setting's own ceiling.
 pub fn effective_cap(operator: u64, asked: Option<u64>) -> u64 {
-    match asked {
+    match asked.map(|a| a.min(MAX_RUN_SECS)) {
         None => operator,
         Some(a) if operator == 0 => a,
         Some(0) => operator,
@@ -474,7 +563,9 @@ pub fn effective_cap(operator: u64, asked: Option<u64>) -> u64 {
 /// Run a command as a job and wait up to `wait_secs` for it. Finished: the result `ops` gives
 /// for a command (`exit_code`, `stdout`, `stderr`). Not finished: `{"job": id, "status":
 /// "running"}` while it keeps running. `max_secs` is how long the caller lets it run (`None`: as
-/// long as the operator allows, `ctx.job_max_secs`).
+/// long as the operator allows, `ctx.job_max_secs`). Once the job has started this never fails:
+/// whatever goes wrong afterwards comes back with the job id and a `note`, so the caller follows
+/// the job instead of running the command again.
 pub fn exec(
     ctx: &Ctx,
     name: &str,
@@ -483,35 +574,59 @@ pub fn exec(
     max_secs: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
-    let job = start(ctx, name, argv, effective_cap(ctx.job_max_secs, max_secs))?;
-    let reply = |j: &Job| json!({"job": j.id, "status": j.state});
+    let (mut job, start_note) =
+        start_noted(ctx, name, argv, effective_cap(ctx.job_max_secs, max_secs))?;
+    let reply = |j: &Job, more: Option<String>| {
+        let mut v = json!({"job": j.id, "status": j.state});
+        let notes: Vec<String> = start_note.iter().cloned().chain(more).collect();
+        if !notes.is_empty() {
+            v["note"] = json!(notes.join("; "));
+        }
+        v
+    };
     let wait = std::time::Duration::from_secs(wait_secs.min(MAX_WAIT));
     if wait.is_zero() {
-        return Ok(reply(&job));
+        return Ok(reply(&job, None));
     }
     let started = std::time::Instant::now();
     let mut pause = 200;
-    let mut job = job;
     loop {
         std::thread::sleep(std::time::Duration::from_millis(pause));
         pause = 500;
-        job = refresh(ctx, job)?;
+        match refresh(ctx, job.clone()) {
+            Ok(j) => job = j,
+            Err(e) => {
+                return Ok(reply(
+                    &job,
+                    Some(format!(
+                        "its state could not be read just now ({e}): ask again with job_status"
+                    )),
+                ))
+            }
+        }
         if job.state != "running" {
             break;
         }
         if started.elapsed() >= wait {
-            return Ok(reply(&job));
+            return Ok(reply(&job, None));
         }
     }
     if job.state != "exited" {
-        return Ok(reply(&job));
+        return Ok(reply(&job, None));
     }
     let mut out = json!({"exit_code": job.exit_code});
     let mut truncated = false;
     for (key, stream) in [("stdout", Stream::Out), ("stderr", Stream::Err)] {
         let (mut text, mut at) = (String::new(), 0);
         loop {
-            let c = output(ctx, &job.id, stream, at, CHUNK)?;
+            let c = match output(ctx, &job.id, stream, at, CHUNK) {
+                Ok(c) => c,
+                Err(e) => {
+                    let mut v = reply(&job, Some(format!("it finished, but its output could not be read just now ({e}): read it with job_output")));
+                    v["exit_code"] = json!(job.exit_code);
+                    return Ok(v);
+                }
+            };
             text.push_str(&c.text);
             at = c.next;
             if !c.more {
@@ -524,8 +639,17 @@ pub fn exec(
         }
         out[key] = json!(text);
     }
+    if let Some(n) = &start_note {
+        out["note"] = json!(n);
+    }
     if truncated {
         out["truncated"] = json!(true);
+        out["job"] = json!(job.id);
+        let cut = "the output is cut here: read the rest with job_output";
+        out["note"] = json!(match &start_note {
+            Some(n) => format!("{n}; {cut}"),
+            None => cut.to_string(),
+        });
     }
     Ok(out)
 }
@@ -693,9 +817,10 @@ mod tests {
         assert_eq!(parse_status("cancelled"), Status::Cancelled);
         assert_eq!(parse_status("lost"), Status::Lost);
         assert_eq!(parse_status("unknown"), Status::Unknown);
-        assert_eq!(parse_status("exited x"), Status::Unknown);
-        assert_eq!(parse_status("garbage"), Status::Unknown);
-        assert_eq!(parse_status(""), Status::Unknown);
+        // Anything else is not an answer (a profile file printing into the output, say).
+        assert_eq!(parse_status("exited x"), Status::Garbled);
+        assert_eq!(parse_status("garbage"), Status::Garbled);
+        assert_eq!(parse_status(""), Status::Garbled);
     }
 
     #[test]
@@ -725,7 +850,7 @@ mod tests {
     impl Drop for Ids {
         fn drop(&mut self) {
             for id in self.0.borrow().iter() {
-                let _ = std::fs::remove_dir_all(format!("{SANDBOX_DIR}/{id}"));
+                let _ = std::fs::remove_dir_all(format!("{}/{id}", sandbox_dir()));
             }
         }
     }
@@ -735,6 +860,9 @@ mod tests {
         std::env::set_var("OSH_FAKE_EXEC_RUN", "1");
         (f, Ids(Default::default()))
     }
+
+    /// What `openshell gateway list -o json` prints when `openshell-docker` is the default.
+    const ACTIVE: &str = r#"[{"name":"openshell-docker","endpoint":"e","active":true}]"#;
 
     fn sh(script: &str) -> Vec<String> {
         vec!["sh".into(), "-c".into(), script.into()]
@@ -777,6 +905,12 @@ mod tests {
         assert_eq!(effective_cap(0, None), 0);
         assert_eq!(effective_cap(0, Some(500)), 500);
         assert_eq!(effective_cap(0, Some(0)), 0);
+        assert_eq!(
+            effective_cap(0, Some(u64::MAX)),
+            604_800,
+            "held to the setting's ceiling"
+        );
+        assert_eq!(effective_cap(100, Some(u64::MAX)), 100);
     }
 
     #[test]
@@ -925,7 +1059,7 @@ mod tests {
             "cancelled",
             "twice is harmless"
         );
-        let pid = std::fs::read_to_string(format!("{SANDBOX_DIR}/{}/pid", slow.id)).unwrap();
+        let pid = std::fs::read_to_string(format!("{}/{}/pid", sandbox_dir(), slow.id)).unwrap();
         let alive = std::process::Command::new("kill")
             .args(["-0", pid.trim()])
             .stderr(std::process::Stdio::null())
@@ -985,6 +1119,7 @@ mod tests {
     #[test]
     fn a_deleted_sandbox_reports_lost_without_hanging() {
         let (f, ids) = running("jobs-lost");
+        std::env::set_var("OSH_FAKE_GATEWAYS", ACTIVE);
         let ctx = f.ctx();
         let j = start(&ctx, "w1", &sh("sleep 3"), 0).unwrap();
         ids.0.borrow_mut().push(j.id.clone());
@@ -1000,6 +1135,7 @@ mod tests {
     #[test]
     fn an_unreachable_gateway_is_an_error_not_a_lost_job() {
         let (f, ids) = running("jobs-unreach");
+        std::env::set_var("OSH_FAKE_GATEWAYS", ACTIVE);
         let ctx = f.ctx();
         let j = start(&ctx, "w1", &sh("sleep 3"), 0).unwrap();
         ids.0.borrow_mut().push(j.id.clone());
@@ -1015,5 +1151,263 @@ mod tests {
             "running",
             "not written off"
         );
+    }
+
+    #[test]
+    fn cancel_signals_the_group_without_the_double_dash_dash_does_not_take() {
+        // `kill -TERM -- -PID` is "Illegal number" in dash, the sandbox images' /bin/sh.
+        assert!(
+            !CANCEL.contains("kill -TERM --") && !CANCEL.contains("kill -KILL --"),
+            "{CANCEL}"
+        );
+        assert!(CANCEL.contains("kill -TERM \"-$pid\"") && CANCEL.contains("kill -KILL \"-$pid\""));
+        // dash is on many CI machines and sandboxes; where it is, run the group form for real.
+        if let Ok(dash) = std::process::Command::new("dash")
+            .arg("-c")
+            .arg("exit 0")
+            .status()
+        {
+            if dash.success() {
+                let out = std::process::Command::new("dash")
+                    .arg("-c")
+                    .arg("kill -TERM \"-99999999\" 2>&1; echo rc=$?")
+                    .output()
+                    .unwrap();
+                let text = String::from_utf8_lossy(&out.stdout);
+                assert!(
+                    !text.contains("Illegal number"),
+                    "dash refuses the form: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_launcher_records_the_pid_with_its_start_time_and_cleans_old_folders() {
+        assert!(LAUNCH.contains("-mtime +7"), "week-old job folders go");
+        assert!(LAUNCH.contains("|| exit 1;"), "no pid file, no command");
+        assert!(
+            STATUS.contains("cut -d' ' -f20") && CANCEL.contains("cut -d' ' -f20"),
+            "pid reuse check"
+        );
+        assert!(LAUNCH.contains("started nocap"));
+    }
+
+    #[test]
+    fn jobs_are_started_and_asked_about_without_the_login_shell() {
+        let (f, ids) = running("jobs-nologin");
+        let ctx = f.ctx();
+        let j = start(&ctx, "w1", &sh("sleep 1"), 0).unwrap();
+        ids.0.borrow_mut().push(j.id.clone());
+        status(&ctx, &j.id).unwrap();
+        for line in f.calls().lines().filter(|l| l.contains("sandbox exec")) {
+            assert!(line.contains("--no-login-shell"), "{line}");
+        }
+    }
+
+    #[test]
+    fn a_job_on_the_default_gateway_records_that_gateways_name() {
+        let (f, ids) = running("jobs-active");
+        std::env::set_var("OSH_FAKE_GATEWAYS", ACTIVE);
+        let ctx = f.ctx();
+        let j = start(&ctx, "w1", &sh("sleep 1"), 0).unwrap();
+        ids.0.borrow_mut().push(j.id.clone());
+        assert_eq!(j.gateway, "openshell-docker");
+        assert_eq!(load(&f.dir, &j.id).unwrap().gateway, "openshell-docker");
+        // The CLI's default moves; the job's calls still go to the gateway it runs on.
+        std::env::set_var(
+            "OSH_FAKE_GATEWAYS",
+            r#"[{"name":"openshell-vm","endpoint":"e","active":true}]"#,
+        );
+        std::fs::write(&f.log, "").unwrap();
+        status(&ctx, &j.id).unwrap();
+        assert!(
+            f.calls()
+                .lines()
+                .next()
+                .unwrap()
+                .starts_with("-g openshell-docker sandbox exec"),
+            "{}",
+            f.calls()
+        );
+    }
+
+    #[test]
+    fn a_job_whose_gateway_was_never_recorded_is_not_written_off_as_lost() {
+        let (f, ids) = running("jobs-unrecorded");
+        let ctx = f.ctx(); // no active gateway to name: the fake lists none
+        let j = start(&ctx, "w1", &sh("sleep 1"), 0).unwrap();
+        ids.0.borrow_mut().push(j.id.clone());
+        assert_eq!(j.gateway, "");
+        std::env::set_var("OSH_FAKE_FAIL", "sandbox exec");
+        let e = status(&ctx, &j.id).unwrap_err();
+        assert!(e.contains("not recorded"), "{e}");
+        assert_eq!(load(&f.dir, &j.id).unwrap().state, "running");
+    }
+
+    #[test]
+    fn exec_never_loses_the_job_id_once_the_job_has_started() {
+        // The state cannot be read: the reply still names the job.
+        let (f, ids) = running("jobs-keepid");
+        std::env::set_var("OSH_FAKE_GATEWAYS", ACTIVE);
+        std::env::set_var(
+            "OSH_FAKE_SANDBOXES",
+            r#"{"sandboxes":[{"name":"w1","phase":"Ready","created_at":"t"}]}"#,
+        );
+        let ctx = f.ctx();
+        // Only the status script contains this text.
+        std::env::set_var("OSH_FAKE_FAIL", "echo lost");
+        let v = exec(&ctx, "w1", &sh("sleep 1"), 5, None).unwrap();
+        for j in list(&f.dir) {
+            ids.0.borrow_mut().push(j.id);
+        }
+        assert_eq!(v["status"], "running", "{v}");
+        assert!(valid_id(v["job"].as_str().unwrap()), "{v}");
+        assert!(v["note"].as_str().unwrap().contains("job_status"), "{v}");
+    }
+
+    #[test]
+    fn exec_keeps_the_job_id_and_the_exit_code_when_the_output_cannot_be_read() {
+        let (f, ids) = running("jobs-keepout");
+        std::env::set_var("OSH_FAKE_GATEWAYS", ACTIVE);
+        let ctx = f.ctx();
+        // Only the read script contains this text.
+        std::env::set_var("OSH_FAKE_FAIL", "wc -c");
+        let v = exec(&ctx, "w1", &sh("echo x; exit 6"), 10, None).unwrap();
+        for j in list(&f.dir) {
+            ids.0.borrow_mut().push(j.id);
+        }
+        assert_eq!(
+            (v["status"].as_str(), v["exit_code"].as_i64()),
+            (Some("exited"), Some(6)),
+            "{v}"
+        );
+        assert!(valid_id(v["job"].as_str().unwrap()), "{v}");
+        assert!(v["note"].as_str().unwrap().contains("job_output"), "{v}");
+    }
+
+    #[test]
+    fn a_long_output_is_cut_inline_with_the_job_id_to_read_the_rest() {
+        let (f, ids) = running("jobs-trunc");
+        let ctx = f.ctx();
+        let v = exec(
+            &ctx,
+            "w1",
+            &sh("head -c 1500000 /dev/zero | tr '\\0' b"),
+            20,
+            None,
+        )
+        .unwrap();
+        for j in list(&f.dir) {
+            ids.0.borrow_mut().push(j.id);
+        }
+        assert_eq!(
+            v["truncated"],
+            true,
+            "{}",
+            v.to_string().chars().take(200).collect::<String>()
+        );
+        assert!(valid_id(v["job"].as_str().unwrap()));
+        let len = v["stdout"].as_str().unwrap().len();
+        assert!((1_048_576..1_200_000).contains(&len), "{len}");
+        assert_eq!(v["exit_code"], 0);
+    }
+
+    #[test]
+    fn a_time_limit_the_sandbox_cannot_enforce_comes_with_a_note() {
+        let (f, ids) = running("jobs-nocap");
+        let has_timeout = std::process::Command::new("sh")
+            .args(["-c", "command -v timeout"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success();
+        let v = exec(&f.ctx(), "w1", &sh("echo capped"), 10, Some(30)).unwrap();
+        for j in list(&f.dir) {
+            ids.0.borrow_mut().push(j.id);
+        }
+        assert_eq!(v["stdout"], "capped\n", "{v}");
+        assert_eq!(v.get("note").is_some(), !has_timeout, "{v}");
+        if !has_timeout {
+            assert!(v["note"].as_str().unwrap().contains("not enforced"));
+        }
+    }
+
+    #[test]
+    fn a_huge_offset_is_refused_not_wrapped() {
+        let (f, ids) = running("jobs-offset");
+        let ctx = f.ctx();
+        let j = start(&ctx, "w1", &sh("echo hi"), 0).unwrap();
+        ids.0.borrow_mut().push(j.id.clone());
+        until_finished(&ctx, &j.id);
+        for bad in [u64::MAX, i64::MAX as u64, MAX_OFFSET + 1] {
+            let e = output(&ctx, &j.id, Stream::Out, bad, 16).unwrap_err();
+            assert!(e.contains("at most"), "{bad}: {e}");
+        }
+        let c = output(&ctx, &j.id, Stream::Out, MAX_OFFSET, 16).unwrap();
+        assert_eq!((c.text.as_str(), c.next, c.more), ("", 3, false));
+    }
+
+    #[test]
+    fn a_launch_that_fails_leaves_nothing_recorded_or_running() {
+        let (f, _ids) = running("jobs-badlaunch");
+        // A sandbox folder that cannot be made: its parent is a file.
+        let blocker = f.dir.join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        std::env::set_var("OSH_JOBS_SANDBOX_DIR", blocker.join("jobs"));
+        let e = start(&f.ctx(), "w1", &sh("sleep 5"), 0).unwrap_err();
+        assert!(e.contains("could not start the job"), "{e}");
+        assert!(list(&f.dir).is_empty(), "no record of a job that never ran");
+    }
+
+    #[test]
+    fn jobs_in_tests_never_touch_the_real_tmp_folder() {
+        let (f, ids) = running("jobs-isolated");
+        let j = start(&f.ctx(), "w1", &sh("sleep 1"), 0).unwrap();
+        ids.0.borrow_mut().push(j.id.clone());
+        assert!(std::path::Path::new(&sandbox_dir())
+            .join(&j.id)
+            .join("pid")
+            .exists());
+        assert!(!std::path::Path::new("/tmp/.osh-jobs").join(&j.id).exists());
+        assert_ne!(sandbox_dir(), "/tmp/.osh-jobs");
+    }
+
+    #[test]
+    fn concurrent_saves_of_one_job_never_leave_a_broken_record() {
+        let d = tmp("racesave");
+        let id = "j00000000000000ab";
+        save(&d.0, &job(id, 5, "running")).unwrap();
+        let handles: Vec<_> = (0..8)
+            .map(|w| {
+                let dir = d.0.clone();
+                std::thread::spawn(move || {
+                    for n in 0..40u64 {
+                        let mut j = job(id, 5, "running");
+                        j.checked = w * 100 + n;
+                        save(&dir, &j).unwrap();
+                        assert!(load(&dir, id).is_some(), "a reader never sees half a file");
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        let names: Vec<String> = std::fs::read_dir(super::dir(&d.0))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![format!("{id}.json")], "no temporary file left");
+    }
+
+    #[test]
+    fn exec_in_a_test_runs_the_scripts_where_the_fake_says() {
+        let (f, ids) = running("jobs-dirs");
+        let v = exec(&f.ctx(), "w1", &sh("echo ok"), 10, None).unwrap();
+        for j in list(&f.dir) {
+            ids.0.borrow_mut().push(j.id);
+        }
+        assert_eq!(v["stdout"], "ok\n");
     }
 }
