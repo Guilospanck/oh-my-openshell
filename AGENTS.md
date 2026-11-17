@@ -14,6 +14,7 @@ Building and testing work on macOS and Linux (see Platforms). Check prerequisite
 just doctor      # cargo, just, gitleaks, Zig 0.15 required; openshell, docker, pngpaste optional
 just install-hooks   # once per clone: pre-commit secret/PII scan
 just check       # cargo fmt --check, clippy -D warnings, cargo test. Run before every commit
+just mcp-serve   # osh mcp serve in the foreground; just mcp-claude-add / just mcp-claude connect Claude Code to it
 ```
 
 - Build and tests need only `cargo` and Zig 0.15 (`brew install zig@0.15`).

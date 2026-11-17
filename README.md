@@ -722,6 +722,33 @@ The operator controls two things through `osh.toml` (`mcp.allow_share`, `mcp.sha
 
 What an agent reaches through it: `sandbox_exec` and `sandbox_delete` work on every sandbox of the gateway, including ones made in the dashboard, and a spec may attach any provider that exists on the gateway. Give the server a gateway that holds only what agents may use.
 
+#### Connect Claude Code
+
+Start the server (`just mcp-serve`, or the service: `osh mcp start`), then register it once and start Claude Code with the token in its environment:
+
+```sh
+just mcp-claude-add     # claude mcp add-json osh ... (the entry names ${OSH_MCP_TOKEN}, never the token)
+just mcp-claude         # starts claude with OSH_MCP_TOKEN set from `osh mcp token`
+```
+
+By hand, from any shell that starts `claude`: `export OSH_MCP_TOKEN="$(osh mcp token)"`, then, with single quotes so that Claude Code and not your shell expands the variable (the token must not land on a command line):
+
+```sh
+claude mcp add-json osh '{"type":"http","url":"http://127.0.0.1:17800/mcp","headers":{"Authorization":"Bearer ${OSH_MCP_TOKEN}"}}'
+```
+
+`claude mcp list` shows `osh` as connected, and `/mcp` inside Claude Code lists the eight tools. The URL uses `mcp.server_port` (17800 by default). To check that everything works, ask Claude Code, in a throwaway sandbox (replace `mcp-try`):
+
+1. "List the tools the osh MCP server gives you." (the connection and the eight tools)
+2. "Using osh, create a sandbox named mcp-try, run `uname -a` in it and show me the output." (`sandbox_create`, then a quick `sandbox_exec` that returns its result)
+3. "In mcp-try, start a job that prints a line every 2 seconds for 20 seconds and then exits with code 3. Do not wait for it: start it with wait_secs 0, then check on it every few seconds and tell me each new line and the final exit code." (`wait_secs`, `job_status`, `job_output` with offsets)
+4. "Start `sleep 600` as a job in mcp-try, cancel it, and confirm it was cancelled." (`job_cancel`)
+5. "Run `sleep 30` in mcp-try with max_secs 3 and tell me what happened." (`max_secs`: it ends, exit code 124)
+6. While a long job runs, stop the server and start it again, then ask "check on job `<id>` again." (a job survives a restart)
+7. "Delete the sandbox mcp-try."
+
+Press `6` in the dashboard meanwhile: the server's address, Claude Code as a client, and the jobs with their state. Claude Code can create, delete and run commands in every sandbox on the server's gateway, so use a throwaway sandbox for a first try; sharing host folders and git credentials stay off unless you enable them (`mcp.allow_share`, `mcp.repo_vars`).
+
 ### Limits
 
 - A headless create does not register the read-write share alert and does not upload config files; use the dashboard for those.

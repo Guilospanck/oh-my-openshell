@@ -24,6 +24,33 @@ doctor:
 	[[ "$(git -C "{{justfile_directory()}}" config core.hooksPath)" == .githooks ]] && echo "ok       pre-commit hook" || echo "optional pre-commit hook  (just install-hooks)"
 	exit $bad
 
+# Runs the MCP server (`osh mcp serve`) in the foreground from this checkout; Ctrl-C stops it
+mcp-serve:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	exec "{{justfile_directory()}}/osh" mcp serve
+
+# Registers the MCP server with Claude Code as `osh` (needs the claude CLI); the entry names ${OSH_MCP_TOKEN}, never the token: `just mcp-claude` sets it
+mcp-claude-add:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	command -v claude >/dev/null 2>&1 || { echo "the claude CLI is not on PATH"; exit 1; }
+	osh="{{justfile_directory()}}/osh"
+	port="$("$osh" config get mcp.server_port)"
+	host="$("$osh" config get mcp.server_bind)"
+	case "$host" in 0.0.0.0) host=127.0.0.1 ;; ::|"[::]") host="[::1]" ;; esac
+	url="http://${host}:${port}/mcp"
+	claude mcp remove osh >/dev/null 2>&1 || true
+	claude mcp add-json osh "{\"type\":\"http\",\"url\":\"${url}\",\"headers\":{\"Authorization\":\"Bearer \${OSH_MCP_TOKEN}\"}}"
+	echo "added osh -> ${url}; start claude with: just mcp-claude"
+
+# Starts Claude Code with the MCP token in its environment (never on a command line), so the `osh` server added by mcp-claude-add can authenticate
+mcp-claude *args:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	command -v claude >/dev/null 2>&1 || { echo "the claude CLI is not on PATH"; exit 1; }
+	OSH_MCP_TOKEN="$("{{justfile_directory()}}/osh" mcp token)" exec claude {{args}}
+
 # Builds the TUI in release mode, finding Zig 0.15 itself (osh does this on its own)
 build:
 	#!/usr/bin/env bash
