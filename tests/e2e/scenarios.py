@@ -917,7 +917,7 @@ def mcp_search():
         with dashboard() as o:
             o.press("6"); o.wait("Jobs", 10)
             o.wait("e2e-alpha", 5); o.wait("e2e-charlie", 5)
-            o.press("j"); o.press("j"); o.wait("2/", 5)
+            o.press("j"); o.press("j"); o.wait("3/", 5)
             o.press("/"); o.wait("Jobs  /", 5)
             o.type("brav"); o.wait("e2e-bravo", 5); o.wait_gone("e2e-alpha", 5)
             o.press("enter"); o.wait("1/1", 5)
