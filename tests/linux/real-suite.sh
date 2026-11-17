@@ -219,6 +219,46 @@ if [[ -n "$extra" ]]; then
   connected "$extra" && pass "the re-added extra answers" || fail "the re-added extra answers"
 fi
 
+echo "== the MCP server as a systemd user service"
+mcp_port=17855
+osh config set mcp.server_port "$mcp_port" >/dev/null 2>&1 && pass "the server port is set in osh.toml" || fail "the server port is set in osh.toml"
+out="$(osh mcp status 2>&1)"
+[[ "$out" == *"not installed"* ]] && pass "status says not installed first" || fail "status says not installed first" "$out"
+osh mcp start --yes >"$log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && pass "osh mcp start installs and starts the service" || { fail "osh mcp start" "rc=$rc"; tail -20 "$log"; }
+check "the unit file is written" test -f "$HOME/.config/systemd/user/osh-mcp.service"
+check "the service is active" systemctl --user is-active osh-mcp.service
+up=0
+for _ in $(seq 1 30); do
+  [[ "$(osh mcp status 2>&1)" == *"on, listening on 127.0.0.1:$mcp_port"* ]] && { up=1; break; }
+  sleep 1
+done
+[[ $up -eq 1 ]] && pass "status says on, with the address" || { fail "status says on"; journalctl --user -u osh-mcp.service --no-pager 2>/dev/null | tail -20; }
+[[ "$(stat -c %a "$data/mcp-token" 2>/dev/null)" == 600 ]] && pass "the token file is owner-only" || fail "the token file is owner-only"
+# The token goes into a header file, never into argv.
+auth="$HOME/mcp-auth.hdr"
+printf 'Authorization: Bearer %s\n' "$(osh mcp token)" >"$auth"; chmod 600 "$auth"
+init='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"real-suite","version":"1"}}}'
+code="$(curl -s -o "$HOME/mcp-init.json" -w '%{http_code}' -m 10 -H "@$auth" -X POST -d "$init" "http://127.0.0.1:$mcp_port/mcp")"
+[[ "$code" == 200 ]] && grep -q serverInfo "$HOME/mcp-init.json" && pass "initialize with the token is answered" || fail "initialize with the token" "code=$code"
+code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST -d "$init" "http://127.0.0.1:$mcp_port/mcp")"
+[[ "$code" == 401 ]] && pass "a request without the token is refused" || fail "a request without the token is refused" "code=$code"
+sleep 2
+grep -q real-suite "$data/mcp-server.json" && pass "the client is listed in the state file" || fail "the client is listed in the state file"
+check "the token is not in the state file" bash -c "! grep -q \"\$(osh mcp token)\" '$data/mcp-server.json'"
+osh mcp stop --yes >"$log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && pass "osh mcp stop exits 0" || { fail "osh mcp stop" "rc=$rc"; tail -20 "$log"; }
+check "the service is inactive" bash -c '! systemctl --user is-active --quiet osh-mcp.service'
+check "the service stays off after a login (disabled)" bash -c '! systemctl --user is-enabled --quiet osh-mcp.service'
+check "the port is closed" bash -c "! curl -s -m 3 -o /dev/null 'http://127.0.0.1:$mcp_port/mcp'"
+out="$(osh mcp status 2>&1)"
+[[ "$out" == *"off"* ]] && pass "status says off after the stop" || fail "status says off after the stop" "$out"
+osh mcp remove --yes >"$log" 2>&1; rc=$?
+[[ $rc -eq 0 ]] && pass "osh mcp remove exits 0" || { fail "osh mcp remove" "rc=$rc"; tail -20 "$log"; }
+check "the unit file is gone" test ! -e "$HOME/.config/systemd/user/osh-mcp.service"
+osh config unset mcp.server_port >/dev/null 2>&1 || true
+rm -f "$auth" "$HOME/mcp-init.json"
+
 echo "== uninstall"
 printf 'uninstall\n' | osh uninstall >"$log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "uninstall exits 0" || { fail "uninstall exits 0" "rc=$rc"; tail -30 "$log"; }
