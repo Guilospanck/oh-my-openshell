@@ -908,6 +908,14 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+const JOB_COLS: Cols = &[
+    ("JOB", 9),
+    ("SANDBOX", 8),
+    ("COMMAND", 8),
+    ("STATE", 10),
+    ("STARTED", 8),
+];
+
 const MCP_COLS: Cols = &[
     ("CLIENT", 10),
     ("VERSION", 7),
@@ -932,6 +940,19 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(4), Constraint::Min(3)])
         .split(area);
+    // Jobs, when there are any, take the lower part of the area under the clients.
+    let (clients_area, jobs_area) = if app.mcp.jobs.is_empty() {
+        (rows[1], None)
+    } else {
+        let h = (app.mcp.jobs.len() as u16 + 4)
+            .min(rows[1].height / 2)
+            .max(5);
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(h)])
+            .split(rows[1]);
+        (split[0], Some(split[1]))
+    };
     let ok = Style::default().fg(role::OK);
     let (head, hint) = match (app.mcp.svc, &app.mcp.state) {
         (Svc::Running, Some(s)) => (
@@ -990,7 +1011,15 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
                     ]
                 })
                 .collect();
-            draw_table(f, rows[1], "Clients", MCP_COLS, cells, app.cursor[5], false);
+            draw_table(
+                f,
+                clients_area,
+                "Clients",
+                MCP_COLS,
+                cells,
+                app.cursor[5],
+                false,
+            );
         }
         _ => {
             let (what, hint) = if matches!(app.mcp.svc, Svc::Running | Svc::External) {
@@ -1001,8 +1030,32 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ("The MCP server is off", "")
             };
-            empty_state(f, rows[1], "Clients", MCP_COLS, what, hint);
+            empty_state(f, clients_area, "Clients", MCP_COLS, what, hint);
         }
+    }
+    if let Some(area) = jobs_area {
+        let cells = app
+            .mcp
+            .jobs
+            .iter()
+            .map(|j| {
+                let state = match (j.state.as_str(), j.exit_code) {
+                    ("exited", Some(n)) => format!("exited {n}"),
+                    ("running", _) if now.saturating_sub(j.checked) > 60 => {
+                        format!("running (seen {} ago)", ago(now, j.checked))
+                    }
+                    (s, _) => s.to_string(),
+                };
+                vec![
+                    Line::from(j.id.chars().take(8).collect::<String>()),
+                    Line::styled(j.sandbox.clone(), role::dim()),
+                    Line::styled(j.command.clone(), role::dim()),
+                    Line::from(state),
+                    Line::styled(ago(now, j.started), role::dim()),
+                ]
+            })
+            .collect();
+        draw_table(f, area, "Jobs", JOB_COLS, cells, 0, true);
     }
 }
 
@@ -2563,6 +2616,54 @@ mod tests {
         let (all, _) = screen(&app, 120, 30);
         assert!(all.contains("outside the service"), "{all}");
         assert!(all.contains("127.0.0.1:17800"), "{all}");
+    }
+
+    #[test]
+    fn the_mcp_tab_lists_jobs_with_their_state() {
+        use crate::mcpsvc::Svc;
+        let mut app = usage_app("vm");
+        app.tab = Tab::Mcp;
+        app.mcp.svc = Svc::NotInstalled;
+        let mut done = osh_core::jobs::Job {
+            id: "j0123456789abcdef".into(),
+            gateway: "".into(),
+            sandbox: "w1".into(),
+            command: "sleep".into(),
+            started: 100,
+            state: "running".into(),
+            exit_code: None,
+            checked: 100,
+        };
+        done.id = "j00000000000000ff".into();
+        done.state = "exited".into();
+        done.exit_code = Some(3);
+        app.mcp.jobs = vec![
+            osh_core::jobs::Job {
+                id: "j0123456789abcdef".into(),
+                gateway: "".into(),
+                sandbox: "w1".into(),
+                command: "sleep".into(),
+                started: 100,
+                state: "running".into(),
+                exit_code: None,
+                checked: 100,
+            },
+            done,
+        ];
+        let (all, _) = screen(&app, 120, 30);
+        for want in [
+            "Jobs", "j0123456", "w1", "sleep", "running", "exited 3", "j0000000",
+        ] {
+            assert!(all.contains(want), "{want}: {all}");
+        }
+    }
+
+    #[test]
+    fn the_tab_has_no_jobs_table_when_there_are_none() {
+        let mut app = usage_app("vm");
+        app.tab = Tab::Mcp;
+        let (all, _) = screen(&app, 120, 30);
+        assert!(!all.contains("Jobs"), "{all}");
     }
 
     #[test]

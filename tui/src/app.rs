@@ -53,7 +53,18 @@ pub const TABS: [(Tab, &str); 6] = [
 pub struct McpView {
     pub svc: crate::mcpsvc::Svc,
     pub state: Option<osh_core::mcpserver::state::State>,
+    /// Background jobs started over MCP, newest first.
+    pub jobs: Vec<osh_core::jobs::Job>,
     pub checked: Option<Instant>,
+}
+
+impl McpView {
+    /// The jobs the tab shows: newest first, at most 50.
+    pub fn read_jobs(dir: &std::path::Path) -> Vec<osh_core::jobs::Job> {
+        let mut jobs = osh_core::jobs::list(dir);
+        jobs.truncate(50);
+        jobs
+    }
 }
 
 impl Default for McpView {
@@ -61,6 +72,7 @@ impl Default for McpView {
         McpView {
             svc: crate::mcpsvc::Svc::NotInstalled,
             state: None,
+            jobs: Vec::new(),
             checked: None,
         }
     }
@@ -5402,6 +5414,7 @@ impl App {
         p.data = self.dir.clone();
         self.mcp.svc = crate::mcpsvc::status(os, &osh_core::platform::RealHost, &p);
         self.mcp.state = osh_core::mcpserver::state::read(&self.dir);
+        self.mcp.jobs = McpView::read_jobs(&self.dir);
         self.mcp.checked = Some(Instant::now());
         let n = self.mcp.state.as_ref().map_or(0, |s| s.clients.len());
         self.cursor[5] = self.cursor[5].min(n.saturating_sub(1));
@@ -6498,6 +6511,32 @@ mod tests {
         a.push_alert(alert("x"));
         a.toast.as_mut().unwrap().1 = ago(2);
         assert!(a.toast().is_none(), "toast_secs = 1");
+    }
+
+    #[test]
+    fn the_mcp_view_reads_the_jobs_folder_newest_first_and_no_more_than_fifty() {
+        let dir = std::env::temp_dir().join(format!("osh-app-jobs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(McpView::read_jobs(&dir).is_empty(), "no folder, no jobs");
+        for n in 0..60u64 {
+            let mut j = osh_core::jobs::Job {
+                id: "j0123456789abcdef".into(),
+                gateway: "".into(),
+                sandbox: "w1".into(),
+                command: "sleep".into(),
+                started: 100,
+                state: "running".into(),
+                exit_code: None,
+                checked: 100,
+            };
+            j.id = format!("j{n:016x}");
+            j.started = 1000 + n;
+            osh_core::jobs::save(&dir, &j).unwrap();
+        }
+        let read = McpView::read_jobs(&dir);
+        assert_eq!(read.len(), 50);
+        assert_eq!(read[0].id, format!("j{:016x}", 59u64), "newest first");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

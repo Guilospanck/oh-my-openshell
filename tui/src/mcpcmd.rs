@@ -270,10 +270,19 @@ fn serve_cmd() -> i32 {
     ));
     registry.flush();
     let ticker = registry.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
-        settings::reload_if_changed();
-        ticker.flush();
+    let jobs_dir = dir.clone();
+    std::thread::spawn(move || {
+        let mut pruned: Option<u64> = None;
+        loop {
+            let now = osh_core::jobs::now();
+            if prune_due(pruned, now) {
+                osh_core::jobs::prune(&jobs_dir, now);
+                pruned = Some(now);
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            settings::reload_if_changed();
+            ticker.flush();
+        }
     });
     eprintln!("osh: mcp: listening on http://{listen}/mcp");
     let result = http::serve(
@@ -378,6 +387,11 @@ fn service_cmd(m: &Mode) -> i32 {
     ))
 }
 
+/// Whether old jobs should be forgotten now: at start, then once an hour.
+fn prune_due(last: Option<u64>, now: u64) -> bool {
+    last.is_none_or(|l| now >= l && now - l >= 3_600)
+}
+
 fn token_cmd() -> i32 {
     let dir = osh_core::assets::data_dir();
     if let Err(e) = token::ensure(&dir) {
@@ -455,6 +469,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         Tmp(d)
+    }
+
+    #[test]
+    fn old_jobs_are_pruned_at_start_and_then_every_hour() {
+        assert!(prune_due(None, 1_000));
+        assert!(!prune_due(Some(1_000), 1_000 + 3_599));
+        assert!(prune_due(Some(1_000), 1_000 + 3_600));
+        assert!(!prune_due(Some(5_000), 4_000), "a clock that went back");
     }
 
     #[test]
