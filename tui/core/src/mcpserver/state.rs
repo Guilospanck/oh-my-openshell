@@ -263,6 +263,19 @@ impl Observer for Registry {
             return;
         };
         let now = (self.clock)();
+        // A call that carries no session id (a client that does not send one after `initialize`)
+        // counts for the session that client already has, so it is listed once.
+        let session = if session.starts_with("ip:") {
+            inner
+                .clients
+                .iter()
+                .filter(|c| c.peer == peer && !c.session.starts_with("ip:"))
+                .max_by_key(|c| c.last_seen)
+                .map_or(session.to_string(), |c| c.session.clone())
+        } else {
+            session.to_string()
+        };
+        let session = session.as_str();
         match inner.clients.iter_mut().find(|c| c.session == session) {
             Some(c) => {
                 c.last_seen = now;
@@ -359,6 +372,22 @@ mod tests {
         let s1 = st.clients.iter().find(|c| c.session == "s1").unwrap();
         assert_eq!((s1.first_seen, s1.last_seen), (1_000, 1_030));
         assert_eq!(s1.peer, "10.0.0.5");
+    }
+
+    #[test]
+    fn a_call_without_a_session_joins_the_session_that_client_already_has() {
+        let d = tmp("joins");
+        let (r, now) = registry(&d.0, 600);
+        r.seen("real", "10.0.0.5", Some(("factory".into(), "0.3".into())));
+        now.store(1_020, Ordering::SeqCst);
+        r.seen("ip:10.0.0.5", "10.0.0.5", None);
+        r.seen("ip:10.0.0.9", "10.0.0.9", None);
+        r.flush();
+        let st = read(&d.0).unwrap();
+        assert_eq!(st.clients.len(), 2, "{:?}", st.clients);
+        let real = st.clients.iter().find(|c| c.session == "real").unwrap();
+        assert_eq!(real.last_seen, 1_020, "the call counted for its session");
+        assert!(st.clients.iter().any(|c| c.session == "ip:10.0.0.9"));
     }
 
     #[test]

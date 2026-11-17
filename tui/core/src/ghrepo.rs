@@ -955,9 +955,14 @@ pub fn load_tracked(file: Option<&std::path::Path>) -> Vec<Tracked> {
         .unwrap_or_default()
 }
 
+/// The tracked-token file is read, changed and written back as a whole, so changes in one process
+/// (the MCP server answers several clients at once) go one at a time.
+static TRACK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Add or replace the entry for `t.gateway` + `t.provider`.
 pub fn track(file: Option<&std::path::Path>, t: Tracked) {
     let Some(file) = file else { return };
+    let _one_at_a_time = TRACK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut all = load_tracked(Some(file));
     all.retain(|o| !(o.gateway == t.gateway && o.provider == t.provider));
     all.push(t);
@@ -966,6 +971,7 @@ pub fn track(file: Option<&std::path::Path>, t: Tracked) {
 
 pub fn untrack(file: Option<&std::path::Path>, gateway: &str, provider: &str) {
     let Some(file) = file else { return };
+    let _one_at_a_time = TRACK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut all = load_tracked(Some(file));
     let n = all.len();
     all.retain(|o| !(o.gateway == gateway && o.provider == provider));
@@ -978,7 +984,11 @@ fn save_tracked(file: &std::path::Path, all: &[Tracked]) {
     if let Some(dir) = file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(file, format_tracked(all));
+    // Beside the file, then renamed: a reader never sees half of it.
+    let tmp = file.with_extension(format!("tmp-{}", std::process::id()));
+    if std::fs::write(&tmp, format_tracked(all)).is_ok() {
+        let _ = std::fs::rename(&tmp, file);
+    }
 }
 
 /// "expires in 12d", "expires today" or "expired" for a token expiring at `expiry_ms`.
@@ -1236,6 +1246,37 @@ mod tests {
         assert_eq!(days_left(1_000, ms), 30);
         assert_eq!(days_left(1_000 + 25 * 86_400 + 5, ms), 4);
         assert_eq!(days_left(u64::MAX / 2, ms), 0);
+    }
+
+    #[test]
+    fn concurrent_tracking_loses_no_entry() {
+        let dir = std::env::temp_dir().join(format!("osh-track-race-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("tokens");
+        let handles: Vec<_> = (0..8)
+            .map(|w| {
+                let file = file.clone();
+                std::thread::spawn(move || {
+                    for n in 0..25 {
+                        track(
+                            Some(&file),
+                            Tracked {
+                                gateway: "vm".into(),
+                                provider: format!("github-w{w}-n{n}"),
+                                expiry_ms: 1,
+                                repo: "o/r".into(),
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(load_tracked(Some(&file)).len(), 200, "every entry kept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
