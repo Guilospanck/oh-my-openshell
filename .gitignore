@@ -20,3 +20,9 @@ __pycache__/
 
 .claude
 /osh.toml
+/mcp-token
+/mcp-token.tmp-*
+/mcp-server.json
+/mcp-server.json.tmp-*
+/mcp-jobs/
+/mcp-logs/
