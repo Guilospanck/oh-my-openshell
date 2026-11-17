@@ -4,6 +4,7 @@
 //! may carry anything.
 
 use crate::gateways;
+use crate::jobs;
 use crate::ops::{self, Ctx};
 use serde_json::{json, Map, Value};
 
@@ -63,12 +64,14 @@ fn base_tools() -> Value {
         },
         {
             "name": "sandbox_exec",
-            "description": "Run a command in a sandbox; returns exit_code, stdout, stderr.",
+            "description": "Run a command in a sandbox. When it finishes within wait_secs (default 30) the reply is exit_code, stdout, stderr. Otherwise the reply is {job, status: \"running\"} and the command keeps running: follow it with job_status and job_output. wait_secs 0 returns a job at once (use it for long work). max_secs ends the job after that many seconds; the operator's own limit (mcp.job_max_secs) caps it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string"},
-                    "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+                    "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                    "wait_secs": {"type": "integer", "minimum": 0, "maximum": 900, "description": "How long to wait for the command before returning a job (default 30)."},
+                    "max_secs": {"type": "integer", "minimum": 0, "description": "End the job after this many seconds."}
                 },
                 "required": ["name", "argv"],
                 "additionalProperties": false
@@ -81,6 +84,41 @@ fn base_tools() -> Value {
                 "type": "object",
                 "properties": {"spec": {"type": "object", "description": SPEC_DOC}},
                 "required": ["spec"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "job_status",
+            "description": "State of a job started by sandbox_exec: running, exited (with exit_code), cancelled or lost (its process or sandbox is gone).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job": {"type": "string"}},
+                "required": ["job"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "job_output",
+            "description": "New output of a job from the given offsets: stdout, stderr, the offsets to pass next time, and more (true when output remains beyond them). Offsets count bytes and start at 0; a reply holds at most max_bytes (default and limit 65536) of each stream.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "job": {"type": "string"},
+                    "stdout_offset": {"type": "integer", "minimum": 0},
+                    "stderr_offset": {"type": "integer", "minimum": 0},
+                    "max_bytes": {"type": "integer", "minimum": 16, "maximum": 65536}
+                },
+                "required": ["job"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "job_cancel",
+            "description": "End a running job (its whole process group). A job that already exited stays exited.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"job": {"type": "string"}},
+                "required": ["job"],
                 "additionalProperties": false
             }
         }
@@ -125,6 +163,35 @@ fn req_str(a: &Map<String, Value>, k: &str) -> Result<String, Fault> {
         Some(_) => Err(invalid(format!("argument `{k}` must be a string"))),
         None => Err(invalid(format!("missing argument `{k}`"))),
     }
+}
+
+/// An optional whole number of zero or more.
+fn opt_u64(a: &Map<String, Value>, k: &str) -> Result<Option<u64>, Fault> {
+    match a.get(k) {
+        None => Ok(None),
+        Some(Value::Number(n)) if n.as_u64().is_some() => Ok(n.as_u64()),
+        Some(_) => Err(invalid(format!(
+            "argument `{k}` must be a whole number, zero or more"
+        ))),
+    }
+}
+
+fn job_json(j: &jobs::Job) -> Value {
+    json!({
+        "job": j.id, "state": j.state, "exit_code": j.exit_code,
+        "sandbox": j.sandbox, "started": j.started,
+    })
+}
+
+/// New output of both streams of a job from the given offsets.
+fn job_output(ctx: &Ctx, id: &str, so: u64, eo: u64, limit: usize) -> Result<Value, String> {
+    let out = jobs::output(ctx, id, jobs::Stream::Out, so, limit)?;
+    let err = jobs::output(ctx, id, jobs::Stream::Err, eo, limit)?;
+    Ok(json!({
+        "stdout": out.text, "stderr": err.text,
+        "stdout_offset": out.next, "stderr_offset": err.next,
+        "more": out.more || err.more,
+    }))
 }
 
 fn req_spec(a: &Map<String, Value>) -> Result<Value, Fault> {
@@ -183,9 +250,31 @@ fn call(p: &Value, ctx: &Ctx) -> Result<Value, Fault> {
             ops::sandbox_delete(ctx, &req_str(&a, "name")?)
         }
         "sandbox_exec" => {
-            let a = args_of(p, &["name", "argv"])?;
+            let a = args_of(p, &["name", "argv", "wait_secs", "max_secs"])?;
             let n = req_str(&a, "name")?;
-            ops::sandbox_exec(ctx, &n, &argv_of(&a)?)
+            let argv = argv_of(&a)?;
+            let wait =
+                opt_u64(&a, "wait_secs")?.map_or(jobs::DEFAULT_WAIT, |w| w.min(jobs::MAX_WAIT));
+            let max = opt_u64(&a, "max_secs")?;
+            jobs::exec(ctx, &n, &argv, wait, max)
+        }
+        "job_status" => {
+            let a = args_of(p, &["job"])?;
+            jobs::status(ctx, &req_str(&a, "job")?).map(|j| job_json(&j))
+        }
+        "job_output" => {
+            let a = args_of(p, &["job", "stdout_offset", "stderr_offset", "max_bytes"])?;
+            let id = req_str(&a, "job")?;
+            let so = opt_u64(&a, "stdout_offset")?.unwrap_or(0);
+            let eo = opt_u64(&a, "stderr_offset")?.unwrap_or(0);
+            let limit = opt_u64(&a, "max_bytes")?
+                .map_or(jobs::CHUNK as u64, |m| m.min(jobs::CHUNK as u64))
+                as usize;
+            job_output(ctx, &id, so, eo, limit)
+        }
+        "job_cancel" => {
+            let a = args_of(p, &["job"])?;
+            jobs::cancel(ctx, &req_str(&a, "job")?).map(|j| job_json(&j))
         }
         "sandbox_apply" => {
             let a = args_of(p, &["spec"])?;
@@ -300,7 +389,10 @@ mod tests {
                 "sandbox_create",
                 "sandbox_delete",
                 "sandbox_exec",
-                "sandbox_apply"
+                "sandbox_apply",
+                "job_status",
+                "job_output",
+                "job_cancel"
             ]
         );
         for x in t {
@@ -414,6 +506,200 @@ mod tests {
         serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
     }
 
+    /// A fake `openshell` whose `sandbox exec` really runs the command, for tools that start jobs.
+    fn running(tag: &str) -> Fake {
+        let f = Fake::new(tag);
+        std::env::set_var("OSH_FAKE_EXEC_RUN", "1");
+        f
+    }
+
+    /// Remove the job folders a test left in the "sandbox" (a folder on this machine).
+    fn forget_jobs(f: &Fake) {
+        for j in crate::jobs::list(&f.dir) {
+            let _ = std::fs::remove_dir_all(format!("{}/{}", crate::jobs::SANDBOX_DIR, j.id));
+        }
+    }
+
+    fn job_id(r: &Value) -> String {
+        text_json(r)["job"].as_str().expect("a job id").to_string()
+    }
+
+    #[test]
+    fn tools_list_has_the_job_tools_with_closed_schemas() {
+        let r = ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &ctx());
+        let t = r["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = t.iter().map(|x| x["name"].as_str().unwrap()).collect();
+        assert_eq!(&names[5..], ["job_status", "job_output", "job_cancel"]);
+        for x in &t[5..] {
+            assert_eq!(x["inputSchema"]["additionalProperties"], false, "{x}");
+            assert_eq!(x["inputSchema"]["required"], json!(["job"]), "{x}");
+        }
+        let props = &t[3]["inputSchema"]["properties"];
+        assert_eq!(props["wait_secs"]["type"], "integer");
+        assert_eq!(props["max_secs"]["type"], "integer");
+        assert!(t[3]["description"].as_str().unwrap().contains("job_status"));
+    }
+
+    #[test]
+    fn sandbox_exec_takes_wait_and_max_secs_and_refuses_bad_values() {
+        let c = ctx();
+        let code = |args: Value| ask(&call_line("sandbox_exec", args), &c)["error"]["code"].clone();
+        for bad in [
+            json!({"name":"w1","argv":["ls"],"wait_secs":-1}),
+            json!({"name":"w1","argv":["ls"],"wait_secs":1.5}),
+            json!({"name":"w1","argv":["ls"],"wait_secs":"5"}),
+            json!({"name":"w1","argv":["ls"],"max_secs":-1}),
+            json!({"name":"w1","argv":["ls"],"max_secs":1e30}),
+            json!({"name":"w1","argv":["ls"],"max_secs":null}),
+        ] {
+            assert_eq!(code(bad.clone()), -32602, "{bad}");
+        }
+        // Too long a wait is clamped, not refused: the command still runs.
+        let f = running("mcp-clamp");
+        let r = ask(
+            &call_line(
+                "sandbox_exec",
+                json!({"name":"w1","argv":["true"],"wait_secs":901}),
+            ),
+            &f.ctx(),
+        );
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert_eq!(text_json(&r)["exit_code"], 0);
+        forget_jobs(&f);
+    }
+
+    #[test]
+    fn over_mcp_a_quick_command_returns_the_result_and_a_slow_one_a_job() {
+        let f = running("mcp-slow");
+        let c = f.ctx();
+        let slow = ask(
+            &call_line(
+                "sandbox_exec",
+                json!({"name":"w1","argv":["sh","-c","sleep 2; echo late; exit 5"],"wait_secs":0}),
+            ),
+            &c,
+        );
+        assert_eq!(text_json(&slow)["status"], "running", "{slow}");
+        let id = job_id(&slow);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let state = loop {
+            let s = ask(&call_line("job_status", json!({"job": id})), &c);
+            assert_eq!(s["result"]["isError"], false, "{s}");
+            let v = text_json(&s);
+            if v["state"] != "running" || std::time::Instant::now() > end {
+                break v;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
+        assert_eq!(
+            (state["state"].as_str(), state["exit_code"].as_i64()),
+            (Some("exited"), Some(5))
+        );
+        assert_eq!(state["sandbox"], "w1");
+        let out = text_json(&ask(&call_line("job_output", json!({"job": id})), &c));
+        assert_eq!(out["stdout"], "late\n");
+        assert_eq!(
+            (out["stdout_offset"].as_u64(), out["stderr_offset"].as_u64()),
+            (Some(5), Some(0))
+        );
+        assert_eq!(out["more"], false);
+        let again = text_json(&ask(
+            &call_line("job_output", json!({"job": id, "stdout_offset": 5})),
+            &c,
+        ));
+        assert_eq!(again["stdout"], "");
+        forget_jobs(&f);
+    }
+
+    #[test]
+    fn job_output_offsets_must_be_non_negative_integers() {
+        let c = ctx();
+        for bad in [
+            json!({"job":"j0123456789abcdef","stdout_offset":-1}),
+            json!({"job":"j0123456789abcdef","stderr_offset":1.5}),
+            json!({"job":"j0123456789abcdef","stdout_offset":"3"}),
+            json!({"job":"j0123456789abcdef","stdout_offset":1e30}),
+            json!({"job":"j0123456789abcdef","max_bytes":-5}),
+        ] {
+            let r = ask(&call_line("job_output", bad.clone()), &c);
+            assert_eq!(r["error"]["code"], -32602, "{bad}: {r}");
+        }
+    }
+
+    #[test]
+    fn job_tools_refuse_an_unknown_or_malformed_job_id_without_reaching_openshell() {
+        let f = Fake::new("mcp-badjob");
+        for tool in ["job_status", "job_output", "job_cancel"] {
+            for id in ["../x", "j0000000000000000", ""] {
+                let r = ask(&call_line(tool, json!({"job": id})), &f.ctx());
+                assert!(r.get("error").is_none(), "{r}");
+                assert_eq!(r["result"]["isError"], true, "{tool} {id:?}");
+                assert!(text_json(&r)["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("unknown job"));
+            }
+            let r = ask(&call_line(tool, json!({})), &f.ctx());
+            assert_eq!(r["error"]["code"], -32602, "{tool} needs a job");
+        }
+        assert_eq!(f.calls(), "");
+    }
+
+    #[test]
+    fn the_caller_cannot_raise_the_operators_cap() {
+        let f = running("mcp-cap");
+        let mut c = f.ctx();
+        c.job_max_secs = 100;
+        let ask_for = |max: Value| {
+            let mut args = json!({"name":"w1","argv":["true"],"wait_secs":0});
+            if !max.is_null() {
+                args["max_secs"] = max;
+            }
+            job_id(&ask(&call_line("sandbox_exec", args), &c))
+        };
+        let greedy = ask_for(json!(500));
+        let modest = ask_for(json!(50));
+        let none = ask_for(Value::Null);
+        let calls = f.calls();
+        let dir = crate::jobs::SANDBOX_DIR;
+        assert!(calls.contains(&format!("{dir}/{greedy} 100 ")), "{calls}");
+        assert!(calls.contains(&format!("{dir}/{modest} 50 ")), "{calls}");
+        assert!(calls.contains(&format!("{dir}/{none} 100 ")), "{calls}");
+        forget_jobs(&f);
+    }
+
+    #[test]
+    fn a_job_call_uses_the_gateway_the_job_was_started_on() {
+        let f = running("mcp-jobgw");
+        std::fs::write(
+            f.dir.join("gateways.json"),
+            r#"{"gateways":[{"name":"openshell-docker","kind":"docker","port":17671,"main":false}]}"#,
+        )
+        .unwrap();
+        let c = f.ctx();
+        let started = ask(
+            &call_line(
+                "sandbox_exec",
+                json!({"name":"w1","argv":["sleep","1"],"wait_secs":0,"gateway":"openshell-docker"}),
+            ),
+            &c,
+        );
+        let id = job_id(&started);
+        std::fs::write(&f.log, "").unwrap();
+        let s = ask(&call_line("job_status", json!({"job": id})), &c);
+        assert_eq!(s["result"]["isError"], false, "{s}");
+        let calls = f.calls();
+        assert!(
+            calls
+                .lines()
+                .next()
+                .unwrap()
+                .starts_with("-g openshell-docker sandbox exec"),
+            "{calls}"
+        );
+        forget_jobs(&f);
+    }
+
     #[test]
     fn list_returns_json_text() {
         let f = Fake::new("mcp-list");
@@ -441,15 +727,15 @@ mod tests {
 
     #[test]
     fn exec_multiline_output_stays_one_line() {
-        let f = Fake::new("mcp-exec");
-        std::env::set_var("OSH_FAKE_EXEC_STDOUT", "a\nb");
-        let line = call_line("sandbox_exec", json!({"name":"w1","argv":["echo","x"]}));
+        let f = running("mcp-exec");
+        let line = call_line(
+            "sandbox_exec",
+            json!({"name":"w1","argv":["sh","-c","printf 'a\\nb'"],"wait_secs":10}),
+        );
         let r = ask(&line, &f.ctx());
-        assert_eq!(r["result"]["isError"], false);
-        assert!(text_json(&r)["stdout"]
-            .as_str()
-            .unwrap()
-            .starts_with("a\nb"));
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        assert_eq!(text_json(&r)["stdout"], "a\nb");
+        forget_jobs(&f);
     }
 
     #[test]
