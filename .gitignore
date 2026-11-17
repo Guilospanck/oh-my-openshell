@@ -26,3 +26,4 @@ __pycache__/
 /mcp-server.json.tmp-*
 /mcp-jobs/
 /mcp-logs/
+/mcp-secrets/

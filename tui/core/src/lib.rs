@@ -14,6 +14,7 @@ pub mod ops;
 pub mod platform;
 pub mod preload;
 pub mod sandbox;
+pub mod secrets;
 pub mod settings;
 pub mod testmode;
 pub mod text;

@@ -18,6 +18,7 @@ const USAGE: &str = "usage: osh mcp [--gateway G]\n\
        osh mcp token    print the bearer token HTTP clients must present\n\
        osh mcp start|stop|remove [--yes]    install and turn on, turn off, or delete the service\n\
        osh mcp status   say whether the server is on\n\
+       osh mcp secret set NAME|list|remove NAME    store a token (hidden prompt) a spec's repo.env_var may name\n\
 Serves MCP over stdio (newline-delimited JSON-RPC). What agents may do is set in osh.toml \
 (see `osh config`): mcp.allow_share lets specs mount host folders inside the directories in \
 mcp.share_roots, and mcp.repo_vars lists the variables a spec's repo.env_var may name. \
@@ -33,9 +34,18 @@ enum Mode {
     Stdio(Option<String>),
     Serve,
     Token,
+    Secret(SecretAct),
     Status,
     /// `--yes` given: run the steps without asking.
     Service(Verb, bool),
+}
+
+/// `osh mcp secret ...`: tokens the server may use for a repo grant, stored by the operator.
+#[derive(Debug, PartialEq, Eq)]
+enum SecretAct {
+    Set(String),
+    List,
+    Remove(String),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -57,6 +67,14 @@ fn mode(args: &[String]) -> Result<Mode, String> {
             [] => Ok(Mode::Service(v, false)),
             [y] if y == "--yes" => Ok(Mode::Service(v, true)),
             [other, ..] => Err(format!("unexpected argument {other:?}")),
+        };
+    }
+    if args.first().map(String::as_str) == Some("secret") {
+        return match &args[1..] {
+            [v, name] if v == "set" => Ok(Mode::Secret(SecretAct::Set(name.clone()))),
+            [v, name] if v == "remove" => Ok(Mode::Secret(SecretAct::Remove(name.clone()))),
+            [v] if v == "list" => Ok(Mode::Secret(SecretAct::List)),
+            _ => Err("usage: osh mcp secret set NAME | list | remove NAME (the value is asked for, never an argument)".into()),
         };
     }
     match args.first().map(String::as_str) {
@@ -411,11 +429,98 @@ fn token_cmd() -> i32 {
     }
 }
 
+/// Read one line without echoing it. On a terminal the echo is switched off for the read and
+/// restored after; piped input is read as it comes (`printf %s "$T" | osh mcp secret set NAME`).
+fn read_hidden(prompt: &str) -> std::io::Result<String> {
+    use std::io::IsTerminal;
+    let tty = std::io::stdin().is_terminal();
+    let mut line = String::new();
+    if tty {
+        eprint!("{prompt}");
+        let _ = std::io::stderr().flush();
+        let saved = std::process::Command::new("stty")
+            .arg("-g")
+            .stdin(std::process::Stdio::inherit())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+        let _ = std::process::Command::new("stty")
+            .arg("-echo")
+            .stdin(std::process::Stdio::inherit())
+            .status();
+        let read = std::io::stdin().read_line(&mut line);
+        let _ = match saved {
+            Some(s) => std::process::Command::new("stty").arg(s).status(),
+            None => std::process::Command::new("stty").arg("echo").status(),
+        };
+        eprintln!();
+        read?;
+    } else {
+        std::io::stdin().read_line(&mut line)?;
+    }
+    Ok(line)
+}
+
+fn secret_cmd(act: SecretAct) -> i32 {
+    use osh_core::secrets;
+    let dir = osh_core::assets::data_dir();
+    match act {
+        SecretAct::Set(name) => {
+            if !secrets::valid_name(&name) {
+                eprintln!("osh: mcp: {name:?} is not a usable name (letters, digits and _)");
+                return 2;
+            }
+            let value = match read_hidden(&format!("Token for {name} (input is hidden): ")) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("osh: mcp: cannot read the token: {e}");
+                    return 1;
+                }
+            };
+            match secrets::set(&dir, &name, &value) {
+                Ok(()) => {
+                    println!(
+                        "stored {name} in {}. An agent may now name it as repo.env_var; no restart is needed.",
+                        secrets::dir(&dir).display()
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("osh: mcp: {e}");
+                    1
+                }
+            }
+        }
+        SecretAct::List => {
+            for n in secrets::list(&dir) {
+                println!("{n}");
+            }
+            0
+        }
+        SecretAct::Remove(name) => match secrets::remove(&dir, &name) {
+            Ok(true) => {
+                println!("removed {name}");
+                0
+            }
+            Ok(false) => {
+                eprintln!("osh: mcp: no secret named {name}");
+                1
+            }
+            Err(e) => {
+                eprintln!("osh: mcp: {e}");
+                2
+            }
+        },
+    }
+}
+
 pub fn run(args: &[String]) -> i32 {
     let gateway = match mode(args) {
         Ok(Mode::Stdio(g)) => g,
         Ok(Mode::Serve) => return serve_cmd(),
         Ok(Mode::Token) => return token_cmd(),
+        Ok(Mode::Secret(act)) => return secret_cmd(act),
         Ok(m @ (Mode::Status | Mode::Service(..))) => return service_cmd(&m),
         Err(e) => {
             eprintln!("osh: {e}\n{USAGE}");
@@ -494,6 +599,37 @@ mod tests {
         assert!(mode(&a(&["serve", "--bogus"])).is_err());
         assert!(mode(&a(&["token", "x"])).is_err());
         assert!(mode(&a(&["--gateway"])).is_err());
+    }
+
+    #[test]
+    fn mode_accepts_the_secret_verbs() {
+        assert_eq!(
+            mode(&a(&["secret", "set", "MY_TOK"])),
+            Ok(Mode::Secret(SecretAct::Set("MY_TOK".into())))
+        );
+        assert_eq!(
+            mode(&a(&["secret", "list"])),
+            Ok(Mode::Secret(SecretAct::List))
+        );
+        assert_eq!(
+            mode(&a(&["secret", "remove", "T"])),
+            Ok(Mode::Secret(SecretAct::Remove("T".into())))
+        );
+        for bad in [
+            &["secret"][..],
+            &["secret", "set"],
+            &["secret", "set", "a", "b"],
+            &["secret", "list", "x"],
+            &["secret", "show", "T"],
+        ] {
+            assert!(mode(&a(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_value_is_never_a_command_line_argument() {
+        // `set NAME VALUE` would put the token in argv and in history: refused.
+        assert!(mode(&a(&["secret", "set", "T", "github_pat_x"])).is_err());
     }
 
     #[test]

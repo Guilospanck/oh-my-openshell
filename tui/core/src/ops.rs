@@ -107,15 +107,27 @@ fn checked_spec(ctx: &Ctx, spec: &Value, home: &str) -> Result<Checked, String> 
 /// `repo.env_var` must be one the caller allows (`Ctx::repo_vars`). The refusal names the
 /// variable only, never a value.
 fn check_repo_var(ctx: &Ctx, var: &str) -> Result<(), String> {
+    // A token the operator stored (`osh mcp secret set NAME`) is allowed by that very act.
+    if crate::secrets::get(&ctx.dir, var).is_some() {
+        return Ok(());
+    }
+    let stored = crate::secrets::list(&ctx.dir);
+    let how = format!(
+        "to allow {var}, the user runs `osh mcp secret set {var}` in a terminal of their own, outside this chat (it asks for the token with a hidden prompt)"
+    );
+    let have = if stored.is_empty() {
+        String::new()
+    } else {
+        format!("; stored tokens: {}", stored.join(", "))
+    };
     match &ctx.repo_vars {
         None => Ok(()),
-        Some(list) if list.is_empty() => Err(
-            "repo grants are off: the server operator has not listed any variable in OSH_MCP_REPO_VARS"
-                .into(),
-        ),
+        Some(list) if list.is_empty() => Err(format!(
+            "repo grants are off: the server operator has not listed any variable in OSH_MCP_REPO_VARS and stored no token; {how}{have}"
+        )),
         Some(list) if list.iter().any(|v| v == var) => Ok(()),
         Some(_) => Err(format!(
-            "repo.env_var {var:?} is not one of the variables the server operator allows (OSH_MCP_REPO_VARS)"
+            "repo.env_var {var:?} is not one of the variables the server operator allows (OSH_MCP_REPO_VARS); {how}{have}"
         )),
     }
 }
@@ -164,9 +176,9 @@ fn join_notes(a: Option<String>, b: Option<String>) -> Option<String> {
     }
 }
 
-/// The secret named by `repo.env_var`, read from this process's environment. Errors name the
+/// The secret named by `repo.env_var`, read from this process's environment, else from the store. Errors name the
 /// variable only, never its value.
-fn repo_secret(var: &str) -> Result<String, String> {
+fn repo_secret(ctx: &Ctx, var: &str) -> Result<String, String> {
     if var.is_empty() || var.contains(['=', '\0']) {
         return Err(format!("repo.env_var {var:?} is not a variable name"));
     }
@@ -174,9 +186,12 @@ fn repo_secret(var: &str) -> Result<String, String> {
         Some(v) if !v.is_empty() => v
             .into_string()
             .map_err(|_| format!("environment variable {var} (repo.env_var) is not valid UTF-8")),
-        _ => Err(format!(
-            "environment variable {var} (repo.env_var) is unset or empty"
-        )),
+        // Not in the environment: the token the operator stored under that name.
+        _ => crate::secrets::get(&ctx.dir, var).ok_or_else(|| {
+            format!(
+                "environment variable {var} (repo.env_var) is unset or empty and no token is stored under that name; the user can run `osh mcp secret set {var}` in their own terminal"
+            )
+        }),
     }
 }
 
@@ -225,7 +240,7 @@ fn create_in(ctx: &Ctx, spec: &Value, dry_run: bool, home: &str) -> Result<Value
         note: share_note,
     } = checked_spec(ctx, spec, home)?;
     let grant = match &s.repo {
-        Some(g) => Some((sandbox::grant_repo(&g.url)?, repo_secret(&g.env_var)?)),
+        Some(g) => Some((sandbox::grant_repo(&g.url)?, repo_secret(ctx, &g.env_var)?)),
         None => None,
     };
     target(ctx)?;
@@ -1287,6 +1302,40 @@ pub(crate) mod tests {
         ok.unwrap();
         cli_any.unwrap();
         assert_eq!(f.calls(), "");
+    }
+
+    #[test]
+    fn a_stored_secret_allows_its_name_and_supplies_the_token() {
+        let f = Fake::new("stored-secret");
+        std::env::remove_var("OSH_TEST_STORED");
+        let ctx = Ctx {
+            repo_vars: Some(Vec::new()),
+            ..f.ctx()
+        };
+        let refused = sandbox_create(&ctx, &with_repo("OSH_TEST_STORED"), true).unwrap_err();
+        assert!(
+            refused.contains("osh mcp secret set OSH_TEST_STORED"),
+            "the refusal says what to run: {refused}"
+        );
+        crate::secrets::set(&ctx.dir, "OSH_TEST_STORED", &secret_value()).unwrap();
+        sandbox_create(&ctx, &with_repo("OSH_TEST_STORED"), true).unwrap();
+        let other = sandbox_create(&ctx, &with_repo("OSH_TEST_OTHER"), true).unwrap_err();
+        assert!(
+            other.contains("OSH_TEST_STORED"),
+            "names what is stored: {other}"
+        );
+        assert!(!other.contains(&secret_value()), "{other}");
+        // The real environment wins over the file.
+        std::env::set_var("OSH_TEST_STORED", "from-env");
+        assert_eq!(repo_secret(&ctx, "OSH_TEST_STORED").unwrap(), "from-env");
+        std::env::remove_var("OSH_TEST_STORED");
+        assert_eq!(
+            repo_secret(&ctx, "OSH_TEST_STORED").unwrap(),
+            secret_value()
+        );
+        assert!(repo_secret(&ctx, "OSH_TEST_NOPE")
+            .unwrap_err()
+            .contains("secret set"));
     }
 
     #[test]
