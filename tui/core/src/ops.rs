@@ -125,19 +125,16 @@ fn check_repo_var(ctx: &Ctx, var: &str) -> Result<(), String> {
 
 /// What the refusal tells the agent to ask for. The name is the agent's own text, so it only
 /// appears in a command line when it is a plain variable name.
-fn secret_hint(ctx: &Ctx, var: &str) -> String {
-    let stored = crate::secrets::list(&ctx.dir);
-    let have = if stored.is_empty() {
-        String::new()
-    } else {
-        format!("; stored tokens: {}", stored.join(", "))
-    };
+fn secret_hint(var: &str) -> String {
+    // The names already stored are not listed: a misled agent would learn which ones to target.
+    // The user names the one to use in their request.
     if crate::secrets::valid_name(var) {
         format!(
-            "to allow {var}, the user runs `osh mcp secret set {var}` in a terminal of their own, outside this chat (it asks for the token with a hidden prompt){have}"
+            "to allow {var}, the user runs `osh mcp secret set {var}` in a terminal of their own, outside this chat (it asks for the token with a hidden prompt)"
         )
     } else {
-        format!("a token is stored by the user with `osh mcp secret set NAME`, in a terminal of their own{have}")
+        "a token is stored by the user with `osh mcp secret set NAME`, in a terminal of their own"
+            .to_string()
     }
 }
 
@@ -147,12 +144,12 @@ fn allowed_by_list(ctx: &Ctx, var: &str) -> Result<(), String> {
         None => Ok(()),
         Some(list) if list.is_empty() => Err(format!(
             "repo grants are off: the server operator has not listed any variable in OSH_MCP_REPO_VARS and stored no token; {}",
-            secret_hint(ctx, var)
+            secret_hint(var)
         )),
         Some(list) if list.iter().any(|v| v == var) => Ok(()),
         Some(_) => Err(format!(
             "repo.env_var {var:?} is not one of the variables the server operator allows (OSH_MCP_REPO_VARS); {}",
-            secret_hint(ctx, var)
+            secret_hint(var)
         )),
     }
 }
@@ -220,7 +217,7 @@ fn repo_secret(ctx: &Ctx, var: &str) -> Result<String, String> {
             .map_err(|_| format!("environment variable {var} (repo.env_var) is not valid UTF-8")),
         _ => Err(format!(
             "environment variable {var} (repo.env_var) is unset or empty and no token is stored under that name; {}",
-            secret_hint(ctx, var)
+            secret_hint(var)
         )),
     }
 }
@@ -1351,8 +1348,8 @@ pub(crate) mod tests {
         sandbox_create(&ctx, &with_repo("OSH_TEST_STORED"), true).unwrap();
         let other = sandbox_create(&ctx, &with_repo("OSH_TEST_OTHER"), true).unwrap_err();
         assert!(
-            other.contains("OSH_TEST_STORED"),
-            "names what is stored: {other}"
+            !other.contains("OSH_TEST_STORED"),
+            "a refusal does not list the stored names: {other}"
         );
         assert!(!other.contains(&secret_value()), "{other}");
         // The stored token wins over a variable of the same name in the server's environment.

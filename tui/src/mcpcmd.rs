@@ -429,36 +429,52 @@ fn token_cmd() -> i32 {
     }
 }
 
-/// Read one line without echoing it. On a terminal the echo is switched off for the read and
-/// restored after; piped input is read as it comes (`printf %s "$T" | osh mcp secret set NAME`).
-fn read_hidden(prompt: &str) -> std::io::Result<String> {
-    use std::io::IsTerminal;
-    let tty = std::io::stdin().is_terminal();
-    let mut line = String::new();
-    if tty {
-        eprint!("{prompt}");
-        let _ = std::io::stderr().flush();
-        let saved = std::process::Command::new("stty")
-            .arg("-g")
-            .stdin(std::process::Stdio::inherit())
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        let _ = std::process::Command::new("stty")
-            .arg("-echo")
-            .stdin(std::process::Stdio::inherit())
-            .status();
-        let read = std::io::stdin().read_line(&mut line);
-        let _ = match saved {
-            Some(s) => std::process::Command::new("stty").arg(s).status(),
-            None => std::process::Command::new("stty").arg("echo").status(),
-        };
-        eprintln!();
-        read?;
-    } else {
-        std::io::stdin().read_line(&mut line)?;
+/// Raw mode off again however the read ends (an error, a cancel, a panic).
+struct RawGuard;
+
+impl Drop for RawGuard {
+    fn drop(&mut self) {
+        let _ = ratatui::crossterm::terminal::disable_raw_mode();
     }
+}
+
+/// Read one line without echoing it. On a terminal the keys are read in raw mode, so nothing is
+/// echoed and Ctrl-C or Esc arrive as keys: a cancel never leaves the terminal with its echo off,
+/// and when raw mode cannot be had the token is refused, not shown. Piped input is read as it
+/// comes (`printf %s "$T" | osh mcp secret set NAME`).
+fn read_hidden(prompt: &str) -> std::io::Result<String> {
+    use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+    use std::io::IsTerminal;
+    let mut line = String::new();
+    if !std::io::stdin().is_terminal() {
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line);
+    }
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    ratatui::crossterm::terminal::enable_raw_mode()?;
+    let _guard = RawGuard;
+    let cancelled = || std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled");
+    loop {
+        match event::read()? {
+            Event::Key(k) if k.kind != KeyEventKind::Release => match k.code {
+                KeyCode::Enter => break,
+                KeyCode::Esc => return Err(cancelled()),
+                KeyCode::Char('c' | 'd') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Err(cancelled())
+                }
+                KeyCode::Backspace => {
+                    line.pop();
+                }
+                KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => line.push(c),
+                _ => {}
+            },
+            Event::Paste(p) => line.push_str(p.trim_end_matches(['\r', '\n'])),
+            _ => {}
+        }
+    }
+    drop(_guard);
+    eprintln!();
     Ok(line)
 }
 
@@ -473,6 +489,10 @@ fn secret_cmd(act: SecretAct) -> i32 {
             }
             let value = match read_hidden(&format!("Token for {name} (input is hidden): ")) {
                 Ok(v) => v,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    eprintln!("\nosh: mcp: cancelled; nothing was stored");
+                    return 130;
+                }
                 Err(e) => {
                     eprintln!("osh: mcp: cannot read the token: {e}");
                     return 1;
