@@ -13,6 +13,7 @@ mod gwops;
 mod headless;
 mod logview;
 mod mcpcmd;
+mod mcpsvc;
 mod palette;
 mod ports;
 mod settingsview;

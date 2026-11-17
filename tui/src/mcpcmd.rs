@@ -16,6 +16,8 @@ use std::sync::Arc;
 const USAGE: &str = "usage: osh mcp [--gateway G]\n\
        osh mcp serve    run the HTTP server in the foreground (the service runs this)\n\
        osh mcp token    print the bearer token HTTP clients must present\n\
+       osh mcp start|stop|remove [--yes]    install and turn on, turn off, or delete the service\n\
+       osh mcp status   say whether the server is on\n\
 Serves MCP over stdio (newline-delimited JSON-RPC). What agents may do is set in osh.toml \
 (see `osh config`): mcp.allow_share lets specs mount host folders inside the directories in \
 mcp.share_roots, and mcp.repo_vars lists the variables a spec's repo.env_var may name. \
@@ -31,10 +33,35 @@ enum Mode {
     Stdio(Option<String>),
     Serve,
     Token,
+    Status,
+    /// `--yes` given: run the steps without asking.
+    Service(Verb, bool),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Verb {
+    Start,
+    Stop,
+    Remove,
 }
 
 fn mode(args: &[String]) -> Result<Mode, String> {
+    let verb = match args.first().map(String::as_str) {
+        Some("start") => Some(Verb::Start),
+        Some("stop") => Some(Verb::Stop),
+        Some("remove") => Some(Verb::Remove),
+        _ => None,
+    };
+    if let Some(v) = verb {
+        return match &args[1..] {
+            [] => Ok(Mode::Service(v, false)),
+            [y] if y == "--yes" => Ok(Mode::Service(v, true)),
+            [other, ..] => Err(format!("unexpected argument {other:?}")),
+        };
+    }
     match args.first().map(String::as_str) {
+        Some("status") if args.len() > 1 => Err(format!("unexpected argument {:?}", args[1])),
+        Some("status") => Ok(Mode::Status),
         Some("serve") | Some("token") if args.len() > 1 => {
             Err(format!("unexpected argument {:?}", args[1]))
         }
@@ -256,6 +283,72 @@ fn serve_cmd() -> i32 {
     }
 }
 
+/// One line for `osh mcp status`.
+fn status_line(svc: crate::mcpsvc::Svc, st: Option<&state::State>) -> String {
+    use crate::mcpsvc::Svc;
+    match (svc, st) {
+        (Svc::Running, Some(s)) => format!(
+            "MCP server: on, listening on {}, {} client{}",
+            s.listen,
+            s.clients.len(),
+            if s.clients.len() == 1 { "" } else { "s" }
+        ),
+        (Svc::Running, None) => "MCP server: on".into(),
+        (Svc::Stopped, _) => {
+            "MCP server: off (the service is installed; `osh mcp start` turns it on)".into()
+        }
+        (Svc::NotInstalled, _) => {
+            "MCP server: off (not installed; `osh mcp start` installs and starts it)".into()
+        }
+    }
+}
+
+/// `osh mcp start|stop|remove|status`: steps through the same consent as the gateway commands.
+fn service_cmd(m: &Mode) -> i32 {
+    use crate::mcpsvc::{self, Svc};
+    use std::io::IsTerminal;
+    let h = crate::platform::RealHost;
+    let f = crate::platform::gather(&h);
+    let p = crate::gateway::Paths::detect();
+    let svc = mcpsvc::status(f.os, &h, &p);
+    let (verb, yes) = match m {
+        Mode::Status => {
+            println!("{}", status_line(svc, state::read(&p.data).as_ref()));
+            return 0;
+        }
+        Mode::Service(v, y) => (*v, *y),
+        _ => return 2,
+    };
+    let steps = match (verb, svc) {
+        (Verb::Start, Svc::Running) => {
+            println!("The MCP server is already on.");
+            return 0;
+        }
+        (Verb::Start, Svc::NotInstalled) => mcpsvc::install_steps(&f, &p),
+        (Verb::Start, Svc::Stopped) => mcpsvc::start_steps(&f, &p),
+        (Verb::Stop, Svc::NotInstalled) => {
+            println!("The MCP server is not installed.");
+            return 0;
+        }
+        (Verb::Stop, _) => mcpsvc::stop_steps(&f, &p),
+        (Verb::Remove, Svc::NotInstalled) => {
+            println!("The MCP server is not installed.");
+            return 0;
+        }
+        (Verb::Remove, _) => mcpsvc::remove_steps(&f, &p),
+    };
+    let o = crate::setup::Options {
+        yes,
+        ..Default::default()
+    };
+    i32::from(!crate::setup::run_steps(
+        &h,
+        steps,
+        &o,
+        std::io::stdin().is_terminal(),
+    ))
+}
+
 fn token_cmd() -> i32 {
     let dir = osh_core::assets::data_dir();
     if let Err(e) = token::ensure(&dir) {
@@ -279,6 +372,7 @@ pub fn run(args: &[String]) -> i32 {
         Ok(Mode::Stdio(g)) => g,
         Ok(Mode::Serve) => return serve_cmd(),
         Ok(Mode::Token) => return token_cmd(),
+        Ok(m @ (Mode::Status | Mode::Service(..))) => return service_cmd(&m),
         Err(e) => {
             eprintln!("osh: {e}\n{USAGE}");
             return 2;
@@ -345,6 +439,46 @@ mod tests {
         assert!(mode(&a(&["serve", "--bogus"])).is_err());
         assert!(mode(&a(&["token", "x"])).is_err());
         assert!(mode(&a(&["--gateway"])).is_err());
+    }
+
+    #[test]
+    fn mode_accepts_the_service_verbs_with_an_optional_yes() {
+        assert_eq!(mode(&a(&["start"])), Ok(Mode::Service(Verb::Start, false)));
+        assert_eq!(
+            mode(&a(&["stop", "--yes"])),
+            Ok(Mode::Service(Verb::Stop, true))
+        );
+        assert_eq!(
+            mode(&a(&["remove", "--yes"])),
+            Ok(Mode::Service(Verb::Remove, true))
+        );
+        assert_eq!(mode(&a(&["status"])), Ok(Mode::Status));
+        assert!(mode(&a(&["start", "--bogus"])).is_err());
+        assert!(mode(&a(&["status", "--yes"])).is_err());
+    }
+
+    #[test]
+    fn the_status_line_says_on_off_or_not_installed() {
+        use crate::mcpsvc::Svc;
+        let st = osh_core::mcpserver::state::State {
+            pid: 1,
+            listen: "127.0.0.1:17800".into(),
+            started: 0,
+            version: "v".into(),
+            clients: vec![],
+        };
+        assert_eq!(
+            status_line(Svc::Running, Some(&st)),
+            "MCP server: on, listening on 127.0.0.1:17800, 0 clients"
+        );
+        assert_eq!(
+            status_line(Svc::Stopped, None),
+            "MCP server: off (the service is installed; `osh mcp start` turns it on)"
+        );
+        assert_eq!(
+            status_line(Svc::NotInstalled, None),
+            "MCP server: off (not installed; `osh mcp start` installs and starts it)"
+        );
     }
 
     #[test]

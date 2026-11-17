@@ -326,7 +326,7 @@ pub fn gateway_toml(spec: &GatewaySpec, os: Os) -> String {
 /// The folders `osh gateway-service` must resolve exactly as the process that wrote the service
 /// did: a launchd agent or systemd unit starts with none of the caller's environment, so a
 /// registry kept in a checkout (`OSH_DIR`) or a custom `XDG_CONFIG_HOME` would not be found.
-fn service_env(p: &Paths) -> Vec<(&'static str, String)> {
+pub(crate) fn service_env(p: &Paths) -> Vec<(&'static str, String)> {
     vec![
         ("OSH_DIR", p.data.to_string_lossy().into_owned()),
         (
@@ -393,17 +393,19 @@ pub fn launchd_plist(spec: &GatewaySpec, p: &Paths, logs: &Path) -> String {
         &["gateway-service", &spec.name],
         &env,
         logs,
+        "gateway",
     )
 }
 
 /// A launchd agent that runs `exe ARGS...` with Homebrew's folders on PATH plus `env`, and keeps
 /// it alive while it fails.
-fn agent_plist(
+pub(crate) fn agent_plist(
     label: &str,
     exe: &Path,
     args: &[&str],
     env: &[(&str, &str)],
     logs: &Path,
+    log_stem: &str,
 ) -> String {
     let esc = |t: &str| {
         t.replace('&', "&amp;")
@@ -428,13 +430,14 @@ fn agent_plist(
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>{env}</dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>StandardOutPath</key><string>{logs}/gateway.out.log</string>
-  <key>StandardErrorPath</key><string>{logs}/gateway.err.log</string>
+  <key>StandardOutPath</key><string>{logs}/{log_stem}.out.log</string>
+  <key>StandardErrorPath</key><string>{logs}/{log_stem}.err.log</string>
 </dict></plist>
 "#,
         label = esc(label),
         exe = path(exe),
-        logs = path(logs)
+        logs = path(logs),
+        log_stem = esc(log_stem)
     )
 }
 
@@ -449,6 +452,7 @@ pub fn legacy_docker_plist(p: &Paths) -> String {
         &["gateway-service", "docker"],
         &[("OSH_DIR", &p.data.to_string_lossy())],
         &p.state.join("gateway-docker"),
+        "gateway",
     )
 }
 
