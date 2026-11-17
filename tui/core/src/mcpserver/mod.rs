@@ -2,4 +2,5 @@
 //! dashboard reads. The protocol itself stays in `crate::mcp`.
 
 pub mod http;
+pub mod state;
 pub mod token;
