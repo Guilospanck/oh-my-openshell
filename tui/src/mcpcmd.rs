@@ -1,12 +1,21 @@
 //! `osh mcp [--gateway G]`: the stdio loop around `osh_core::mcp::handle`. Stdout carries
 //! protocol lines only; diagnostics go to stderr and never include request bodies.
+//! `osh mcp serve` is the same server over HTTP, kept running (see `osh_core::mcpserver`), and
+//! `osh mcp token` prints the bearer token its clients present.
 
 use osh_core::mcp;
+use osh_core::mcpserver::{http, state, token};
 use osh_core::ops::Ctx;
+use osh_core::settings;
 use std::io::{BufRead, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 const USAGE: &str = "usage: osh mcp [--gateway G]\n\
+       osh mcp serve    run the HTTP server in the foreground (the service runs this)\n\
+       osh mcp token    print the bearer token HTTP clients must present\n\
 Serves MCP over stdio (newline-delimited JSON-RPC). What agents may do is set in osh.toml \
 (see `osh config`): mcp.allow_share lets specs mount host folders inside the directories in \
 mcp.share_roots, and mcp.repo_vars lists the variables a spec's repo.env_var may name. \
@@ -16,6 +25,24 @@ OSH_MCP_ALLOW_SHARE=1, OSH_MCP_SHARE_ROOT (separated like PATH) and OSH_MCP_REPO
 /// The answer to a line that is not UTF-8: a parse error with no id, as for bad JSON.
 const NOT_UTF8: &str =
     r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error: not UTF-8"}}"#;
+
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    Stdio(Option<String>),
+    Serve,
+    Token,
+}
+
+fn mode(args: &[String]) -> Result<Mode, String> {
+    match args.first().map(String::as_str) {
+        Some("serve") | Some("token") if args.len() > 1 => {
+            Err(format!("unexpected argument {:?}", args[1]))
+        }
+        Some("serve") => Ok(Mode::Serve),
+        Some("token") => Ok(Mode::Token),
+        _ => parse(args).map(Mode::Stdio),
+    }
+}
 
 fn parse(args: &[String]) -> Result<Option<String>, String> {
     let mut gateway = None;
@@ -125,9 +152,133 @@ pub fn serve(input: impl BufRead, mut out: impl Write, ctx: &Ctx) -> std::io::Re
     Ok(())
 }
 
+/// The context for each HTTP request, built from the settings as they are now: a changed
+/// `osh.toml` applies to the next request without restarting the service. The variables still
+/// win over the file, as for stdio.
+fn ctx_source(
+    dir: PathBuf,
+    env: impl Fn(&str) -> Option<std::ffi::OsString> + Send + Sync + 'static,
+) -> impl Fn() -> Ctx + Send + Sync {
+    move || {
+        let snap = settings::load(&dir, &env);
+        let gateway = snap
+            .rows
+            .iter()
+            .find(|r| r.def.key == "mcp.server_gateway")
+            .and_then(|r| match &r.value {
+                settings::Value::Str(s) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            });
+        build_ctx(gateway, &snap).0
+    }
+}
+
+/// A line to print when the server listens beyond this machine, `None` for loopback.
+fn exposure_note(ip: IpAddr) -> Option<String> {
+    (!ip.is_loopback()).then(|| {
+        format!(
+            "osh: mcp: listening on {ip}, which other machines may reach; every request needs the \
+             bearer token (`osh mcp token`), and the address belongs behind a VPN or tunnel"
+        )
+    })
+}
+
+/// Claim the state file, then listen. A taken port gives back the claim, so the dashboard
+/// does not show a server that never started; a live server elsewhere is never disturbed.
+fn bind_and_claim(dir: &Path, ip: IpAddr, port: u16) -> Result<TcpListener, String> {
+    let wanted = SocketAddr::new(ip, port);
+    state::claim(dir, &wanted.to_string())?;
+    TcpListener::bind(wanted).map_err(|e| {
+        let _ = std::fs::remove_file(state::path(dir));
+        format!("cannot listen on {wanted}: {e}")
+    })
+}
+
+fn serve_cmd() -> i32 {
+    let dir = osh_core::assets::data_dir();
+    if let Err(e) = token::ensure(&dir) {
+        eprintln!("osh: mcp: cannot create the token file: {e}");
+        return 1;
+    }
+    settings::init(&dir);
+    let snap = settings::snapshot();
+    for p in snap
+        .problems
+        .iter()
+        .filter(|p| p.key.as_deref().is_none_or(|k| k.starts_with("mcp.")))
+    {
+        eprintln!("osh: mcp: {}", p.msg);
+    }
+    let ip = settings::mcp_server_bind()
+        .parse::<IpAddr>()
+        .unwrap_or_else(|_| "127.0.0.1".parse().expect("a literal address"));
+    let port = settings::mcp_server_port();
+    let listener = match bind_and_claim(&dir, ip, port) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("osh: mcp: {e}");
+            return 1;
+        }
+    };
+    if let Some(note) = exposure_note(ip) {
+        eprintln!("{note}");
+    }
+    let listen = SocketAddr::new(ip, port).to_string();
+    let registry = Arc::new(state::Registry::new(
+        dir.clone(),
+        listen.clone(),
+        env!("CARGO_PKG_VERSION").into(),
+        settings::mcp_client_idle,
+    ));
+    registry.flush();
+    let ticker = registry.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        settings::reload_if_changed();
+        ticker.flush();
+    });
+    eprintln!("osh: mcp: listening on http://{listen}/mcp");
+    let result = http::serve(
+        listener,
+        dir.clone(),
+        Arc::new(ctx_source(dir, |k| std::env::var_os(k))),
+        registry.clone(),
+        http::Limits::default(),
+        Arc::new(AtomicBool::new(false)),
+    );
+    registry.remove();
+    match result {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("osh: mcp: {e}");
+            1
+        }
+    }
+}
+
+fn token_cmd() -> i32 {
+    let dir = osh_core::assets::data_dir();
+    if let Err(e) = token::ensure(&dir) {
+        eprintln!("osh: mcp: cannot create the token file: {e}");
+        return 1;
+    }
+    match token::read(&dir) {
+        Some(t) => {
+            println!("{t}");
+            0
+        }
+        None => {
+            eprintln!("osh: mcp: the token file is empty");
+            1
+        }
+    }
+}
+
 pub fn run(args: &[String]) -> i32 {
-    let gateway = match parse(args) {
-        Ok(g) => g,
+    let gateway = match mode(args) {
+        Ok(Mode::Stdio(g)) => g,
+        Ok(Mode::Serve) => return serve_cmd(),
+        Ok(Mode::Token) => return token_cmd(),
         Err(e) => {
             eprintln!("osh: {e}\n{USAGE}");
             return 2;
@@ -166,6 +317,107 @@ mod tests {
             share_roots: Some(Vec::new()),
             version: env!("CARGO_PKG_VERSION").into(),
         }
+    }
+
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tmp(tag: &str) -> Tmp {
+        let d = std::env::temp_dir().join(format!("osh-mcpcmd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        Tmp(d)
+    }
+
+    #[test]
+    fn mode_accepts_serve_and_token_and_keeps_stdio() {
+        assert_eq!(mode(&a(&[])), Ok(Mode::Stdio(None)));
+        assert_eq!(
+            mode(&a(&["--gateway", "x"])),
+            Ok(Mode::Stdio(Some("x".into())))
+        );
+        assert_eq!(mode(&a(&["serve"])), Ok(Mode::Serve));
+        assert_eq!(mode(&a(&["token"])), Ok(Mode::Token));
+        assert!(mode(&a(&["serve", "--bogus"])).is_err());
+        assert!(mode(&a(&["token", "x"])).is_err());
+        assert!(mode(&a(&["--gateway"])).is_err());
+    }
+
+    #[test]
+    fn the_server_context_follows_settings_changes_without_a_restart() {
+        let d = tmp("ctx");
+        let file = d.0.join("osh.toml");
+        let src = ctx_source(d.0.clone(), |_| None);
+        assert!(!src().allow_share);
+        assert_eq!(src().gateway, None);
+        std::fs::write(
+            &file,
+            "[mcp]\nallow_share = true\nserver_gateway = \"openshell-docker\"\nrepo_vars = [\"MY_FORGE_VAR\"]\n",
+        )
+        .unwrap();
+        let c = src();
+        assert!(c.allow_share);
+        assert_eq!(c.gateway.as_deref(), Some("openshell-docker"));
+        assert_eq!(c.repo_vars, Some(vec!["MY_FORGE_VAR".to_string()]));
+        // The variables still win over the file, as for stdio `osh mcp`.
+        let forced = ctx_source(d.0.clone(), |k| {
+            (k == "OSH_MCP_REPO_VARS").then(|| "ONLY_THIS".into())
+        });
+        assert_eq!(forced().repo_vars, Some(vec!["ONLY_THIS".to_string()]));
+        // Share and repo limits are never absent: `None` would mean no check at all.
+        assert!(c.share_roots.is_some() && c.refuse_risky_share);
+    }
+
+    #[test]
+    fn a_taken_port_is_a_clear_error_and_leaves_no_claim_behind() {
+        let d = tmp("port");
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        let e = bind_and_claim(&d.0, "127.0.0.1".parse().unwrap(), port).unwrap_err();
+        assert!(e.contains(&format!("127.0.0.1:{port}")), "{e}");
+        assert!(
+            osh_core::mcpserver::state::read(&d.0).is_none(),
+            "a claim this server could not use is released"
+        );
+        assert!(!osh_core::mcpserver::state::path(&d.0).exists());
+    }
+
+    #[test]
+    fn a_live_other_server_keeps_its_state_file() {
+        let d = tmp("other");
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let theirs = format!(
+            r#"{{"pid":{},"listen":"127.0.0.1:1","started":1,"version":"v","clients":[]}}"#,
+            other.id()
+        );
+        std::fs::write(osh_core::mcpserver::state::path(&d.0), &theirs).unwrap();
+        let e = bind_and_claim(&d.0, "127.0.0.1".parse().unwrap(), 0).unwrap_err();
+        assert!(
+            e.contains("already running") && e.contains("127.0.0.1:1"),
+            "{e}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(osh_core::mcpserver::state::path(&d.0)).unwrap(),
+            theirs
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    #[test]
+    fn only_a_loopback_bind_is_quiet() {
+        assert!(exposure_note("127.0.0.1".parse().unwrap()).is_none());
+        assert!(exposure_note("::1".parse().unwrap()).is_none());
+        let n = exposure_note("10.1.2.3".parse().unwrap()).unwrap();
+        assert!(n.contains("10.1.2.3") && n.contains("token"), "{n}");
+        assert!(exposure_note("0.0.0.0".parse().unwrap()).is_some());
     }
 
     #[test]
