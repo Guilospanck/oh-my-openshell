@@ -36,15 +36,40 @@ pub enum Tab {
     Profiles,
     Images,
     Gateways,
+    Mcp,
 }
 
-pub const TABS: [(Tab, &str); 5] = [
+pub const TABS: [(Tab, &str); 6] = [
     (Tab::Sandboxes, "Sandboxes"),
     (Tab::Providers, "Providers"),
     (Tab::Profiles, "Profiles"),
     (Tab::Images, "Images"),
     (Tab::Gateways, "Gateways"),
+    (Tab::Mcp, "MCP"),
 ];
+
+/// What the MCP tab shows. Read from the service manager's files and the server's state file,
+/// and only while the tab is open (see `App::tick`).
+pub struct McpView {
+    pub svc: crate::mcpsvc::Svc,
+    pub state: Option<osh_core::mcpserver::state::State>,
+    pub checked: Option<Instant>,
+}
+
+impl Default for McpView {
+    fn default() -> McpView {
+        McpView {
+            svc: crate::mcpsvc::Svc::NotInstalled,
+            state: None,
+            checked: None,
+        }
+    }
+}
+
+/// The address MCP clients connect to, from the server's `listen` (`127.0.0.1:17800`).
+pub(crate) fn mcp_url(listen: &str) -> String {
+    format!("http://{listen}/mcp")
+}
 
 /// Entry in the Providers tab's create list that starts the repo token flow.
 /// How long an alert stays top-right.
@@ -726,7 +751,8 @@ pub struct App {
     pub config_stale: bool,
     pub tab: Tab,
     pub snap: Snapshot,
-    pub cursor: [usize; 5],
+    pub cursor: [usize; 6],
+    pub mcp: McpView,
     pub modal: Option<Modal>,
     /// Full-screen live log viewer; takes over the keyboard while open.
     pub logview: Option<LogView>,
@@ -1101,7 +1127,8 @@ impl App {
             dir,
             tab: Tab::Sandboxes,
             snap: Snapshot::default(),
-            cursor: [0; 5],
+            cursor: [0; 6],
+            mcp: McpView::default(),
             modal: None,
             logview: None,
             status: "Loading...".into(),
@@ -1177,7 +1204,7 @@ impl App {
             ..Default::default()
         };
         let on_gateways = self.cursor[4];
-        self.cursor = [0; 5];
+        self.cursor = [0; 6];
         self.cursor[4] = on_gateways;
         self.awaiting_snapshot = true;
         self.status = format!("Switching to {name}...");
@@ -1226,6 +1253,7 @@ impl App {
             Tab::Profiles => self.profile_rows().len(),
             Tab::Images => self.snap.images.len(),
             Tab::Gateways => self.snap.gateways.len(),
+            Tab::Mcp => self.mcp.state.as_ref().map_or(0, |s| s.clients.len()),
         }
     }
 
@@ -1304,6 +1332,14 @@ impl App {
 
     /// Note a status change, so a focused shell can flash it.
     pub fn tick(&mut self) {
+        if self.tab == Tab::Mcp
+            && self
+                .mcp
+                .checked
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(2))
+        {
+            self.refresh_mcp();
+        }
         if self
             .status_at
             .as_ref()
@@ -5216,7 +5252,7 @@ impl App {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Tab => self.switch((self.idx() + 1) % TABS.len()),
             KeyCode::BackTab => self.switch((self.idx() + TABS.len() - 1) % TABS.len()),
-            KeyCode::Char(c @ '1'..='5') => self.switch(c as usize - '1' as usize),
+            KeyCode::Char(c @ '1'..='6') => self.switch(c as usize - '1' as usize),
             KeyCode::Char('j') | KeyCode::Down => self.mv(1),
             KeyCode::Char('k') | KeyCode::Up => self.mv(-1),
             KeyCode::Char('g') => self.switch_gateway(),
@@ -5330,6 +5366,63 @@ impl App {
 
     fn switch(&mut self, i: usize) {
         self.tab = TABS[i].0;
+        if self.tab == Tab::Mcp {
+            self.refresh_mcp();
+        }
+    }
+
+    /// Re-read whether the MCP server is installed and running, and who is connected.
+    fn refresh_mcp(&mut self) {
+        let os = if cfg!(target_os = "macos") {
+            osh_core::platform::Os::MacOs
+        } else {
+            osh_core::platform::Os::Linux
+        };
+        let mut p = crate::gateway::Paths::detect();
+        p.data = self.dir.clone();
+        self.mcp.svc = crate::mcpsvc::status(os, &osh_core::platform::RealHost, &p);
+        self.mcp.state = osh_core::mcpserver::state::read(&self.dir);
+        self.mcp.checked = Some(Instant::now());
+        let n = self.mcp.state.as_ref().map_or(0, |s| s.clients.len());
+        self.cursor[5] = self.cursor[5].min(n.saturating_sub(1));
+    }
+
+    /// `Enter` turns the server on or off (after a question); `t` copies its address.
+    fn mcp_key(&mut self, code: KeyCode) {
+        use crate::mcpsvc::Svc;
+        match code {
+            KeyCode::Enter => {
+                let (text, verb) = match self.mcp.svc {
+                    Svc::Running => (
+                        "Turn the MCP server off?\n\nClients lose their connection, and it stays off after the next login.",
+                        "stop",
+                    ),
+                    Svc::Stopped => (
+                        "Turn the MCP server on?\n\nosh starts its service and keeps it on at login.",
+                        "start",
+                    ),
+                    Svc::NotInstalled => (
+                        "Install the MCP server as a service and turn it on?\n\nosh writes a systemd user unit (Linux) or a launchd agent (macOS) that runs `osh mcp serve`, and starts it. It listens on 127.0.0.1 only, unless mcp.server_bind says otherwise; every request needs the token (`osh mcp token`).",
+                        "start",
+                    ),
+                };
+                self.modal = Some(Modal::Confirm {
+                    text: text.into(),
+                    kind: ConfKind::OshJob(vec!["mcp".into(), verb.into(), "--yes".into()]),
+                });
+            }
+            KeyCode::Char('t') => match (&self.mcp.state, self.mcp.svc) {
+                (Some(s), crate::mcpsvc::Svc::Running) => {
+                    let url = mcp_url(&s.listen);
+                    self.copy(&url, "copied");
+                    self.status = format!("Copied {url}");
+                }
+                _ => {
+                    self.status = "The MCP server is off: there is no address to copy".into();
+                }
+            },
+            _ => {}
+        }
     }
 
     fn mv(&mut self, d: i32) {
@@ -5347,6 +5440,7 @@ impl App {
             Tab::Providers => self.provider_key(code),
             Tab::Profiles => self.profile_key(code),
             Tab::Gateways => self.gateway_key(code),
+            Tab::Mcp => self.mcp_key(code),
             Tab::Images => {
                 if code == KeyCode::Char('n') {
                     return self.new_file(false);
@@ -6369,6 +6463,60 @@ mod tests {
         a.push_alert(alert("x"));
         a.toast.as_mut().unwrap().1 = ago(2);
         assert!(a.toast().is_none(), "toast_secs = 1");
+    }
+
+    #[test]
+    fn six_tabs_switch_with_tab_and_the_6_key() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('6'));
+        assert!(a.tab == Tab::Mcp);
+        press(&mut a, KeyCode::Tab);
+        assert!(a.tab == Tab::Sandboxes, "Tab wraps around");
+        press(&mut a, KeyCode::BackTab);
+        assert!(a.tab == Tab::Mcp, "Shift-Tab wraps the other way");
+    }
+
+    #[test]
+    fn enter_on_the_mcp_tab_offers_start_when_off_and_stop_when_on() {
+        use crate::mcpsvc::Svc;
+        let job = |a: &App| match &a.modal {
+            Some(Modal::Confirm {
+                text,
+                kind: ConfKind::OshJob(args),
+            }) => (text.clone(), args.clone()),
+            _ => panic!("a confirmation that runs an osh command"),
+        };
+        let mut a = app();
+        a.tab = Tab::Mcp;
+        a.mcp.svc = Svc::NotInstalled;
+        press(&mut a, KeyCode::Enter);
+        let (text, args) = job(&a);
+        assert_eq!(args, ["mcp", "start", "--yes"]);
+        assert!(text.to_lowercase().contains("install"), "{text}");
+        a.modal = None;
+        a.mcp.svc = Svc::Stopped;
+        press(&mut a, KeyCode::Enter);
+        let (text, args) = job(&a);
+        assert_eq!(args, ["mcp", "start", "--yes"]);
+        assert!(!text.to_lowercase().contains("install"), "{text}");
+        a.modal = None;
+        a.mcp.svc = Svc::Running;
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(job(&a).1, ["mcp", "stop", "--yes"]);
+    }
+
+    #[test]
+    fn t_on_the_mcp_tab_says_so_when_there_is_no_address_to_copy() {
+        let mut a = app();
+        a.tab = Tab::Mcp;
+        press(&mut a, KeyCode::Char('t'));
+        assert!(a.status.contains("off"), "{}", a.status);
+        assert_eq!(
+            mcp_url("127.0.0.1:17800"),
+            "http://127.0.0.1:17800/mcp",
+            "the address clients connect to"
+        );
+        assert_eq!(mcp_url("[::1]:17800"), "http://[::1]:17800/mcp");
     }
 
     fn settings_app(tag: &str) -> App {

@@ -20,7 +20,7 @@ def sh(cmd, timeout=120):
     return r.returncode, (r.stdout + r.stderr)
 
 GW = os.environ.get("OSH_GATEWAY", "")
-TABS = {"1": "PHASE", "2": "CREDENTIAL KEYS", "3": "ON GATEWAY", "4": "DOCKERFILE", "5": "GATEWAY"}
+TABS = {"1": "PHASE", "2": "CREDENTIAL KEYS", "3": "ON GATEWAY", "4": "DOCKERFILE", "5": "GATEWAY", "6": "MCP server"}
 
 def osc(args, timeout=120):
     return sh(f"openshell {'-g ' + GW if GW else ''} {args}", timeout)
@@ -141,6 +141,7 @@ def nav_tabs():
         o.press("1"); o.wait(TABS["1"], 10)
         o.press("tab"); o.wait(TABS["2"], 10)
         o.press("backtab"); o.wait(TABS["1"], 10)
+        o.press("backtab"); o.wait(TABS["6"], 10)
         o.press("backtab"); o.wait(TABS["5"], 10)
 
 @scenario("nav-move")
@@ -886,6 +887,16 @@ def gateway_vm_size():
         move_to(o, vm.split()[0])
         o.press("V"); o.wait("vCPUs for every sandbox", 10)
         o.press("esc")
+
+@scenario("mcp-onoff")
+def mcp_onoff():
+    """The MCP tab says the server is off and offers to install and start it; the question can be
+    declined. (Installing a service is not done here: the real systemd run in tests/linux does it.)"""
+    with dashboard() as o:
+        o.press("6"); o.wait("MCP server", 10)
+        o.wait("off", 5)
+        o.press("enter"); o.wait("Install the MCP server", 5)
+        o.press("n"); o.wait_gone("Install the MCP server", 5)
 
 @scenario("gateway-restart")
 def gateway_restart():

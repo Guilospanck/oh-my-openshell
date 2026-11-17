@@ -253,6 +253,19 @@ pub const ACTIONS: &[Action] = &[
     a(Global, "3", KeyCode::Char('3'), "Go to Profiles"),
     a(Global, "4", KeyCode::Char('4'), "Go to Images"),
     a(Global, "5", KeyCode::Char('5'), "Go to Gateways"),
+    a(Global, "6", KeyCode::Char('6'), "Go to MCP"),
+    a(
+        T(Tab::Mcp),
+        "Enter",
+        KeyCode::Enter,
+        "Turn the MCP server on or off",
+    ),
+    a(
+        T(Tab::Mcp),
+        "t",
+        KeyCode::Char('t'),
+        "Copy the MCP server's address",
+    ),
     a(Global, "g", KeyCode::Char('g'), "Switch gateway"),
     a(Global, "r", KeyCode::Char('r'), "Refresh"),
     a(

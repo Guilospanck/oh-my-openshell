@@ -394,6 +394,7 @@ fn draw_screen(f: &mut Frame, app: &App) {
         Tab::Profiles => draw_profiles(f, app, rows[2]),
         Tab::Images => draw_images(f, app, rows[2]),
         Tab::Gateways => draw_gateways(f, app, rows[2]),
+        Tab::Mcp => draw_mcp(f, app, rows[2]),
     }
     let mut lines = status;
     lines.extend(help);
@@ -453,10 +454,12 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         } else {
             format!(" {gw}")
         };
-        (
-            vec![format!("connecting{g}..."), "connecting...".into()],
-            role::WARN,
-        )
+        // On a narrow screen the gateway's name matters more than the word "connecting".
+        let mut variants = vec![format!("connecting{g}..."), "connecting...".into()];
+        if !gw.is_empty() {
+            variants.insert(1, gw.clone());
+        }
+        (variants, role::WARN)
     } else if app.snap.gateway_ok {
         let driver = if app.snap.driver.is_empty() {
             String::new()
@@ -905,9 +908,96 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+const MCP_COLS: Cols = &[
+    ("CLIENT", 10),
+    ("VERSION", 7),
+    ("PEER", 12),
+    ("LAST SEEN", 9),
+];
+
+/// How long ago `then` was as one short word (`now`, `10s`, `5m`, `2h`); both are Unix seconds.
+pub(crate) fn ago(now: u64, then: u64) -> String {
+    match now.saturating_sub(then) {
+        0 => "now".into(),
+        d @ 1..=59 => format!("{d}s"),
+        d @ 60..=3599 => format!("{}m", d / 60),
+        d => format!("{}h", d / 3600),
+    }
+}
+
+/// The MCP tab: whether the server is on, its address, and the clients that called it lately.
+fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
+    use crate::mcpsvc::Svc;
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(3)])
+        .split(area);
+    let ok = Style::default().fg(role::OK);
+    let (head, hint) = match (app.mcp.svc, &app.mcp.state) {
+        (Svc::Running, Some(s)) => (
+            dot(&format!("on, listening on {}", s.listen), ok),
+            format!(
+                "Clients connect to {} with the token from `osh mcp token`.",
+                crate::app::mcp_url(&s.listen)
+            ),
+        ),
+        (Svc::Running, None) => (dot("on", ok), String::new()),
+        (Svc::Stopped, _) => (
+            dot("off (the service is installed)", role::dim()),
+            "Enter  turn it on".to_string(),
+        ),
+        (Svc::NotInstalled, _) => (
+            dot("off (not installed)", role::dim()),
+            "Enter  install the service and turn it on".to_string(),
+        ),
+    };
+    let block = panel("MCP server", None);
+    let inner = block.inner(rows[0]);
+    f.render_widget(block, rows[0]);
+    f.render_widget(
+        Paragraph::new(vec![head, Line::styled(hint, role::dim())]),
+        inner,
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let clients = app.mcp.state.as_ref().map(|s| s.clients.as_slice());
+    match clients {
+        Some(list) if !list.is_empty() => {
+            let cells = list
+                .iter()
+                .map(|c| {
+                    vec![
+                        if c.name.is_empty() {
+                            Line::styled("(no name)", role::dim())
+                        } else {
+                            Line::from(c.name.clone())
+                        },
+                        Line::styled(c.version.clone(), role::dim()),
+                        Line::styled(c.peer.clone(), role::dim()),
+                        Line::styled(ago(now, c.last_seen), role::dim()),
+                    ]
+                })
+                .collect();
+            draw_table(f, rows[1], "Clients", MCP_COLS, cells, app.cursor[5], false);
+        }
+        _ => {
+            let (what, hint) = if app.mcp.svc == Svc::Running {
+                (
+                    "No clients connected",
+                    "A client shows up here when it calls the server.",
+                )
+            } else {
+                ("The MCP server is off", "")
+            };
+            empty_state(f, rows[1], "Clients", MCP_COLS, what, hint);
+        }
+    }
+}
+
 /// The keys every tab has, last in the footer.
 pub const GLOBAL_HELP: &str =
-    "Tab/1-5 switch  j/k move  g gateway  r refresh  c osh config  ! alerts  ? help  : commands  q quit";
+    "Tab/1-6 switch  j/k move  g gateway  r refresh  c osh config  ! alerts  ? help  : commands  q quit";
 
 /// The per-tab key hints in the footer.
 pub fn footer_help(tab: Tab) -> &'static str {
@@ -917,6 +1007,7 @@ pub fn footer_help(tab: Tab) -> &'static str {
         Tab::Profiles => "u / Enter import or update from providers/  e file  n new",
         Tab::Images => "b / Enter build  e Dockerfile  n new",
         Tab::Gateways => "Enter select  s make default  a add  R start/restart  l log  e config  V VM size  d wipe (delete all data)  x remove",
+        Tab::Mcp => "Enter on/off  t copy address",
     }
 }
 
@@ -1420,11 +1511,11 @@ pub fn help_lines(tab: Tab) -> Vec<Line<'static>> {
             .filter(|x| {
                 x.scope == Scope::Global
                     && !x.key.is_empty()
-                    && !matches!(x.key, "1" | "2" | "3" | "4" | "5")
+                    && !matches!(x.key, "1" | "2" | "3" | "4" | "5" | "6")
             })
             .map(|x| key_row(x.key, x.title)),
     );
-    out.push(key_row("1-5", "Go to a tab"));
+    out.push(key_row("1-6", "Go to a tab"));
     out.push(key_row(
         ": or Ctrl-P",
         "Command palette: type to find any action",
@@ -2402,6 +2493,55 @@ mod tests {
         let buf = term.backend().buffer().clone();
         let all = buf.content().iter().map(|c| c.symbol()).collect();
         (all, buf)
+    }
+
+    #[test]
+    fn the_mcp_tab_says_off_then_lists_the_connected_clients() {
+        use crate::mcpsvc::Svc;
+        use osh_core::mcpserver::state::{Client, State};
+        let mut app = usage_app("vm");
+        app.tab = Tab::Mcp;
+        app.mcp.svc = Svc::NotInstalled;
+        let (all, _) = screen(&app, 120, 30);
+        assert!(
+            all.contains("MCP server") && all.contains("not installed"),
+            "{all}"
+        );
+        assert!(all.contains("Enter"), "says how to turn it on: {all}");
+        app.mcp.svc = Svc::Running;
+        app.mcp.state = Some(State {
+            pid: 1,
+            listen: "127.0.0.1:17800".into(),
+            started: 0,
+            version: "0.6.0".into(),
+            clients: vec![Client {
+                session: "s1".into(),
+                peer: "10.0.0.5".into(),
+                name: "factory".into(),
+                version: "0.3".into(),
+                first_seen: 100,
+                last_seen: 190,
+            }],
+        });
+        let (all, _) = screen(&app, 120, 30);
+        for want in [
+            "127.0.0.1:17800",
+            "factory",
+            "0.3",
+            "10.0.0.5",
+            "osh mcp token",
+        ] {
+            assert!(all.contains(want), "{want}: {all}");
+        }
+    }
+
+    #[test]
+    fn ago_reads_seconds_minutes_and_hours() {
+        assert_eq!(ago(100, 100), "now");
+        assert_eq!(ago(100, 90), "10s");
+        assert_eq!(ago(1000, 700), "5m");
+        assert_eq!(ago(100_000, 90_000), "2h");
+        assert_eq!(ago(10, 20), "now", "a clock that went backwards");
     }
 
     #[test]

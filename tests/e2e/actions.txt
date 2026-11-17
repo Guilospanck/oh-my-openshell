@@ -3,7 +3,7 @@
 # tests/e2e guard (a unit test in tui/src/app.rs) fails when the footer has a key that is not
 # listed here, or a listed scenario does not exist. Add the key, then write the scenario.
 global | Tab | nav-tabs
-global | 1-5 | nav-tabs
+global | 1-6 | nav-tabs
 global | j | nav-move
 global | k | nav-move
 global | g | nav-gateway
@@ -46,6 +46,8 @@ Gateways | R | gateway-restart
 Gateways | l | gateway-log
 Gateways | e | gateway-config
 Gateways | V | gateway-vm-size
+MCP | Enter | mcp-onoff
+MCP | t | SKIP: copies to the host clipboard, which no test machine has; a unit test covers the address and the empty case
 shell | ctrl-] menu | shell-menu
 palette | Edit toolchains.toml | editor-toolchains
 palette | Data files | data-files
