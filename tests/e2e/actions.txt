@@ -7,6 +7,7 @@ global | 1-6 | nav-tabs
 global | j | nav-move
 global | k | nav-move
 global | / | list-search
+global | click | mouse-dashboard
 global | g | nav-gateway
 global | r | nav-refresh
 global | c | settings-screen

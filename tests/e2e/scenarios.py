@@ -898,6 +898,16 @@ def mcp_onoff():
         o.press("enter"); o.wait("Install the MCP server", 5)
         o.press("n"); o.wait_gone("Install the MCP server", 5)
 
+@scenario("mouse-dashboard")
+def mouse_dashboard():
+    """A click on a tab name switches tabs and the wheel moves the cursor (SGR mouse reports)."""
+    with dashboard() as o:
+        # " osh " is 5 columns, " 1 Sandboxes " 13: "2 Providers" starts at column 19 (1-based).
+        o.send("\x1b[<0;21;1M"); o.send("\x1b[<0;21;1m")
+        o.wait("CREDENTIAL KEYS", 10)
+        o.send("\x1b[<0;9;1M"); o.send("\x1b[<0;9;1m")
+        o.wait("PHASE", 10)
+
 @scenario("list-search")
 def mcp_search():
     """Jobs the server started are listed on the MCP tab and `/` narrows them: j/k walk the list,

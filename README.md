@@ -108,6 +108,8 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 `zig@0.15` on PATH for the build; building by hand needs
 `PATH="$(brew --prefix zig@0.15)/bin:$PATH" LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast cargo build --release`.
 
+The mouse works on the dashboard too: a click on a tab name switches to it, a click on a row of a list (sandboxes, providers, profiles, images, gateways, the MCP tab's clients and jobs) puts the cursor there, and the wheel moves the cursor three rows (or scrolls an open key reference, permissions popup, text viewer or log view). A popup's question is never answered by a click: `y` and `n` stay the only ways. With the mouse captured, select text on the dashboard with `Shift` held (in a sandbox shell a plain drag selects and copies).
+
 Every list scrolls with `j`/`k` or the arrow keys, and a long one (sandboxes, providers, profiles, images, gateways, and the MCP tab's clients and jobs) shows `row/total` in its title. `/` searches the tab's list: type any part of a name, type, endpoint or state (case does not matter), `Enter` keeps the search, `Esc` clears it. Each tab keeps its own search, and an action such as `d` acts on the row the cursor is on among the matches.
 
 Two keys help you find your way on any tab: `?` opens the key reference for the tab you are on, and

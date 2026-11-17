@@ -190,12 +190,47 @@ fn full_row(cols: Cols, row: &[Line<'static>], width: usize) -> Vec<Line<'static
     out
 }
 
+/// Where the last frame put things a mouse can point at: the tab names and the rows of the
+/// table of the current tab. Drawing records them and `App::on_mouse` reads them, on one thread.
+#[derive(Clone, Default, Debug)]
+pub struct Hits {
+    /// Row of the tab bar, and per tab its columns `x0..x1` and index in `TABS`.
+    pub tab_y: u16,
+    pub tabs: Vec<(u16, u16, usize)>,
+    pub tables: Vec<TableHit>,
+}
+
+/// The visible rows `y0..y1` of a table across columns `x0..x1`; row `offset + k` is on line
+/// `y0 + k`. `id` is the tab's index for a list tab; 5 and 6 are the MCP tab's clients and jobs.
+#[derive(Clone, Debug)]
+pub struct TableHit {
+    pub id: u8,
+    pub x0: u16,
+    pub x1: u16,
+    pub y0: u16,
+    pub y1: u16,
+    pub offset: usize,
+    pub n: usize,
+}
+
+const NO_TABLE: u8 = u8::MAX;
+
+thread_local! {
+    static HITS: std::cell::RefCell<Hits> = std::cell::RefCell::new(Hits::default());
+}
+
+/// What the last frame drew that a click can hit.
+pub fn hits() -> Hits {
+    HITS.with(|h| h.borrow().clone())
+}
+
 /// The `cursor` of a table the cursor is not in.
 const NO_CURSOR: usize = usize::MAX;
 
 /// A tab's table in a panel titled `title`. Cells too wide for their column end in `…`; then
 /// (unless `elsewhere`, a details pane that already shows the selected row whole) the bottom of the
 /// panel shows the selected row in full, so no value is out of reach.
+#[allow(clippy::too_many_arguments)]
 fn draw_table(
     f: &mut Frame,
     area: Rect,
@@ -204,6 +239,7 @@ fn draw_table(
     cells: Vec<Vec<Line<'static>>>,
     cursor: usize,
     elsewhere: bool,
+    id: u8,
 ) {
     let n = cells.len();
     // A table the cursor is not in shows no highlighted row and no position.
@@ -261,13 +297,28 @@ fn draw_table(
         state = table_state(cursor);
     }
     f.render_stateful_widget(t, parts[0], &mut state);
+    if id != NO_TABLE {
+        // Rows start under the header and its spacer line.
+        let rows = parts[0];
+        HITS.with(|h| {
+            h.borrow_mut().tables.push(TableHit {
+                id,
+                x0: rows.x,
+                x1: rows.right(),
+                y0: rows.y + 2,
+                y1: rows.bottom(),
+                offset: state.offset(),
+                n,
+            })
+        });
+    }
     f.render_widget(Paragraph::new(strip), parts[1]);
 }
 
 /// What a list says when it is empty: the table's header stays (the columns tell which list
 /// this is), and below it the next step, centred and wrapped to the panel.
 fn empty_state(f: &mut Frame, area: Rect, title: &str, cols: Cols, what: &str, hint: &str) {
-    draw_table(f, area, title, cols, Vec::new(), 0, true);
+    draw_table(f, area, title, cols, Vec::new(), 0, true, NO_TABLE);
     let inner = area.inner(ratatui::layout::Margin::new(2, 1));
     let w = usize::from(inner.width);
     let mut lines: Vec<Line> = wrap_text(what, w)
@@ -331,6 +382,7 @@ fn draw_toast(f: &mut Frame, app: &App) {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
+    HITS.with(|h| *h.borrow_mut() = Hits::default());
     draw_screen(f, app);
     draw_toast(f, app);
 }
@@ -512,6 +564,20 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
         }
     }
     let (left, right) = chosen.unwrap_or_else(|| (tabs(true, false), right_of("")));
+    // Each tab's name is a click target: its spans come after the name, when it is shown.
+    HITS.with(|h| {
+        let mut h = h.borrow_mut();
+        h.tab_y = area.y;
+        let skip = left.spans.len().saturating_sub(TABS.len());
+        let mut x = area.x;
+        for (k, sp) in left.spans.iter().enumerate() {
+            let w = sp.width() as u16;
+            if k >= skip {
+                h.tabs.push((x, x + w, k - skip));
+            }
+            x += w;
+        }
+    });
     let rw = (right.width() as u16).min(area.width);
     f.render_widget(Paragraph::new(left), area);
     f.render_widget(
@@ -615,6 +681,7 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
             cells,
             app.cursor[0],
             true,
+            0,
         );
     }
 
@@ -815,6 +882,7 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
         cells,
         app.cursor[1],
         false,
+        1,
     );
 }
 
@@ -871,6 +939,7 @@ fn draw_profiles(f: &mut Frame, app: &App, area: Rect) {
         cells,
         app.cursor[2],
         false,
+        2,
     );
 }
 
@@ -927,6 +996,7 @@ fn draw_images(f: &mut Frame, app: &App, area: Rect) {
         cells,
         app.cursor[3],
         false,
+        3,
     );
 }
 
@@ -985,6 +1055,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
         cells,
         app.cursor[4],
         false,
+        4,
     );
 }
 
@@ -1111,6 +1182,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
                     NO_CURSOR
                 },
                 false,
+                5,
             );
         }
         _ => {
@@ -1176,7 +1248,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
         } else {
             app.cursor[5] - app.mcp_clients()
         };
-        draw_table(f, area, &jobs_title, JOB_COLS, cells, at, false);
+        draw_table(f, area, &jobs_title, JOB_COLS, cells, at, false, 6);
     }
 }
 
@@ -2865,6 +2937,148 @@ mod tests {
         let (all, _) = screen(&app, 120, 30);
         assert!(all.contains("y yes") && all.contains("n no"), "{all}");
         assert!(!all.contains("v details"), "{all}");
+    }
+
+    fn mouse(
+        kind: ratatui::crossterm::event::MouseEventKind,
+        column: u16,
+        row: u16,
+    ) -> ratatui::crossterm::event::MouseEvent {
+        ratatui::crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: ratatui::crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    fn click(app: &mut App, column: u16, row: u16) {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        app.on_mouse(mouse(MouseEventKind::Down(MouseButton::Left), column, row));
+    }
+
+    fn sandbox_app(n: usize) -> App {
+        let mut app = usage_app("vm");
+        app.snap.sandboxes = (0..n)
+            .map(|i| cli::Sandbox {
+                name: format!("sb{i:02}"),
+                phase: "Ready".into(),
+                created: "now".into(),
+                conditions: vec![],
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn clicking_a_tab_name_switches_to_that_tab() {
+        let mut app = sandbox_app(3);
+        screen(&app, 120, 30);
+        let h = hits();
+        let (x0, _, _) = *h.tabs.iter().find(|t| t.2 == 3).expect("the Images tab");
+        click(&mut app, x0 + 1, h.tab_y);
+        assert!(app.tab == Tab::Images);
+    }
+
+    #[test]
+    fn clicking_a_row_moves_the_cursor_there() {
+        let mut app = sandbox_app(5);
+        screen(&app, 120, 30);
+        let t = hits().tables.into_iter().find(|t| t.id == 0).unwrap();
+        click(&mut app, t.x0 + 1, t.y0 + 3);
+        assert_eq!(app.cursor[0], 3);
+        assert_eq!(
+            app.selected_sandbox().map(|s| s.name.as_str()),
+            Some("sb03")
+        );
+        click(&mut app, t.x0 + 1, t.y0 + 30);
+        assert_eq!(app.cursor[0], 3, "below the last row does nothing");
+    }
+
+    #[test]
+    fn a_click_in_a_scrolled_list_hits_the_row_under_it() {
+        let mut app = sandbox_app(40);
+        app.cursor[0] = 35;
+        screen(&app, 120, 24);
+        let t = hits().tables.into_iter().find(|t| t.id == 0).unwrap();
+        assert!(t.offset > 0, "scrolled");
+        click(&mut app, t.x0 + 1, t.y0);
+        assert_eq!(app.cursor[0], t.offset, "the first visible row");
+    }
+
+    #[test]
+    fn a_click_with_a_search_set_counts_the_matches() {
+        let mut app = sandbox_app(40);
+        app.filters[0] = "sb3".into();
+        screen(&app, 120, 24);
+        let t = hits().tables.into_iter().find(|t| t.id == 0).unwrap();
+        click(&mut app, t.x0 + 1, t.y0 + 2);
+        assert_eq!(
+            app.selected_sandbox().map(|s| s.name.as_str()),
+            Some("sb32")
+        );
+    }
+
+    #[test]
+    fn the_wheel_moves_the_cursor_three_rows_on_the_dashboard() {
+        use ratatui::crossterm::event::MouseEventKind;
+        let mut app = sandbox_app(20);
+        screen(&app, 120, 30);
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 10));
+        assert_eq!(app.cursor[0], 3);
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 10, 10));
+        assert_eq!(app.cursor[0], 0);
+        app.on_mouse(mouse(MouseEventKind::ScrollUp, 10, 10));
+        assert_eq!(app.cursor[0], 0, "stops at the top");
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_popup_and_a_click_never_answers_one() {
+        use ratatui::crossterm::event::MouseEventKind;
+        let mut app = sandbox_app(3);
+        app.modal = Some(Modal::Help { scroll: 0 });
+        screen(&app, 120, 30);
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 10));
+        assert!(matches!(app.modal, Some(Modal::Help { scroll }) if scroll > 0));
+        app.modal = Some(Modal::Confirm {
+            text: "Turn the MCP server off?".into(),
+            kind: crate::app::ConfKind::OshJob(vec!["mcp".into(), "stop".into()]),
+        });
+        screen(&app, 120, 30);
+        click(&mut app, 10, 10);
+        app.on_mouse(mouse(MouseEventKind::ScrollDown, 10, 10));
+        assert!(
+            matches!(app.modal, Some(Modal::Confirm { .. })),
+            "still asking"
+        );
+    }
+
+    #[test]
+    fn clicking_a_job_row_on_the_mcp_tab_puts_the_cursor_after_the_clients() {
+        use crate::mcpsvc::Svc;
+        let mut app = usage_app("vm");
+        app.tab = Tab::Mcp;
+        app.mcp.svc = Svc::NotInstalled;
+        app.mcp.jobs = (0..4u64)
+            .map(|n| osh_core::jobs::Job {
+                id: format!("j{n:016x}"),
+                gateway: "".into(),
+                sandbox: format!("box{n}"),
+                command: "sleep".into(),
+                started: 100,
+                state: "running".into(),
+                exit_code: None,
+                checked: 100,
+            })
+            .collect();
+        screen(&app, 120, 30);
+        let t = hits()
+            .tables
+            .into_iter()
+            .find(|t| t.id == 6)
+            .expect("the jobs table");
+        click(&mut app, t.x0 + 1, t.y0 + 2);
+        assert_eq!(app.cursor[5], 2, "no clients: the third job");
     }
 
     #[test]

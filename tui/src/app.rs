@@ -1723,6 +1723,80 @@ impl App {
                 self.copy(&text, "copied");
             }
         }
+        if self.session().is_none() && self.ext_session().is_none() {
+            self.on_dashboard_mouse(&me);
+        }
+    }
+
+    /// The mouse on the dashboard, a popup or the log view: the wheel scrolls (as `j`/`k` do),
+    /// a left click on a tab name switches to it and a click on a table row moves the cursor
+    /// there. A popup is never answered by a click: `y` and `n` stay the only ways.
+    fn on_dashboard_mouse(&mut self, me: &MouseEvent) {
+        use ratatui::crossterm::event::{MouseButton, MouseEventKind};
+        let wheel = match me.kind {
+            MouseEventKind::ScrollUp => Some(KeyCode::Up),
+            MouseEventKind::ScrollDown => Some(KeyCode::Down),
+            _ => None,
+        };
+        if let Some(lv) = &mut self.logview {
+            if let Some(code) = wheel {
+                for _ in 0..3 {
+                    lv.on_key(KeyEvent::from(code));
+                }
+            }
+            return;
+        }
+        if self.modal.is_some() {
+            let scrolls = matches!(
+                self.modal,
+                Some(Modal::Help { .. } | Modal::Providers { .. } | Modal::Viewer { .. })
+            );
+            if let (Some(code), true) = (wheel, scrolls) {
+                for _ in 0..3 {
+                    if let Some(m) = self.modal.take() {
+                        self.modal_key(m, KeyEvent::from(code));
+                    }
+                }
+            }
+            return;
+        }
+        if let Some(code) = wheel {
+            let d = if code == KeyCode::Up { -1 } else { 1 };
+            for _ in 0..3 {
+                self.mv(d);
+            }
+            return;
+        }
+        if me.kind != MouseEventKind::Down(MouseButton::Left) {
+            return;
+        }
+        let hits = crate::ui::hits();
+        if me.row == hits.tab_y {
+            if let Some((_, _, i)) = hits
+                .tabs
+                .iter()
+                .find(|(x0, x1, _)| (*x0..*x1).contains(&me.column))
+            {
+                self.switch(*i);
+            }
+            return;
+        }
+        let Some(t) = hits
+            .tables
+            .iter()
+            .find(|t| (t.x0..t.x1).contains(&me.column) && (t.y0..t.y1).contains(&me.row))
+        else {
+            return;
+        };
+        let row = t.offset + usize::from(me.row - t.y0);
+        if row >= t.n {
+            return;
+        }
+        match t.id {
+            0..=5 => self.cursor[usize::from(t.id)] = row,
+            _ => self.cursor[5] = self.mcp_clients() + row,
+        }
+        self.sync_selection();
     }
 
     /// Host clipboard: OSC 52 through the terminal, plus `pbcopy` on macOS.
