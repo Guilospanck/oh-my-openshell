@@ -245,7 +245,8 @@ code="$(curl -s -o /dev/null -w '%{http_code}' -m 10 -X POST -d "$init" "http://
 [[ "$code" == 401 ]] && pass "a request without the token is refused" || fail "a request without the token is refused" "code=$code"
 sleep 2
 grep -q real-suite "$data/mcp-server.json" && pass "the client is listed in the state file" || fail "the client is listed in the state file"
-check "the token is not in the state file" bash -c "! grep -q \"\$(osh mcp token)\" '$data/mcp-server.json'"
+# The token is the pattern file (a process substitution), so it is never on a command line.
+check "the token is not in the state file" bash -c "! grep -qFf <(osh mcp token) '$data/mcp-server.json'"
 osh mcp stop --yes >"$log" 2>&1; rc=$?
 [[ $rc -eq 0 ]] && pass "osh mcp stop exits 0" || { fail "osh mcp stop" "rc=$rc"; tail -20 "$log"; }
 check "the service is inactive" bash -c '! systemctl --user is-active --quiet osh-mcp.service'
