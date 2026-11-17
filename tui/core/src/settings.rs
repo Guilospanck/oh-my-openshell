@@ -19,6 +19,22 @@ pub enum Kind {
     PathList,
     /// Environment variable names.
     NameList,
+    /// A whole number in `min..=max` that is not a duration (a port).
+    Count {
+        min: u64,
+        max: u64,
+    },
+    /// Text that must satisfy `TextRule`.
+    Text(TextRule),
+}
+
+/// What a `Kind::Text` value must look like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextRule {
+    /// An IPv4 or IPv6 address.
+    IpAddress,
+    /// Empty, or a gateway name (letters, digits, `.`, `_`, `-`; not starting with `-`).
+    GatewayName,
 }
 
 /// When a changed value reaches the running program.
@@ -78,7 +94,7 @@ const fn secs(
     }
 }
 
-static REGISTRY: [Def; 14] = [
+static REGISTRY: [Def; 18] = [
     Def {
         key: "general.editor",
         kind: Kind::Choice(EDITORS),
@@ -128,6 +144,31 @@ static REGISTRY: [Def; 14] = [
         env: Some(MCP_VARS_ENV),
         desc: "Environment variable names agents may name as a git credential. The environment variable (comma-separated) replaces this list.",
     },
+    Def {
+        key: "mcp.server_bind",
+        kind: Kind::Text(TextRule::IpAddress),
+        default: "\"127.0.0.1\"",
+        effect: Effect::RestartMcp,
+        env: None,
+        desc: "The address osh mcp serve listens on. Anything but a loopback address (127.0.0.1, ::1) is reachable by other machines, so it is protected by the token and should sit behind a VPN or tunnel.",
+    },
+    Def {
+        key: "mcp.server_port",
+        kind: Kind::Count { min: 1024, max: 65535 },
+        default: "17800",
+        effect: Effect::RestartMcp,
+        env: None,
+        desc: "The port osh mcp serve listens on.",
+    },
+    Def {
+        key: "mcp.server_gateway",
+        kind: Kind::Text(TextRule::GatewayName),
+        default: "\"\"",
+        effect: Effect::RestartMcp,
+        env: None,
+        desc: "The gateway the MCP server uses when a call names none. Empty means OpenShell's active gateway.",
+    },
+    secs("mcp.client_idle_secs", 10, 86400, "600", Effect::Live, "How long a client may stay silent before the MCP server stops listing it as connected."),
 ];
 
 pub fn registry() -> &'static [Def] {
@@ -223,6 +264,30 @@ pub(crate) fn from_toml(d: &Def, v: &toml::Value) -> Result<Value, String> {
             Some(s) if c.contains(&s) => Ok(Value::Str(s.into())),
             _ => Err(format!("expected one of: {}", c.join(", "))),
         },
+        Kind::Count { min, max } => match v.as_integer() {
+            Some(n) if n >= min as i64 && n <= max as i64 => Ok(Value::Int(n as u64)),
+            Some(n) => Err(format!("{n} is outside {min} to {max}")),
+            None => Err("expected a whole number".into()),
+        },
+        Kind::Text(rule) => {
+            let s = v.as_str().ok_or("expected text")?;
+            match rule {
+                TextRule::IpAddress => s
+                    .parse::<std::net::IpAddr>()
+                    .map(|_| Value::Str(s.into()))
+                    .map_err(|_| format!("{s:?} is not an IP address")),
+                TextRule::GatewayName => {
+                    let ok = !s.starts_with('-')
+                        && s.chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+                    if ok {
+                        Ok(Value::Str(s.into()))
+                    } else {
+                        Err(format!("{s:?} is not a gateway name"))
+                    }
+                }
+            }
+        }
         Kind::PathList => {
             let l = strings(v)?;
             if let Some(bad) = l.iter().find(|p| !Path::new(p).is_absolute()) {
@@ -254,7 +319,11 @@ pub fn parse_value(d: &Def, text: &str) -> Result<Value, String> {
             t.parse::<i64>()
                 .map_err(|_| format!("{t:?} is not a whole number of seconds"))?,
         ),
-        Kind::Choice(_) => toml::Value::String(t.into()),
+        Kind::Count { .. } => toml::Value::Integer(
+            t.parse::<i64>()
+                .map_err(|_| format!("{t:?} is not a whole number"))?,
+        ),
+        Kind::Choice(_) | Kind::Text(_) => toml::Value::String(t.into()),
         Kind::PathList | Kind::NameList => toml::Value::Array(
             t.split(if d.kind == Kind::PathList { ':' } else { ',' })
                 .map(str::trim)
@@ -1104,6 +1173,19 @@ pub fn mcp_share_roots() -> Vec<PathBuf> {
 pub fn mcp_repo_vars() -> Vec<String> {
     list("mcp.repo_vars")
 }
+pub fn mcp_server_bind() -> String {
+    text("mcp.server_bind")
+}
+pub fn mcp_server_port() -> u16 {
+    u16::try_from(int("mcp.server_port")).unwrap_or(17800)
+}
+/// `None` = the CLI's active gateway.
+pub fn mcp_server_gateway() -> Option<String> {
+    Some(text("mcp.server_gateway")).filter(|g| !g.is_empty())
+}
+pub fn mcp_client_idle() -> Duration {
+    Duration::from_secs(int("mcp.client_idle_secs"))
+}
 
 /// A snapshot from `osh.toml` text with no environment, for tests of the code that reads
 /// settings. Pair with `install_for_test`.
@@ -1872,6 +1954,66 @@ mod tests {
         assert!(e.starts_with("osh.toml:2:") && e.contains("outside"), "{e}");
         let e = check("[refresh]\nports_secs = = 1\n").unwrap_err();
         assert!(e.starts_with("osh.toml:2:"), "{e}");
+    }
+
+    #[test]
+    fn the_server_settings_have_defaults_and_refuse_bad_values() {
+        let s = load(&tmp(), &no_env);
+        assert_eq!(
+            row(&s, "mcp.server_bind").value,
+            Value::Str("127.0.0.1".into())
+        );
+        assert_eq!(row(&s, "mcp.server_port").value, Value::Int(17800));
+        assert_eq!(
+            row(&s, "mcp.server_gateway").value,
+            Value::Str(String::new())
+        );
+        assert_eq!(row(&s, "mcp.client_idle_secs").value, Value::Int(600));
+        let s = with_file(
+            "[mcp]\nserver_bind = \"not an ip\"\nserver_port = 80\nserver_gateway = \"-x\"\nclient_idle_secs = 1\n",
+        );
+        for key in [
+            "mcp.server_bind",
+            "mcp.server_port",
+            "mcp.server_gateway",
+            "mcp.client_idle_secs",
+        ] {
+            assert!(
+                s.problems.iter().any(|p| p.key.as_deref() == Some(key)),
+                "{key}: {:?}",
+                s.problems
+            );
+        }
+        assert_eq!(
+            row(&s, "mcp.server_bind").value,
+            Value::Str("127.0.0.1".into())
+        );
+        assert_eq!(row(&s, "mcp.server_port").value, Value::Int(17800));
+    }
+
+    #[test]
+    fn the_server_settings_parse_typed_text() {
+        let d = |k| def(k).unwrap();
+        assert_eq!(
+            parse_value(d("mcp.server_port"), "9000"),
+            Ok(Value::Int(9000))
+        );
+        assert!(parse_value(d("mcp.server_port"), "80").is_err());
+        assert!(parse_value(d("mcp.server_port"), "x").is_err());
+        assert_eq!(
+            parse_value(d("mcp.server_bind"), " ::1 "),
+            Ok(Value::Str("::1".into()))
+        );
+        assert!(parse_value(d("mcp.server_bind"), "localhost").is_err());
+        assert_eq!(
+            parse_value(d("mcp.server_gateway"), "openshell-docker"),
+            Ok(Value::Str("openshell-docker".into()))
+        );
+        assert_eq!(
+            parse_value(d("mcp.server_gateway"), ""),
+            Ok(Value::Str(String::new()))
+        );
+        assert!(parse_value(d("mcp.server_gateway"), "a/b").is_err());
     }
 
     #[test]

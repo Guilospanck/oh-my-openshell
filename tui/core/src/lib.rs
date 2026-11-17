@@ -8,6 +8,7 @@ pub mod cli;
 pub mod gateways;
 pub mod ghrepo;
 pub mod mcp;
+pub mod mcpserver;
 pub mod ops;
 pub mod platform;
 pub mod preload;

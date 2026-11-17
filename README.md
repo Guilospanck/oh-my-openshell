@@ -615,6 +615,10 @@ Other configuration keeps its own file and editor: `toolchains.toml`, `sandbox-p
 | `mcp.allow_share` | bool | `false` | restart of osh mcp | `OSH_MCP_ALLOW_SHARE` | Let agents mount host folders through `osh mcp`. The variable set to `1` forces this on. |
 | `mcp.share_roots` | list of absolute paths | `[]` | restart of osh mcp | `OSH_MCP_SHARE_ROOT` | Folders agents may share from. The variable (separated like `PATH`) replaces the list. |
 | `mcp.repo_vars` | list of variable names | `[]` | restart of osh mcp | `OSH_MCP_REPO_VARS` | Variables agents may name as a git credential. The variable (comma-separated) replaces the list. |
+| `mcp.server_bind` | IP address | `"127.0.0.1"` | restart of osh mcp | none | The address `osh mcp serve` listens on. Anything but a loopback address (`127.0.0.1`, `::1`) can be reached from other machines: it is protected by the token and belongs behind a VPN or tunnel. |
+| `mcp.server_port` | whole number, 1024 to 65535 | `17800` | restart of osh mcp | none | The port `osh mcp serve` listens on. |
+| `mcp.server_gateway` | gateway name, or empty | `""` | restart of osh mcp | none | The gateway the MCP server uses when a call names none. Empty means OpenShell's active gateway. |
+| `mcp.client_idle_secs` | seconds, 10 to 86400 | `600` | live | none | How long a client may stay silent before the MCP server stops listing it as connected. |
 
 ## Development and agents
 
