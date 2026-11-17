@@ -521,6 +521,9 @@ fn secret_cmd(act: SecretAct) -> i32 {
         SecretAct::Remove(name) => match secrets::remove(&dir, &name) {
             Ok(true) => {
                 println!("removed {name}");
+                println!(
+                    "This only deleted osh's stored copy. A grant already made keeps its own copy in a provider attached to the sandbox until sandbox_repo_revoke (or deleting the sandbox) removes it, and the token stays valid on the forge until you delete it there (GitHub: github.com/settings/personal-access-tokens)."
+                );
                 0
             }
             Ok(false) => {

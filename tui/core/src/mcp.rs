@@ -127,7 +127,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "sandbox_repo_grant",
-            "description": "Give a RUNNING sandbox access to one git repo (no recreation or restart): attaches the repo provider and configures git in the sandbox. env_var is the NAME of the token (never the token). It needs a token the user stored with `osh mcp secret set NAME` in a terminal of their own; when there is none, the error is the exact set of steps to read to the user (create the token at the given page, run that command, tell you), and you must not ask for the token in the chat.",
+            "description": "Give a RUNNING sandbox access to one git repo (no recreation or restart): attaches the repo provider and configures git in the sandbox. env_var is the NAME of the token (never the token). It needs a token the user stored with `osh mcp secret set NAME` in a terminal of their own; when there is none, the error is the exact set of steps to read to the user (create the token at the given page, run that command, tell you), and you must not ask for the token in the chat. Tell the user that `osh mcp secret remove` only deletes osh's stored copy: the gateway's provider keeps its own copy and the token stays valid on the forge until sandbox_repo_revoke (or deleting the sandbox) and deleting the token there.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -140,7 +140,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "sandbox_repo_revoke",
-            "description": "Take a repo grant away from a sandbox: detach and delete its repo provider. Afterwards the user can run `osh mcp secret remove NAME` to forget the stored token.",
+            "description": "Take a repo grant away from a sandbox: detach and delete its repo provider. This does not make the token invalid: tell the user to delete it on the forge's token page (github.com/settings/personal-access-tokens), then run `osh mcp secret remove NAME` to forget osh's stored copy.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

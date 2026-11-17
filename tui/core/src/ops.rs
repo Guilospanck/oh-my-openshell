@@ -362,6 +362,14 @@ fn run_plan(
     Ok(json!({"name": name, "phase": phase}))
 }
 
+/// How access is really cut, for the user: the stored copy is not the grant.
+fn cut_access_steps(repo: &ghrepo::GhRepo, var: &str) -> String {
+    format!(
+        "Removing the stored token does NOT revoke access: when a grant is made, the OpenShell gateway keeps its own copy in a provider attached to the sandbox, and the token stays valid on the forge until it expires or is deleted there. To cut access fully: 1) call sandbox_repo_revoke (or delete the sandbox), which detaches and deletes the provider; 2) the user deletes the token at {page}; 3) the user runs `osh mcp secret remove {var}`.",
+        page = ghrepo::tokens_page(repo),
+    )
+}
+
 /// What to tell the agent when it asks for a repo grant the user has not prepared: the page that
 /// creates the token, the steps there, the one command the user runs in a terminal of their own,
 /// and how to take it away again. Written for the user to read out of the agent's answer.
@@ -382,12 +390,13 @@ fn token_guidance(
          A. {steps}\n\
          B. When they have it, in a terminal of their own (outside this chat) they run `osh mcp secret set {name}`; it asks for the token with a hidden prompt, so it never appears in this session or in their shell history.\n\
          C. {then}\n\
-         D. To remove it later: call sandbox_repo_revoke, then the user runs `osh mcp secret remove {name}` (and may delete the token on the forge's token page).",
+         D. {cut}",
         then = if running {
             format!("They tell you it is done, and you call this tool again with env_var \"{name}\". No sandbox restart or recreation is needed: the grant is added to the running sandbox.")
         } else {
             format!("They tell you it is done, and you create the sandbox again with env_var \"{name}\"; for a sandbox that already exists, call sandbox_repo_grant instead, which adds the access to the running sandbox with no recreation.")
         },
+        cut = cut_access_steps(repo, name),
         repo = repo.shown(),
         steps = ghrepo::steps_for(repo, &ghrepo::token_url(repo, sandbox), sandbox).replace('\n', "\n   "),
     )
@@ -435,7 +444,7 @@ pub fn repo_grant(ctx: &Ctx, name: &str, url: &str, env_var: &str) -> Result<Val
     }
     let mut out = json!({
         "name": name, "provider": provider, "repo": repo.shown(), "attached": true,
-        "remove": "sandbox_repo_revoke removes the grant; the user then runs `osh mcp secret remove NAME`",
+        "to_remove": cut_access_steps(&repo, env_var),
     });
     if repo.is_github() {
         let argv: Vec<String> = ["sh", "-c", ghrepo::GITHUB_GIT_CONFIG]
@@ -481,7 +490,13 @@ pub fn repo_revoke(ctx: &Ctx, name: &str, url: &str) -> Result<Value, String> {
             &provider,
         );
     }
-    Ok(json!({"name": name, "provider": provider, "detached": was_attached, "deleted": existed}))
+    Ok(json!({
+        "name": name, "provider": provider, "detached": was_attached, "deleted": existed,
+        "next": format!(
+            "The sandbox no longer has the grant. The token itself is still valid: the user deletes it at {}, then runs `osh mcp secret remove NAME` to forget the stored copy.",
+            ghrepo::tokens_page(&repo)
+        ),
+    }))
 }
 
 /// Delete a sandbox and, as the dashboard does, the per-sandbox repo providers osh made for it.
@@ -1585,6 +1600,10 @@ pub(crate) mod tests {
             "{e}"
         );
         assert!(e.contains("sandbox_repo_revoke"), "{e}");
+        assert!(
+            e.contains("does NOT revoke access") && e.contains("settings/personal-access-tokens"),
+            "{e}"
+        );
         let calls = f.calls();
         assert!(
             !calls.contains("provider create") && !calls.contains("attach"),
@@ -1613,6 +1632,13 @@ pub(crate) mod tests {
         }
         let out = out.unwrap();
         assert_eq!(out["attached"], true, "{out}");
+        assert!(
+            out["to_remove"]
+                .as_str()
+                .unwrap()
+                .contains("does NOT revoke access"),
+            "{out}"
+        );
         assert_eq!(out["repo"], "o/r");
         let calls = f.calls();
         assert!(
@@ -1672,6 +1698,10 @@ pub(crate) mod tests {
         std::env::remove_var("OSH_FAKE_PROVIDERS");
         let out = out.unwrap();
         assert_eq!(out["deleted"], true, "{out}");
+        assert!(
+            out["next"].as_str().unwrap().contains("still valid"),
+            "{out}"
+        );
         let calls = f.calls();
         assert!(calls.contains("provider delete github-w1-r"), "{calls}");
         assert!(repo_revoke(&f.ctx(), "../x", URL).is_err());
