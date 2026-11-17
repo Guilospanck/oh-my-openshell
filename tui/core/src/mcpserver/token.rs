@@ -55,6 +55,12 @@ pub fn matches(dir: &Path, presented: &str) -> bool {
     let Some(token) = read(dir) else {
         return false;
     };
+    // A file put back with a loose mode while the server runs is tightened before it is used.
+    if let Ok(meta) = std::fs::metadata(path(dir)) {
+        if meta.permissions().mode() & 0o077 != 0 {
+            let _ = std::fs::set_permissions(path(dir), std::fs::Permissions::from_mode(0o600));
+        }
+    }
     let (a, b) = (token.as_bytes(), presented.as_bytes());
     let mut diff = a.len() ^ b.len();
     for i in 0..a.len().max(b.len()) {
@@ -122,6 +128,15 @@ mod tests {
         std::fs::write(path(&d.0), "second-token\n").unwrap();
         assert!(!matches(&d.0, "first-token"), "the old token stops working");
         assert!(matches(&d.0, "second-token"));
+    }
+
+    #[test]
+    fn matches_tightens_a_loose_file_that_was_put_back_while_running() {
+        let d = tmp("loosen");
+        std::fs::write(path(&d.0), "tok-abc\n").unwrap();
+        std::fs::set_permissions(path(&d.0), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches(&d.0, "tok-abc"));
+        assert_eq!(mode(&path(&d.0)), 0o600, "others can no longer read it");
     }
 
     #[test]

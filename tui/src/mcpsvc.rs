@@ -40,6 +40,11 @@ fn unit_quote(v: &str) -> String {
         .replace('%', "%%")
 }
 
+/// A value in `ExecStart=`, where systemd also expands `$VAR`.
+fn exec_quote(v: &str) -> String {
+    unit_quote(v).replace('$', "$$")
+}
+
 /// The Linux user unit. `PATH` lists where `openshell` and the container runtime may live
 /// (a user unit does not inherit the login shell's PATH); the token is never in the unit: the
 /// server reads it from the data folder.
@@ -56,7 +61,7 @@ pub fn systemd_unit(p: &Paths) -> String {
          ExecStart=\"{exe}\" mcp serve\n\
          Restart=on-failure\nRestartSec=5s\nUMask=0077\n\n\
          [Install]\nWantedBy=default.target\n",
-        exe = unit_quote(&p.exe.display().to_string())
+        exe = exec_quote(&p.exe.display().to_string())
     )
 }
 
@@ -285,6 +290,18 @@ mod tests {
         assert!(u.contains("WantedBy=default.target"));
         let lower = u.to_lowercase();
         assert!(!lower.contains("token") && !lower.contains("bearer"), "{u}");
+    }
+
+    #[test]
+    fn exec_start_also_escapes_the_dollar_sign() {
+        let mut p = paths();
+        p.exe = "/opt/$HOME/osh".into();
+        let u = systemd_unit(&p);
+        assert!(u.contains("ExecStart=\"/opt/$$HOME/osh\" mcp serve"), "{u}");
+        assert!(
+            !u.contains("Environment=\"OSH_DIR=/h/.local/share/osh$"),
+            "{u}"
+        );
     }
 
     #[test]

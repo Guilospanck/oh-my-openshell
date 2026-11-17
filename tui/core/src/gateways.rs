@@ -5,8 +5,11 @@
 use crate::ops::Ctx;
 use std::path::Path;
 
-/// The gateways listed in `<dir>/gateways.json`, with the same trust rules as the registry the
-/// dashboard reads: the name must be exactly what osh gives that kind, and the port must leave
+/// Names of gateways set up before osh kept a registry.
+const LEGACY: [&str; 2] = ["openshell", "openshell-docker"];
+
+/// The gateways listed in `<dir>/gateways.json`. The trust rules are those of
+/// `gwmodel::Registry::load` in the `osh-tui` crate (keep the two in step): the the name must be exactly what osh gives that kind, and the port must leave
 /// room for the health and metrics ports above it.
 pub fn names(dir: &Path) -> Vec<String> {
     let v: Option<serde_json::Value> = std::fs::read_to_string(dir.join("gateways.json"))
@@ -35,7 +38,13 @@ pub fn resolve(ctx: &Ctx, arg: Option<&str>) -> Result<Option<String>, String> {
     let Some(name) = arg else {
         return Ok(ctx.gateway.clone());
     };
-    if names(&ctx.dir).iter().any(|n| n == name) {
+    // Gateways that predate osh's registry (or were set up outside osh) are not in it: the two
+    // names OpenShell and the older `just gateway-docker` used, and the server's own default.
+    // A name that is no gateway at all only makes `openshell` answer "not found".
+    let known = names(&ctx.dir).iter().any(|n| n == name)
+        || LEGACY.contains(&name)
+        || ctx.gateway.as_deref() == Some(name);
+    if known && !name.starts_with('-') {
         return Ok(Some(name.to_string()));
     }
     Err(format!(
@@ -84,7 +93,7 @@ mod tests {
     #[test]
     fn resolve_rejects_unusable_names() {
         let c = ctx(dir_with(REG, "reject"), None);
-        for bad in ["", "-x", "a/b", "nope", "openshell-docker"] {
+        for bad in ["", "-x", "a/b", "nope", "openshell-podman"] {
             let e = resolve(&c, Some(bad)).unwrap_err();
             assert!(e.contains(&format!("{bad:?}")), "{e}");
         }
@@ -92,6 +101,17 @@ mod tests {
             resolve(&c, Some("openshell-vm")).unwrap(),
             Some("openshell-vm".to_string())
         );
+    }
+
+    #[test]
+    fn resolve_also_accepts_the_legacy_names_and_the_servers_own_default() {
+        // A gateway set up before osh kept a registry, or outside osh, is not in gateways.json.
+        let c = ctx(dir_with(REG, "legacy"), Some("my-own-gateway"));
+        for ok in ["openshell", "openshell-docker", "my-own-gateway"] {
+            assert_eq!(resolve(&c, Some(ok)).unwrap(), Some(ok.to_string()), "{ok}");
+        }
+        assert!(resolve(&c, Some("someone-elses")).is_err());
+        assert!(resolve(&c, Some("-openshell")).is_err());
     }
 
     #[test]
