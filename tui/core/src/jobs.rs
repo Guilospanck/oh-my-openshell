@@ -268,10 +268,12 @@ echo "$s" | tr -d ' '
 tail -c +$((o + 1)) "$f" 2>/dev/null | head -c "$l"
 "#;
 
-/// `$1` the job directory. Marks the job cancelled (unless it already exited), ends its process
-/// group (else the process and its children), waits up to 3 seconds, then kills. A pid that now
-/// belongs to another process is left alone. `kill -TERM "-$pid"` and not `kill -TERM -- ...`:
-/// dash, the usual `sh` of the sandbox images, does not take `--`.
+/// `$1` the job directory. Marks the job cancelled (unless it already exited) and ends its
+/// processes: the wrapper, everything it started (found through parent links in `/proc`, else
+/// `ps`) and everything in its session, each signalled by its own pid, with TERM, then after up
+/// to 3 seconds KILL. A pid that now belongs to another process is left alone. Not a group kill:
+/// in a real sandbox `kill -TERM -PID` is "Operation not permitted", and the image has neither
+/// `ps` nor `pkill`.
 pub const CANCEL: &str = r#"set -u
 d=$1
 [ -d "$d" ] || { echo unknown; exit 0; }
@@ -283,13 +285,44 @@ if [ -n "$st" ] && [ -r "/proc/$pid/stat" ]; then
   cur=$(sed 's/^[^)]*) //' "/proc/$pid/stat" | cut -d' ' -f20)
   if [ "$cur" != "$st" ]; then echo done; exit 0; fi
 fi
-if command -v pkill >/dev/null 2>&1; then pkill -TERM -P "$pid" 2>/dev/null; fi
-kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+# One line per process: pid, parent pid, session id (0 where unknown).
+tree() {
+  if [ -d /proc/self ]; then
+    for p in /proc/[0-9]*; do
+      r=$(sed 's/^[^)]*) //' "$p/stat" 2>/dev/null) || continue
+      [ -n "$r" ] || continue
+      set -- $r
+      echo "${p#/proc/} $2 $4"
+    done
+  elif command -v ps >/dev/null 2>&1; then
+    ps -A -o pid= -o ppid= | while read -r a b; do echo "$a $b 0"; done
+  fi
+}
+# $fam: the job's wrapper, its descendants and everything in its session.
+family() {
+  tree > "$d/.tree"
+  fam=" $pid "
+  grow=1
+  while [ "$grow" = 1 ]; do
+    grow=0
+    while read -r q pp sid; do
+      case "$fam" in *" $q "*) continue ;; esac
+      add=0
+      if [ "$sid" = "$pid" ]; then add=1; else case "$fam" in *" $pp "*) add=1 ;; esac; fi
+      if [ "$add" = 1 ]; then fam="$fam$q "; grow=1; fi
+    done < "$d/.tree"
+  done
+  rm -f "$d/.tree"
+}
+alive() { for q in $fam; do if kill -0 "$q" 2>/dev/null; then return 0; fi; done; return 1; }
+family
+first=$fam
+for q in $fam; do kill -TERM "$q" 2>/dev/null; done
 i=0
-while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
-if kill -0 "$pid" 2>/dev/null; then
-  if command -v pkill >/dev/null 2>&1; then pkill -KILL -P "$pid" 2>/dev/null; fi
-  kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+while alive && [ "$i" -lt 30 ]; do sleep 0.1; i=$((i + 1)); done
+if alive; then
+  family
+  for q in $first $fam; do kill -KILL "$q" 2>/dev/null; done
 fi
 echo done
 "#;
@@ -1154,31 +1187,79 @@ mod tests {
     }
 
     #[test]
-    fn cancel_signals_the_group_without_the_double_dash_dash_does_not_take() {
-        // `kill -TERM -- -PID` is "Illegal number" in dash, the sandbox images' /bin/sh.
+    fn cancel_signals_each_process_by_its_pid_not_a_group() {
+        // A real sandbox refuses `kill -TERM -PID` ("Operation not permitted") and has no ps or
+        // pkill: the script must find the job's processes itself and signal them one by one.
         assert!(
-            !CANCEL.contains("kill -TERM --") && !CANCEL.contains("kill -KILL --"),
+            !CANCEL.contains("kill -TERM -\"") && !CANCEL.contains("kill -TERM --"),
             "{CANCEL}"
         );
-        assert!(CANCEL.contains("kill -TERM \"-$pid\"") && CANCEL.contains("kill -KILL \"-$pid\""));
-        // dash is on many CI machines and sandboxes; where it is, run the group form for real.
-        if let Ok(dash) = std::process::Command::new("dash")
-            .arg("-c")
-            .arg("exit 0")
+        assert!(!CANCEL.contains("pkill"), "{CANCEL}");
+        assert!(
+            CANCEL.contains("/proc/[0-9]*") && CANCEL.contains("kill -TERM \"$q\""),
+            "{CANCEL}"
+        );
+        assert!(CANCEL.contains("kill -KILL \"$q\""));
+    }
+
+    /// Run `CANCEL` in `shell` against a job whose wrapper has two children (the shape of a real
+    /// job), and say how many of the three processes are left. The wrapper is not a group
+    /// leader here, as in a sandbox where signalling a group is refused.
+    fn cancel_leaves(shell: &str, a: &str, b: &str) -> usize {
+        let t = tmp(&format!("cancelfam-{shell}-{a}"));
+        let wrapper = std::process::Command::new("sh")
+            .args(["-c", &format!("sleep {a} & sleep {b} & wait")])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let jobdir = t.0.join("job");
+        std::fs::create_dir_all(&jobdir).unwrap();
+        std::fs::write(jobdir.join("pid"), format!("{} \n", wrapper.id())).unwrap();
+        let out = std::process::Command::new(shell)
+            .args(["-c", CANCEL, "sh"])
+            .arg(&jobdir)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("done"),
+            "{out:?}"
+        );
+        assert!(jobdir.join("cancelled").exists());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let left = std::process::Command::new("pgrep")
+            .args(["-f", &format!("sleep ({a}|{b})")])
+            .output()
+            .unwrap();
+        let n = String::from_utf8_lossy(&left.stdout)
+            .split_whitespace()
+            .count();
+        // Whatever the script left must not outlive the test.
+        for pid in String::from_utf8_lossy(&left.stdout).split_whitespace() {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid])
+                .status();
+        }
+        let mut w = wrapper;
+        let _ = w.wait();
+        n
+    }
+
+    #[test]
+    fn cancel_ends_the_wrapper_and_the_children_it_started() {
+        assert_eq!(cancel_leaves("sh", "40117", "40118"), 0);
+    }
+
+    #[test]
+    fn cancel_does_the_same_under_dash_the_sandbox_shell() {
+        if std::process::Command::new("dash")
+            .args(["-c", "exit 0"])
             .status()
+            .is_ok_and(|s| s.success())
         {
-            if dash.success() {
-                let out = std::process::Command::new("dash")
-                    .arg("-c")
-                    .arg("kill -TERM \"-99999999\" 2>&1; echo rc=$?")
-                    .output()
-                    .unwrap();
-                let text = String::from_utf8_lossy(&out.stdout);
-                assert!(
-                    !text.contains("Illegal number"),
-                    "dash refuses the form: {text}"
-                );
-            }
+            assert_eq!(cancel_leaves("dash", "40127", "40128"), 0);
         }
     }
 

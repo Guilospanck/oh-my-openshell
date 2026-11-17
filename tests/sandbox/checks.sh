@@ -226,7 +226,7 @@ jobs_checks() {
   done
   [[ $code -eq 0 ]] && pass "no process of the cancelled job is left in the sandbox" || fail "no process of the cancelled job is left in the sandbox" "still running: $out"
 
-  # The whole process group goes, not only the program: a command with children of its own. With
+  # Every process of the job goes, not only the program: a command with children of its own. With
   # no cap (mcp.job_max_secs 0) there is no `timeout` between the job and its children either.
   osh config set mcp.job_max_secs 0 >/dev/null 2>&1
   out="$(mcpcall sandbox_exec "{\"name\":\"$hn\",\"argv\":[\"sh\",\"-c\",\"sleep 601 & sleep 602 & wait\"],\"wait_secs\":0}")"

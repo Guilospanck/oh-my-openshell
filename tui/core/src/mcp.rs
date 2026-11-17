@@ -114,7 +114,7 @@ fn base_tools() -> Value {
         },
         {
             "name": "job_cancel",
-            "description": "End a running job (its whole process group). A job that already exited stays exited. Uses the gateway the job was started on.",
+            "description": "End a running job and every process it started. A job that already exited stays exited. Uses the gateway the job was started on.",
             "inputSchema": {
                 "type": "object",
                 "properties": {"job": {"type": "string"}},
