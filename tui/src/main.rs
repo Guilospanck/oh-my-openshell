@@ -11,6 +11,7 @@ mod gateway;
 mod gwmodel;
 mod gwops;
 mod headless;
+mod listfilter;
 mod logview;
 mod mcpcmd;
 mod mcpsvc;

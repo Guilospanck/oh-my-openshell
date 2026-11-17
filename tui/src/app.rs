@@ -55,6 +55,9 @@ pub struct McpView {
     pub state: Option<osh_core::mcpserver::state::State>,
     /// Background jobs started over MCP, newest first.
     pub jobs: Vec<osh_core::jobs::Job>,
+    /// The search (`/`) over clients and jobs; `filtering` while it is being typed.
+    pub filter: String,
+    pub filtering: bool,
     pub checked: Option<Instant>,
 }
 
@@ -74,6 +77,8 @@ impl Default for McpView {
             svc: crate::mcpsvc::Svc::NotInstalled,
             state: None,
             jobs: Vec::new(),
+            filter: String::new(),
+            filtering: false,
             checked: None,
         }
     }
@@ -1286,7 +1291,7 @@ impl App {
             Tab::Profiles => self.profile_rows().len(),
             Tab::Images => self.snap.images.len(),
             Tab::Gateways => self.snap.gateways.len(),
-            Tab::Mcp => self.mcp_clients() + self.mcp.jobs.len(),
+            Tab::Mcp => self.mcp_clients() + self.mcp_visible_jobs().len(),
         }
     }
 
@@ -5270,6 +5275,10 @@ impl App {
             self.modal_key(modal, key);
             return;
         }
+        if self.tab == Tab::Mcp && self.mcp.filtering {
+            self.mcp_filter_key(key.code);
+            return;
+        }
         match key.code {
             KeyCode::Esc if self.toast().is_some() => {
                 self.dismiss_toast();
@@ -5420,21 +5429,68 @@ impl App {
         self.clamp_mcp_cursor();
     }
 
-    /// The connected clients, listed above the jobs.
+    /// The connected clients that match the search, listed above the jobs.
+    pub fn mcp_visible_clients(&self) -> Vec<&osh_core::mcpserver::state::Client> {
+        let q = &self.mcp.filter;
+        self.mcp.state.as_ref().map_or(Vec::new(), |s| {
+            s.clients
+                .iter()
+                .filter(|c| crate::listfilter::matches(q, &[&c.name, &c.version, &c.peer]))
+                .collect()
+        })
+    }
+
     pub fn mcp_clients(&self) -> usize {
-        self.mcp.state.as_ref().map_or(0, |s| s.clients.len())
+        self.mcp_visible_clients().len()
+    }
+
+    /// The jobs that match the search.
+    pub fn mcp_visible_jobs(&self) -> Vec<&osh_core::jobs::Job> {
+        let q = &self.mcp.filter;
+        self.mcp
+            .jobs
+            .iter()
+            .filter(|j| {
+                crate::listfilter::matches(
+                    q,
+                    &[&j.id, &j.gateway, &j.sandbox, &j.command, &j.state],
+                )
+            })
+            .collect()
     }
 
     /// The MCP tab's cursor walks the clients, then the jobs, as one list.
     fn clamp_mcp_cursor(&mut self) {
-        let n = self.mcp_clients() + self.mcp.jobs.len();
+        let n = self.mcp_clients() + self.mcp_visible_jobs().len();
         self.cursor[5] = self.cursor[5].min(n.saturating_sub(1));
+    }
+
+    /// Keys while the search is being typed: everything is text except Enter and Esc.
+    fn mcp_filter_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char(c) => self.mcp.filter.push(c),
+            KeyCode::Backspace => {
+                self.mcp.filter.pop();
+            }
+            KeyCode::Enter => self.mcp.filtering = false,
+            KeyCode::Esc => {
+                self.mcp.filter.clear();
+                self.mcp.filtering = false;
+            }
+            _ => {}
+        }
+        self.cursor[5] = 0;
     }
 
     /// `Enter` turns the server on or off (after a question); `t` copies its address.
     fn mcp_key(&mut self, code: KeyCode) {
         use crate::mcpsvc::Svc;
         match code {
+            KeyCode::Char('/') => self.mcp.filtering = true,
+            KeyCode::Esc if !self.mcp.filter.is_empty() => {
+                self.mcp.filter.clear();
+                self.cursor[5] = 0;
+            }
             KeyCode::Enter if self.mcp.svc == Svc::External => {
                 let pid = self
                     .mcp
@@ -6626,6 +6682,86 @@ mod tests {
         a.mcp.state = None;
         a.clamp_mcp_cursor();
         assert_eq!(a.cursor[5], 0);
+    }
+
+    #[test]
+    fn slash_starts_a_search_and_typing_narrows_the_jobs() {
+        let mut a = mcp_app(0, 4);
+        a.mcp.jobs[1].sandbox = "other".into();
+        press(&mut a, KeyCode::Char('/'));
+        assert!(a.mcp.filtering);
+        type_text(&mut a, "OTH");
+        assert_eq!(a.mcp.filter, "OTH");
+        assert_eq!(a.mcp_visible_jobs().len(), 1);
+        press(&mut a, KeyCode::Backspace);
+        assert_eq!(a.mcp.filter, "OT");
+        assert_eq!(a.mcp_visible_jobs().len(), 1);
+    }
+
+    #[test]
+    fn the_search_covers_the_clients_too() {
+        let mut a = mcp_app(3, 2);
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "c2");
+        assert_eq!(a.mcp_clients(), 1);
+        assert_eq!(a.mcp_visible_jobs().len(), 0);
+    }
+
+    #[test]
+    fn keys_are_text_while_typing_the_search() {
+        let mut a = mcp_app(0, 3);
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "q1j6:c");
+        assert!(!a.quit, "q is text");
+        assert!(a.tab == Tab::Mcp, "1 and 6 are text");
+        assert!(a.modal.is_none(), ": is text");
+        assert_eq!(a.mcp.filter, "q1j6:c");
+    }
+
+    #[test]
+    fn enter_keeps_the_search_and_esc_clears_it() {
+        let mut a = mcp_app(0, 3);
+        a.mcp.jobs[2].sandbox = "zed".into();
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "zed");
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.mcp.filtering, "typing is over");
+        assert_eq!(a.mcp_visible_jobs().len(), 1, "the search stays");
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.cursor[5], 0, "j moves again, within the match");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.mcp.filter, "", "Esc clears a kept search");
+        assert_eq!(a.mcp_visible_jobs().len(), 3);
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "x");
+        press(&mut a, KeyCode::Esc);
+        assert!(
+            !a.mcp.filtering && a.mcp.filter.is_empty(),
+            "Esc while typing clears too"
+        );
+    }
+
+    #[test]
+    fn a_search_with_no_match_leaves_no_rows_and_the_cursor_valid() {
+        let mut a = mcp_app(1, 3);
+        a.cursor[5] = 3;
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "nothing");
+        assert_eq!(a.cursor[5], 0);
+        press(&mut a, KeyCode::Char('x'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.cursor[5], 0);
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_cursor_inside_the_matches() {
+        let mut a = mcp_app(0, 5);
+        a.cursor[5] = 4;
+        a.mcp.filter = "w1".into();
+        a.mcp.jobs.truncate(2);
+        a.clamp_mcp_cursor();
+        assert_eq!(a.cursor[5], 1);
     }
 
     #[test]

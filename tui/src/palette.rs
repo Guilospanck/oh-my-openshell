@@ -266,6 +266,12 @@ pub const ACTIONS: &[Action] = &[
         KeyCode::Char('t'),
         "Copy the MCP server's address",
     ),
+    a(
+        T(Tab::Mcp),
+        "/",
+        KeyCode::Char('/'),
+        "Search the MCP clients and jobs (Enter keeps it, Esc clears it)",
+    ),
     a(Global, "g", KeyCode::Char('g'), "Switch gateway"),
     a(Global, "r", KeyCode::Char('r'), "Refresh"),
     a(

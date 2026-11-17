@@ -47,6 +47,7 @@ Gateways | l | gateway-log
 Gateways | e | gateway-config
 Gateways | V | gateway-vm-size
 MCP | Enter | mcp-onoff
+MCP | / | mcp-search
 MCP | t | SKIP: copies to the host clipboard, which no test machine has; a unit test covers the address and the empty case
 shell | ctrl-] menu | shell-menu
 palette | Edit toolchains.toml | editor-toolchains

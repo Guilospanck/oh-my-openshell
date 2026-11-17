@@ -898,6 +898,39 @@ def mcp_onoff():
         o.press("enter"); o.wait("Install the MCP server", 5)
         o.press("n"); o.wait_gone("Install the MCP server", 5)
 
+@scenario("mcp-search")
+def mcp_search():
+    """Jobs the server started are listed on the MCP tab and `/` narrows them: j/k walk the list,
+    typed text (even keys like q and 6) goes into the search, Enter keeps it and Esc clears it."""
+    import json
+    d = os.path.join(DATA, "mcp-jobs")
+    os.makedirs(d, exist_ok=True)
+    now = int(time.time())
+    ids = []
+    for n, box in enumerate(["alpha", "bravo", "charlie"]):
+        jid = "j%016x" % (0xe2e000 + n)
+        ids.append(jid)
+        with open(os.path.join(d, jid + ".json"), "w") as f:
+            json.dump({"id": jid, "gateway": "openshell-vm", "sandbox": "e2e-" + box, "command": "sleep",
+                       "started": now - n, "state": "exited", "exit_code": 0, "checked": now}, f)
+    try:
+        with dashboard() as o:
+            o.press("6"); o.wait("Jobs", 10)
+            o.wait("e2e-alpha", 5); o.wait("e2e-charlie", 5)
+            o.press("j"); o.press("j"); o.wait("2/", 5)
+            o.press("/"); o.wait("Jobs  /", 5)
+            o.type("brav"); o.wait("e2e-bravo", 5); o.wait_gone("e2e-alpha", 5)
+            o.press("enter"); o.wait("1/1", 5)
+            o.press("esc"); o.wait("e2e-alpha", 5)
+            o.press("/"); o.type("q6"); o.wait("No job matches", 5)
+            o.press("esc"); o.wait("e2e-charlie", 5)
+    finally:
+        for jid in ids:
+            try:
+                os.remove(os.path.join(d, jid + ".json"))
+            except OSError:
+                pass
+
 @scenario("gateway-restart")
 def gateway_restart():
     """R restarts the main gateway through osh's own steps; it answers again afterwards."""

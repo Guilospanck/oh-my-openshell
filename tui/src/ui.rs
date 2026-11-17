@@ -947,6 +947,8 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Length(4), Constraint::Min(3)])
         .split(area);
     // Jobs, when there are any, take the lower part of the area under the clients.
+    let jobs = app.mcp_visible_jobs();
+    let searching = !app.mcp.filter.is_empty() || app.mcp.filtering;
     let (clients_area, jobs_area) = if app.mcp.jobs.is_empty() {
         (rows[1], None)
     } else {
@@ -998,7 +1000,13 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
-    let clients = app.mcp.state.as_ref().map(|s| s.clients.as_slice());
+    let shown = app.mcp_visible_clients();
+    let clients_title = if searching {
+        format!("Clients  /{}", app.mcp.filter)
+    } else {
+        "Clients".to_string()
+    };
+    let clients = app.mcp.state.as_ref().map(|_| shown.as_slice());
     match clients {
         Some(list) if !list.is_empty() => {
             let cells = list
@@ -1019,7 +1027,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
             draw_table(
                 f,
                 clients_area,
-                "Clients",
+                &clients_title,
                 MCP_COLS,
                 cells,
                 app.cursor[5],
@@ -1027,7 +1035,9 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
             );
         }
         _ => {
-            let (what, hint) = if matches!(app.mcp.svc, Svc::Running | Svc::External) {
+            let (what, hint) = if searching && app.mcp.state.is_some() {
+                ("No client matches", "Esc clears the search.")
+            } else if matches!(app.mcp.svc, Svc::Running | Svc::External) {
                 (
                     "No clients connected",
                     "A client shows up here when it calls the server.",
@@ -1035,13 +1045,27 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 ("The MCP server is off", "")
             };
-            empty_state(f, clients_area, "Clients", MCP_COLS, what, hint);
+            empty_state(f, clients_area, &clients_title, MCP_COLS, what, hint);
         }
     }
     if let Some(area) = jobs_area {
-        let cells = app
-            .mcp
-            .jobs
+        let jobs_title = if searching {
+            format!("Jobs  /{}", app.mcp.filter)
+        } else {
+            "Jobs".to_string()
+        };
+        if jobs.is_empty() {
+            empty_state(
+                f,
+                area,
+                &jobs_title,
+                JOB_COLS,
+                "No job matches",
+                "Esc clears the search.",
+            );
+            return;
+        }
+        let cells = jobs
             .iter()
             .map(|j| {
                 let state = match (j.state.as_str(), j.exit_code) {
@@ -1072,7 +1096,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
         draw_table(
             f,
             area,
-            "Jobs",
+            &jobs_title,
             JOB_COLS,
             cells,
             at,
@@ -1093,7 +1117,7 @@ pub fn footer_help(tab: Tab) -> &'static str {
         Tab::Profiles => "u / Enter import or update from providers/  e file  n new",
         Tab::Images => "b / Enter build  e Dockerfile  n new",
         Tab::Gateways => "Enter select  s make default  a add  R start/restart  l log  e config  V VM size  d wipe (delete all data)  x remove",
-        Tab::Mcp => "Enter on/off  t copy address",
+        Tab::Mcp => "Enter on/off  t copy address  / search",
     }
 }
 
