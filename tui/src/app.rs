@@ -1385,6 +1385,7 @@ impl App {
                 .is_some_and(|(gw, _)| *gw == self.snap.gateway)
         {
             if let Some((_, name)) = self.pending_open.take() {
+                self.filtering = false;
                 self.open_session(name);
             }
         }
@@ -5301,6 +5302,7 @@ impl App {
             && self.logview.is_none()
             && self.modal.is_none()
         {
+            self.filtering = false;
             self.modal = Some(Modal::Palette {
                 query: String::new(),
                 cursor: 0,
@@ -5318,7 +5320,7 @@ impl App {
             return;
         }
         if self.filtering {
-            self.filter_key(key.code);
+            self.filter_key(key);
             return;
         }
         match key.code {
@@ -5457,6 +5459,7 @@ impl App {
 
     fn switch(&mut self, i: usize) {
         self.tab = TABS[i].0;
+        self.filtering = false;
         if self.tab == Tab::Mcp {
             self.refresh_mcp();
         }
@@ -5515,10 +5518,17 @@ impl App {
     }
 
     /// Keys while the search is being typed: everything is text except Enter and Esc.
-    fn filter_key(&mut self, code: KeyCode) {
+    fn filter_key(&mut self, key: KeyEvent) {
         let i = self.idx();
-        match code {
-            KeyCode::Char(c) => self.filters[i].push(c),
+        let before = self.filters[i].clone();
+        match key.code {
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.filters[i].push(c)
+            }
             KeyCode::Backspace => {
                 self.filters[i].pop();
             }
@@ -5529,7 +5539,9 @@ impl App {
             }
             _ => {}
         }
-        self.cursor[i] = 0;
+        if self.filters[i] != before {
+            self.cursor[i] = 0;
+        }
         self.sync_selection();
     }
 
@@ -6858,6 +6870,40 @@ mod tests {
         press(&mut a, KeyCode::Esc);
         assert_eq!(a.shown(Tab::Sandboxes).len(), 3);
         assert_eq!(a.cursor[0], 0);
+    }
+
+    #[test]
+    fn the_palette_ends_a_search_so_its_action_is_not_typed_into_it() {
+        let mut a = app();
+        a.snap.sandboxes = sandboxes(&["alpha", "bravo"]);
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "br");
+        a.on_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert!(matches!(a.modal, Some(Modal::Palette { .. })));
+        assert!(!a.filtering, "the palette replays actions as keys");
+        assert_eq!(a.filters[0], "br", "the search itself stays");
+    }
+
+    #[test]
+    fn control_and_alt_letters_are_not_search_text_and_arrows_keep_the_cursor() {
+        let mut a = app();
+        a.snap.sandboxes = sandboxes(&["alpha", "bravo", "brick"]);
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "br");
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.cursor[0], 0, "arrows do nothing while typing");
+        a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT));
+        assert_eq!(a.filters[0], "br");
+        a.on_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(a.filters[0], "br");
+    }
+
+    #[test]
+    fn switching_tabs_ends_a_search_being_typed() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('/'));
+        a.switch(1);
+        assert!(!a.filtering);
     }
 
     #[test]

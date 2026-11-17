@@ -190,12 +190,12 @@ fn full_row(cols: Cols, row: &[Line<'static>], width: usize) -> Vec<Line<'static
     out
 }
 
-/// A tab's table in a panel titled `title`. Cells too wide for their column end in `…`; then
-/// (unless `elsewhere`, a details pane that already shows the selected row whole) the bottom of the
-/// panel shows the selected row in full, so no value is out of reach.
 /// The `cursor` of a table the cursor is not in.
 const NO_CURSOR: usize = usize::MAX;
 
+/// A tab's table in a panel titled `title`. Cells too wide for their column end in `…`; then
+/// (unless `elsewhere`, a details pane that already shows the selected row whole) the bottom of the
+/// panel shows the selected row in full, so no value is out of reach.
 fn draw_table(
     f: &mut Frame,
     area: Rect,
@@ -576,7 +576,7 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
         empty_state(
             f,
             cols[0],
-            "Sandboxes",
+            &search_title(app, "Sandboxes", Tab::Sandboxes),
             SANDBOX_COLS,
             "No sandboxes yet",
             "n  create one",
@@ -763,7 +763,7 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
         empty_state(
             f,
             area,
-            "Providers",
+            &search_title(app, "Providers", Tab::Providers),
             PROVIDER_COLS,
             "No providers",
             "n  create one (credentials a sandbox may use)",
@@ -853,7 +853,14 @@ fn draw_profiles(f: &mut Frame, app: &App, area: Rect) {
             "n creates one; the files live in {}",
             app.dir.join("providers").display()
         );
-        empty_state(f, area, "Profiles", PROFILE_COLS, "No profiles", &hint);
+        empty_state(
+            f,
+            area,
+            &search_title(app, "Profiles", Tab::Profiles),
+            PROFILE_COLS,
+            "No profiles",
+            &hint,
+        );
         return;
     }
     draw_table(
@@ -874,7 +881,14 @@ fn draw_images(f: &mut Frame, app: &App, area: Rect) {
             "n creates a Dockerfile; they live in {}",
             app.dir.join("images").display()
         );
-        empty_state(f, area, "Images", IMAGE_COLS, "No images", &hint);
+        empty_state(
+            f,
+            area,
+            &search_title(app, "Images", Tab::Images),
+            IMAGE_COLS,
+            "No images",
+            &hint,
+        );
         return;
     }
     if app.shown(Tab::Images).is_empty() {
@@ -922,7 +936,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
         empty_state(
             f,
             area,
-            "Gateways",
+            &search_title(app, "Gateways", Tab::Gateways),
             GATEWAY_COLS,
             "No gateways",
             "a  add one",
@@ -2821,6 +2835,16 @@ mod tests {
         app.filters[0] = "zzz".into();
         let (all, _) = screen(&app, 120, 24);
         assert!(all.contains("Nothing matches"), "{all}");
+    }
+
+    #[test]
+    fn a_search_typed_on_an_empty_list_is_visible() {
+        let mut app = usage_app("vm");
+        app.tab = Tab::Providers;
+        app.filtering = true;
+        app.filters[1] = "ab".into();
+        let (all, _) = screen(&app, 120, 24);
+        assert!(all.contains("Providers  /ab_"), "{all}");
     }
 
     #[test]
