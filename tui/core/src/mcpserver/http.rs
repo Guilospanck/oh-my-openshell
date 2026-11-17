@@ -7,12 +7,13 @@ use crate::mcp;
 use crate::mcpserver::token;
 use crate::ops::Ctx;
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +27,12 @@ pub struct Limits {
     pub read_timeout: Duration,
     /// Connections served at once; more are answered `503`.
     pub max_conns: usize,
+    /// Connections one address may hold at once, so a single peer cannot take every slot.
+    pub max_per_ip: usize,
+    /// Time to send one whole response to a client that reads slowly.
+    pub write_timeout: Duration,
+    /// An address (besides localhost) whose `Origin` is accepted: the one the server listens on.
+    pub origin_host: Option<IpAddr>,
 }
 
 impl Default for Limits {
@@ -35,6 +42,9 @@ impl Default for Limits {
             max_body: 4 * 1024 * 1024,
             read_timeout: Duration::from_secs(10),
             max_conns: 64,
+            max_per_ip: 16,
+            write_timeout: Duration::from_secs(60),
+            origin_host: None,
         }
     }
 }
@@ -125,7 +135,9 @@ fn read_line(r: &mut impl BufRead, max: usize, used: &mut usize) -> Result<Strin
     String::from_utf8(buf).map_err(|_| HttpError::Bad("request is not text"))
 }
 
-pub fn read_request(r: &mut impl BufRead, l: &Limits) -> Result<Request, HttpError> {
+/// The request line and headers; the body is left unread (its length is returned) so a request
+/// can be refused before its body is taken.
+pub fn read_head(r: &mut impl BufRead, l: &Limits) -> Result<(Request, usize), HttpError> {
     let mut used = 0usize;
     let line = read_line(r, l.max_header, &mut used)?;
     let mut parts = line.split(' ');
@@ -162,7 +174,7 @@ pub fn read_request(r: &mut impl BufRead, l: &Limits) -> Result<Request, HttpErr
             return Err(HttpError::HeaderTooLarge);
         }
     }
-    let mut req = Request {
+    let req = Request {
         method: method.to_string(),
         path: path.to_string(),
         headers,
@@ -198,6 +210,11 @@ pub fn read_request(r: &mut impl BufRead, l: &Limits) -> Result<Request, HttpErr
     if len > l.max_body {
         return Err(HttpError::BodyTooLarge);
     }
+    Ok((req, len))
+}
+
+/// Read the `len` body bytes `read_head` announced.
+pub fn read_body(r: &mut impl BufRead, req: &mut Request, len: usize) -> Result<(), HttpError> {
     let mut body = Vec::with_capacity(len.min(64 * 1024));
     (&mut *r)
         .take(len as u64)
@@ -207,6 +224,12 @@ pub fn read_request(r: &mut impl BufRead, l: &Limits) -> Result<Request, HttpErr
         return Err(HttpError::Bad("the body ended early"));
     }
     req.body = body;
+    Ok(())
+}
+
+pub fn read_request(r: &mut impl BufRead, l: &Limits) -> Result<Request, HttpError> {
+    let (mut req, len) = read_head(r, l)?;
+    read_body(r, &mut req, len)?;
     Ok(req)
 }
 
@@ -221,6 +244,7 @@ pub fn write_response(
         202 => "Accepted",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
@@ -258,6 +282,8 @@ pub trait Observer: Send + Sync {
 struct Timed {
     stream: TcpStream,
     until: Rc<Cell<Instant>>,
+    /// Set when any byte of the current request has arrived.
+    got: Rc<Cell<bool>>,
 }
 
 impl Read for Timed {
@@ -267,7 +293,11 @@ impl Read for Timed {
             return Err(io::ErrorKind::TimedOut.into());
         }
         self.stream.set_read_timeout(Some(left))?;
-        self.stream.read(buf)
+        let n = self.stream.read(buf)?;
+        if n > 0 {
+            self.got.set(true);
+        }
+        Ok(n)
     }
 }
 
@@ -307,22 +337,44 @@ fn plain(status: u16, headers: &[(&str, &str)], body: &str) -> Reply {
     )
 }
 
-fn respond(
-    req: &Request,
-    peer: SocketAddr,
-    dir: &Path,
-    ctx: &(dyn Fn() -> Ctx + Send + Sync),
-    obs: &dyn Observer,
-) -> Reply {
+/// An `Origin` a browser could only send from a page on this machine or on the address the
+/// server listens on. A page on any other site (including one that points its own name at this
+/// machine, which is how DNS rebinding works) is refused. Clients that are not browsers send none.
+fn origin_allowed(origin: &str, extra: Option<IpAddr>) -> bool {
+    let Some((_, rest)) = origin.split_once("://") else {
+        return false;
+    };
+    let host = rest.split('/').next().unwrap_or("");
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+        || extra.is_some_and(|ip| ip.to_string() == host)
+}
+
+/// Everything that can be decided from the request line and headers: the route, the origin and
+/// the token. `Some` is the refusal, sent before the body is read.
+fn gate(req: &Request, dir: &Path, l: &Limits) -> Option<Reply> {
     if req.path != "/mcp" {
-        return plain(404, &[("Content-Type", "text/plain")], "not found");
+        return Some(plain(404, &[("Content-Type", "text/plain")], "not found"));
     }
     if req.method != "POST" {
-        return plain(
+        return Some(plain(
             405,
             &[("Allow", "POST"), ("Content-Type", "text/plain")],
             "use POST",
-        );
+        ));
+    }
+    if req
+        .header("origin")
+        .is_some_and(|o| !origin_allowed(o, l.origin_host))
+    {
+        return Some(plain(
+            403,
+            &[("Content-Type", "text/plain")],
+            "this origin is not allowed",
+        ));
     }
     let authorised = req
         .header("authorization")
@@ -331,15 +383,24 @@ fn respond(
             scheme.eq_ignore_ascii_case("bearer") && token::matches(dir, t.trim())
         });
     if !authorised {
-        return plain(
+        return Some(plain(
             401,
             &[
                 ("WWW-Authenticate", "Bearer"),
                 ("Content-Type", "text/plain"),
             ],
             "a bearer token is required",
-        );
+        ));
     }
+    None
+}
+
+fn answer(
+    req: &Request,
+    peer: SocketAddr,
+    ctx: &(dyn Fn() -> Ctx + Send + Sync),
+    obs: &dyn Observer,
+) -> Reply {
     let json = [("Content-Type", "application/json")];
     let Ok(text) = std::str::from_utf8(&req.body) else {
         return plain(
@@ -393,6 +454,59 @@ fn respond(
     }
 }
 
+/// A writer that gives up when the whole response has taken too long, however slowly the
+/// client reads it.
+struct TimedWriter<'a> {
+    stream: &'a mut TcpStream,
+    until: Instant,
+}
+
+impl Write for TimedWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        self.stream.set_write_timeout(Some(left))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+/// Close after an answer the client may still be sending its request into: say we are done,
+/// then take (a bounded amount of) what is still arriving, so the close does not become a
+/// connection reset that wipes the answer before the client reads it.
+fn close_politely(stream: &mut TcpStream) {
+    let _ = stream.shutdown(Shutdown::Write);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut sink = [0u8; 8192];
+    let mut taken = 0usize;
+    while taken < 256 * 1024 && Instant::now() < deadline {
+        match stream.read(&mut sink) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => taken += n,
+        }
+    }
+}
+
+fn send(
+    out: &mut TcpStream,
+    l: &Limits,
+    status: u16,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> bool {
+    let mut w = TimedWriter {
+        stream: out,
+        until: Instant::now() + l.write_timeout,
+    };
+    write_response(&mut w, status, headers, body).is_ok()
+}
+
 fn connection(
     stream: TcpStream,
     peer: SocketAddr,
@@ -401,36 +515,57 @@ fn connection(
     obs: &dyn Observer,
     l: &Limits,
 ) {
-    let _ = stream.set_write_timeout(Some(l.read_timeout));
     let until = Rc::new(Cell::new(Instant::now()));
+    let got = Rc::new(Cell::new(false));
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(Timed {
         stream: read_half,
         until: until.clone(),
+        got: got.clone(),
     });
     let mut out = stream;
+    let fail = |out: &mut TcpStream, e: HttpError| {
+        let _ = send(
+            out,
+            l,
+            e.status(),
+            &[("Content-Type", "text/plain"), ("Connection", "close")],
+            e.message().as_bytes(),
+        );
+        close_politely(out);
+    };
     loop {
         until.set(Instant::now() + l.read_timeout);
-        let req = match read_request(&mut reader, l) {
+        got.set(false);
+        let (mut req, len) = match read_head(&mut reader, l) {
             Ok(r) => r,
             Err(HttpError::Closed) => return,
-            Err(e) => {
-                let _ = write_response(
-                    &mut out,
-                    e.status(),
-                    &[("Content-Type", "text/plain"), ("Connection", "close")],
-                    e.message().as_bytes(),
-                );
+            // A keep-alive connection that stayed quiet is closed, not answered.
+            Err(HttpError::Timeout) if !got.get() => return,
+            Err(e) => return fail(&mut out, e),
+        };
+        if let Some((status, mut headers, body)) = gate(&req, dir, l) {
+            headers.push(("Connection".into(), "close".into()));
+            let borrowed: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            let _ = send(&mut out, l, status, &borrowed, &body);
+            close_politely(&mut out);
+            return;
+        }
+        if let Err(e) = read_body(&mut reader, &mut req, len) {
+            if e == HttpError::Closed {
                 return;
             }
-        };
+            return fail(&mut out, e);
+        }
         let keep = !req
             .header("connection")
             .is_some_and(|c| c.eq_ignore_ascii_case("close"));
-        let (status, mut headers, body) = respond(&req, peer, dir, ctx, obs);
-        let keep = keep && status < 400;
+        let (status, mut headers, body) = answer(&req, peer, ctx, obs);
         if !keep {
             headers.push(("Connection".into(), "close".into()));
         }
@@ -438,7 +573,7 @@ fn connection(
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
-        if write_response(&mut out, status, &borrowed, &body).is_err() || !keep {
+        if !send(&mut out, l, status, &borrowed, &body) || !keep {
             return;
         }
     }
@@ -450,6 +585,56 @@ struct Live(Arc<AtomicUsize>);
 impl Drop for Live {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Answer `503` and hang up, without ever waiting on the peer: the accept loop must not stall.
+/// What the peer has already sent is taken first, because closing a socket with unread data
+/// resets the connection and the peer may then never see the answer.
+fn refuse(mut s: TcpStream) {
+    let _ = s.set_nonblocking(true);
+    let _ = s.read(&mut [0u8; 8192]);
+    let _ = s.set_nonblocking(false);
+    let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+    let _ = write_response(
+        &mut s,
+        503,
+        &[("Content-Type", "text/plain"), ("Connection", "close")],
+        b"too many connections",
+    );
+    let _ = s.shutdown(Shutdown::Write);
+}
+
+/// One connection counted against its peer's address while a thread serves it.
+struct IpSlot {
+    map: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    ip: IpAddr,
+    /// How many this address holds, this one included.
+    held: usize,
+}
+
+impl IpSlot {
+    fn take(map: &Arc<Mutex<HashMap<IpAddr, usize>>>, ip: IpAddr) -> IpSlot {
+        let mut m = map.lock().unwrap_or_else(|e| e.into_inner());
+        let n = m.entry(ip).or_insert(0);
+        *n += 1;
+        IpSlot {
+            map: map.clone(),
+            ip,
+            held: *n,
+        }
+    }
+}
+
+impl Drop for IpSlot {
+    fn drop(&mut self) {
+        let mut m = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -465,22 +650,20 @@ pub fn serve(
 ) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     let live = Arc::new(AtomicUsize::new(0));
+    let per_ip: Arc<Mutex<HashMap<IpAddr, usize>>> = Arc::default();
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, peer)) => {
                 // Some systems hand the accepted socket the listener's non-blocking mode.
                 let _ = stream.set_nonblocking(false);
                 let guard = Live(live.clone());
-                if live.fetch_add(1, Ordering::SeqCst) >= limits.max_conns {
-                    let mut s = stream;
-                    let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
-                    let _ = write_response(
-                        &mut s,
-                        503,
-                        &[("Content-Type", "text/plain"), ("Connection", "close")],
-                        b"too many connections",
-                    );
+                let slot = IpSlot::take(&per_ip, peer.ip());
+                if live.fetch_add(1, Ordering::SeqCst) >= limits.max_conns
+                    || slot.held > limits.max_per_ip
+                {
+                    refuse(stream);
                     drop(guard);
+                    drop(slot);
                     continue;
                 }
                 let (dir, ctx, obs) = (dir.clone(), ctx.clone(), obs.clone());
@@ -488,6 +671,7 @@ pub fn serve(
                     .name("osh-mcp-conn".into())
                     .spawn(move || {
                         let _guard = guard;
+                        let _slot = slot;
                         connection(stream, peer, &dir, &*ctx, &*obs, &limits);
                     });
                 // A thread that cannot start drops its closure, and with it the count.
@@ -496,12 +680,10 @@ pub fn serve(
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(25))
             }
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
-                ) => {}
-            Err(e) => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            // Out of descriptors or memory, an aborted connection and the like are the machine's
+            // trouble of the moment: wait and go on, so requests already being served finish.
+            Err(_) => thread::sleep(Duration::from_millis(100)),
         }
     }
     Ok(())
@@ -877,6 +1059,122 @@ mod tests {
                 got.extend_from_slice(&buf[..n]);
             }
         }
+    }
+
+    #[test]
+    fn a_refused_request_is_answered_before_its_body_is_read() {
+        let s = start("early", quick());
+        let started = Instant::now();
+        // Headers only, a 1000 byte body promised and never sent: a server that reads the body
+        // first would wait out the whole read timeout before it said 401.
+        let r = exchange(
+            s.addr,
+            b"POST /mcp HTTP/1.1\r\nContent-Length: 1000\r\n\r\n",
+        );
+        assert_eq!(r.status, 401, "{}", r.head);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_browser_request_from_another_origin_is_refused() {
+        let s = start("origin", quick());
+        let with = |origin: &str| {
+            let body = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+            let req = format!(
+                "POST /mcp HTTP/1.1\r\nAuthorization: Bearer tok-123\r\nOrigin: {origin}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            exchange(s.addr, req.as_bytes()).status
+        };
+        assert_eq!(with("http://evil.example"), 403);
+        assert_eq!(with("null"), 403);
+        assert_eq!(with("http://localhost:3000"), 200);
+        assert_eq!(with("http://127.0.0.1:17800"), 200);
+        assert_eq!(with("http://[::1]:5173"), 200);
+        assert_eq!(
+            post(&s, Some("tok-123"), INIT).status,
+            200,
+            "no Origin: not a browser"
+        );
+    }
+
+    #[test]
+    fn the_configured_address_is_an_allowed_origin() {
+        let s = start(
+            "originhost",
+            Limits {
+                origin_host: Some("10.1.2.3".parse().unwrap()),
+                ..quick()
+            },
+        );
+        let body = r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#;
+        let req = format!(
+            "POST /mcp HTTP/1.1\r\nAuthorization: Bearer tok-123\r\nOrigin: http://10.1.2.3:17800\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        assert_eq!(exchange(s.addr, req.as_bytes()).status, 200);
+    }
+
+    #[test]
+    fn one_peer_cannot_take_every_slot() {
+        let s = start(
+            "perip",
+            Limits {
+                max_per_ip: 2,
+                ..quick()
+            },
+        );
+        let _a = TcpStream::connect(s.addr).unwrap();
+        let _b = TcpStream::connect(s.addr).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        let r = exchange(s.addr, b"GET / HTTP/1.1\r\n\r\n");
+        assert_eq!(r.status, 503, "{}", r.head);
+        assert!(r.body.contains("too many"), "{}", r.body);
+    }
+
+    #[test]
+    fn an_idle_connection_is_closed_without_an_answer() {
+        let s = start(
+            "idle",
+            Limits {
+                read_timeout: Duration::from_millis(300),
+                ..Limits::default()
+            },
+        );
+        let mut c = TcpStream::connect(s.addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
+        assert!(
+            out.is_empty(),
+            "nothing was asked, nothing is answered: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_refusal_reaches_a_client_that_keeps_sending() {
+        let s = start(
+            "drain",
+            Limits {
+                max_body: 100,
+                ..quick()
+            },
+        );
+        let mut c = TcpStream::connect(s.addr).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        c.write_all(
+            b"POST /mcp HTTP/1.1\r\nAuthorization: Bearer tok-123\r\nContent-Length: 60000\r\n\r\n",
+        )
+        .unwrap();
+        // The body follows although the server will not take it.
+        let _ = c.write_all(&vec![b'x'; 60000]);
+        let mut out = Vec::new();
+        let _ = c.read_to_end(&mut out);
+        assert_eq!(parse(&String::from_utf8_lossy(&out)).status, 413);
     }
 
     #[test]

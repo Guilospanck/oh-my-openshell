@@ -270,7 +270,12 @@ fn serve_cmd() -> i32 {
         dir.clone(),
         Arc::new(ctx_source(dir, |k| std::env::var_os(k))),
         registry.clone(),
-        http::Limits::default(),
+        http::Limits {
+            // A browser page on the address the server listens on may call it; any other
+            // site may not (the bearer token is the other half of that defence).
+            origin_host: (!ip.is_unspecified()).then_some(ip),
+            ..http::Limits::default()
+        },
         Arc::new(AtomicBool::new(false)),
     );
     registry.remove();

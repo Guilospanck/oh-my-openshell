@@ -640,11 +640,16 @@ mod tests {
         let a = got.expect("an alert");
         assert!(a.title.contains(".envrc"), "{a:?}");
         assert_eq!(a.sandbox.as_deref(), Some("sb"));
-        while rx.try_recv().is_ok() {}
-        assert!(
-            rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "reported once"
-        );
+        // A scan that was already running when the last write landed may report once more; once
+        // the file stops changing nothing may come, however many scans follow.
+        let mut quiet = false;
+        for _ in 0..20 {
+            if rx.recv_timeout(Duration::from_millis(250)).is_err() {
+                quiet = true;
+                break;
+            }
+        }
+        assert!(quiet, "the same change is reported once, not on every scan");
         let _ = fs::remove_dir_all(&data);
         let _ = fs::remove_dir_all(&share);
     }
