@@ -34,6 +34,7 @@ class Osh:
             os.execvpe(args[0], list(args), e)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
         self.status = None
+        self.raw = bytearray()  # everything osh wrote, to check which terminal modes it asked for
 
     def __enter__(self):
         return self
@@ -54,6 +55,7 @@ class Osh:
                 return False
             if not data:
                 return False
+            self.raw += data
             self.stream.feed(data)
             # A real terminal answers cursor-position requests (osh asks after a job returns).
             for _ in range(data.count(b"\x1b[6n")):

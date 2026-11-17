@@ -90,17 +90,23 @@ fn host_keys(kitty: bool) -> HostKeys {
     }
 }
 
-/// Mouse, paste and focus reports (and modified keys, when the host has them) are only
-/// wanted while a shell has focus; the dashboard keeps the host terminal's own.
+/// Mouse reports, for the dashboard (clicks and the wheel) and for a focused shell. Off while
+/// a job or the wizard owns the terminal, and at exit.
+fn mouse(on: bool) {
+    let mut out = io::stdout();
+    let _ = if on {
+        execute!(out, EnableMouseCapture)
+    } else {
+        execute!(out, DisableMouseCapture)
+    };
+}
+
+/// Paste and focus reports (and modified keys, when the host has them) are only wanted while a
+/// shell has focus; the dashboard keeps the host terminal's own.
 fn host_modes(on: bool, keys: HostKeys) {
     let mut out = io::stdout();
     if on {
-        let _ = execute!(
-            out,
-            EnableMouseCapture,
-            EnableBracketedPaste,
-            EnableFocusChange
-        );
+        let _ = execute!(out, EnableBracketedPaste, EnableFocusChange);
         match keys {
             HostKeys::Kitty => {
                 let _ = execute!(
@@ -126,12 +132,7 @@ fn host_modes(on: bool, keys: HostKeys) {
             }
             HostKeys::Legacy => {}
         }
-        let _ = execute!(
-            out,
-            DisableMouseCapture,
-            DisableBracketedPaste,
-            DisableFocusChange
-        );
+        let _ = execute!(out, DisableBracketedPaste, DisableFocusChange);
     }
     tmuxpass::focus(on);
 }
@@ -740,6 +741,7 @@ fn main() -> io::Result<()> {
     // Bracketed paste is on with a focused shell (host_modes) and while the editor is open, so a
     // pasted block arrives as one paste, not as typed keys that Enter would auto-indent.
     let mut pasting = false;
+    mouse(true);
     let result = (|| -> io::Result<()> {
         while !app.quit {
             if let Some(lv) = &mut app.logview {
@@ -823,8 +825,10 @@ fn main() -> io::Result<()> {
                     captured = false;
                     pasting = false;
                 }
+                mouse(false);
                 let failed = run_steps(steps, app.capture, app.job_prints_secret());
                 terminal = ratatui::init();
+                mouse(true);
                 terminal.clear()?;
                 app.finish_job(failed);
                 app.reload_gateways();
@@ -837,7 +841,10 @@ fn main() -> io::Result<()> {
                     pasting = false;
                 }
                 let data = app.dir.clone();
-                match wizard::run(&mut terminal, wizard::open(mode, &data), &data) {
+                mouse(false);
+                let outcome = wizard::run(&mut terminal, wizard::open(mode, &data), &data);
+                mouse(true);
+                match outcome {
                     Ok(wizard::Outcome::NeedsAction(t)) => {
                         app.status = format!("Gateway setup stopped: {t}")
                     }
@@ -851,6 +858,7 @@ fn main() -> io::Result<()> {
         }
         Ok(())
     })();
+    mouse(false);
     if captured {
         host_modes(false, keys);
     } else if pasting {

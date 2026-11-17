@@ -902,6 +902,8 @@ def mcp_onoff():
 def mouse_dashboard():
     """A click on a tab name switches tabs and the wheel moves the cursor (SGR mouse reports)."""
     with dashboard() as o:
+        # Without this request a real terminal never sends the clicks and wheel to osh.
+        assert b"\x1b[?1000h" in o.raw, "the dashboard asks the terminal for mouse reports"
         # " osh " is 5 columns, " 1 Sandboxes " 13: "2 Providers" starts at column 19 (1-based).
         o.send("\x1b[<0;21;1M"); o.send("\x1b[<0;21;1m")
         o.wait("CREDENTIAL KEYS", 10)
