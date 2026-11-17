@@ -109,6 +109,8 @@ which builds only with Zig 0.15 (`brew install zig@0.15`). The launcher puts
 `PATH="$(brew --prefix zig@0.15)/bin:$PATH" LIBGHOSTTY_VT_SYS_OPTIMIZE=ReleaseFast cargo build --release`.
 
 Two keys help you find your way on any tab: `?` opens the key reference for the tab you are on, and
+Every list scrolls with `j`/`k` or the arrow keys, and a long one (sandboxes, providers, profiles, images, gateways, and the MCP tab's clients and jobs) shows `row/total` in its title. `/` searches the tab's list: type any part of a name, type, endpoint or state (case does not matter), `Enter` keeps the search, `Esc` clears it. Each tab keeps its own search, and an action such as `d` acts on the row the cursor is on among the matches.
+
 `:` (or `Ctrl-P`) opens the command palette, where you type a few letters of any action (`del`, `go to g`) and
 press `Enter` to run it. The palette sends the action's own key, so it does exactly what the key does.
 A few actions have no key and live only in the palette:

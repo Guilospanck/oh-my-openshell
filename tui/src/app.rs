@@ -55,9 +55,6 @@ pub struct McpView {
     pub state: Option<osh_core::mcpserver::state::State>,
     /// Background jobs started over MCP, newest first.
     pub jobs: Vec<osh_core::jobs::Job>,
-    /// The search (`/`) over clients and jobs; `filtering` while it is being typed.
-    pub filter: String,
-    pub filtering: bool,
     pub checked: Option<Instant>,
 }
 
@@ -77,8 +74,6 @@ impl Default for McpView {
             svc: crate::mcpsvc::Svc::NotInstalled,
             state: None,
             jobs: Vec::new(),
-            filter: String::new(),
-            filtering: false,
             checked: None,
         }
     }
@@ -790,6 +785,9 @@ pub struct App {
     pub tab: Tab,
     pub snap: Snapshot,
     pub cursor: [usize; 6],
+    /// The search (`/`) of each tab, and whether its text is being typed now.
+    pub filters: [String; 6],
+    pub filtering: bool,
     pub mcp: McpView,
     pub modal: Option<Modal>,
     /// Full-screen live log viewer; takes over the keyboard while open.
@@ -1166,6 +1164,8 @@ impl App {
             tab: Tab::Sandboxes,
             snap: Snapshot::default(),
             cursor: [0; 6],
+            filters: Default::default(),
+            filtering: false,
             mcp: McpView::default(),
             modal: None,
             logview: None,
@@ -1286,21 +1286,69 @@ impl App {
 
     fn len(&self) -> usize {
         match self.tab {
-            Tab::Sandboxes => self.snap.sandboxes.len(),
-            Tab::Providers => self.snap.providers.len(),
-            Tab::Profiles => self.profile_rows().len(),
-            Tab::Images => self.snap.images.len(),
-            Tab::Gateways => self.snap.gateways.len(),
+            Tab::Sandboxes | Tab::Providers | Tab::Profiles | Tab::Images | Tab::Gateways => {
+                self.shown(self.tab).len()
+            }
             Tab::Mcp => self.mcp_clients() + self.mcp_visible_jobs().len(),
         }
     }
 
-    pub fn current(&self) -> usize {
-        self.cursor[self.idx()]
+    pub fn selected_sandbox(&self) -> Option<&cli::Sandbox> {
+        self.snap
+            .sandboxes
+            .get(*self.shown(Tab::Sandboxes).get(self.cursor[0])?)
     }
 
-    pub fn selected_sandbox(&self) -> Option<&cli::Sandbox> {
-        self.snap.sandboxes.get(self.cursor[0])
+    /// Which rows of a tab's list match its search, as indexes into the list (all of them
+    /// without a search). The cursor counts these rows, not the whole list.
+    pub fn shown(&self, tab: Tab) -> Vec<usize> {
+        use crate::listfilter::matches;
+        let q = self.filters[TABS.iter().position(|(t, _)| *t == tab).unwrap_or(0)].as_str();
+        let pick = |n: usize, fields: &dyn Fn(usize) -> Vec<String>| {
+            (0..n)
+                .filter(|&i| {
+                    let f = fields(i);
+                    matches(q, &f.iter().map(String::as_str).collect::<Vec<_>>())
+                })
+                .collect::<Vec<_>>()
+        };
+        match tab {
+            Tab::Sandboxes => pick(self.snap.sandboxes.len(), &|i| {
+                let s = &self.snap.sandboxes[i];
+                vec![s.name.clone(), s.phase.clone(), s.created.clone()]
+            }),
+            Tab::Providers => pick(self.snap.providers.len(), &|i| {
+                let p = &self.snap.providers[i];
+                let mut f = vec![p.name.clone(), p.ty.clone()];
+                f.extend(p.keys.iter().cloned());
+                f
+            }),
+            Tab::Profiles => {
+                let rows = self.profile_rows();
+                pick(rows.len(), &|i| vec![rows[i].id.clone()])
+            }
+            Tab::Images => pick(self.snap.images.len(), &|i| {
+                let m = &self.snap.images[i];
+                vec![
+                    m.tag.clone(),
+                    m.file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                ]
+            }),
+            Tab::Gateways => pick(self.snap.gateways.len(), &|i| {
+                let g = &self.snap.gateways[i];
+                vec![g.name.clone(), g.endpoint.clone()]
+            }),
+            Tab::Mcp => Vec::new(),
+        }
+    }
+
+    /// The index in its list of the row the cursor is on in `tab`.
+    pub fn current_idx(&self, tab: Tab) -> Option<usize> {
+        let i = TABS.iter().position(|(t, _)| *t == tab)?;
+        self.shown(tab).get(self.cursor[i]).copied()
     }
 
     /// What a snapshot says about its gateway, as a status line.
@@ -1341,14 +1389,8 @@ impl App {
             }
         }
         self.config_stale = config_stale(&self.registry);
-        for i in 0..5 {
-            let len = [
-                self.snap.sandboxes.len(),
-                self.snap.providers.len(),
-                self.profile_rows().len(),
-                self.snap.images.len(),
-                self.snap.gateways.len(),
-            ][i];
+        for (i, (tab, _)) in TABS.iter().enumerate().take(5) {
+            let len = self.shown(*tab).len();
             self.cursor[i] = self.cursor[i].min(len.saturating_sub(1));
         }
         self.sync_selection();
@@ -5275,13 +5317,20 @@ impl App {
             self.modal_key(modal, key);
             return;
         }
-        if self.tab == Tab::Mcp && self.mcp.filtering {
-            self.mcp_filter_key(key.code);
+        if self.filtering {
+            self.filter_key(key.code);
             return;
         }
         match key.code {
             KeyCode::Esc if self.toast().is_some() => {
                 self.dismiss_toast();
+            }
+            KeyCode::Char('/') => self.filtering = true,
+            KeyCode::Esc if !self.filters[self.idx()].is_empty() => {
+                let i = self.idx();
+                self.filters[i].clear();
+                self.cursor[i] = 0;
+                self.sync_selection();
             }
             KeyCode::Char('!') => self.show_alerts(None),
             KeyCode::Char('?') => self.modal = Some(Modal::Help { scroll: 0 }),
@@ -5431,7 +5480,7 @@ impl App {
 
     /// The connected clients that match the search, listed above the jobs.
     pub fn mcp_visible_clients(&self) -> Vec<&osh_core::mcpserver::state::Client> {
-        let q = &self.mcp.filter;
+        let q = &self.filters[5];
         self.mcp.state.as_ref().map_or(Vec::new(), |s| {
             s.clients
                 .iter()
@@ -5446,7 +5495,7 @@ impl App {
 
     /// The jobs that match the search.
     pub fn mcp_visible_jobs(&self) -> Vec<&osh_core::jobs::Job> {
-        let q = &self.mcp.filter;
+        let q = &self.filters[5];
         self.mcp
             .jobs
             .iter()
@@ -5466,31 +5515,28 @@ impl App {
     }
 
     /// Keys while the search is being typed: everything is text except Enter and Esc.
-    fn mcp_filter_key(&mut self, code: KeyCode) {
+    fn filter_key(&mut self, code: KeyCode) {
+        let i = self.idx();
         match code {
-            KeyCode::Char(c) => self.mcp.filter.push(c),
+            KeyCode::Char(c) => self.filters[i].push(c),
             KeyCode::Backspace => {
-                self.mcp.filter.pop();
+                self.filters[i].pop();
             }
-            KeyCode::Enter => self.mcp.filtering = false,
+            KeyCode::Enter => self.filtering = false,
             KeyCode::Esc => {
-                self.mcp.filter.clear();
-                self.mcp.filtering = false;
+                self.filters[i].clear();
+                self.filtering = false;
             }
             _ => {}
         }
-        self.cursor[5] = 0;
+        self.cursor[i] = 0;
+        self.sync_selection();
     }
 
     /// `Enter` turns the server on or off (after a question); `t` copies its address.
     fn mcp_key(&mut self, code: KeyCode) {
         use crate::mcpsvc::Svc;
         match code {
-            KeyCode::Char('/') => self.mcp.filtering = true,
-            KeyCode::Esc if !self.mcp.filter.is_empty() => {
-                self.mcp.filter.clear();
-                self.cursor[5] = 0;
-            }
             KeyCode::Enter if self.mcp.svc == Svc::External => {
                 let pid = self
                     .mcp
@@ -5561,7 +5607,10 @@ impl App {
                     return self.new_file(false);
                 }
                 if code == KeyCode::Char('e') {
-                    if let Some(img) = self.snap.images.get(self.current()) {
+                    if let Some(img) = self
+                        .current_idx(Tab::Images)
+                        .and_then(|i| self.snap.images.get(i))
+                    {
                         let rel = img
                             .file
                             .strip_prefix(&self.dir)
@@ -5576,7 +5625,10 @@ impl App {
                     if cli::runtime().is_none() {
                         return self.offer_runtime_start();
                     }
-                    if let Some(img) = self.snap.images.get(self.current()) {
+                    if let Some(img) = self
+                        .current_idx(Tab::Images)
+                        .and_then(|i| self.snap.images.get(i))
+                    {
                         self.job = Some(vec![Step {
                             prog: cli::runtime_bin().into(),
                             args: cli::build_args(&self.dir, &img.file, &img.tag),
@@ -5722,7 +5774,11 @@ impl App {
             self.wizard_request = Some(crate::wizard::Mode::Add);
             return;
         }
-        let Some(g) = self.snap.gateways.get(self.current()).cloned() else {
+        let Some(g) = self
+            .current_idx(Tab::Gateways)
+            .and_then(|i| self.snap.gateways.get(i))
+            .cloned()
+        else {
             return;
         };
         let info = self.gateway_info(&g.name, &g.endpoint);
@@ -5861,7 +5917,11 @@ impl App {
                 );
             }
             KeyCode::Char('u') => {
-                if let Some(p) = self.snap.providers.get(self.current()).cloned() {
+                if let Some(p) = self
+                    .current_idx(Tab::Providers)
+                    .and_then(|i| self.snap.providers.get(i))
+                    .cloned()
+                {
                     if let Some(t) = self.tracked_for(&p.name) {
                         return self.renew(&t);
                     }
@@ -5874,7 +5934,10 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(p) = self.snap.providers.get(self.current()) {
+                if let Some(p) = self
+                    .current_idx(Tab::Providers)
+                    .and_then(|i| self.snap.providers.get(i))
+                {
                     self.modal = Some(Modal::Confirm {
                         text: format!("Delete provider '{}'?", p.name),
                         kind: ConfKind::DeleteProvider(p.name.clone()),
@@ -5893,7 +5956,7 @@ impl App {
             return;
         }
         let rows = self.profile_rows();
-        let Some(row) = rows.get(self.current()) else {
+        let Some(row) = self.current_idx(Tab::Profiles).and_then(|i| rows.get(i)) else {
             return;
         };
         let rel = self.profile_rel(&row.id);
@@ -6689,12 +6752,12 @@ mod tests {
         let mut a = mcp_app(0, 4);
         a.mcp.jobs[1].sandbox = "other".into();
         press(&mut a, KeyCode::Char('/'));
-        assert!(a.mcp.filtering);
+        assert!(a.filtering);
         type_text(&mut a, "OTH");
-        assert_eq!(a.mcp.filter, "OTH");
+        assert_eq!(a.filters[5], "OTH");
         assert_eq!(a.mcp_visible_jobs().len(), 1);
         press(&mut a, KeyCode::Backspace);
-        assert_eq!(a.mcp.filter, "OT");
+        assert_eq!(a.filters[5], "OT");
         assert_eq!(a.mcp_visible_jobs().len(), 1);
     }
 
@@ -6715,7 +6778,7 @@ mod tests {
         assert!(!a.quit, "q is text");
         assert!(a.tab == Tab::Mcp, "1 and 6 are text");
         assert!(a.modal.is_none(), ": is text");
-        assert_eq!(a.mcp.filter, "q1j6:c");
+        assert_eq!(a.filters[5], "q1j6:c");
     }
 
     #[test]
@@ -6725,18 +6788,18 @@ mod tests {
         press(&mut a, KeyCode::Char('/'));
         type_text(&mut a, "zed");
         press(&mut a, KeyCode::Enter);
-        assert!(!a.mcp.filtering, "typing is over");
+        assert!(!a.filtering, "typing is over");
         assert_eq!(a.mcp_visible_jobs().len(), 1, "the search stays");
         press(&mut a, KeyCode::Char('j'));
         assert_eq!(a.cursor[5], 0, "j moves again, within the match");
         press(&mut a, KeyCode::Esc);
-        assert_eq!(a.mcp.filter, "", "Esc clears a kept search");
+        assert_eq!(a.filters[5], "", "Esc clears a kept search");
         assert_eq!(a.mcp_visible_jobs().len(), 3);
         press(&mut a, KeyCode::Char('/'));
         type_text(&mut a, "x");
         press(&mut a, KeyCode::Esc);
         assert!(
-            !a.mcp.filtering && a.mcp.filter.is_empty(),
+            !a.filtering && a.filters[5].is_empty(),
             "Esc while typing clears too"
         );
     }
@@ -6758,10 +6821,115 @@ mod tests {
     fn a_refresh_keeps_the_cursor_inside_the_matches() {
         let mut a = mcp_app(0, 5);
         a.cursor[5] = 4;
-        a.mcp.filter = "w1".into();
+        a.filters[5] = "w1".into();
         a.mcp.jobs.truncate(2);
         a.clamp_mcp_cursor();
         assert_eq!(a.cursor[5], 1);
+    }
+
+    fn sandboxes(names: &[&str]) -> Vec<cli::Sandbox> {
+        names
+            .iter()
+            .map(|n| cli::Sandbox {
+                name: n.to_string(),
+                phase: "Ready".into(),
+                created: "now".into(),
+                conditions: vec![],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn slash_searches_every_list_tab_and_the_cursor_counts_the_matches() {
+        let mut a = app();
+        a.snap.sandboxes = sandboxes(&["alpha", "bravo", "brick"]);
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "br");
+        assert_eq!(a.shown(Tab::Sandboxes), vec![1, 2]);
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(
+            a.selected_sandbox().map(|s| s.name.as_str()),
+            Some("brick"),
+            "the cursor is on the second match, whatever its place in the list"
+        );
+        press(&mut a, KeyCode::Char('j'));
+        assert_eq!(a.cursor[0], 1, "stops at the last match");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.shown(Tab::Sandboxes).len(), 3);
+        assert_eq!(a.cursor[0], 0);
+    }
+
+    #[test]
+    fn each_tab_keeps_its_own_search() {
+        let mut a = app();
+        a.snap.sandboxes = sandboxes(&["alpha", "bravo"]);
+        press(&mut a, KeyCode::Char('/'));
+        type_text(&mut a, "alp");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Char('2'));
+        assert_eq!(a.filters[1], "", "another tab starts without one");
+        press(&mut a, KeyCode::Char('1'));
+        assert_eq!(a.shown(Tab::Sandboxes), vec![0]);
+    }
+
+    #[test]
+    fn providers_images_and_gateways_are_searched_by_name_and_kind() {
+        let mut a = app();
+        a.snap.providers = vec![
+            cli::Provider {
+                name: "work".into(),
+                ty: "github".into(),
+                keys: vec!["TOKEN".into()],
+            },
+            cli::Provider {
+                name: "home".into(),
+                ty: "npm".into(),
+                keys: vec![],
+            },
+        ];
+        a.snap.gateways = vec![
+            cli::Gateway {
+                name: "openshell-vm".into(),
+                endpoint: "127.0.0.1:17670".into(),
+                active: true,
+            },
+            cli::Gateway {
+                name: "openshell-docker".into(),
+                endpoint: "127.0.0.1:17671".into(),
+                active: false,
+            },
+        ];
+        a.filters[1] = "NPM".into();
+        assert_eq!(a.shown(Tab::Providers), vec![1], "by type");
+        a.filters[1] = "token".into();
+        assert_eq!(a.shown(Tab::Providers), vec![0], "by key name");
+        a.filters[4] = "17671".into();
+        assert_eq!(a.shown(Tab::Gateways), vec![1], "by endpoint");
+    }
+
+    #[test]
+    fn an_action_acts_on_the_row_the_search_left_under_the_cursor() {
+        let mut a = app();
+        a.tab = Tab::Gateways;
+        a.snap.gateways = vec![
+            cli::Gateway {
+                name: "openshell-vm".into(),
+                endpoint: "e1".into(),
+                active: true,
+            },
+            cli::Gateway {
+                name: "openshell-docker".into(),
+                endpoint: "e2".into(),
+                active: false,
+            },
+        ];
+        a.filters[4] = "docker".into();
+        assert_eq!(
+            a.current_idx(Tab::Gateways),
+            Some(1),
+            "the first match is the second gateway"
+        );
     }
 
     #[test]

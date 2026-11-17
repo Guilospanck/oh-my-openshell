@@ -193,6 +193,9 @@ fn full_row(cols: Cols, row: &[Line<'static>], width: usize) -> Vec<Line<'static
 /// A tab's table in a panel titled `title`. Cells too wide for their column end in `…`; then
 /// (unless `elsewhere`, a details pane that already shows the selected row whole) the bottom of the
 /// panel shows the selected row in full, so no value is out of reach.
+/// The `cursor` of a table the cursor is not in.
+const NO_CURSOR: usize = usize::MAX;
+
 fn draw_table(
     f: &mut Frame,
     area: Rect,
@@ -204,7 +207,7 @@ fn draw_table(
 ) {
     let n = cells.len();
     // A table the cursor is not in shows no highlighted row and no position.
-    let block = panel(title, (!elsewhere).then_some((cursor, n)));
+    let block = panel(title, (cursor != NO_CURSOR).then_some((cursor, n)));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let width = usize::from(inner.width);
@@ -253,9 +256,9 @@ fn draw_table(
         .column_spacing(1)
         .header(head(&names))
         .row_highlight_style(row_highlight());
-    let mut state = table_state(cursor);
-    if elsewhere {
-        state = TableState::default();
+    let mut state = TableState::default();
+    if cursor != NO_CURSOR {
+        state = table_state(cursor);
     }
     f.render_stateful_widget(t, parts[0], &mut state);
     f.render_widget(Paragraph::new(strip), parts[1]);
@@ -536,6 +539,33 @@ fn kv(label: &str, value: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>
         .collect()
 }
 
+/// A panel's title with the tab's search after it while one is set or being typed.
+fn search_title(app: &App, base: &str, tab: Tab) -> String {
+    let i = TABS.iter().position(|(t, _)| *t == tab).unwrap_or(0);
+    let typing = app.filtering && app.tab == tab;
+    if app.filters[i].is_empty() && !typing {
+        base.to_string()
+    } else {
+        format!(
+            "{base}  /{}{}",
+            app.filters[i],
+            if typing { "_" } else { "" }
+        )
+    }
+}
+
+/// Stand-in for a list the search left empty.
+fn no_match(f: &mut Frame, area: Rect, title: &str, cols: Cols) {
+    empty_state(
+        f,
+        area,
+        title,
+        cols,
+        "Nothing matches",
+        "Esc clears the search.",
+    );
+}
+
 fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -551,11 +581,14 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
             "No sandboxes yet",
             "n  create one",
         );
+    } else if app.shown(Tab::Sandboxes).is_empty() {
+        let title = search_title(app, "Sandboxes", Tab::Sandboxes);
+        no_match(f, cols[0], &title, SANDBOX_COLS);
     } else {
         let cells: Vec<Vec<Line<'static>>> = app
-            .snap
-            .sandboxes
-            .iter()
+            .shown(Tab::Sandboxes)
+            .into_iter()
+            .map(|i| &app.snap.sandboxes[i])
             .map(|s| {
                 // A running shell is marked after the name, so every name starts in the header's column.
                 let name = if app.has_session(&s.name) {
@@ -577,7 +610,7 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
         draw_table(
             f,
             cols[0],
-            "Sandboxes",
+            &search_title(app, "Sandboxes", Tab::Sandboxes),
             SANDBOX_COLS,
             cells,
             app.cursor[0],
@@ -737,10 +770,14 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
+    if app.shown(Tab::Providers).is_empty() {
+        let title = search_title(app, "Providers", Tab::Providers);
+        return no_match(f, area, &title, PROVIDER_COLS);
+    }
     let cells: Vec<Vec<Line<'static>>> = app
-        .snap
-        .providers
-        .iter()
+        .shown(Tab::Providers)
+        .into_iter()
+        .map(|i| &app.snap.providers[i])
         .map(|p| {
             let gw = cli::gateway();
             let note = app
@@ -773,7 +810,7 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
     draw_table(
         f,
         area,
-        "Providers",
+        &search_title(app, "Providers", Tab::Providers),
         PROVIDER_COLS,
         cells,
         app.cursor[1],
@@ -782,9 +819,17 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_profiles(f: &mut Frame, app: &App, area: Rect) {
-    let cells: Vec<Vec<Line<'static>>> = app
-        .profile_rows()
+    let all_rows = app.profile_rows();
+    let shown = app.shown(Tab::Profiles);
+    if !all_rows.is_empty() && shown.is_empty() {
+        let title = search_title(app, "Profiles", Tab::Profiles);
+        return no_match(f, area, &title, PROFILE_COLS);
+    }
+    let cells: Vec<Vec<Line<'static>>> = all_rows
         .into_iter()
+        .enumerate()
+        .filter(|(i, _)| shown.contains(i))
+        .map(|(_, r)| r)
         .map(|r| {
             let (gw, gs) = r
                 .gateway_version
@@ -814,7 +859,7 @@ fn draw_profiles(f: &mut Frame, app: &App, area: Rect) {
     draw_table(
         f,
         area,
-        "Profiles",
+        &search_title(app, "Profiles", Tab::Profiles),
         PROFILE_COLS,
         cells,
         app.cursor[2],
@@ -832,10 +877,14 @@ fn draw_images(f: &mut Frame, app: &App, area: Rect) {
         empty_state(f, area, "Images", IMAGE_COLS, "No images", &hint);
         return;
     }
+    if app.shown(Tab::Images).is_empty() {
+        let title = search_title(app, "Images", Tab::Images);
+        return no_match(f, area, &title, IMAGE_COLS);
+    }
     let cells: Vec<Vec<Line<'static>>> = app
-        .snap
-        .images
-        .iter()
+        .shown(Tab::Images)
+        .into_iter()
+        .map(|i| &app.snap.images[i])
         .map(|i| {
             let (s, c) = match (i.built, i.freshness) {
                 (false, _) => ("not built", role::WARN),
@@ -856,7 +905,15 @@ fn draw_images(f: &mut Frame, app: &App, area: Rect) {
             ]
         })
         .collect();
-    draw_table(f, area, "Images", IMAGE_COLS, cells, app.cursor[3], false);
+    draw_table(
+        f,
+        area,
+        &search_title(app, "Images", Tab::Images),
+        IMAGE_COLS,
+        cells,
+        app.cursor[3],
+        false,
+    );
 }
 
 fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
@@ -872,10 +929,14 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
+    if app.shown(Tab::Gateways).is_empty() {
+        let title = search_title(app, "Gateways", Tab::Gateways);
+        return no_match(f, area, &title, GATEWAY_COLS);
+    }
     let cells: Vec<Vec<Line<'static>>> = app
-        .snap
-        .gateways
-        .iter()
+        .shown(Tab::Gateways)
+        .into_iter()
+        .map(|i| &app.snap.gateways[i])
         .map(|g| {
             let cur = g.name == app.snap.gateway;
             let info = app.gateway_info(&g.name, &g.endpoint);
@@ -905,7 +966,7 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
     draw_table(
         f,
         area,
-        "Gateways",
+        &search_title(app, "Gateways", Tab::Gateways),
         GATEWAY_COLS,
         cells,
         app.cursor[4],
@@ -948,7 +1009,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
         .split(area);
     // Jobs, when there are any, take the lower part of the area under the clients.
     let jobs = app.mcp_visible_jobs();
-    let searching = !app.mcp.filter.is_empty() || app.mcp.filtering;
+    let searching = !app.filters[5].is_empty() || app.filtering;
     let (clients_area, jobs_area) = if app.mcp.jobs.is_empty() {
         (rows[1], None)
     } else {
@@ -1002,7 +1063,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
         .map_or(0, |d| d.as_secs());
     let shown = app.mcp_visible_clients();
     let clients_title = if searching {
-        format!("Clients  /{}", app.mcp.filter)
+        search_title(app, "Clients", Tab::Mcp)
     } else {
         "Clients".to_string()
     };
@@ -1030,8 +1091,12 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
                 &clients_title,
                 MCP_COLS,
                 cells,
-                app.cursor[5],
-                app.cursor[5] >= list.len(),
+                if app.cursor[5] < list.len() {
+                    app.cursor[5]
+                } else {
+                    NO_CURSOR
+                },
+                false,
             );
         }
         _ => {
@@ -1050,7 +1115,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
     }
     if let Some(area) = jobs_area {
         let jobs_title = if searching {
-            format!("Jobs  /{}", app.mcp.filter)
+            search_title(app, "Jobs", Tab::Mcp)
         } else {
             "Jobs".to_string()
         };
@@ -1092,22 +1157,18 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
                 ]
             })
             .collect();
-        let at = app.cursor[5].saturating_sub(app.mcp_clients());
-        draw_table(
-            f,
-            area,
-            &jobs_title,
-            JOB_COLS,
-            cells,
-            at,
-            app.cursor[5] < app.mcp_clients(),
-        );
+        let at = if app.cursor[5] < app.mcp_clients() {
+            NO_CURSOR
+        } else {
+            app.cursor[5] - app.mcp_clients()
+        };
+        draw_table(f, area, &jobs_title, JOB_COLS, cells, at, true);
     }
 }
 
 /// The keys every tab has, last in the footer.
 pub const GLOBAL_HELP: &str =
-    "Tab/1-6 switch  j/k move  g gateway  r refresh  c osh config  ! alerts  ? help  : commands  q quit";
+    "Tab/1-6 switch  j/k move  / search  g gateway  r refresh  c osh config  ! alerts  ? help  : commands  q quit";
 
 /// The per-tab key hints in the footer.
 pub fn footer_help(tab: Tab) -> &'static str {
@@ -1117,7 +1178,7 @@ pub fn footer_help(tab: Tab) -> &'static str {
         Tab::Profiles => "u / Enter import or update from providers/  e file  n new",
         Tab::Images => "b / Enter build  e Dockerfile  n new",
         Tab::Gateways => "Enter select  s make default  a add  R start/restart  l log  e config  V VM size  d wipe (delete all data)  x remove",
-        Tab::Mcp => "Enter on/off  t copy address  / search",
+        Tab::Mcp => "Enter on/off  t copy address",
     }
 }
 
@@ -2730,6 +2791,36 @@ mod tests {
         let (all, _) = screen(&app, 120, 24);
         assert!(all.contains("box25") && !all.contains("box00"), "{all}");
         assert!(all.contains("26/30"), "{all}");
+    }
+
+    #[test]
+    fn a_long_sandbox_list_scrolls_and_a_search_narrows_it() {
+        let mut app = usage_app("vm");
+        app.snap.sandboxes = (0..40)
+            .map(|n| cli::Sandbox {
+                name: format!("sb{n:02}"),
+                phase: "Ready".into(),
+                created: "now".into(),
+                conditions: vec![],
+            })
+            .collect();
+        let (all, _) = screen(&app, 120, 24);
+        assert!(all.contains("sb00") && !all.contains("sb35"), "{all}");
+        app.cursor[0] = 35;
+        let (all, _) = screen(&app, 120, 24);
+        assert!(all.contains("sb35") && !all.contains("sb00"), "{all}");
+        assert!(all.contains("36/40"), "{all}");
+        app.filters[0] = "sb3".into();
+        app.cursor[0] = 0;
+        let (all, _) = screen(&app, 120, 24);
+        assert!(
+            all.contains("Sandboxes  /sb3") && all.contains("1/10"),
+            "{all}"
+        );
+        assert!(all.contains("sb30") && !all.contains("sb12"), "{all}");
+        app.filters[0] = "zzz".into();
+        let (all, _) = screen(&app, 120, 24);
+        assert!(all.contains("Nothing matches"), "{all}");
     }
 
     #[test]

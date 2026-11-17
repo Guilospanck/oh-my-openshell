@@ -898,7 +898,7 @@ def mcp_onoff():
         o.press("enter"); o.wait("Install the MCP server", 5)
         o.press("n"); o.wait_gone("Install the MCP server", 5)
 
-@scenario("mcp-search")
+@scenario("list-search")
 def mcp_search():
     """Jobs the server started are listed on the MCP tab and `/` narrows them: j/k walk the list,
     typed text (even keys like q and 6) goes into the search, Enter keeps it and Esc clears it."""
