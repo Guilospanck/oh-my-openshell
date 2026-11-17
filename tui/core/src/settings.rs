@@ -97,7 +97,7 @@ const fn secs(
     }
 }
 
-static REGISTRY: [Def; 18] = [
+static REGISTRY: [Def; 19] = [
     Def {
         key: "general.editor",
         kind: Kind::Choice(EDITORS),
@@ -172,6 +172,7 @@ static REGISTRY: [Def; 18] = [
         desc: "The gateway the MCP server uses when a call names none. Empty means OpenShell's active gateway.",
     },
     secs("mcp.client_idle_secs", 10, 86400, "600", Effect::Live, "How long a client may stay silent before the MCP server stops listing it as connected."),
+    secs("mcp.job_max_secs", 0, 604800, "14400", Effect::McpRequest, "The longest a background job may run before it is ended; 0 means no limit. A caller's max_secs can lower it, never raise it."),
 ];
 
 pub fn registry() -> &'static [Def] {
@@ -1186,6 +1187,9 @@ pub fn mcp_server_port() -> u16 {
 pub fn mcp_server_gateway() -> Option<String> {
     Some(text("mcp.server_gateway")).filter(|g| !g.is_empty())
 }
+pub fn mcp_job_max_secs() -> u64 {
+    int("mcp.job_max_secs")
+}
 pub fn mcp_client_idle() -> Duration {
     Duration::from_secs(int("mcp.client_idle_secs"))
 }
@@ -1981,6 +1985,28 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    #[test]
+    fn the_job_cap_setting_has_a_default_and_a_range() {
+        let s = load(&tmp(), &no_env);
+        assert_eq!(row(&s, "mcp.job_max_secs").value, Value::Int(14_400));
+        let ok = with_file("[mcp]\njob_max_secs = 0\n");
+        assert_eq!(
+            row(&ok, "mcp.job_max_secs").value,
+            Value::Int(0),
+            "0 means no cap"
+        );
+        let bad = with_file("[mcp]\njob_max_secs = 604801\n");
+        assert!(bad
+            .problems
+            .iter()
+            .any(|p| p.key.as_deref() == Some("mcp.job_max_secs")));
+        assert_eq!(row(&bad, "mcp.job_max_secs").value, Value::Int(14_400));
+        assert_eq!(
+            effect_name(def("mcp.job_max_secs").unwrap().effect),
+            "next request (osh mcp over stdio: restart)"
+        );
     }
 
     #[test]

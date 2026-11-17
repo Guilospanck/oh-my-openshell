@@ -460,9 +460,21 @@ pub fn cancel(ctx: &Ctx, id: &str) -> Result<Job, String> {
     Ok(after)
 }
 
+/// How long a job may run: the operator's cap, which the caller may lower and never raise. `0`
+/// is no limit, which only an operator who set no cap can allow.
+pub fn effective_cap(operator: u64, asked: Option<u64>) -> u64 {
+    match asked {
+        None => operator,
+        Some(a) if operator == 0 => a,
+        Some(0) => operator,
+        Some(a) => a.min(operator),
+    }
+}
+
 /// Run a command as a job and wait up to `wait_secs` for it. Finished: the result `ops` gives
 /// for a command (`exit_code`, `stdout`, `stderr`). Not finished: `{"job": id, "status":
-/// "running"}` while it keeps running. `max_secs` is how long it may run (`None`: no limit).
+/// "running"}` while it keeps running. `max_secs` is how long the caller lets it run (`None`: as
+/// long as the operator allows, `ctx.job_max_secs`).
 pub fn exec(
     ctx: &Ctx,
     name: &str,
@@ -471,7 +483,7 @@ pub fn exec(
     max_secs: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     use serde_json::json;
-    let job = start(ctx, name, argv, max_secs.unwrap_or(0))?;
+    let job = start(ctx, name, argv, effective_cap(ctx.job_max_secs, max_secs))?;
     let reply = |j: &Job| json!({"job": j.id, "status": j.state});
     let wait = std::time::Duration::from_secs(wait_secs.min(MAX_WAIT));
     if wait.is_zero() {
@@ -750,6 +762,21 @@ mod tests {
                 return text;
             }
         }
+    }
+
+    #[test]
+    fn effective_cap_never_exceeds_the_operators() {
+        assert_eq!(effective_cap(100, None), 100);
+        assert_eq!(effective_cap(100, Some(50)), 50);
+        assert_eq!(effective_cap(100, Some(500)), 100);
+        assert_eq!(
+            effective_cap(100, Some(0)),
+            100,
+            "no limit is not the caller's to ask for"
+        );
+        assert_eq!(effective_cap(0, None), 0);
+        assert_eq!(effective_cap(0, Some(500)), 500);
+        assert_eq!(effective_cap(0, Some(0)), 0);
     }
 
     #[test]

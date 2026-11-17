@@ -183,6 +183,7 @@ pub fn headless(args: &[String]) -> i32 {
         repo_vars: None,
         share_roots: None,
         version: env!("CARGO_PKG_VERSION").into(),
+        job_max_secs: 0,
     };
     let mut exec = false;
     let result = match cmd {

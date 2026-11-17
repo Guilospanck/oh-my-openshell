@@ -75,6 +75,7 @@ mod tests {
             repo_vars: Some(Vec::new()),
             share_roots: Some(Vec::new()),
             version: "t".into(),
+            job_max_secs: 0,
         }
     }
 

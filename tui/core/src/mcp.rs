@@ -252,6 +252,7 @@ mod tests {
             repo_vars: Some(Vec::new()),
             share_roots: Some(Vec::new()),
             version: "9.8.7-given".into(),
+            job_max_secs: 0,
         }
     }
 

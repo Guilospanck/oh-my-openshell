@@ -620,6 +620,7 @@ Other configuration keeps its own file and editor: `toolchains.toml`, `sandbox-p
 | `mcp.server_port` | whole number, 1024 to 65535 | `17800` | restart of osh mcp | none | The port `osh mcp serve` listens on. |
 | `mcp.server_gateway` | gateway name, or empty | `""` | next request (osh mcp over stdio: restart) | none | The gateway the MCP server uses when a call names none. Empty means OpenShell's active gateway. |
 | `mcp.client_idle_secs` | seconds, 10 to 86400 | `600` | live | none | How long a client may stay silent before the MCP server stops listing it as connected. |
+| `mcp.job_max_secs` | seconds, 0 to 604800 | `14400` | next request (osh mcp over stdio: restart) | none | The longest a background job may run before it is ended; `0` means no limit. A caller's `max_secs` can lower it, never raise it. |
 
 ## Development and agents
 

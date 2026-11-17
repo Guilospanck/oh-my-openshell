@@ -29,6 +29,9 @@ pub struct Ctx {
     pub share_roots: Option<Vec<PathBuf>>,
     /// The version of the program serving the calls (the MCP `serverInfo`).
     pub version: String,
+    /// The longest a background job may run, in seconds (`0` = no limit): the operator's
+    /// `mcp.job_max_secs`. Only MCP starts jobs; the CLI leaves it `0`.
+    pub job_max_secs: u64,
 }
 
 /// Aim every following `openshell` call at the context's gateway. A name starting with `-`
@@ -491,6 +494,7 @@ pub(crate) mod tests {
                 repo_vars: None,
                 share_roots: None,
                 version: "0.0.0-test".into(),
+                job_max_secs: 0,
             }
         }
 

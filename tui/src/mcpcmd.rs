@@ -139,6 +139,7 @@ fn server_ctx(gateway: Option<String>, allow_share: bool, repo_vars: Vec<String>
         repo_vars: Some(repo_vars),
         share_roots: Some(Vec::new()),
         version: env!("CARGO_PKG_VERSION").into(),
+        job_max_secs: 0,
     }
 }
 
@@ -155,8 +156,18 @@ fn build_ctx(gateway: Option<String>, snap: &osh_core::settings::Snapshot) -> (C
     let (allow_share, root_entries, vars) = limits(snap);
     let (roots, dropped) = share_roots(&root_entries);
     warnings.extend(dropped);
+    let job_max_secs = snap
+        .rows
+        .iter()
+        .find(|r| r.def.key == "mcp.job_max_secs")
+        .and_then(|r| match r.value {
+            settings::Value::Int(n) => Some(n),
+            _ => None,
+        })
+        .unwrap_or(0);
     let ctx = Ctx {
         share_roots: Some(roots),
+        job_max_secs,
         ..server_ctx(gateway, allow_share, vars)
     };
     (ctx, warnings)
@@ -428,6 +439,7 @@ mod tests {
             repo_vars: Some(Vec::new()),
             share_roots: Some(Vec::new()),
             version: env!("CARGO_PKG_VERSION").into(),
+            job_max_secs: 0,
         }
     }
 
@@ -501,6 +513,17 @@ mod tests {
             status_line(Svc::NotInstalled, None),
             "MCP server: off (not installed; `osh mcp start` installs and starts it)"
         );
+    }
+
+    #[test]
+    fn the_servers_context_carries_the_cap_from_osh_toml() {
+        let d = tmp("cap");
+        let src = ctx_source(d.0.clone(), |_| None);
+        assert_eq!(src().job_max_secs, 14_400, "the default");
+        std::fs::write(d.0.join("osh.toml"), "[mcp]\njob_max_secs = 60\n").unwrap();
+        assert_eq!(src().job_max_secs, 60);
+        let snap = settings::load(&d.0, &|_| None);
+        assert_eq!(build_ctx(None, &snap).0.job_max_secs, 60, "stdio too");
     }
 
     #[test]

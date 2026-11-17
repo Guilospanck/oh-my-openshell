@@ -754,6 +754,7 @@ mod tests {
             repo_vars: Some(Vec::new()),
             share_roots: Some(Vec::new()),
             version: "t-1".into(),
+            job_max_secs: 0,
         });
         let (d, s, st) = (dir.clone(), seen.clone(), stop.clone());
         let join = thread::spawn(move || {
