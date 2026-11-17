@@ -216,7 +216,7 @@ fn bind_and_claim(dir: &Path, ip: IpAddr, port: u16) -> Result<TcpListener, Stri
     let wanted = SocketAddr::new(ip, port);
     state::claim(dir, &wanted.to_string())?;
     TcpListener::bind(wanted).map_err(|e| {
-        let _ = std::fs::remove_file(state::path(dir));
+        state::release(dir);
         format!("cannot listen on {wanted}: {e}")
     })
 }
@@ -527,16 +527,15 @@ mod tests {
             .arg("30")
             .spawn()
             .unwrap();
+        let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap().to_string();
         let theirs = format!(
-            r#"{{"pid":{},"listen":"127.0.0.1:1","started":1,"version":"v","clients":[]}}"#,
+            r#"{{"pid":{},"listen":"{addr}","started":1,"version":"v","clients":[]}}"#,
             other.id()
         );
         std::fs::write(osh_core::mcpserver::state::path(&d.0), &theirs).unwrap();
         let e = bind_and_claim(&d.0, "127.0.0.1".parse().unwrap(), 0).unwrap_err();
-        assert!(
-            e.contains("already running") && e.contains("127.0.0.1:1"),
-            "{e}"
-        );
+        assert!(e.contains("already running") && e.contains(&addr), "{e}");
         assert_eq!(
             std::fs::read_to_string(osh_core::mcpserver::state::path(&d.0)).unwrap(),
             theirs

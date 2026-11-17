@@ -434,7 +434,8 @@ mod tests {
             "the agent is another file"
         );
         // A live server (this process owns the state file) is running whatever installed it.
-        state::claim(&p.data, "127.0.0.1:17800").unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        state::claim(&p.data, &listener.local_addr().unwrap().to_string()).unwrap();
         assert_eq!(status(Os::Linux, &h, &p), Svc::Running);
         assert_eq!(status(Os::MacOs, &FakeHost::default(), &p), Svc::Running);
         let _ = std::fs::remove_dir_all(&p.data);

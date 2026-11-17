@@ -117,11 +117,40 @@ fn write_atomic(dir: &Path, text: &str) -> std::io::Result<()> {
     std::fs::rename(&tmp, path(dir))
 }
 
-/// The state of the running server, or `None` when there is no file, it is not ours to read,
-/// or the process that wrote it is gone.
+fn load(dir: &Path) -> Option<State> {
+    State::from_json(&std::fs::read_to_string(path(dir)).ok()?)
+}
+
+/// Whether something accepts connections at `listen` (`ip:port`). A server that stopped
+/// leaves its file behind, and its pid may be given to an unrelated process later, so a live
+/// pid alone does not prove a server; one that answers where it said it listens does.
+fn answers(listen: &str) -> bool {
+    let Ok(mut addr) = listen.parse::<std::net::SocketAddr>() else {
+        return false;
+    };
+    if addr.ip().is_unspecified() {
+        addr.set_ip(if addr.is_ipv6() {
+            std::net::Ipv6Addr::LOCALHOST.into()
+        } else {
+            std::net::Ipv4Addr::LOCALHOST.into()
+        });
+    }
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+}
+
+/// The state of the running server, or `None` when there is no file, it is not ours to read, or
+/// no server is behind it: its process is gone, or nothing answers at the address it recorded.
 pub fn read(dir: &Path) -> Option<State> {
-    let st = State::from_json(&std::fs::read_to_string(path(dir)).ok()?)?;
-    pid_alive(st.pid).then_some(st)
+    let st = load(dir)?;
+    (pid_alive(st.pid) && answers(&st.listen)).then_some(st)
+}
+
+/// Delete the state file if this process wrote it (a start that failed after claiming); a file
+/// another process wrote since is left alone.
+pub fn release(dir: &Path) {
+    if load(dir).is_some_and(|s| s.pid == std::process::id()) {
+        let _ = std::fs::remove_file(path(dir));
+    }
 }
 
 /// Take the right to run: refuse when another live server owns the file, else record this
@@ -287,16 +316,21 @@ mod tests {
         Tmp(d)
     }
 
+    /// An address something listens on for the rest of the test run (a live server's address).
+    fn answering() -> String {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        Box::leak(Box::new(l));
+        addr
+    }
+
     /// A registry on a clock the test moves by hand.
     fn registry(dir: &Path, idle_secs: u64) -> (Registry, Arc<AtomicU64>) {
         let now = Arc::new(AtomicU64::new(1_000));
         let n = now.clone();
-        let r = Registry::new(
-            dir.to_path_buf(),
-            "127.0.0.1:17800".into(),
-            "9.9.9".into(),
-            move || Duration::from_secs(idle_secs),
-        )
+        let r = Registry::new(dir.to_path_buf(), answering(), "9.9.9".into(), move || {
+            Duration::from_secs(idle_secs)
+        })
         .with_clock(move || n.load(Ordering::SeqCst));
         (r, now)
     }
@@ -319,7 +353,7 @@ mod tests {
         r.flush();
         let st = read(&d.0).expect("state");
         assert_eq!(st.pid, std::process::id());
-        assert_eq!(st.listen, "127.0.0.1:17800");
+        assert!(st.listen.starts_with("127.0.0.1:"));
         assert_eq!(st.version, "9.9.9");
         assert_eq!(st.clients.len(), 2);
         let s1 = st.clients.iter().find(|c| c.session == "s1").unwrap();
@@ -391,6 +425,36 @@ mod tests {
     }
 
     #[test]
+    fn a_pid_that_exists_but_serves_nothing_reads_as_off() {
+        // A stopped server leaves its file behind, and its pid may be handed to another
+        // process later: that must not look like a running server.
+        let d = tmp("reused");
+        let quiet = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = quiet.local_addr().unwrap().to_string();
+        drop(quiet);
+        let st = json!({"pid": std::process::id(), "listen": addr, "started": 1, "version": "v", "clients": []});
+        std::fs::write(path(&d.0), st.to_string()).unwrap();
+        assert!(read(&d.0).is_none(), "the address does not answer");
+        let live = answering();
+        let st = json!({"pid": std::process::id(), "listen": live, "started": 1, "version": "v", "clients": []});
+        std::fs::write(path(&d.0), st.to_string()).unwrap();
+        assert!(read(&d.0).is_some(), "the address answers");
+    }
+
+    #[test]
+    fn a_failed_start_does_not_delete_the_file_of_a_server_that_took_over() {
+        let d = tmp("release");
+        let theirs = json!({"pid": 1, "listen": "x", "started": 1, "version": "v", "clients": []})
+            .to_string();
+        std::fs::write(path(&d.0), &theirs).unwrap();
+        release(&d.0);
+        assert!(path(&d.0).exists(), "not ours: kept");
+        claim(&d.0, &answering()).unwrap();
+        release(&d.0);
+        assert!(!path(&d.0).exists(), "ours: removed");
+    }
+
+    #[test]
     fn a_dead_pid_or_a_broken_file_reads_as_off() {
         let d = tmp("dead");
         assert!(read(&d.0).is_none(), "no file");
@@ -407,22 +471,21 @@ mod tests {
         let d = tmp("claim");
         let other = std::process::Command::new("sleep").arg("30").spawn();
         let mut other = other.unwrap();
-        let st = json!({"pid": other.id(), "listen": "127.0.0.1:1", "started": 1, "version": "v", "clients": []});
+        let theirs = answering();
+        let st = json!({"pid": other.id(), "listen": theirs, "started": 1, "version": "v", "clients": []});
         std::fs::write(path(&d.0), st.to_string()).unwrap();
         let e = claim(&d.0, "127.0.0.1:17800").unwrap_err();
         assert!(
-            e.contains(&other.id().to_string()) && e.contains("127.0.0.1:1"),
+            e.contains(&other.id().to_string()) && e.contains(&theirs),
             "{e}"
         );
-        assert_eq!(read(&d.0).unwrap().listen, "127.0.0.1:1", "untouched");
+        assert_eq!(read(&d.0).unwrap().listen, theirs, "untouched");
         let _ = other.kill();
         let _ = other.wait();
-        claim(&d.0, "127.0.0.1:17800").unwrap();
+        let mine_addr = answering();
+        claim(&d.0, &mine_addr).unwrap();
         let mine = read(&d.0).unwrap();
-        assert_eq!(
-            (mine.pid, mine.listen.as_str()),
-            (std::process::id(), "127.0.0.1:17800")
-        );
+        assert_eq!((mine.pid, mine.listen), (std::process::id(), mine_addr));
     }
 
     #[test]
