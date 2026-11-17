@@ -26,7 +26,22 @@ pub fn set_gateway(name: &str) {
     }
 }
 
+thread_local! {
+    /// A gateway this thread chose for itself (the MCP server answers several clients at once,
+    /// each naming its own); `Some("")` means the CLI's active gateway. Wins over `GATEWAY`.
+    static THREAD_GATEWAY: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Aim this thread's `openshell` calls at `name` without touching other threads; `None` goes
+/// back to the process-wide choice.
+pub fn set_thread_gateway(name: Option<&str>) {
+    THREAD_GATEWAY.with(|g| *g.borrow_mut() = name.map(str::to_string));
+}
+
 pub fn gateway() -> String {
+    if let Some(own) = THREAD_GATEWAY.with(|g| g.borrow().clone()) {
+        return own;
+    }
     GATEWAY.lock().map(|g| g.clone()).unwrap_or_default()
 }
 
@@ -2105,6 +2120,42 @@ pub fn sync_check(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gateway_choice_is_per_thread() {
+        use std::sync::{Arc, Barrier};
+        let process_wide = super::gateway();
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|name| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    super::set_thread_gateway(Some(name));
+                    barrier.wait();
+                    assert_eq!(super::gateway(), name);
+                    assert_eq!(
+                        super::with_gateway(vec!["x".into()]),
+                        vec!["-g".to_string(), name.to_string(), "x".to_string()]
+                    );
+                    barrier.wait();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        // A thread that chose nothing still sees the process-wide value.
+        assert_eq!(super::gateway(), process_wide);
+        // An empty choice means "the CLI's active gateway", not "fall back to the process-wide one".
+        let inherited = std::thread::spawn(|| {
+            super::set_thread_gateway(Some(""));
+            super::with_gateway(vec!["x".into()])
+        })
+        .join()
+        .unwrap();
+        assert_eq!(inherited, vec!["x".to_string()]);
+    }
+
     #[test]
     fn every_lint_run_gets_its_own_temp_file() {
         let (a, b) = (super::lint_temp_path(), super::lint_temp_path());

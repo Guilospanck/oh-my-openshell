@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// What every operation runs against.
+#[derive(Clone)]
 pub struct Ctx {
     /// The data dir (`sandbox-policy.yaml`, `toolchains.toml`, `images/`).
     pub dir: PathBuf,
@@ -39,7 +40,7 @@ fn target(ctx: &Ctx) -> Result<(), String> {
             "invalid gateway name {gw:?}: a gateway name cannot start with `-`"
         ));
     }
-    cli::set_gateway(gw);
+    cli::set_thread_gateway(Some(gw));
     Ok(())
 }
 
