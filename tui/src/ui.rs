@@ -1940,14 +1940,17 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
                 area,
             );
         }
-        Modal::Confirm { text, .. } => {
+        Modal::Confirm { text, kind } => {
             let w = popup_width(screen.width, 84);
             let (area, lines, cut) = fit_lines(screen, w, wrap_text(text, text_cols(w)));
             f.render_widget(Clear, area);
             let hint = if cut {
                 "y yes · n no · v read all"
-            } else {
+            } else if matches!(kind, crate::app::ConfKind::SyncGen { .. }) {
+                // Only here is there more to see than the question: the generated file.
                 "y yes · n no · v details"
+            } else {
+                "y yes · n no"
             };
             f.render_widget(
                 Paragraph::new(lines).block(frame("Confirm", hint, Color::Yellow)),
@@ -2849,6 +2852,19 @@ mod tests {
         }];
         let (all, _) = screen(&app, 60, 30);
         assert!(all.contains("a-sandbox-with-a-really-long-name"), "{all}");
+    }
+
+    #[test]
+    fn a_short_question_offers_no_details_key() {
+        let mut app = usage_app("vm");
+        app.tab = Tab::Mcp;
+        app.modal = Some(Modal::Confirm {
+            text: "Turn the MCP server off?".into(),
+            kind: crate::app::ConfKind::OshJob(vec!["mcp".into(), "stop".into()]),
+        });
+        let (all, _) = screen(&app, 120, 30);
+        assert!(all.contains("y yes") && all.contains("n no"), "{all}");
+        assert!(!all.contains("v details"), "{all}");
     }
 
     #[test]
