@@ -481,7 +481,7 @@ fn status_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     rows
 }
 
-/// The top bar: the app name, the tabs (the current one bold and underlined in the accent colour),
+/// The top bar: the app name, the tabs (the current one bold in the accent colour),
 /// and on the right the gateway as one dot and its name. On a narrow screen the gateway line drops
 /// its version, then its driver; then the other tabs show only their number (Tab and 1-5 still
 /// reach them, `?` names them), so nothing overlaps or is cut.
@@ -495,9 +495,7 @@ fn draw_tabs(f: &mut Frame, app: &App, area: Rect) {
             if *tab == app.tab {
                 spans.push(Span::styled(
                     format!(" {} {title} ", i + 1),
-                    role::accent()
-                        .add_modifier(Modifier::BOLD)
-                        .add_modifier(Modifier::UNDERLINED),
+                    role::accent().add_modifier(Modifier::BOLD),
                 ));
             } else if short {
                 spans.push(Span::styled(format!(" {} ", i + 1), role::dim()));
