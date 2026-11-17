@@ -737,6 +737,10 @@ pub(crate) mod tests {
             std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
             std::env::set_var("OSH_FAKE_LOG", &log);
             std::env::set_var("OSH_JOBS_SANDBOX_DIR", root.join("jobs"));
+            // Defence in depth: a test that ever runs `git config --global` for real writes to
+            // this scratch file, never to the user's own configuration.
+            std::env::set_var("GIT_CONFIG_GLOBAL", root.join("scratch-gitconfig"));
+            std::env::set_var("GIT_CONFIG_SYSTEM", "/dev/null");
             for v in FAKE_VARS {
                 std::env::remove_var(v);
             }
@@ -1620,14 +1624,13 @@ pub(crate) mod tests {
             r#"{"sandboxes":[{"name":"w1","phase":"Ready","created_at":"t"}]}"#,
         );
         std::env::set_var("OSH_FAKE_FAIL", "provider get");
-        std::env::set_var("OSH_FAKE_EXEC_RUN", "1");
         let ctx = Ctx {
             repo_vars: Some(Vec::new()),
             ..f.ctx()
         };
         crate::secrets::set(&ctx.dir, "OSH_TEST_GRANT_OK", &secret_value()).unwrap();
         let out = repo_grant(&ctx, "w1", URL, "OSH_TEST_GRANT_OK");
-        for k in ["OSH_FAKE_SANDBOXES", "OSH_FAKE_FAIL", "OSH_FAKE_EXEC_RUN"] {
+        for k in ["OSH_FAKE_SANDBOXES", "OSH_FAKE_FAIL"] {
             std::env::remove_var(k);
         }
         let out = out.unwrap();
