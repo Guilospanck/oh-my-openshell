@@ -1910,7 +1910,7 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
                 &format!("Providers of {sandbox}"),
                 lines,
                 *scroll,
-                "j/k PgUp/PgDn g/G scroll · Esc close",
+                "j/k g/G scroll · Esc close",
             );
         }
         Modal::Settings(v) => draw_settings(f, v),
@@ -1924,13 +1924,7 @@ fn draw_modal(f: &mut Frame, m: &Modal, tab: Tab) {
             ..
         } => {
             let lines = wrap_text(text, tall_cols(screen.width));
-            draw_scroller(
-                f,
-                title,
-                lines,
-                *scroll,
-                "j/k PgUp/PgDn g/G scroll · Esc back",
-            );
+            draw_scroller(f, title, lines, *scroll, "j/k g/G scroll · Esc back");
         }
         Modal::Info(t) => {
             let w = popup_width(screen.width, 76);
@@ -2400,7 +2394,7 @@ pub fn log_line(l: &str) -> Line<'static> {
 
 /// The log view's keys.
 pub const LOGVIEW_HELP: &str =
-    "/ search  s source  j/k PgUp/PgDn scroll  g/G top/bottom  f follow  h/l pan  q close";
+    "/ search  s source  j/k scroll  g/G top/bottom  f follow  h/l pan  q close";
 
 /// The log view: the lines (h/l pan sideways; the title says when lines go on past the right
 /// edge) and the keys below, on as many rows as they need.
