@@ -44,7 +44,7 @@ fn target(ctx: &Ctx) -> Result<(), String> {
     Ok(())
 }
 
-fn check_name(name: &str) -> Result<(), String> {
+pub(crate) fn check_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
         return Err("field `name` is required".into());
     }
@@ -332,17 +332,25 @@ pub fn sandbox_delete(ctx: &Ctx, name: &str) -> Result<Value, String> {
     Ok(json!({"name": name, "deleted": true}))
 }
 
-/// Run `argv` in a sandbox. The command's own exit code, non-zero included, is `Ok`; only
-/// failing to run `openshell` is `Err`.
-pub fn sandbox_exec(ctx: &Ctx, name: &str, argv: &[String]) -> Result<Value, String> {
+/// Run `argv` in a sandbox with `openshell sandbox exec`, giving up after `timeout_secs`. The
+/// command's exit code (a signal as 128 + its number) and both streams come back as they are;
+/// only failing to run `openshell` is `Err`.
+pub(crate) fn run_in_sandbox(
+    ctx: &Ctx,
+    name: &str,
+    argv: &[String],
+    timeout_secs: u64,
+) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
     check_name(name)?;
     if argv.is_empty() {
         return Err("no command to run".into());
     }
     target(ctx)?;
-    let mut args: Vec<String> = ["sandbox", "exec", "-n", name, "--timeout", "600", "--"]
+    let mut args: Vec<String> = ["sandbox", "exec", "-n", name, "--timeout"]
         .map(String::from)
         .to_vec();
+    args.push(timeout_secs.to_string());
+    args.push("--".into());
     args.extend(argv.iter().cloned());
     // Not `cli::exec`: it turns a non-zero exit into `Err` and drops the code, while the
     // command's own exit code and both streams are the answer here.
@@ -356,10 +364,17 @@ pub fn sandbox_exec(ctx: &Ctx, name: &str, argv: &[String]) -> Result<Value, Str
         .code()
         .or_else(|| out.status.signal().map(|s| 128 + s))
         .unwrap_or(-1);
+    Ok((code, out.stdout, out.stderr))
+}
+
+/// Run `argv` in a sandbox. The command's own exit code, non-zero included, is `Ok`; only
+/// failing to run `openshell` is `Err`.
+pub fn sandbox_exec(ctx: &Ctx, name: &str, argv: &[String]) -> Result<Value, String> {
+    let (code, stdout, stderr) = run_in_sandbox(ctx, name, argv, 600)?;
     Ok(json!({
         "exit_code": code,
-        "stdout": String::from_utf8_lossy(&out.stdout),
-        "stderr": String::from_utf8_lossy(&out.stderr),
+        "stdout": String::from_utf8_lossy(&stdout),
+        "stderr": String::from_utf8_lossy(&stderr),
     }))
 }
 
@@ -416,6 +431,7 @@ pub(crate) mod tests {
         "OSH_FAKE_EXEC_STDOUT",
         "OSH_FAKE_EXEC_STDERR",
         "OSH_FAKE_ENV_KEYS",
+        "OSH_FAKE_EXEC_RUN",
     ];
 
     /// The stand-in `openshell` (and a failing `curl`, so a repo grant never reaches the

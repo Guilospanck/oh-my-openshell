@@ -16,6 +16,9 @@
 #   OSH_FAKE_EXEC_EXIT    exit code of `sandbox exec` (default 0)
 #   OSH_FAKE_EXEC_STDOUT  printed on stdout by `sandbox exec`
 #   OSH_FAKE_EXEC_STDERR  printed on stderr by `sandbox exec`
+#   OSH_FAKE_EXEC_RUN     when 1, `sandbox exec` runs the command after `--` for real on this
+#                         machine and gives its output and exit code (the canned values above
+#                         are then ignored)
 #   OSH_FAKE_ENV_KEYS     space-separated variable names; for each, a line `env NAME set` or
 #                         `env NAME unset` is logged after the argv. Values are never logged, so
 #                         a test can prove a secret came through the environment, not argv.
@@ -67,6 +70,13 @@ case "${1:-} ${2:-}" in
     printf '%s\n' "${OSH_FAKE_GATEWAY_INFO:-$docker_info}"
     ;;
 "sandbox exec")
+    if [ "${OSH_FAKE_EXEC_RUN:-0}" = 1 ]; then
+        # Run what follows `--` for real on this machine (tests of jobs need a command that runs).
+        shift 2
+        while [ "$#" -gt 0 ] && [ "$1" != "--" ]; do shift; done
+        shift
+        exec "$@"
+    fi
     if [ -n "${OSH_FAKE_EXEC_STDOUT:-}" ]; then printf '%s' "$OSH_FAKE_EXEC_STDOUT"; fi
     if [ -n "${OSH_FAKE_EXEC_STDERR:-}" ]; then printf '%s' "$OSH_FAKE_EXEC_STDERR" >&2; fi
     exit "${OSH_FAKE_EXEC_EXIT:-0}"
