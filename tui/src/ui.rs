@@ -572,6 +572,7 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(area);
     let n = app.snap.sandboxes.len();
+    let shown = app.shown(Tab::Sandboxes);
     if n == 0 {
         empty_state(
             f,
@@ -581,12 +582,11 @@ fn draw_sandboxes(f: &mut Frame, app: &App, area: Rect) {
             "No sandboxes yet",
             "n  create one",
         );
-    } else if app.shown(Tab::Sandboxes).is_empty() {
+    } else if shown.is_empty() {
         let title = search_title(app, "Sandboxes", Tab::Sandboxes);
         no_match(f, cols[0], &title, SANDBOX_COLS);
     } else {
-        let cells: Vec<Vec<Line<'static>>> = app
-            .shown(Tab::Sandboxes)
+        let cells: Vec<Vec<Line<'static>>> = shown
             .into_iter()
             .map(|i| &app.snap.sandboxes[i])
             .map(|s| {
@@ -770,12 +770,12 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    if app.shown(Tab::Providers).is_empty() {
+    let shown = app.shown(Tab::Providers);
+    if shown.is_empty() {
         let title = search_title(app, "Providers", Tab::Providers);
         return no_match(f, area, &title, PROVIDER_COLS);
     }
-    let cells: Vec<Vec<Line<'static>>> = app
-        .shown(Tab::Providers)
+    let cells: Vec<Vec<Line<'static>>> = shown
         .into_iter()
         .map(|i| &app.snap.providers[i])
         .map(|p| {
@@ -820,7 +820,7 @@ fn draw_providers(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_profiles(f: &mut Frame, app: &App, area: Rect) {
     let all_rows = app.profile_rows();
-    let shown = app.shown(Tab::Profiles);
+    let shown = app.profile_shown(&all_rows);
     if !all_rows.is_empty() && shown.is_empty() {
         let title = search_title(app, "Profiles", Tab::Profiles);
         return no_match(f, area, &title, PROFILE_COLS);
@@ -891,12 +891,12 @@ fn draw_images(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    if app.shown(Tab::Images).is_empty() {
+    let shown = app.shown(Tab::Images);
+    if shown.is_empty() {
         let title = search_title(app, "Images", Tab::Images);
         return no_match(f, area, &title, IMAGE_COLS);
     }
-    let cells: Vec<Vec<Line<'static>>> = app
-        .shown(Tab::Images)
+    let cells: Vec<Vec<Line<'static>>> = shown
         .into_iter()
         .map(|i| &app.snap.images[i])
         .map(|i| {
@@ -943,12 +943,12 @@ fn draw_gateways(f: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
-    if app.shown(Tab::Gateways).is_empty() {
+    let shown = app.shown(Tab::Gateways);
+    if shown.is_empty() {
         let title = search_title(app, "Gateways", Tab::Gateways);
         return no_match(f, area, &title, GATEWAY_COLS);
     }
-    let cells: Vec<Vec<Line<'static>>> = app
-        .shown(Tab::Gateways)
+    let cells: Vec<Vec<Line<'static>>> = shown
         .into_iter()
         .map(|i| &app.snap.gateways[i])
         .map(|g| {
@@ -1176,7 +1176,7 @@ fn draw_mcp(f: &mut Frame, app: &App, area: Rect) {
         } else {
             app.cursor[5] - app.mcp_clients()
         };
-        draw_table(f, area, &jobs_title, JOB_COLS, cells, at, true);
+        draw_table(f, area, &jobs_title, JOB_COLS, cells, at, false);
     }
 }
 
@@ -2835,6 +2835,26 @@ mod tests {
         app.filters[0] = "zzz".into();
         let (all, _) = screen(&app, 120, 24);
         assert!(all.contains("Nothing matches"), "{all}");
+    }
+
+    #[test]
+    fn the_selected_job_is_shown_in_full_when_its_row_is_cut() {
+        use crate::mcpsvc::Svc;
+        let mut app = usage_app("vm");
+        app.tab = Tab::Mcp;
+        app.mcp.svc = Svc::NotInstalled;
+        app.mcp.jobs = vec![osh_core::jobs::Job {
+            id: "j0123456789abcdef".into(),
+            gateway: "openshell-podman".into(),
+            sandbox: "a-sandbox-with-a-really-long-name".into(),
+            command: "sleep".into(),
+            started: 100,
+            state: "running".into(),
+            exit_code: None,
+            checked: 100,
+        }];
+        let (all, _) = screen(&app, 60, 30);
+        assert!(all.contains("a-sandbox-with-a-really-long-name"), "{all}");
     }
 
     #[test]

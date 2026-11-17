@@ -1323,10 +1323,7 @@ impl App {
                 f.extend(p.keys.iter().cloned());
                 f
             }),
-            Tab::Profiles => {
-                let rows = self.profile_rows();
-                pick(rows.len(), &|i| vec![rows[i].id.clone()])
-            }
+            Tab::Profiles => self.profile_shown(&self.profile_rows()),
             Tab::Images => pick(self.snap.images.len(), &|i| {
                 let m = &self.snap.images[i];
                 vec![
@@ -1343,6 +1340,14 @@ impl App {
             }),
             Tab::Mcp => Vec::new(),
         }
+    }
+
+    /// Which of `rows` the Profiles search matches.
+    pub fn profile_shown(&self, rows: &[ProfileRow]) -> Vec<usize> {
+        let q = &self.filters[2];
+        (0..rows.len())
+            .filter(|&i| crate::listfilter::matches(q, &[&rows[i].id]))
+            .collect()
     }
 
     /// The index in its list of the row the cursor is on in `tab`.
@@ -5475,9 +5480,30 @@ impl App {
         let mut p = crate::gateway::Paths::detect();
         p.data = self.dir.clone();
         self.mcp.svc = crate::mcpsvc::status(os, &osh_core::platform::RealHost, &p);
-        self.mcp.state = osh_core::mcpserver::state::read(&self.dir);
-        self.mcp.jobs = McpView::read_jobs(&self.dir);
+        let state = osh_core::mcpserver::state::read(&self.dir);
+        let jobs = McpView::read_jobs(&self.dir);
+        self.set_mcp_lists(state, jobs);
         self.mcp.checked = Some(Instant::now());
+    }
+
+    /// Takes new clients and jobs. A cursor in the jobs stays on its job when clients come or
+    /// go, since the list counts the clients first.
+    fn set_mcp_lists(
+        &mut self,
+        state: Option<osh_core::mcpserver::state::State>,
+        jobs: Vec<osh_core::jobs::Job>,
+    ) {
+        let before = self.mcp_clients();
+        let in_jobs = self.cursor[5] >= before;
+        self.mcp.state = state;
+        self.mcp.jobs = jobs;
+        let now = self.mcp_clients();
+        if in_jobs {
+            self.cursor[5] = (self.cursor[5] - before) + now;
+        } else {
+            // A client that left: the last one left, not a jump into the jobs.
+            self.cursor[5] = self.cursor[5].min(now.saturating_sub(1));
+        }
         self.clamp_mcp_cursor();
     }
 
@@ -6904,6 +6930,37 @@ mod tests {
         press(&mut a, KeyCode::Char('/'));
         a.switch(1);
         assert!(!a.filtering);
+    }
+
+    #[test]
+    fn a_client_leaving_does_not_move_the_cursor_off_its_job() {
+        let mut a = mcp_app(2, 4);
+        a.cursor[5] = 3; // the second job
+        let state = osh_core::mcpserver::state::State {
+            clients: vec![client("c0")],
+            ..a.mcp.state.clone().unwrap()
+        };
+        let jobs = a.mcp.jobs.clone();
+        a.set_mcp_lists(Some(state), jobs.clone());
+        assert_eq!(a.cursor[5], 2, "still the second job");
+        a.set_mcp_lists(None, jobs);
+        assert_eq!(a.cursor[5], 1, "still the second job");
+    }
+
+    #[test]
+    fn a_client_before_the_cursor_keeps_a_client_cursor_in_range() {
+        let mut a = mcp_app(3, 1);
+        a.cursor[5] = 2; // the last client
+        let state = osh_core::mcpserver::state::State {
+            clients: vec![client("c0")],
+            ..a.mcp.state.clone().unwrap()
+        };
+        let jobs = a.mcp.jobs.clone();
+        a.set_mcp_lists(Some(state), jobs);
+        assert_eq!(
+            a.cursor[5], 0,
+            "the last client left: the first row of the list"
+        );
     }
 
     #[test]
