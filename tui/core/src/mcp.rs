@@ -3,6 +3,7 @@
 //! binary's stdin/stdout loop stays trivial. Request bodies are never logged: tool arguments
 //! may carry anything.
 
+use crate::gateways;
 use crate::ops::{self, Ctx};
 use serde_json::{json, Map, Value};
 
@@ -16,7 +17,21 @@ must be one the server operator allows), share {path, rw} (refused unless the se
 operator enabled it; path must resolve, through symlinks, inside one of the operator's share \
 root folders; risky folders such as home, the disk or system folders are refused even there).";
 
+/// The tools with the optional `gateway` argument every one of them takes.
 fn tools() -> Value {
+    let mut t = base_tools();
+    if let Some(list) = t.as_array_mut() {
+        for tool in list {
+            tool["inputSchema"]["properties"]["gateway"] = json!({
+                "type": "string",
+                "description": "Which gateway to act on: one osh knows (its main or a gateway osh added). Leave it out for the server's default."
+            });
+        }
+    }
+    t
+}
+
+fn base_tools() -> Value {
     json!([
         {
             "name": "sandbox_list",
@@ -97,7 +112,7 @@ fn args_of(p: &Value, allowed: &[&str]) -> Result<Map<String, Value>, Fault> {
         Some(_) => return Err(invalid("`arguments` must be an object")),
     };
     for k in args.keys() {
-        if !allowed.contains(&k.as_str()) {
+        if !allowed.contains(&k.as_str()) && k != "gateway" {
             return Err(invalid(format!("unknown argument `{k}`")));
         }
     }
@@ -137,6 +152,17 @@ fn call(p: &Value, ctx: &Ctx) -> Result<Value, Fault> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("missing tool `name`"))?;
+    let named = match p.get("arguments").and_then(|a| a.get("gateway")) {
+        None | Some(Value::Null) => None,
+        Some(Value::String(g)) => Some(g.as_str()),
+        Some(_) => return Err(invalid("argument `gateway` must be a string")),
+    };
+    let gateway = gateways::resolve(ctx, named).map_err(invalid)?;
+    let scoped = Ctx {
+        gateway,
+        ..ctx.clone()
+    };
+    let ctx = &scoped;
     let result = match name {
         "sandbox_list" => {
             args_of(p, &[])?;
@@ -286,6 +312,55 @@ mod tests {
             assert!(doc.contains("refused unless the server operator enabled it"));
             assert!(doc.contains("env_var") && !doc.contains("token_env"));
         }
+    }
+
+    #[test]
+    fn every_tool_accepts_an_optional_gateway() {
+        let r = ask(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#, &ctx());
+        for x in r["result"]["tools"].as_array().unwrap() {
+            assert_eq!(
+                x["inputSchema"]["properties"]["gateway"]["type"], "string",
+                "{x}"
+            );
+            assert_eq!(x["inputSchema"]["additionalProperties"], false, "{x}");
+            assert!(!x["inputSchema"]["required"]
+                .as_array()
+                .is_some_and(|r| r.iter().any(|n| n == "gateway")));
+        }
+    }
+
+    #[test]
+    fn an_unknown_gateway_is_invalid_params_and_runs_nothing() {
+        let f = Fake::new("mcp-gw-unknown");
+        for bad in ["nope", "", "-x", "a/b"] {
+            let r = ask(
+                &call_line("sandbox_list", json!({"gateway": bad})),
+                &f.ctx(),
+            );
+            assert_eq!(r["error"]["code"], -32602, "{bad:?}: {r}");
+        }
+        assert_eq!(std::fs::read_to_string(&f.log).unwrap(), "");
+    }
+
+    #[test]
+    fn a_known_gateway_is_used_for_that_call_only() {
+        let f = Fake::new("mcp-gw-known");
+        std::fs::write(
+            f.dir.join("gateways.json"),
+            r#"{"gateways":[{"name":"openshell-docker","kind":"docker","port":17671,"main":false}]}"#,
+        )
+        .unwrap();
+        std::env::set_var("OSH_FAKE_SANDBOXES", r#"{"sandboxes":[]}"#);
+        let r = ask(
+            &call_line("sandbox_list", json!({"gateway": "openshell-docker"})),
+            &f.ctx(),
+        );
+        assert_eq!(r["result"]["isError"], false, "{r}");
+        let log = std::fs::read_to_string(&f.log).unwrap();
+        assert!(log.contains("-g openshell-docker"), "{log}");
+        std::fs::write(&f.log, "").unwrap();
+        ask(&call_line("sandbox_list", json!({})), &f.ctx());
+        assert!(!std::fs::read_to_string(&f.log).unwrap().contains("-g"));
     }
 
     #[test]

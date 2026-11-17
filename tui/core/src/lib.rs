@@ -5,6 +5,7 @@
 pub mod agents;
 pub mod assets;
 pub mod cli;
+pub mod gateways;
 pub mod ghrepo;
 pub mod mcp;
 pub mod ops;
