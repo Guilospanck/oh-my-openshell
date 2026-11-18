@@ -49,7 +49,7 @@ to read to the user; never ask the user to paste a token into the chat, and neve
 for them.\n\
 \n\
 Long work. A command that may take over half a minute: sandbox_exec with wait_secs 0, then \
-job_status and job_output. Delete a sandbox only when it was a throwaway one (spec.command, which deletes \
+job_status and job_output. Delete an image (image_delete) only when the user asks for it. Delete a sandbox only when it was a throwaway one (spec.command, which deletes \
 itself) or the user asks you to; never delete a sandbox that holds work, and never after long work. \
 When you do remove access, tell the user that removing a stored token does not revoke it on the \
 forge.";
@@ -225,6 +225,19 @@ fn base_tools() -> Value {
                 "required": ["name", "dockerfile"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "image_delete",
+            "description": "Delete one of osh's own images (the ones sandbox_options lists, as in the Images tab): the built image, and with remove_dockerfile true its Dockerfile too (not for a Dockerfile that ships with osh). Any other image is refused, and an image a sandbox still runs from is not forced. Destructive: only when the user asks for it or agrees, never on your own to tidy up; deleting claude-code:latest means the next kept sandbox rebuilds it (minutes).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The image, with or without :latest."},
+                    "remove_dockerfile": {"type": "boolean", "description": "Also delete its Dockerfile from osh's images folder (default false)."}
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -370,6 +383,15 @@ fn call(p: &Value, ctx: &Ctx) -> Result<Value, Fault> {
                 &verify,
                 dry,
             )
+        }
+        "image_delete" => {
+            let a = args_of(p, &["name", "remove_dockerfile"])?;
+            let rm = match a.get("remove_dockerfile") {
+                None => false,
+                Some(Value::Bool(b)) => *b,
+                Some(_) => return Err(invalid("argument `remove_dockerfile` must be a boolean")),
+            };
+            ops::image_delete(ctx, &req_str(&a, "name")?, rm)
         }
         "sandbox_create" => {
             let a = args_of(p, &["spec", "dry_run"])?;
@@ -570,7 +592,8 @@ mod tests {
                 "sandbox_repo_revoke",
                 "sandbox_options",
                 "image_guide",
-                "image_build"
+                "image_build",
+                "image_delete"
             ]
         );
         for x in t {

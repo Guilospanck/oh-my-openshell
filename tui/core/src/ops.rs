@@ -693,6 +693,68 @@ pub fn image_build(
     Ok(v)
 }
 
+/// Delete an image osh lists (one with a `Dockerfile-*` in the data folder, as in the Images tab):
+/// remove it from the container runtime, and with `remove_dockerfile` the Dockerfile too, unless
+/// the Dockerfile ships with osh (it would come back). Any other image of the user's is out of
+/// reach by design. The runtime refuses an image a sandbox still runs from; that is not forced.
+pub fn image_delete(ctx: &Ctx, name: &str, remove_dockerfile: bool) -> Result<Value, String> {
+    let want = name.trim();
+    let found = cli::dockerfiles(&ctx.dir)
+        .into_iter()
+        .find(|f| {
+            let t = cli::dockerfile_tag(f);
+            t == want || t == format!("{want}:latest")
+        })
+        .ok_or_else(|| {
+            let known: Vec<String> = cli::dockerfiles(&ctx.dir)
+                .iter()
+                .map(|f| cli::dockerfile_tag(f))
+                .collect();
+            format!(
+                "{want:?} is not an osh image; only these can be deleted: {}",
+                known.join(", ")
+            )
+        })?;
+    let tag = cli::dockerfile_tag(&found);
+    let file_name = found
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if remove_dockerfile && crate::assets::embedded(&format!("images/{file_name}")).is_some() {
+        return Err(format!(
+            "{tag} ships with osh, so osh would write its Dockerfile back; delete only the image (leave remove_dockerfile off)"
+        ));
+    }
+    let built = cli::image_built(&tag);
+    if !built && !remove_dockerfile {
+        return Err(format!(
+            "{tag} is not built, so there is no image to delete (remove_dockerfile true would drop its Dockerfile)"
+        ));
+    }
+    if built {
+        cli::run(
+            cli::runtime_bin(),
+            &["image".into(), "rm".into(), tag.clone()],
+            &[],
+        )
+        .map_err(|e| {
+            format!(
+                "could not delete {tag}: {} (a sandbox that runs from it must be deleted first)",
+                crate::text::error_summary(&e)
+            )
+        })?;
+    }
+    if remove_dockerfile {
+        std::fs::remove_file(&found).map_err(|e| format!("removing {}: {e}", found.display()))?;
+    }
+    let mut v = json!({"image": tag, "deleted": built, "dockerfile_removed": remove_dockerfile});
+    if tag == DEFAULT_IMAGE {
+        v["note"] = json!("this is the default image of a kept sandbox; the next one rebuilds it, which takes minutes");
+    }
+    Ok(v)
+}
+
 /// Build `file` as `tag` in an empty context, after the osh images it starts from.
 fn build_image(ctx: &Ctx, file: &Path, tag: &str, text: &str) -> Result<(), String> {
     for base in from_images(text) {
@@ -1324,7 +1386,7 @@ pub(crate) mod tests {
                 std::fs::write(
                     &stub,
                     format!(
-                        "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1\" = run ] && echo \"$@\" | grep -q FAILME; then echo 'sh: FAILME: not found' >&2; exit 127; fi\nif [ \"$1 $2\" = \"build --check\" ]; then if grep -q '^FORM' \"$3/Dockerfile\"; then echo 'ERROR: dockerfile parse error on line 2: unknown instruction: FORM' >&2; exit 1; fi; if grep -q LINTME \"$3/Dockerfile\"; then printf 'WARNING: StubRule - https://example.test/rule\\nlint me\\nDockerfile:1\\n' >&2; fi; exit 0; fi\nif [ \"$1 $2\" = \"image inspect\" ]; then [ \"$3\" = \"--format\" ] && echo node && exit 0; exit 1; fi\nexit 0\n",
+                        "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1\" = run ] && echo \"$@\" | grep -q FAILME; then echo 'sh: FAILME: not found' >&2; exit 127; fi\nif [ \"$1 $2\" = \"build --check\" ]; then if grep -q '^FORM' \"$3/Dockerfile\"; then echo 'ERROR: dockerfile parse error on line 2: unknown instruction: FORM' >&2; exit 1; fi; if grep -q LINTME \"$3/Dockerfile\"; then printf 'WARNING: StubRule - https://example.test/rule\\nlint me\\nDockerfile:1\\n' >&2; fi; exit 0; fi\nif [ \"$1 $2\" = \"image inspect\" ]; then [ \"$3\" = \"--format\" ] && echo node && exit 0; case \"$3\" in *built*) exit 0;; esac; exit 1; fi\nif [ \"$1 $2\" = \"image rm\" ]; then case \"$3\" in *inuse*) echo 'conflict: image is being used by container abc' >&2; exit 1;; esac; fi\nexit 0\n",
                         runtime_log.display()
                     ),
                 )
@@ -2302,6 +2364,51 @@ pub(crate) mod tests {
             .contains("claude-code-gcc:latest"));
         let e = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, &ok(), false).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
+    }
+
+    #[test]
+    fn only_osh_images_can_be_deleted_and_a_used_one_is_not_forced() {
+        let f = Fake::new("image-delete");
+        with_image_and_profiles(&f);
+        let img = |n: &str| f.dir.join(format!("images/Dockerfile-{n}"));
+        for n in ["my-built", "built-inuse", "idle"] {
+            std::fs::write(img(n), "FROM scratch\n").unwrap();
+        }
+        // Not an osh image: refused, and the message names what can be deleted.
+        let e = image_delete(&f.ctx(), "postgres:17-alpine", false).unwrap_err();
+        assert!(
+            e.contains("not an osh image") && e.contains("my-built:latest"),
+            "{e}"
+        );
+        assert!(!f.runtime_calls().contains("image rm"));
+        // Built: removed from the runtime by tag; the name works with or without :latest.
+        let v = image_delete(&f.ctx(), "my-built", false).unwrap();
+        assert_eq!(v["deleted"], true);
+        assert!(f.runtime_calls().contains("image rm my-built:latest"));
+        assert!(
+            img("my-built").exists(),
+            "the Dockerfile stays unless asked"
+        );
+        // And the Dockerfile on request.
+        let v = image_delete(&f.ctx(), "my-built:latest", true).unwrap();
+        assert_eq!(v["dockerfile_removed"], true);
+        assert!(!img("my-built").exists());
+        // In use: the runtime says no, osh does not force it.
+        let e = image_delete(&f.ctx(), "built-inuse", false).unwrap_err();
+        assert!(e.contains("sandbox") && e.contains("deleted first"), "{e}");
+        assert!(
+            !f.runtime_calls().contains("rmi") && !f.runtime_calls().contains("-f built-inuse")
+        );
+        // Not built: nothing to delete, unless the Dockerfile is the target.
+        assert!(image_delete(&f.ctx(), "idle", false)
+            .unwrap_err()
+            .contains("not built"));
+        image_delete(&f.ctx(), "idle", true).unwrap();
+        assert!(!img("idle").exists());
+        // A shipped Dockerfile is never removed, only its image.
+        std::fs::write(f.dir.join("images/Dockerfile-pi"), "FROM scratch\n").unwrap();
+        let e = image_delete(&f.ctx(), "pi", true).unwrap_err();
+        assert!(e.contains("ships with osh"), "{e}");
     }
 
     fn ok() -> Vec<String> {
