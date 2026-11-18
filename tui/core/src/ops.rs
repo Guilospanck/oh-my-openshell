@@ -500,13 +500,23 @@ fn lint_dockerfile(text: &str) -> Result<Option<String>, String> {
 
 fn run_check(dir: &Path, text: &str) -> Option<(bool, String)> {
     std::fs::write(dir.join("Dockerfile"), text).ok()?;
-    let log = dir.join("check.log");
-    let err = std::fs::File::create(&log).ok()?;
+    let args = [
+        "build".to_string(),
+        "--check".into(),
+        dir.to_string_lossy().into(),
+    ];
+    run_deadline(&args, &dir.join("check.log"), 60)
+}
+
+/// Run the container runtime with `args`, its stderr and stdout in `log`, killed after `secs`.
+/// `None` when it cannot start or overruns; else (success, output).
+fn run_deadline(args: &[String], log: &Path, secs: u64) -> Option<(bool, String)> {
+    let out = std::fs::File::create(log).ok()?;
+    let err = out.try_clone().ok()?;
     let mut child = Command::new(cli::runtime_bin())
-        .args(["build", "--check"])
-        .arg(dir)
+        .args(args)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(out)
         .stderr(err)
         .spawn()
         .ok()?;
@@ -515,7 +525,7 @@ fn run_check(dir: &Path, text: &str) -> Option<(bool, String)> {
         if let Some(s) = child.try_wait().ok()? {
             break s;
         }
-        if start.elapsed() > std::time::Duration::from_secs(60) {
+        if start.elapsed() > std::time::Duration::from_secs(secs) {
             let _ = child.kill();
             let _ = child.wait();
             return None;
@@ -524,8 +534,56 @@ fn run_check(dir: &Path, text: &str) -> Option<(bool, String)> {
     };
     Some((
         status.success(),
-        std::fs::read_to_string(&log).unwrap_or_default(),
+        std::fs::read_to_string(log).unwrap_or_default(),
     ))
+}
+
+/// Prove the new image does what the work needs: each `verify` command runs in a throwaway
+/// container of it with a clean environment (`env -i`, a plain PATH), because a sandbox does not
+/// apply the Dockerfile's ENV, so a tool that only works through ENV fails here instead of after
+/// the sandbox is made. The container is named and removed.
+fn verify_image(tag: &str, verify: &[String]) -> Result<(), String> {
+    for (i, cmd) in verify.iter().enumerate() {
+        let name = format!("osh-verify-{}-{i}", std::process::id());
+        let log = std::env::temp_dir().join(format!("{name}.log"));
+        let args: Vec<String> = [
+            "run",
+            "--rm",
+            "--name",
+            &name,
+            "--entrypoint",
+            "env",
+            tag,
+            "-i",
+            "HOME=/home/node",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "sh",
+            "-c",
+            cmd,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let r = run_deadline(&args, &log, 120);
+        let _ = cli::run(cli::runtime_bin(), &["rm".into(), "-f".into(), name], &[]);
+        let _ = std::fs::remove_file(&log);
+        match r {
+            Some((true, _)) => {}
+            Some((false, out)) => {
+                let tail: Vec<&str> = out.lines().rev().take(6).collect();
+                return Err(format!(
+                    "the image built but `{cmd}` failed in a clean environment ({}); the image was removed. A sandbox does not apply the Dockerfile's ENV (PATH, HOME-like variables), so make the tool work without it: symlink or wrapper in /usr/local/bin, defaults that need no variable. Fix the Dockerfile and call image_build again with the same name",
+                    tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+                ));
+            }
+            None => {
+                return Err(format!(
+                    "`{cmd}` did not finish in 120 s; the image was removed"
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Turn the output of `build --check` into a verdict: a parse error is an error; each
@@ -572,6 +630,7 @@ pub fn image_build(
     ctx: &Ctx,
     name: &str,
     dockerfile: &str,
+    verify: &[String],
     dry_run: bool,
 ) -> Result<Value, String> {
     if !valid_image_name(name) {
@@ -580,6 +639,16 @@ pub fn image_build(
         ));
     }
     let note = check_dockerfile(dockerfile)?;
+    if verify.len() > 10
+        || verify
+            .iter()
+            .any(|c| c.trim().is_empty() || c.len() > 500 || c.contains('\0'))
+    {
+        return Err("`verify` is at most 10 commands of at most 500 characters each".into());
+    }
+    if !dry_run && verify.is_empty() {
+        return Err("`verify` is required for a build: list the commands the work needs this image to run (for example `cargo --version`, `cc --version`); osh runs each in the new image with a clean environment (no Dockerfile ENV, as in the sandbox) and removes the image if one fails".into());
+    }
     let file = ctx.dir.join("images").join(format!("Dockerfile-{name}"));
     let tag = cli::dockerfile_tag(&file);
     if file.exists() || cli::image_built(&tag) {
@@ -597,7 +666,8 @@ pub fn image_build(
         (a, b) => a.or(b),
     };
     if dry_run {
-        let mut v = json!({"image": tag, "dockerfile": text, "built": false});
+        let mut v = json!({"image": tag, "dockerfile": text, "verify": verify, "built": false,
+                           "show_user": "paste this Dockerfile and the verify commands to the user in full, in a code block: a summary is not enough, and the tool output is collapsed in their view"});
         if let Some(n) = note {
             v["note"] = json!(n);
         }
@@ -605,12 +675,17 @@ pub fn image_build(
     }
     std::fs::create_dir_all(ctx.dir.join("images")).map_err(|e| e.to_string())?;
     std::fs::write(&file, &text).map_err(|e| format!("writing {}: {e}", file.display()))?;
-    let outcome = build_image(ctx, &file, &tag, &text);
+    let outcome = build_image(ctx, &file, &tag, &text).and_then(|_| verify_image(&tag, verify));
     if let Err(e) = outcome {
         let _ = std::fs::remove_file(&file);
+        let _ = cli::run(
+            cli::runtime_bin(),
+            &["image".into(), "rm".into(), tag.clone()],
+            &[],
+        );
         return Err(e);
     }
-    let mut v = json!({"image": tag, "built": true,
+    let mut v = json!({"image": tag, "built": true, "verified": verify,
                        "next": "name it as spec.image when you create the sandbox, then check inside it that it does what was asked"});
     if let Some(n) = note {
         v["note"] = json!(n);
@@ -1249,7 +1324,7 @@ pub(crate) mod tests {
                 std::fs::write(
                     &stub,
                     format!(
-                        "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1 $2\" = \"build --check\" ]; then if grep -q '^FORM' \"$3/Dockerfile\"; then echo 'ERROR: dockerfile parse error on line 2: unknown instruction: FORM' >&2; exit 1; fi; if grep -q LINTME \"$3/Dockerfile\"; then printf 'WARNING: StubRule - https://example.test/rule\\nlint me\\nDockerfile:1\\n' >&2; fi; exit 0; fi\nif [ \"$1 $2\" = \"image inspect\" ]; then [ \"$3\" = \"--format\" ] && echo node && exit 0; exit 1; fi\nexit 0\n",
+                        "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1\" = run ] && echo \"$@\" | grep -q FAILME; then echo 'sh: FAILME: not found' >&2; exit 127; fi\nif [ \"$1 $2\" = \"build --check\" ]; then if grep -q '^FORM' \"$3/Dockerfile\"; then echo 'ERROR: dockerfile parse error on line 2: unknown instruction: FORM' >&2; exit 1; fi; if grep -q LINTME \"$3/Dockerfile\"; then printf 'WARNING: StubRule - https://example.test/rule\\nlint me\\nDockerfile:1\\n' >&2; fi; exit 0; fi\nif [ \"$1 $2\" = \"image inspect\" ]; then [ \"$3\" = \"--format\" ] && echo node && exit 0; exit 1; fi\nexit 0\n",
                         runtime_log.display()
                     ),
                 )
@@ -2195,7 +2270,7 @@ pub(crate) mod tests {
         let f = Fake::new("image-build");
         with_image_and_profiles(&f);
         // dry_run: the text back, nothing written or built.
-        let v = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, true).unwrap();
+        let v = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, &[], true).unwrap();
         assert_eq!(v["image"], "claude-code-gcc:latest");
         assert!(v["dockerfile"]
             .as_str()
@@ -2207,7 +2282,7 @@ pub(crate) mod tests {
         assert!(f.runtime_calls().contains("build --check"));
         // For real: written, then the base (osh's own, not built) and the image built, the image
         // in an empty folder rather than the data folder.
-        let v = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, false).unwrap();
+        let v = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, &ok(), false).unwrap();
         assert_eq!(v["built"], true);
         assert!(f.dir.join("images/Dockerfile-claude-code-gcc").is_file());
         let built = f.runtime_calls();
@@ -2225,8 +2300,37 @@ pub(crate) mod tests {
             .unwrap()
             .to_string()
             .contains("claude-code-gcc:latest"));
-        let e = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, false).unwrap_err();
+        let e = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, &ok(), false).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
+    }
+
+    fn ok() -> Vec<String> {
+        vec!["true".into()]
+    }
+
+    #[test]
+    fn a_build_must_name_what_it_verifies_and_a_failed_check_removes_the_image() {
+        let f = Fake::new("image-verify");
+        with_image_and_profiles(&f);
+        let e = image_build(&f.ctx(), "v", ENV_IMAGE, &[], false).unwrap_err();
+        assert!(e.contains("`verify` is required"), "{e}");
+        let d = image_build(&f.ctx(), "v", ENV_IMAGE, &["cargo --version".into()], true).unwrap();
+        assert_eq!(d["verify"][0], "cargo --version");
+        assert!(d["show_user"].as_str().unwrap().contains("in full"), "{d}");
+        // A command that fails in the clean container: error, image and Dockerfile removed.
+        let e = image_build(&f.ctx(), "v", ENV_IMAGE, &["FAILME".into()], false).unwrap_err();
+        assert!(
+            e.contains("clean environment") && e.contains("removed"),
+            "{e}"
+        );
+        assert!(!f.dir.join("images/Dockerfile-v").exists());
+        let calls = f.runtime_calls();
+        assert!(calls.contains("image rm v:latest"), "{calls}");
+        assert!(calls.contains("rm -f osh-verify-"), "{calls}");
+        // The same name can be tried again, and passes.
+        let v = image_build(&f.ctx(), "v", ENV_IMAGE, &["cargo --version".into()], false).unwrap();
+        assert_eq!(v["verified"][0], "cargo --version");
+        assert!(f.runtime_calls().contains("run --rm --name osh-verify-"));
     }
 
     #[test]
@@ -2234,19 +2338,25 @@ pub(crate) mod tests {
         let f = Fake::new("image-lint");
         with_image_and_profiles(&f);
         // A syntax error is refused, before anything is written or built.
-        let e =
-            image_build(&f.ctx(), "bad", "FROM debian\nFORM x\nUSER node\n", false).unwrap_err();
+        let e = image_build(
+            &f.ctx(),
+            "bad",
+            "FROM debian\nFORM x\nUSER node\n",
+            &ok(),
+            false,
+        )
+        .unwrap_err();
         assert!(e.contains("does not parse") && e.contains("FORM"), "{e}");
         assert!(!f.dir.join("images/Dockerfile-bad").exists());
         assert_eq!(f.runtime_calls().matches("build -f").count(), 0);
         // A lint warning comes back as a note, on a dry run and on the real build.
         let text = "FROM debian\n# LINTME\nUSER node\n";
-        let v = image_build(&f.ctx(), "warn", text, true).unwrap();
+        let v = image_build(&f.ctx(), "warn", text, &[], true).unwrap();
         assert!(
             v["note"].as_str().unwrap().contains("StubRule: lint me"),
             "{v}"
         );
-        let v = image_build(&f.ctx(), "warn", text, false).unwrap();
+        let v = image_build(&f.ctx(), "warn", text, &ok(), false).unwrap();
         assert_eq!(v["built"], true);
         assert!(v["note"].as_str().unwrap().contains("StubRule"), "{v}");
     }
@@ -2288,11 +2398,11 @@ pub(crate) mod tests {
                 "host access",
             ),
         ] {
-            let e = image_build(&f.ctx(), name, text, false).unwrap_err();
+            let e = image_build(&f.ctx(), name, text, &ok(), false).unwrap_err();
             assert!(e.contains(want), "{name}: {e}");
         }
         let big = format!("FROM debian\n{}", "# x\n".repeat(20_000));
-        assert!(image_build(&f.ctx(), "x", &big, true)
+        assert!(image_build(&f.ctx(), "x", &big, &[], true)
             .unwrap_err()
             .contains("64 KB"));
         assert_eq!(f.runtime_calls().matches("build").count(), 0);
@@ -2303,9 +2413,16 @@ pub(crate) mod tests {
     fn an_image_that_ends_as_root_is_flagged_and_stages_are_not_bases() {
         let f = Fake::new("image-build-root");
         with_image_and_profiles(&f);
-        let v = image_build(&f.ctx(), "x", "FROM debian:trixie\nRUN true\n", true).unwrap();
+        let v = image_build(&f.ctx(), "x", "FROM debian:trixie\nRUN true\n", &[], true).unwrap();
         assert!(v["note"].as_str().unwrap().contains("USER node"), "{v}");
-        let v = image_build(&f.ctx(), "x", "FROM debian AS b\nFROM b\nUSER node\n", true).unwrap();
+        let v = image_build(
+            &f.ctx(),
+            "x",
+            "FROM debian AS b\nFROM b\nUSER node\n",
+            &[],
+            true,
+        )
+        .unwrap();
         assert!(v.get("note").is_none(), "{v}");
         assert_eq!(
             from_images("FROM --platform=linux/amd64 a:1 AS s\nFROM s\nFROM b:2\n"),

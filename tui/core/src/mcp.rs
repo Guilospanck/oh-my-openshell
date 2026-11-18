@@ -28,8 +28,8 @@ can install at run time (no root: user-level pip, npm, go and prebuilt binaries 
 and what needs a new image (apt packages, compilers and linkers, Rust, builds of native code, \
 browsers, databases), and how to write the Dockerfile. Tell the user which side each need falls \
 on and why, then let them choose: a new image (you write the Dockerfile following the guide, \
-show it with image_build and dry_run true, and build it only after they agree, then create the \
-sandbox from it), or an install at run time within those limits. Never pick for them, and never \
+paste the complete Dockerfile in a code block (not a summary) from image_build with dry_run true, and build it only after they agree, then create the \
+sandbox from it). Before you write a Dockerfile, find out what each tool needs to run (search its official install docs): PATH, environment variables, config and cache folders, linkers and libraries. A sandbox does NOT apply the Dockerfile's ENV, so the image must work without it, and give image_build verify commands that prove it. Get all of this right in the first Dockerfile: the user must not find out afterwards that a new image is needed, or an install at run time within those limits. Never pick for them, and never \
 pipe curl into a shell. \
 Translate what the user wants into the spec: a language or tool \
 (rust, go, node, python, zig...) means that toolchain group in spec.toolchains plus the provider \
@@ -213,12 +213,13 @@ fn base_tools() -> Value {
         },
         {
             "name": "image_build",
-            "description": "Build a new sandbox image from a Dockerfile you wrote (follow image_guide). Always call it first with dry_run true and show the user the Dockerfile; build (minutes, downloads a lot) only after they agree. The build context is empty (nothing can be copied in), osh's own base images are built first if missing, an existing image is never overwritten. Then name the image as spec.image.",
+            "description": "Build a new sandbox image from a Dockerfile you wrote (follow image_guide). Always call it first with dry_run true and paste the COMPLETE Dockerfile and the verify list to the user in a code block (a summary is not enough; tool output is collapsed in their view); build (minutes, downloads a lot) only after they agree. The build context is empty (nothing can be copied in), osh's own base images are built first if missing, an existing image is never overwritten. Then name the image as spec.image.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Lowercase letters, digits and `-`: the image becomes NAME:latest."},
                     "dockerfile": {"type": "string", "description": "The whole Dockerfile text."},
+                    "verify": {"type": "array", "items": {"type": "string"}, "description": "Shell commands the work needs this image to run (`cargo --version`, `cc --version`, a compile of a hello world). Required for a build. osh runs each in the new image with a clean environment (no Dockerfile ENV, like the sandbox) and removes the image if one fails."},
                     "dry_run": {"type": "boolean", "description": "Only check it and return it; write and build nothing."}
                 },
                 "required": ["name", "dockerfile"],
@@ -347,13 +348,28 @@ fn call(p: &Value, ctx: &Ctx) -> Result<Value, Fault> {
             ops::image_guide(ctx)
         }
         "image_build" => {
-            let a = args_of(p, &["name", "dockerfile", "dry_run"])?;
+            let a = args_of(p, &["name", "dockerfile", "verify", "dry_run"])?;
+            let verify: Vec<String> = match a.get("verify") {
+                None => Vec::new(),
+                Some(Value::Array(v)) => v
+                    .iter()
+                    .map(|x| x.as_str().map(str::to_string))
+                    .collect::<Option<_>>()
+                    .ok_or_else(|| invalid("argument `verify` must be a list of strings"))?,
+                Some(_) => return Err(invalid("argument `verify` must be a list of strings")),
+            };
             let dry = match a.get("dry_run") {
                 None => false,
                 Some(Value::Bool(b)) => *b,
                 Some(_) => return Err(invalid("argument `dry_run` must be a boolean")),
             };
-            ops::image_build(ctx, &req_str(&a, "name")?, &req_str(&a, "dockerfile")?, dry)
+            ops::image_build(
+                ctx,
+                &req_str(&a, "name")?,
+                &req_str(&a, "dockerfile")?,
+                &verify,
+                dry,
+            )
         }
         "sandbox_create" => {
             let a = args_of(p, &["spec", "dry_run"])?;

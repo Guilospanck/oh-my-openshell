@@ -57,24 +57,45 @@ WRITING THE DOCKERFILE (image_build takes the whole text)
    HOME as the base has them.
 7. Keep it small and quiet: install only what the work needs, clean caches, one concern per RUN
    layer where it helps rebuilds.
-8. If it installs a language into a shared location, make it usable by the non-root user: a
-   system-wide path (/usr/local) on PATH through ENV, files readable and any cache directory
-   writable (`chmod -R a+rwX`).
+8. A sandbox does NOT apply the Dockerfile's ENV (nor shell profiles): its shell and sandbox_exec
+   start with a plain environment, so a tool that works in the image only through ENV PATH or
+   ENV SOME_HOME fails there ("command not found", exit 127). Make every tool work with no
+   variables: put (or symlink) the binaries in /usr/local/bin, and when a tool needs a variable,
+   either make its default location the right one or put a small wrapper script in
+   /usr/local/bin that exports the variable and execs the real binary. Make the files readable
+   and any cache or state folder writable by the non-root user (`chmod -R a+rwX`).
 9. Name it for what it holds (`claude-code-rust`). The image is NAME:latest. osh never overwrites
    an existing image: pick a new name for a change.
+
+RESEARCH FIRST, SO THE FIRST IMAGE IS RIGHT
+
+The user must never learn after the build that something was missing. Before you write the
+Dockerfile, for every tool the work needs, find out from its official install documentation
+(search the web) how it installs and what it needs to RUN: the PATH entry, environment
+variables, default home, config and cache folders, system libraries and a linker or compiler, TLS
+certificates, and the hosts it contacts at run time (those must be open: sandbox_options). Put
+all of it in the Dockerfile, applying rule 8. If you cannot find out, say so to the user rather
+than guess. The same holds for a run-time install: after it, run the tool by name and by absolute
+path, since ~/.local/bin or a cargo or npm bin folder is not necessarily on PATH.
 
 BEFORE BUILDING
 
 osh runs the runtime's own parser and lint rules over it first (`build --check`): a syntax error comes back as an error to fix, lint warnings as a `note` to fix or explain.
-Show the user the Dockerfile (image_build with dry_run true) and the base and name you chose, and
-build only after they agree; a build takes minutes and downloads a lot. After it, create the
-sandbox with spec.image set to the new tag and check inside it (`cargo --version`, a compile) that
-the image does what was asked.
+Call image_build with dry_run true and PASTE the complete Dockerfile and the verify commands to
+the user in a code block, with the base and name you chose: a summary is not enough, and tool
+output is collapsed in their view. Build only after they agree; a build takes minutes and
+downloads a lot. `verify` is required for a build: the commands the work needs (`cargo --version`,
+`cc --version`, a hello-world compile, `python -c "import x"`). osh runs each in the new image with
+a clean environment, as the sandbox will, and removes the image if one fails, so you fix the
+Dockerfile and call again with the same name. After a verified build, create the sandbox with
+spec.image set to the new tag and run the work's command inside it once.
 
 EXAMPLE (Rust, in the same style): the shipped Dockerfiles below show the conventions: pinned
 versions, checksums, `dpkg --print-architecture`, apt cleanup. A Rust image adds, as root: gcc,
 libc6-dev, make, pkg-config, libssl-dev from apt; rustup-init from
 https://static.rust-lang.org/rustup/dist/<triple>/ checked against its `.sha256`, installed with
 RUSTUP_HOME=/usr/local/rustup and CARGO_HOME=/usr/local/cargo, the minimal profile plus clippy
-and rustfmt, `chmod -R a+rwX` on both, /usr/local/cargo/bin on PATH, then USER node.
+and rustfmt, `chmod -R a+rwX` on both, then, because ENV does not reach the sandbox, wrapper
+scripts /usr/local/bin/cargo, rustc, rustup and so on that export both variables and exec the real
+binaries from /usr/local/cargo/bin; verify `cargo --version` and `rustc --version`; then USER node.
 "#;
