@@ -990,6 +990,22 @@ pub(crate) mod tests {
             let curl = bin.join("curl");
             std::fs::write(&curl, "#!/bin/sh\nexit 7\n").unwrap();
             std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // The container runtime is faked too: a test that builds an image must never reach the
+            // user's Docker. `image inspect` says "not built"; everything else succeeds and is
+            // logged to runtime.log.
+            let runtime_log = root.join("runtime.log");
+            for rt in ["docker", "podman"] {
+                let stub = bin.join(rt);
+                std::fs::write(
+                    &stub,
+                    format!(
+                        "#!/bin/sh\necho \"$@\" >> '{}'\n[ \"$1 $2\" = \"image inspect\" ] && exit 1\nexit 0\n",
+                        runtime_log.display()
+                    ),
+                )
+                .unwrap();
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
             let log = root.join("calls.log");
             std::fs::write(&log, "").unwrap();
             let path = std::env::var_os("PATH");
@@ -1030,6 +1046,12 @@ pub(crate) mod tests {
                 version: "0.0.0-test".into(),
                 job_max_secs: 0,
             }
+        }
+
+        /// What the faked container runtime was asked.
+        pub(crate) fn runtime_calls(&self) -> String {
+            std::fs::read_to_string(self.dir.parent().unwrap().join("runtime.log"))
+                .unwrap_or_default()
         }
 
         pub(crate) fn calls(&self) -> String {
@@ -1947,6 +1969,8 @@ pub(crate) mod tests {
         assert!(!f.calls().contains("sandbox create"), "{}", f.calls());
         // A credential-free profile is created, then the sandbox.
         sandbox_create(&f.ctx(), &json!({"name":"w1","providers":["rust"]}), false).unwrap();
+        // The default image was built through the faked runtime, never the real one.
+        assert!(f.runtime_calls().contains("build"), "{}", f.runtime_calls());
         let calls = f.calls();
         let made = calls
             .find("provider create")
