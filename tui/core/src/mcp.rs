@@ -21,12 +21,7 @@ the sandbox (a git push, a missing tool), do not redo it on the host: read the e
 the sandbox or stop and tell the user.\n\
 \n\
 Before you create a sandbox, call sandbox_options. It lists the images, the providers and the \
-toolchain groups there are. Toolchain groups and providers only OPEN NETWORK HOSTS: they install \
-nothing. The tools a sandbox has come from its image (each image's `about` says what it holds), \
-so a language the image lacks is not there, and osh picks the Rust image itself when the spec \
-names rust. If no listed image has what the work needs, do not install it with curl piped to a \
-shell: tell the user which image or Dockerfile they need (the Images tab can build one). \
-Translate what the user wants into the spec: a language or tool \
+toolchain groups there are. Translate what the user wants into the spec: a language or tool \
 (rust, go, node, python, zig...) means that toolchain group in spec.toolchains plus the provider \
 of that name in spec.providers when sandbox_options lists one (one that needs a credential is refused with the user's steps: read them out, and never ask for the credential in the chat); a \
 specific environment means an image from the list. Without an image a kept sandbox gets \

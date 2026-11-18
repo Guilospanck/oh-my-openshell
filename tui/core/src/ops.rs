@@ -253,33 +253,11 @@ fn repo_secret(ctx: &Ctx, var: &str) -> Result<String, String> {
 /// nothing changes when the Dockerfile is not in the data folder.
 const DEFAULT_IMAGE: &str = "claude-code:latest";
 
-/// Images that carry a language's tools: toolchain groups and providers only open network hosts,
-/// they install nothing, so a spec that needs the language needs an image that has it.
-const LANGUAGE_IMAGES: &[(&str, &str)] = &[("rust", "claude-code-rust:latest")];
-
-/// The image for a spec that names none: the one that has the language it needs (a Rust spec
-/// gets the Rust image, kept or throwaway), else, for a kept sandbox, Claude Code's. A throwaway
-/// one otherwise keeps OpenShell's default, and nothing changes when the Dockerfile is not in
-/// the data folder.
 fn default_image(ctx: &Ctx, s: &mut SandboxSpec) -> Option<String> {
-    if !s.image.is_empty() {
-        return None;
-    }
-    let names = |w: &str| {
-        s.providers.iter().any(|p| p == w)
-            || s.toolchains
-                .as_ref()
-                .is_some_and(|t| t.iter().any(|g| g == w))
-    };
-    for (lang, image) in LANGUAGE_IMAGES {
-        if names(lang) && !images_for(&ctx.dir, image).is_empty() {
-            s.image = (*image).into();
-            return Some(format!(
-                "the spec needs {lang} and names no image, so it uses {image} (toolchain groups and providers only open network hosts; this image has {lang} installed; built on first use, which can take minutes)"
-            ));
-        }
-    }
-    if !s.command.is_empty() || images_for(&ctx.dir, DEFAULT_IMAGE).is_empty() {
+    if !s.image.is_empty()
+        || !s.command.is_empty()
+        || images_for(&ctx.dir, DEFAULT_IMAGE).is_empty()
+    {
         return None;
     }
     s.image = DEFAULT_IMAGE.into();
@@ -1922,11 +1900,6 @@ pub(crate) mod tests {
             "# syntax=docker/dockerfile:1\n\n# Claude Code and its tools.\nFROM scratch\n",
         )
         .unwrap();
-        std::fs::write(
-            f.dir.join("images/Dockerfile-claude_code_rust"),
-            "# Claude Code plus Rust.\nFROM scratch\n",
-        )
-        .unwrap();
         std::fs::create_dir_all(f.dir.join("providers")).unwrap();
         std::fs::write(
             f.dir.join("providers/rust.yaml"),
@@ -1963,33 +1936,6 @@ pub(crate) mod tests {
         assert!(!sandbox_create(&f.ctx(), &once, true).unwrap()["steps"]
             .to_string()
             .contains("claude-code"));
-    }
-
-    #[test]
-    fn a_spec_that_needs_rust_gets_the_image_that_has_it() {
-        let f = Fake::new("rust-image");
-        with_image_and_profiles(&f);
-        for spec in [
-            json!({"name":"w1","providers":["rust"]}),
-            json!({"name":"w1","toolchains":["rust"]}),
-            json!({"name":"w1","toolchains":["rust"],"command":"cargo test"}),
-        ] {
-            let v = sandbox_create(&f.ctx(), &spec, true).unwrap();
-            let steps = v["steps"].to_string();
-            assert!(steps.contains("claude-code-rust:latest"), "{spec}: {steps}");
-            assert!(v["note"].as_str().unwrap().contains("installed"), "{v}");
-        }
-        // Not for a spec that names its own image, nor one that does not need Rust.
-        let own = json!({"name":"w1","providers":["rust"],"image":"other:1"});
-        assert!(!sandbox_create(&f.ctx(), &own, true).unwrap()["steps"]
-            .to_string()
-            .contains("claude-code-rust"));
-        let go = json!({"name":"w1","toolchains":["go"]});
-        let steps = sandbox_create(&f.ctx(), &go, true).unwrap()["steps"].to_string();
-        assert!(
-            steps.contains("claude-code:latest") && !steps.contains("claude-code-rust"),
-            "{steps}"
-        );
     }
 
     #[test]

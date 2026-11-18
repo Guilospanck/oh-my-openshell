@@ -54,10 +54,6 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../images/Dockerfile-claude_code"),
     ),
     (
-        "images/Dockerfile-claude_code_rust",
-        include_str!("../../../images/Dockerfile-claude_code_rust"),
-    ),
-    (
         "images/Dockerfile-pi",
         include_str!("../../../images/Dockerfile-pi"),
     ),
