@@ -410,6 +410,153 @@ pub fn provider_add(ctx: &Ctx, id: &str, values: &[(String, String)]) -> Result<
     cli::create_provider(&ctx.dir, id, values)
 }
 
+/// Dockerfile text that adds a toolchain to an image, keyed by the name an agent asks for. Fixed
+/// text only: nothing an agent writes reaches a Dockerfile. Each recipe runs as root and is
+/// wrapped by `image_build` so the image's own user is restored.
+const RECIPES: &[(&str, &str)] = &[(
+    "rust",
+    r#"# Rust, system-wide in the layout of the official rust image (providers/rust.yaml lists
+# /usr/local/cargo and /usr/local/rustup). rustup-init is checked against the sha256 file published
+# next to it, then installs the stable toolchain (minimal profile, plus clippy and rustfmt).
+# gcc is the linker cargo needs; pkg-config and libssl-dev are what many crates link against.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends gcc libc6-dev make pkg-config libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN case "$(dpkg --print-architecture)" in \
+        amd64) triple=x86_64-unknown-linux-gnu ;; \
+        arm64) triple=aarch64-unknown-linux-gnu ;; \
+        *) echo "unsupported architecture" >&2; exit 1 ;; \
+    esac \
+    && base="https://static.rust-lang.org/rustup/dist/${triple}" \
+    && cd /tmp \
+    && curl -fsSLO "${base}/rustup-init" \
+    && echo "$(curl -fsSL "${base}/rustup-init.sha256" | cut -d' ' -f1)  rustup-init" | sha256sum --check - \
+    && chmod +x rustup-init \
+    && ./rustup-init -y --no-modify-path --profile minimal --default-toolchain stable -c clippy -c rustfmt \
+    && rm rustup-init \
+    && chmod -R a+rwX "$CARGO_HOME" "$RUSTUP_HOME" \
+    && rustc --version \
+    && cargo --version
+"#,
+)];
+
+/// A valid image name: lowercase letters, digits and `-`, starting with a letter or digit.
+fn valid_image_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 40
+        && n.starts_with(|c: char| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && n.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Make a new image `name` from the image `base` (one `sandbox_options` lists) plus the toolchains
+/// asked for (`RECIPES`): write `images/Dockerfile-NAME` in the data folder, so the dashboard's
+/// Images tab shows it, and build it (base first if it is not built). The user picks the base and
+/// the name; `dry_run` returns the Dockerfile without writing or building anything. Never
+/// overwrites a Dockerfile.
+pub fn image_build(
+    ctx: &Ctx,
+    name: &str,
+    base: &str,
+    toolchains: &[String],
+    dry_run: bool,
+) -> Result<Value, String> {
+    if !valid_image_name(name) {
+        return Err(format!(
+            "image name {name:?} must be lowercase letters, digits and `-` (at most 40)"
+        ));
+    }
+    let known: Vec<&str> = RECIPES.iter().map(|(n, _)| *n).collect();
+    if toolchains.is_empty() {
+        return Err(format!(
+            "toolchains must name at least one of: {}",
+            known.join(", ")
+        ));
+    }
+    let mut blocks = String::new();
+    for t in toolchains {
+        let Some((_, text)) = RECIPES.iter().find(|(n, _)| n == t) else {
+            return Err(format!(
+                "no recipe for toolchain {t:?}; osh can add: {}. For anything else the user writes a Dockerfile in the Images tab",
+                known.join(", ")
+            ));
+        };
+        blocks.push_str(text);
+        blocks.push('\n');
+    }
+    let base_image = images_for(&ctx.dir, base)
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            let tags: Vec<String> = cli::dockerfiles(&ctx.dir)
+                .iter()
+                .map(|f| cli::dockerfile_tag(f))
+                .collect();
+            format!(
+                "base {base:?} is not an image osh can build from; the user picks one of: {}",
+                tags.join(", ")
+            )
+        })?;
+    let file = ctx.dir.join("images").join(format!("Dockerfile-{name}"));
+    let tag = cli::dockerfile_tag(&file);
+    if file.exists() || cli::image_built(&tag) {
+        return Err(format!(
+            "an image named {tag} already exists; choose another name (osh never overwrites one)"
+        ));
+    }
+    let user = cli::run(
+        cli::runtime_bin(),
+        &["image", "inspect", "--format", "{{.Config.User}}", base].map(String::from),
+        &[],
+    )
+    .map(|u| u.trim().to_string())
+    .unwrap_or_default();
+    let restore = if user.is_empty()
+        || !user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c))
+    {
+        String::new()
+    } else {
+        format!("USER {user}\n")
+    };
+    let text = format!(
+        "# {tag}: {base} plus {}. Written by osh (image_build); edit it in the Images tab.\nFROM {base}\n\nUSER root\n\n{blocks}{restore}",
+        toolchains.join(", ")
+    );
+    if dry_run {
+        return Ok(json!({"image": tag, "base": base, "dockerfile": text, "built": false}));
+    }
+    std::fs::create_dir_all(ctx.dir.join("images")).map_err(|e| e.to_string())?;
+    std::fs::write(&file, &text).map_err(|e| format!("writing {}: {e}", file.display()))?;
+    let build =
+        |f: &Path, t: &str| cli::run(cli::runtime_bin(), &cli::build_args(&ctx.dir, f, t), &[]);
+    let outcome = (|| {
+        if !base_image.built {
+            build(&base_image.file, &base_image.tag).map_err(|e| {
+                format!(
+                    "building the base {}: {}",
+                    base_image.tag,
+                    crate::text::error_summary(&e)
+                )
+            })?;
+        }
+        build(&file, &tag)
+            .map_err(|e| format!("building {tag}: {}", crate::text::error_summary(&e)))
+    })();
+    if let Err(e) = outcome {
+        let _ = std::fs::remove_file(&file);
+        return Err(e);
+    }
+    Ok(
+        json!({"image": tag, "base": base, "toolchains": toolchains, "built": true,
+              "note": "name it as spec.image when you create the sandbox"}),
+    )
+}
+
 /// What a spec may name, so an agent picks from facts instead of guessing: the images (and which
 /// one a kept sandbox gets by default), the providers that exist and the profiles osh can turn
 /// into one, and the toolchain host groups.
@@ -460,6 +607,7 @@ pub fn sandbox_options(ctx: &Ctx) -> Result<Value, String> {
             "kept": DEFAULT_IMAGE,
             "throwaway": "OpenShell's own default (a spec with `command`)",
         },
+        "image_build_toolchains": RECIPES.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
         "providers_to_name": profiles,
         "providers_existing": existing,
         "toolchains": groups,
@@ -991,7 +1139,7 @@ pub(crate) mod tests {
             std::fs::write(&curl, "#!/bin/sh\nexit 7\n").unwrap();
             std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
             // The container runtime is faked too: a test that builds an image must never reach the
-            // user's Docker. `image inspect` says "not built"; everything else succeeds and is
+            // user's Docker. `image inspect` says "not built" (and names the user `node` when asked its config); everything else succeeds and is
             // logged to runtime.log.
             let runtime_log = root.join("runtime.log");
             for rt in ["docker", "podman"] {
@@ -999,7 +1147,7 @@ pub(crate) mod tests {
                 std::fs::write(
                     &stub,
                     format!(
-                        "#!/bin/sh\necho \"$@\" >> '{}'\n[ \"$1 $2\" = \"image inspect\" ] && exit 1\nexit 0\n",
+                        "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1 $2\" = \"image inspect\" ]; then [ \"$3\" = \"--format\" ] && echo node && exit 0; exit 1; fi\nexit 0\n",
                         runtime_log.display()
                     ),
                 )
@@ -1936,6 +2084,90 @@ pub(crate) mod tests {
         assert!(!sandbox_create(&f.ctx(), &once, true).unwrap()["steps"]
             .to_string()
             .contains("claude-code"));
+    }
+
+    #[test]
+    fn image_build_writes_a_dockerfile_from_a_recipe_and_builds_base_then_image() {
+        let f = Fake::new("image-build");
+        with_image_and_profiles(&f);
+        let rust = ["rust".to_string()];
+        // dry_run: the Dockerfile only, nothing written or built.
+        let v = image_build(
+            &f.ctx(),
+            "claude-code-rust",
+            "claude-code:latest",
+            &rust,
+            true,
+        )
+        .unwrap();
+        let text = v["dockerfile"].as_str().unwrap();
+        assert!(
+            text.contains("FROM claude-code:latest") && text.contains("USER root"),
+            "{text}"
+        );
+        assert!(
+            text.contains("rustup-init") && text.trim_end().ends_with("USER node"),
+            "{text}"
+        );
+        assert!(!f.dir.join("images/Dockerfile-claude-code-rust").exists());
+        assert_eq!(f.runtime_calls().matches("build").count(), 0);
+        // For real: the file is written, the base (not built) and the image are built.
+        let v = image_build(
+            &f.ctx(),
+            "claude-code-rust",
+            "claude-code:latest",
+            &rust,
+            false,
+        )
+        .unwrap();
+        assert_eq!(v["image"], "claude-code-rust:latest");
+        assert!(f.dir.join("images/Dockerfile-claude-code-rust").is_file());
+        let built = f.runtime_calls();
+        assert_eq!(built.matches("build -f").count(), 2, "{built}");
+        // The new image is listed for the next call.
+        let opts = sandbox_options(&f.ctx()).unwrap();
+        assert!(
+            opts.to_string().contains("claude-code-rust:latest"),
+            "{opts}"
+        );
+        assert_eq!(opts["image_build_toolchains"][0], "rust");
+        // Never overwrites.
+        let e = image_build(
+            &f.ctx(),
+            "claude-code-rust",
+            "claude-code:latest",
+            &rust,
+            false,
+        )
+        .unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+    }
+
+    #[test]
+    fn image_build_refuses_what_it_has_no_recipe_or_base_for() {
+        let f = Fake::new("image-build-refuse");
+        with_image_and_profiles(&f);
+        let rust = ["rust".to_string()];
+        for (name, base, tc, want) in [
+            ("Bad Name", "claude-code:latest", &rust[..], "lowercase"),
+            (
+                "x",
+                "ubuntu:24.04",
+                &rust[..],
+                "not an image osh can build from",
+            ),
+            (
+                "x",
+                "claude-code:latest",
+                &["cobol".to_string()][..],
+                "no recipe",
+            ),
+            ("x", "claude-code:latest", &[][..], "at least one"),
+        ] {
+            let e = image_build(&f.ctx(), name, base, tc, false).unwrap_err();
+            assert!(e.contains(want), "{name} {base}: {e}");
+        }
+        assert_eq!(f.runtime_calls().matches("build").count(), 0);
     }
 
     #[test]
