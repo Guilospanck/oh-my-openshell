@@ -10,6 +10,18 @@ use serde_json::{json, Map, Value};
 
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
 
+/// Standing rules every client is given when it connects. The server cannot stop a client's own
+/// host tools; the user's Claude Code permissions do that. This is what an agent is told.
+const INSTRUCTIONS: &str = "osh gives you sandboxes: do the user's work INSIDE them. When the \
+user asks for work in a sandbox, do every command, file change, git commit and push through \
+sandbox_exec (or a sandbox_create command); never run it on the user's own machine with your \
+host tools (shell, editor, git), not even as a fallback. When something fails in the sandbox \
+(for example a git push), do not redo it on the host: read the error, fix it in the sandbox \
+(sandbox_repo_grant for git access, which needs the user's token steps) or stop and tell the user. \
+If a request asks for a repo or a folder, put it in the spec (repo, share) when you create the \
+sandbox, then check with sandbox_exec that it works (for git: `git ls-remote origin`) before you \
+call it ready. Never ask the user to paste a token into the chat.";
+
 const SPEC_DOC: &str = "Sandbox spec. Keys: name (required), image, providers (array of names), \
 cpu, memory, command (run once, then the sandbox is deleted; its output is not returned; \
 leave it out for a sandbox to exec in), toolchains (array), repo {url, env_var} (env_var is \
@@ -380,6 +392,7 @@ pub fn handle(line: &str, ctx: &Ctx) -> Option<String> {
                 .unwrap_or(DEFAULT_PROTOCOL),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "osh", "version": ctx.version},
+            "instructions": INSTRUCTIONS,
         })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({"tools": tools()})),
@@ -431,6 +444,11 @@ mod tests {
         // The binary's version, as given in the context, not osh-core's own.
         assert_eq!(r["result"]["serverInfo"]["version"], "9.8.7-given");
         assert!(r["result"]["capabilities"]["tools"].is_object());
+        // Standing rules for the agent: work inside the sandbox, never fall back to the host.
+        let rules = r["result"]["instructions"].as_str().unwrap();
+        assert!(
+            rules.contains("INSIDE") && rules.contains("never run it on the user's own machine")
+        );
         let d = ask(
             r#"{"jsonrpc":"2.0","id":"a","method":"initialize"}"#,
             &ctx(),

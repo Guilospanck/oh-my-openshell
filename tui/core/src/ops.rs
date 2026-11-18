@@ -327,6 +327,10 @@ fn create_in(ctx: &Ctx, spec: &Value, dry_run: bool, home: &str) -> Result<Value
             !s.command.is_empty(),
         )
     };
+    // A sandbox that lives on gets git set up for its grant, as `sandbox_repo_grant` does.
+    if let (Ok(v), Some((repo, _)), false) = (&mut out, &grant, dry_run || !s.command.is_empty()) {
+        configure_git(ctx, &s.name, repo, v);
+    }
     // The policy was written for this call alone; the gateway has read it by now.
     if let Some(p) = &plan.policy_file {
         let _ = std::fs::remove_file(p);
@@ -473,6 +477,15 @@ pub fn repo_grant(ctx: &Ctx, name: &str, url: &str, env_var: &str) -> Result<Val
         "name": name, "provider": provider, "repo": repo.shown(), "attached": true,
         "to_remove": cut_access_steps(&repo, env_var),
     });
+    configure_git(ctx, name, &repo, &mut out);
+    Ok(out)
+}
+
+/// Make `git` in the sandbox use the repo's provider token (credential helper, and `git@`/`ssh`
+/// remotes rewritten to https, since the providers only reach port 443). Without this a push
+/// from the sandbox fails and an agent is tempted to push from the host instead. Records
+/// `git_configured` and, when it did not work, a note, in `out`.
+fn configure_git(ctx: &Ctx, name: &str, repo: &ghrepo::GhRepo, out: &mut Value) {
     if repo.is_github() {
         let argv: Vec<String> = ["sh", "-c", ghrepo::GITHUB_GIT_CONFIG]
             .map(String::from)
@@ -485,7 +498,6 @@ pub fn repo_grant(ctx: &Ctx, name: &str, url: &str, env_var: &str) -> Result<Val
     } else {
         out["note"] = json!("attached; git in the sandbox is not configured for this host: it needs the provider's token as a Basic credential (see the dashboard's shell)");
     }
-    Ok(out)
 }
 
 /// Take the repo grant away from a sandbox: detach its provider and delete it. The stored token
@@ -1255,8 +1267,30 @@ pub(crate) mod tests {
         std::env::set_var("OSH_TEST_TOK", secret_value());
         let r = sandbox_create(&f.ctx(), &with_repo("OSH_TEST_TOK"), false);
         std::env::remove_var("OSH_TEST_TOK");
-        r.unwrap();
+        let v = r.unwrap();
         assert!(!f.calls().contains("provider delete"), "{}", f.calls());
+        // git in the sandbox is set up for the grant, so a push from there works (the sandbox
+        // script is only logged by the fake, never run on the host).
+        assert!(
+            f.calls().contains("credential.https://github.com.helper"),
+            "{}",
+            f.calls()
+        );
+        assert!(v.get("git_configured").is_some(), "{v}");
+    }
+
+    #[test]
+    fn a_one_shot_create_does_not_configure_git() {
+        let f = Fake::new("oneshot-nogit");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        let r = sandbox_create(&f.ctx(), &one_shot_with_repo(), false);
+        std::env::remove_var("OSH_TEST_TOK");
+        r.unwrap();
+        assert!(
+            !f.calls().contains("credential.https://github.com.helper"),
+            "{}",
+            f.calls()
+        );
     }
 
     #[test]
