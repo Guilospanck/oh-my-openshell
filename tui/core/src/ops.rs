@@ -410,39 +410,6 @@ pub fn provider_add(ctx: &Ctx, id: &str, values: &[(String, String)]) -> Result<
     cli::create_provider(&ctx.dir, id, values)
 }
 
-/// Dockerfile text that adds a toolchain to an image, keyed by the name an agent asks for. Fixed
-/// text only: nothing an agent writes reaches a Dockerfile. Each recipe runs as root and is
-/// wrapped by `image_build` so the image's own user is restored.
-const RECIPES: &[(&str, &str)] = &[(
-    "rust",
-    r#"# Rust, system-wide in the layout of the official rust image (providers/rust.yaml lists
-# /usr/local/cargo and /usr/local/rustup). rustup-init is checked against the sha256 file published
-# next to it, then installs the stable toolchain (minimal profile, plus clippy and rustfmt).
-# gcc is the linker cargo needs; pkg-config and libssl-dev are what many crates link against.
-ENV RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/usr/local/cargo \
-    PATH=/usr/local/cargo/bin:$PATH
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends gcc libc6-dev make pkg-config libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-RUN case "$(dpkg --print-architecture)" in \
-        amd64) triple=x86_64-unknown-linux-gnu ;; \
-        arm64) triple=aarch64-unknown-linux-gnu ;; \
-        *) echo "unsupported architecture" >&2; exit 1 ;; \
-    esac \
-    && base="https://static.rust-lang.org/rustup/dist/${triple}" \
-    && cd /tmp \
-    && curl -fsSLO "${base}/rustup-init" \
-    && echo "$(curl -fsSL "${base}/rustup-init.sha256" | cut -d' ' -f1)  rustup-init" | sha256sum --check - \
-    && chmod +x rustup-init \
-    && ./rustup-init -y --no-modify-path --profile minimal --default-toolchain stable -c clippy -c rustfmt \
-    && rm rustup-init \
-    && chmod -R a+rwX "$CARGO_HOME" "$RUSTUP_HOME" \
-    && rustc --version \
-    && cargo --version
-"#,
-)];
-
 /// A valid image name: lowercase letters, digits and `-`, starting with a letter or digit.
 fn valid_image_name(n: &str) -> bool {
     !n.is_empty()
@@ -452,16 +419,78 @@ fn valid_image_name(n: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Make a new image `name` from the image `base` (one `sandbox_options` lists) plus the toolchains
-/// asked for (`RECIPES`): write `images/Dockerfile-NAME` in the data folder, so the dashboard's
-/// Images tab shows it, and build it (base first if it is not built). The user picks the base and
-/// the name; `dry_run` returns the Dockerfile without writing or building anything. Never
-/// overwrites a Dockerfile.
+/// The images each `FROM` line names (`FROM [--platform=X] IMAGE [AS name]`), skipping a stage
+/// that is only an earlier stage of the same file.
+fn from_images(text: &str) -> Vec<String> {
+    let mut stages: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut w = line.split_whitespace();
+        if !w.next().is_some_and(|k| k.eq_ignore_ascii_case("FROM")) {
+            continue;
+        }
+        let rest: Vec<&str> = w.filter(|t| !t.starts_with("--")).collect();
+        let Some(image) = rest.first() else { continue };
+        if !stages.iter().any(|s| s == image) {
+            out.push((*image).to_string());
+        }
+        if rest.len() >= 3 && rest[1].eq_ignore_ascii_case("AS") {
+            stages.push(rest[2].to_string());
+        }
+    }
+    out
+}
+
+/// What a Dockerfile written by an agent may not do before it is built on the user's machine: it
+/// needs a `FROM`, must stay a reasonable size, and may not ask Docker for host access
+/// (`--network=host`, `--security=insecure`). Build content is the agent's, so these are the
+/// fences; the user reading it first (dry_run) is the rest.
+fn check_dockerfile(text: &str) -> Result<Option<String>, String> {
+    if text.len() > 64 * 1024 {
+        return Err("the Dockerfile is over 64 KB".into());
+    }
+    if text.contains('\0') {
+        return Err("the Dockerfile holds a NUL byte".into());
+    }
+    if from_images(text).is_empty() {
+        return Err("the Dockerfile needs a FROM line".into());
+    }
+    for line in text.lines() {
+        let l = line.to_ascii_lowercase();
+        if l.contains("--network=host") || l.contains("--security=insecure") {
+            return Err(
+                "the Dockerfile asks Docker for host access (--network=host or --security=insecure), which osh refuses"
+                    .into(),
+            );
+        }
+    }
+    let last_user = text
+        .lines()
+        .filter_map(|l| {
+            let mut w = l.split_whitespace();
+            w.next()
+                .filter(|k| k.eq_ignore_ascii_case("USER"))
+                .and_then(|_| w.next())
+        })
+        .next_back();
+    Ok(match last_user {
+        None | Some("root") | Some("0") => Some(
+            "the image ends as root; sandboxes run as an ordinary user, so end the Dockerfile with `USER node`"
+                .to_string(),
+        ),
+        Some(_) => None,
+    })
+}
+
+/// Make a new image `name` from the Dockerfile `dockerfile` (written by the agent, shown to the
+/// user first with `dry_run`): write `images/Dockerfile-NAME` in the data folder, so the
+/// dashboard's Images tab shows it, and build it. The build context is an empty folder, so
+/// nothing of the user's can be copied in; a base that is one of osh's own images is built
+/// first when missing. Never overwrites an image or a Dockerfile.
 pub fn image_build(
     ctx: &Ctx,
     name: &str,
-    base: &str,
-    toolchains: &[String],
+    dockerfile: &str,
     dry_run: bool,
 ) -> Result<Value, String> {
     if !valid_image_name(name) {
@@ -469,37 +498,7 @@ pub fn image_build(
             "image name {name:?} must be lowercase letters, digits and `-` (at most 40)"
         ));
     }
-    let known: Vec<&str> = RECIPES.iter().map(|(n, _)| *n).collect();
-    if toolchains.is_empty() {
-        return Err(format!(
-            "toolchains must name at least one of: {}",
-            known.join(", ")
-        ));
-    }
-    let mut blocks = String::new();
-    for t in toolchains {
-        let Some((_, text)) = RECIPES.iter().find(|(n, _)| n == t) else {
-            return Err(format!(
-                "no recipe for toolchain {t:?}; osh can add: {}. For anything else the user writes a Dockerfile in the Images tab",
-                known.join(", ")
-            ));
-        };
-        blocks.push_str(text);
-        blocks.push('\n');
-    }
-    let base_image = images_for(&ctx.dir, base)
-        .into_iter()
-        .next()
-        .ok_or_else(|| {
-            let tags: Vec<String> = cli::dockerfiles(&ctx.dir)
-                .iter()
-                .map(|f| cli::dockerfile_tag(f))
-                .collect();
-            format!(
-                "base {base:?} is not an image osh can build from; the user picks one of: {}",
-                tags.join(", ")
-            )
-        })?;
+    let note = check_dockerfile(dockerfile)?;
     let file = ctx.dir.join("images").join(format!("Dockerfile-{name}"));
     let tag = cli::dockerfile_tag(&file);
     if file.exists() || cli::image_built(&tag) {
@@ -507,54 +506,73 @@ pub fn image_build(
             "an image named {tag} already exists; choose another name (osh never overwrites one)"
         ));
     }
-    let user = cli::run(
-        cli::runtime_bin(),
-        &["image", "inspect", "--format", "{{.Config.User}}", base].map(String::from),
-        &[],
-    )
-    .map(|u| u.trim().to_string())
-    .unwrap_or_default();
-    let restore = if user.is_empty()
-        || !user
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-.:".contains(c))
-    {
-        String::new()
+    let text = if dockerfile.ends_with('\n') {
+        dockerfile.to_string()
     } else {
-        format!("USER {user}\n")
+        format!("{dockerfile}\n")
     };
-    let text = format!(
-        "# {tag}: {base} plus {}. Written by osh (image_build); edit it in the Images tab.\nFROM {base}\n\nUSER root\n\n{blocks}{restore}",
-        toolchains.join(", ")
-    );
     if dry_run {
-        return Ok(json!({"image": tag, "base": base, "dockerfile": text, "built": false}));
+        let mut v = json!({"image": tag, "dockerfile": text, "built": false});
+        if let Some(n) = note {
+            v["note"] = json!(n);
+        }
+        return Ok(v);
     }
     std::fs::create_dir_all(ctx.dir.join("images")).map_err(|e| e.to_string())?;
     std::fs::write(&file, &text).map_err(|e| format!("writing {}: {e}", file.display()))?;
-    let build =
-        |f: &Path, t: &str| cli::run(cli::runtime_bin(), &cli::build_args(&ctx.dir, f, t), &[]);
-    let outcome = (|| {
-        if !base_image.built {
-            build(&base_image.file, &base_image.tag).map_err(|e| {
-                format!(
-                    "building the base {}: {}",
-                    base_image.tag,
-                    crate::text::error_summary(&e)
-                )
-            })?;
-        }
-        build(&file, &tag)
-            .map_err(|e| format!("building {tag}: {}", crate::text::error_summary(&e)))
-    })();
+    let outcome = build_image(ctx, &file, &tag, &text);
     if let Err(e) = outcome {
         let _ = std::fs::remove_file(&file);
         return Err(e);
     }
-    Ok(
-        json!({"image": tag, "base": base, "toolchains": toolchains, "built": true,
-              "note": "name it as spec.image when you create the sandbox"}),
-    )
+    let mut v = json!({"image": tag, "built": true,
+                       "next": "name it as spec.image when you create the sandbox, then check inside it that it does what was asked"});
+    if let Some(n) = note {
+        v["note"] = json!(n);
+    }
+    Ok(v)
+}
+
+/// Build `file` as `tag` in an empty context, after the osh images it starts from.
+fn build_image(ctx: &Ctx, file: &Path, tag: &str, text: &str) -> Result<(), String> {
+    for base in from_images(text) {
+        if let Some(img) = images_for(&ctx.dir, &base).into_iter().find(|i| !i.built) {
+            cli::run(
+                cli::runtime_bin(),
+                &cli::build_args(&ctx.dir, &img.file, &img.tag),
+                &[],
+            )
+            .map_err(|e| {
+                format!(
+                    "building the base {}: {}",
+                    img.tag,
+                    crate::text::error_summary(&e)
+                )
+            })?;
+        }
+    }
+    let empty = std::env::temp_dir().join(format!("osh-build-ctx-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&empty);
+    std::fs::create_dir_all(&empty).map_err(|e| e.to_string())?;
+    let mut args = cli::build_args(&ctx.dir, file, tag);
+    args.pop();
+    args.push(empty.to_string_lossy().into_owned());
+    let r = cli::run(cli::runtime_bin(), &args, &[]);
+    let _ = std::fs::remove_dir_all(&empty);
+    r.map(|_| ())
+        .map_err(|e| format!("building {tag}: {}", crate::text::error_summary(&e)))
+}
+
+/// The guide for deciding on and writing an image, with the Dockerfiles osh ships as examples.
+pub fn image_guide(ctx: &Ctx) -> Result<Value, String> {
+    let images: Vec<Value> = cli::dockerfiles(&ctx.dir)
+        .into_iter()
+        .map(|f| {
+            json!({"image": cli::dockerfile_tag(&f),
+                   "dockerfile": std::fs::read_to_string(&f).unwrap_or_default()})
+        })
+        .collect();
+    Ok(json!({"guide": crate::imageguide::GUIDE, "dockerfiles": images}))
 }
 
 /// What a spec may name, so an agent picks from facts instead of guessing: the images (and which
@@ -607,7 +625,6 @@ pub fn sandbox_options(ctx: &Ctx) -> Result<Value, String> {
             "kept": DEFAULT_IMAGE,
             "throwaway": "OpenShell's own default (a spec with `command`)",
         },
-        "image_build_toolchains": RECIPES.iter().map(|(n, _)| *n).collect::<Vec<_>>(),
         "providers_to_name": profiles,
         "providers_existing": existing,
         "toolchains": groups,
@@ -2086,88 +2103,105 @@ pub(crate) mod tests {
             .contains("claude-code"));
     }
 
+    const ENV_IMAGE: &str = "FROM claude-code:latest\nUSER root\nRUN apt-get update && apt-get install --yes gcc\nUSER node\n";
+
     #[test]
-    fn image_build_writes_a_dockerfile_from_a_recipe_and_builds_base_then_image() {
+    fn image_build_checks_writes_and_builds_the_base_then_the_image() {
         let f = Fake::new("image-build");
         with_image_and_profiles(&f);
-        let rust = ["rust".to_string()];
-        // dry_run: the Dockerfile only, nothing written or built.
-        let v = image_build(
-            &f.ctx(),
-            "claude-code-rust",
-            "claude-code:latest",
-            &rust,
-            true,
-        )
-        .unwrap();
-        let text = v["dockerfile"].as_str().unwrap();
-        assert!(
-            text.contains("FROM claude-code:latest") && text.contains("USER root"),
-            "{text}"
-        );
-        assert!(
-            text.contains("rustup-init") && text.trim_end().ends_with("USER node"),
-            "{text}"
-        );
-        assert!(!f.dir.join("images/Dockerfile-claude-code-rust").exists());
+        // dry_run: the text back, nothing written or built.
+        let v = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, true).unwrap();
+        assert_eq!(v["image"], "claude-code-gcc:latest");
+        assert!(v["dockerfile"]
+            .as_str()
+            .unwrap()
+            .contains("FROM claude-code:latest"));
+        assert!(v.get("note").is_none(), "{v}");
+        assert!(!f.dir.join("images/Dockerfile-claude-code-gcc").exists());
         assert_eq!(f.runtime_calls().matches("build").count(), 0);
-        // For real: the file is written, the base (not built) and the image are built.
-        let v = image_build(
-            &f.ctx(),
-            "claude-code-rust",
-            "claude-code:latest",
-            &rust,
-            false,
-        )
-        .unwrap();
-        assert_eq!(v["image"], "claude-code-rust:latest");
-        assert!(f.dir.join("images/Dockerfile-claude-code-rust").is_file());
+        // For real: written, then the base (osh's own, not built) and the image built, the image
+        // in an empty folder rather than the data folder.
+        let v = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, false).unwrap();
+        assert_eq!(v["built"], true);
+        assert!(f.dir.join("images/Dockerfile-claude-code-gcc").is_file());
         let built = f.runtime_calls();
-        assert_eq!(built.matches("build -f").count(), 2, "{built}");
-        // The new image is listed for the next call.
-        let opts = sandbox_options(&f.ctx()).unwrap();
-        assert!(
-            opts.to_string().contains("claude-code-rust:latest"),
-            "{opts}"
-        );
-        assert_eq!(opts["image_build_toolchains"][0], "rust");
-        // Never overwrites.
-        let e = image_build(
-            &f.ctx(),
-            "claude-code-rust",
-            "claude-code:latest",
-            &rust,
-            false,
-        )
-        .unwrap_err();
+        let builds: Vec<&str> = built
+            .lines()
+            .filter(|l| l.starts_with("build -f"))
+            .collect();
+        assert_eq!(builds.len(), 2, "{built}");
+        assert!(builds[0].contains("-t claude-code:latest"), "{built}");
+        assert!(builds[1].contains("-t claude-code-gcc:latest"), "{built}");
+        assert!(!builds[1].trim_end().ends_with("images"), "{}", builds[1]);
+        assert!(builds[1].contains("osh-build-ctx-"), "{}", builds[1]);
+        // The new image is offered to the next call, and never overwritten.
+        assert!(sandbox_options(&f.ctx())
+            .unwrap()
+            .to_string()
+            .contains("claude-code-gcc:latest"));
+        let e = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, false).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
     }
 
     #[test]
-    fn image_build_refuses_what_it_has_no_recipe_or_base_for() {
+    fn image_build_refuses_what_it_should_not_build() {
         let f = Fake::new("image-build-refuse");
         with_image_and_profiles(&f);
-        let rust = ["rust".to_string()];
-        for (name, base, tc, want) in [
-            ("Bad Name", "claude-code:latest", &rust[..], "lowercase"),
+        for (name, text, want) in [
+            ("Bad Name", ENV_IMAGE, "lowercase"),
+            ("x", "RUN echo hi\n", "FROM"),
             (
                 "x",
-                "ubuntu:24.04",
-                &rust[..],
-                "not an image osh can build from",
+                "FROM debian\nRUN --network=host curl x\n",
+                "host access",
             ),
             (
                 "x",
-                "claude-code:latest",
-                &["cobol".to_string()][..],
-                "no recipe",
+                "FROM debian\nRUN --security=insecure true\n",
+                "host access",
             ),
-            ("x", "claude-code:latest", &[][..], "at least one"),
         ] {
-            let e = image_build(&f.ctx(), name, base, tc, false).unwrap_err();
-            assert!(e.contains(want), "{name} {base}: {e}");
+            let e = image_build(&f.ctx(), name, text, false).unwrap_err();
+            assert!(e.contains(want), "{name}: {e}");
         }
+        let big = format!("FROM debian\n{}", "# x\n".repeat(20_000));
+        assert!(image_build(&f.ctx(), "x", &big, true)
+            .unwrap_err()
+            .contains("64 KB"));
         assert_eq!(f.runtime_calls().matches("build").count(), 0);
+        assert!(!f.dir.join("images/Dockerfile-x").exists());
+    }
+
+    #[test]
+    fn an_image_that_ends_as_root_is_flagged_and_stages_are_not_bases() {
+        let f = Fake::new("image-build-root");
+        with_image_and_profiles(&f);
+        let v = image_build(&f.ctx(), "x", "FROM debian:trixie\nRUN true\n", true).unwrap();
+        assert!(v["note"].as_str().unwrap().contains("USER node"), "{v}");
+        let v = image_build(&f.ctx(), "x", "FROM debian AS b\nFROM b\nUSER node\n", true).unwrap();
+        assert!(v.get("note").is_none(), "{v}");
+        assert_eq!(
+            from_images("FROM --platform=linux/amd64 a:1 AS s\nFROM s\nFROM b:2\n"),
+            ["a:1", "b:2"]
+        );
+    }
+
+    #[test]
+    fn image_guide_gives_the_rules_and_the_shipped_dockerfiles() {
+        let f = Fake::new("image-guide");
+        with_image_and_profiles(&f);
+        let v = image_guide(&f.ctx()).unwrap();
+        let guide = v["guide"].as_str().unwrap();
+        for want in [
+            "NEEDS A NEW IMAGE",
+            "WORKS AT RUN TIME",
+            "no root",
+            "USER node",
+            "dry_run",
+        ] {
+            assert!(guide.contains(want), "{want}");
+        }
+        assert!(v["dockerfiles"].to_string().contains("claude-code:latest"));
     }
 
     #[test]

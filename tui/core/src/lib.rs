@@ -7,6 +7,7 @@ pub mod assets;
 pub mod cli;
 pub mod gateways;
 pub mod ghrepo;
+pub mod imageguide;
 pub mod jobs;
 pub mod mcp;
 pub mod mcpserver;

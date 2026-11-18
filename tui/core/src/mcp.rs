@@ -23,15 +23,14 @@ the sandbox or stop and tell the user.\n\
 Before you create a sandbox, call sandbox_options. It lists the images, the providers and the \
 toolchain groups there are. Toolchain groups and providers only OPEN NETWORK HOSTS: they install \
 nothing. The tools a sandbox has come from its image (each image's `about` says what it holds). \
-When the work needs a tool the image lacks (a compiler, a language), do not pick for the user: \
-tell them and offer both ways. (1) A new image: ask which base image they want (one from \
-sandbox_options) and a name, show them the Dockerfile with image_build and dry_run true, then \
-build it with image_build and create the sandbox from it; image_build knows the toolchains \
-listed in image_build_toolchains, and for anything else the user writes a Dockerfile in the \
-Images tab. (2) Installing it inside the sandbox yourself, at user level, with the installer's \
-own steps (download the installer to a file, then run it; do not pipe curl into a shell). Be \
-honest about what (2) cannot do: there is no root in the sandbox, so nothing that needs a system \
-package; Rust also needs a C linker (`cc`) that the images lack, so for Rust only (1) works. \
+Before you create a sandbox, sort what the work needs: call image_guide. It says what a sandbox \
+can install at run time (no root: user-level pip, npm, go and prebuilt binaries from open hosts) \
+and what needs a new image (apt packages, compilers and linkers, Rust, builds of native code, \
+browsers, databases), and how to write the Dockerfile. Tell the user which side each need falls \
+on and why, then let them choose: a new image (you write the Dockerfile following the guide, \
+show it with image_build and dry_run true, and build it only after they agree, then create the \
+sandbox from it), or an install at run time within those limits. Never pick for them, and never \
+pipe curl into a shell. \
 Translate what the user wants into the spec: a language or tool \
 (rust, go, node, python, zig...) means that toolchain group in spec.toolchains plus the provider \
 of that name in spec.providers when sandbox_options lists one (one that needs a credential is refused with the user's steps: read them out, and never ask for the credential in the chat); a \
@@ -208,17 +207,21 @@ fn base_tools() -> Value {
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         },
         {
+            "name": "image_guide",
+            "description": "How to decide whether work needs a new sandbox image and how to write its Dockerfile: what a sandbox can and cannot install at run time, what needs root or a system package, the Dockerfile rules, and the Dockerfiles osh ships as examples. Read-only; call it before sandbox_create when the work needs tools, and before image_build.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+        },
+        {
             "name": "image_build",
-            "description": "Make a new sandbox image from a base image plus toolchains osh has a recipe for (see image_build_toolchains in sandbox_options), and build it (minutes; the base is built first if needed). The USER picks the base and the name: ask them. dry_run returns the Dockerfile to show them without writing or building anything. Never overwrites an image. Then name the image as spec.image.",
+            "description": "Build a new sandbox image from a Dockerfile you wrote (follow image_guide). Always call it first with dry_run true and show the user the Dockerfile; build (minutes, downloads a lot) only after they agree. The build context is empty (nothing can be copied in), osh's own base images are built first if missing, an existing image is never overwritten. Then name the image as spec.image.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string", "description": "Lowercase letters, digits and `-`: the image becomes NAME:latest."},
-                    "base": {"type": "string", "description": "An image tag from sandbox_options, such as claude-code:latest."},
-                    "toolchains": {"type": "array", "items": {"type": "string"}, "minItems": 1},
-                    "dry_run": {"type": "boolean", "description": "Only return the Dockerfile."}
+                    "dockerfile": {"type": "string", "description": "The whole Dockerfile text."},
+                    "dry_run": {"type": "boolean", "description": "Only check it and return it; write and build nothing."}
                 },
-                "required": ["name", "base", "toolchains"],
+                "required": ["name", "dockerfile"],
                 "additionalProperties": false
             }
         }
@@ -339,28 +342,18 @@ fn call(p: &Value, ctx: &Ctx) -> Result<Value, Fault> {
             args_of(p, &[])?;
             ops::sandbox_options(ctx)
         }
+        "image_guide" => {
+            args_of(p, &[])?;
+            ops::image_guide(ctx)
+        }
         "image_build" => {
-            let a = args_of(p, &["name", "base", "toolchains", "dry_run"])?;
-            let toolchains = match a.get("toolchains") {
-                Some(Value::Array(v)) => v
-                    .iter()
-                    .map(|x| x.as_str().map(String::from))
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| invalid("argument `toolchains` must be an array of strings"))?,
-                _ => return Err(invalid("argument `toolchains` must be an array of strings")),
-            };
+            let a = args_of(p, &["name", "dockerfile", "dry_run"])?;
             let dry = match a.get("dry_run") {
                 None => false,
                 Some(Value::Bool(b)) => *b,
                 Some(_) => return Err(invalid("argument `dry_run` must be a boolean")),
             };
-            ops::image_build(
-                ctx,
-                &req_str(&a, "name")?,
-                &req_str(&a, "base")?,
-                &toolchains,
-                dry,
-            )
+            ops::image_build(ctx, &req_str(&a, "name")?, &req_str(&a, "dockerfile")?, dry)
         }
         "sandbox_create" => {
             let a = args_of(p, &["spec", "dry_run"])?;
@@ -560,6 +553,7 @@ mod tests {
                 "sandbox_repo_grant",
                 "sandbox_repo_revoke",
                 "sandbox_options",
+                "image_guide",
                 "image_build"
             ]
         );
