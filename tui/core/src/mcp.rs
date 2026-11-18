@@ -12,25 +12,49 @@ const DEFAULT_PROTOCOL: &str = "2025-06-18";
 
 /// Standing rules every client is given when it connects. The server cannot stop a client's own
 /// host tools; the user's Claude Code permissions do that. This is what an agent is told.
-const INSTRUCTIONS: &str = "osh gives you sandboxes: do the user's work INSIDE them. When the \
-user asks for work in a sandbox, do every command, file change, git commit and push through \
-sandbox_exec (or a sandbox_create command); never run it on the user's own machine with your \
-host tools (shell, editor, git), not even as a fallback. When something fails in the sandbox \
-(for example a git push), do not redo it on the host: read the error, fix it in the sandbox \
-(sandbox_repo_grant for git access, which needs the user's token steps) or stop and tell the user. \
-If a request asks for a repo or a folder, put it in the spec (repo, share) when you create the \
-sandbox, then check with sandbox_exec that it works (for git: `git ls-remote origin`) before you \
-call it ready. Never ask the user to paste a token into the chat.";
+const INSTRUCTIONS: &str = "osh gives you sandboxes: do the user's work INSIDE them.\n\
+\n\
+Where work happens. When the user asks for work in a sandbox, do every command, file change, git \
+commit and push through sandbox_exec (or a sandbox_create command); never run it on the user's own \
+machine with your host tools (shell, editor, git), not even as a fallback. When something fails in \
+the sandbox (a git push, a missing tool), do not redo it on the host: read the error, fix it in \
+the sandbox or stop and tell the user.\n\
+\n\
+Before you create a sandbox, call sandbox_options. It lists the images, the providers and the \
+toolchain groups there are. Translate what the user wants into the spec: a language or tool \
+(rust, go, node, python, zig...) means that toolchain group in spec.toolchains plus the provider \
+of that name in spec.providers when sandbox_options lists one that needs no credential; a \
+specific environment means an image from the list. Without an image a kept sandbox gets \
+claude-code:latest; a throwaway one (spec.command) gets OpenShell's default. Name every \
+toolchain the work needs: giving spec.toolchains selects exactly those groups. Use sandbox_create \
+with dry_run first when unsure what a spec will do.\n\
+\n\
+Folders and repos. A folder the user wants the sandbox to read or write goes in spec.share \
+(rw true to write); it appears at /sandbox/<folder name>, and you work there. A git repo goes in \
+spec.repo; a share alone gives no git access. After the sandbox is up, check that each thing \
+works with sandbox_exec before you call it ready: `ls /sandbox/<folder>`, `git ls-remote origin` \
+(or the repo URL) for git, the compiler's `--version` for a toolchain. A repo that is not a share \
+is cloned by you inside the sandbox. If a share or token is refused, the error is the exact steps \
+to read to the user; never ask the user to paste a token into the chat, and never edit osh.toml \
+for them.\n\
+\n\
+Long work. A command that may take over half a minute: sandbox_exec with wait_secs 0, then \
+job_status and job_output. Clean up with sandbox_delete when the user is done, and tell them that \
+removing a stored token does not revoke it on the forge.";
 
-const SPEC_DOC: &str = "Sandbox spec. Keys: name (required), image, providers (array of names), \
+const SPEC_DOC: &str = "Sandbox spec; call sandbox_options for the names to use. Keys: name (required), \
+image (an image tag from sandbox_options; left out, a kept sandbox gets claude-code:latest and a \
+throwaway one OpenShell's default), providers (array of names from sandbox_options: osh creates \
+a listed profile that needs no credential), \
 cpu, memory, command (run once, then the sandbox is deleted; its output is not returned; \
-leave it out for a sandbox to exec in), toolchains (array), repo {url, env_var} (env_var is \
+leave it out for a sandbox to exec in), toolchains (array of toolchain group names whose hosts \
+the sandbox may read; left out, the groups that are open by default), repo {url, env_var} (env_var is \
 the NAME of an environment variable holding the access token, never the token itself, and \
 must be one the server operator allows or stored with `osh mcp secret set NAME`; pick a name for \
 this repo, such as ELYRIA_GITHUB_TOKEN, not a bare GITHUB_TOKEN, or use the name the user gives; when a call is \
 refused for that, tell the user to run that command themselves in a terminal outside this chat, \
 and never ask them to paste a token to you; for a sandbox that already exists use \
-sandbox_repo_grant instead, which needs no recreation), share {path, rw} (refused unless the server \
+sandbox_repo_grant instead, which needs no recreation), share {path, rw} (mounted at /sandbox/<folder name>; refused unless the server \
 operator enabled it; path must resolve, through symlinks, inside one of the operator's share \
 root folders; risky folders such as home, the disk or system folders are refused even there; when a share is \
 refused for the settings, the error lists the commands the user runs themselves; never edit osh.toml for them).";
@@ -164,6 +188,11 @@ fn base_tools() -> Value {
                 "required": ["name", "repo"],
                 "additionalProperties": false
             }
+        },
+        {
+            "name": "sandbox_options",
+            "description": "What a sandbox spec may name: images (and the default for a kept sandbox), providers (existing, and profiles osh can create), toolchain groups. Read-only; call it before sandbox_create.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }
     ])
 }
@@ -277,6 +306,10 @@ fn call(p: &Value, ctx: &Ctx) -> Result<Value, Fault> {
         "sandbox_list" => {
             args_of(p, &[])?;
             ops::sandbox_list(ctx)
+        }
+        "sandbox_options" => {
+            args_of(p, &[])?;
+            ops::sandbox_options(ctx)
         }
         "sandbox_create" => {
             let a = args_of(p, &["spec", "dry_run"])?;
@@ -474,7 +507,8 @@ mod tests {
                 "job_output",
                 "job_cancel",
                 "sandbox_repo_grant",
-                "sandbox_repo_revoke"
+                "sandbox_repo_revoke",
+                "sandbox_options"
             ]
         );
         for x in t {

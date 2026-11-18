@@ -714,7 +714,7 @@ The path is resolved through symlinks first. A risky folder (the whole disk, you
 
 ### MCP server
 
-`osh mcp` serves the Model Context Protocol over stdio (newline-delimited JSON-RPC; stdout carries protocol lines only). Tools: `sandbox_list`, `sandbox_create` (`spec`, optional `dry_run`), `sandbox_delete` (`name`), `sandbox_exec` (`name`, `argv` array; returns `exit_code`, `stdout`, `stderr`) and `sandbox_apply` (`spec`). Add it to an agent's `.mcp.json`:
+`osh mcp` serves the Model Context Protocol over stdio (newline-delimited JSON-RPC; stdout carries protocol lines only). Tools: `sandbox_list`, `sandbox_create` (`spec`, optional `dry_run`), `sandbox_delete` (`name`), `sandbox_exec` (`name`, `argv` array; returns `exit_code`, `stdout`, `stderr`) and `sandbox_apply` (`spec`); `sandbox_options` (no arguments, read-only) tells an agent what a spec may name: the images, the providers (existing ones, and the shipped profiles that need no credential, which osh creates when a spec names them) and the toolchain groups. A kept sandbox with no `image` gets `claude-code:latest` (built on first use, which can take minutes); a throwaway one (`command`) keeps OpenShell's default. On connect the server also sends the agent standing instructions: work only inside sandboxes, call `sandbox_options` first and map a language or tool to a toolchain group, a provider or an image, put folders in `share` and repos in `repo`, and check each works before calling the sandbox ready. Add it to an agent's `.mcp.json`:
 
 ```json
 {"mcpServers":{"osh":{"command":"osh","args":["mcp"]}}}
@@ -754,9 +754,9 @@ No token is exported, stored in Claude's config or put on a command line: the en
 claude mcp add-json osh '{"type":"http","url":"http://127.0.0.1:17800/mcp","headersHelper":"sh -c '\''printf \"{\\\"Authorization\\\":\\\"Bearer %s\\\"}\" \"$(osh mcp token)\"'\''"}'
 ```
 
-`claude mcp list` shows `osh` as connected, and `/mcp` inside Claude Code lists the ten tools. The URL uses `mcp.server_port` (17800 by default). To check that everything works, ask Claude Code, in a throwaway sandbox (replace `mcp-try`):
+`claude mcp list` shows `osh` as connected, and `/mcp` inside Claude Code lists the eleven tools. The URL uses `mcp.server_port` (17800 by default). To check that everything works, ask Claude Code, in a throwaway sandbox (replace `mcp-try`):
 
-1. "List the tools the osh MCP server gives you." (the connection and the ten tools)
+1. "List the tools the osh MCP server gives you." (the connection and the eleven tools)
 2. "Using osh, create a sandbox named mcp-try, run `uname -a` in it and show me the output." (`sandbox_create`, then a quick `sandbox_exec` that returns its result)
 3. "In mcp-try, start a job that prints a line every 2 seconds for 20 seconds and then exits with code 3. Do not wait for it: start it with wait_secs 0, then check on it every few seconds and tell me each new line and the final exit code." (`wait_secs`, `job_status`, `job_output` with offsets)
 4. "Start `sleep 600` as a job in mcp-try, cancel it, and confirm it was cancelled." (`job_cancel`)

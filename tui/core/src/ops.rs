@@ -248,6 +248,136 @@ fn repo_secret(ctx: &Ctx, var: &str) -> Result<String, String> {
     }
 }
 
+/// The image a kept sandbox gets when the spec names none: Claude Code's, so the agent has a
+/// real working environment. A throwaway one (`command`) keeps OpenShell's own default, and
+/// nothing changes when the Dockerfile is not in the data folder.
+const DEFAULT_IMAGE: &str = "claude-code:latest";
+
+fn default_image(ctx: &Ctx, s: &mut SandboxSpec) -> Option<String> {
+    if !s.image.is_empty()
+        || !s.command.is_empty()
+        || images_for(&ctx.dir, DEFAULT_IMAGE).is_empty()
+    {
+        return None;
+    }
+    s.image = DEFAULT_IMAGE.into();
+    Some(format!(
+        "no image was given, so a kept sandbox uses {DEFAULT_IMAGE} (built on first use, which can take minutes); name another image to change that"
+    ))
+}
+
+/// The `description` and `display_name` of a provider profile's text.
+fn profile_text(body: &str) -> (String, String) {
+    use saphyr::LoadableYamlNode;
+    let docs = saphyr::Yaml::load_from_str(body).unwrap_or_default();
+    let get = |k: &str| {
+        docs.first()
+            .and_then(|d| d.as_mapping_get(k))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    (get("display_name"), get("description"))
+}
+
+/// Every name in `spec.providers` must be a provider the gateway has, or a profile osh ships that
+/// needs no credential (osh creates that provider now, unless `dry_run` skips the check). A profile that wants a
+/// credential is the user's to set up in the dashboard; anything else is refused with the names
+/// that would have worked.
+fn ensure_providers(ctx: &Ctx, names: &[String], dry_run: bool) -> Result<(), String> {
+    // A dry run only shows the plan and asks the gateway nothing.
+    if names.is_empty() || dry_run {
+        return Ok(());
+    }
+    let have: Vec<String> = cli::providers()
+        .map(|l| l.into_iter().map(|p| p.name).collect())
+        .unwrap_or_default();
+    let profiles = cli::profile_ids(&ctx.dir);
+    for n in names {
+        if have.contains(n) {
+            continue;
+        }
+        if profiles.contains(n) {
+            if !cli::profile_env_keys(&ctx.dir, n).is_empty() {
+                return Err(format!(
+                    "provider {n} needs a credential, which only the user can add (the Providers tab of the osh dashboard); create the sandbox without it, or ask the user to add it first"
+                ));
+            }
+            if !dry_run {
+                cli::create_provider(&ctx.dir, n, &[])
+                    .map_err(|e| format!("creating provider {n}: {e}"))?;
+            }
+            continue;
+        }
+        let free: Vec<&String> = profiles
+            .iter()
+            .filter(|p| cli::profile_env_keys(&ctx.dir, p).is_empty())
+            .collect();
+        return Err(format!(
+            "no provider or profile named {n:?}; call sandbox_options for the names (profiles that need no credential: {})",
+            free.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// What a spec may name, so an agent picks from facts instead of guessing: the images (and which
+/// one a kept sandbox gets by default), the providers that exist and the profiles osh can turn
+/// into one, and the toolchain host groups.
+pub fn sandbox_options(ctx: &Ctx) -> Result<Value, String> {
+    target(ctx)?;
+    let images: Vec<Value> = cli::dockerfiles(&ctx.dir)
+        .into_iter()
+        .map(|file| {
+            let tag = cli::dockerfile_tag(&file);
+            let about = std::fs::read_to_string(&file)
+                .unwrap_or_default()
+                .lines()
+                .find(|l| l.starts_with("# ") && !l.starts_with("# syntax"))
+                .map(|l| l.trim_start_matches("# ").to_string())
+                .unwrap_or_default();
+            json!({"image": tag, "built": cli::image_built(&tag), "about": about,
+                   "default_for_kept": tag == DEFAULT_IMAGE})
+        })
+        .collect();
+    let mut profiles = Vec::new();
+    for id in cli::profile_ids(&ctx.dir) {
+        let body = std::fs::read_to_string(cli::profile_path(&ctx.dir, &id)).unwrap_or_default();
+        let (display, about) = profile_text(&body);
+        let needs = cli::env_keys_of(&body);
+        profiles.push(json!({
+            "provider": id, "name": display, "about": about,
+            "needs_credential": !needs.is_empty(),
+        }));
+    }
+    let existing: Vec<Value> = cli::providers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|p| json!({"provider": p.name, "type": p.ty}))
+        .collect();
+    let groups: Vec<Value> = std::fs::read_to_string(ctx.dir.join("toolchains.toml"))
+        .ok()
+        .and_then(|t| crate::preload::parse(&t).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|g| {
+            json!({"toolchain": g.name, "open_by_default": g.on,
+                        "hosts": g.hosts.iter().map(|(h, _)| h.as_str()).collect::<Vec<_>>()})
+        })
+        .collect();
+    Ok(json!({
+        "images": images,
+        "default_image": {
+            "kept": DEFAULT_IMAGE,
+            "throwaway": "OpenShell's own default (a spec with `command`)",
+        },
+        "providers_to_name": profiles,
+        "providers_existing": existing,
+        "toolchains": groups,
+        "how_to_use": "spec.image: a tag from images. spec.providers: names from providers_to_name that need no credential (osh creates them) or from providers_existing. spec.toolchains: the groups to open; leave it out for the ones marked open_by_default, give a list to choose exactly those (name every language the work needs).",
+    }))
+}
+
 /// The Dockerfile image the spec names, if any, with whether it is built: the only image
 /// `plan_create` looks at, so only it is inspected.
 fn images_for(dir: &Path, image: &str) -> Vec<cli::Image> {
@@ -289,14 +419,16 @@ pub fn sandbox_create(ctx: &Ctx, spec: &Value, dry_run: bool) -> Result<Value, S
 
 fn create_in(ctx: &Ctx, spec: &Value, dry_run: bool, home: &str) -> Result<Value, String> {
     let Checked {
-        spec: s,
+        spec: mut s,
         note: share_note,
     } = checked_spec(ctx, spec, home)?;
+    let image_note = default_image(ctx, &mut s);
     let grant = match &s.repo {
         Some(g) => Some((sandbox::grant_repo(&g.url)?, repo_secret(ctx, &g.env_var)?)),
         None => None,
     };
     target(ctx)?;
+    ensure_providers(ctx, &s.providers, dry_run)?;
     let images = images_for(&ctx.dir, &s.image);
     let driver = if s.share.is_some() {
         cli::gateway_driver()
@@ -335,6 +467,7 @@ fn create_in(ctx: &Ctx, spec: &Value, dry_run: bool, home: &str) -> Result<Value
     if let Some(p) = &plan.policy_file {
         let _ = std::fs::remove_file(p);
     }
+    let share_note = join_notes(share_note, image_note);
     if let (Ok(v), Some(note)) = (&mut out, join_notes(share_note, plan.policy_note)) {
         v["note"] = Value::String(note);
     }
@@ -783,6 +916,11 @@ pub(crate) mod tests {
             for v in FAKE_VARS {
                 std::env::remove_var(v);
             }
+            // The gateway has the `npm` provider the shared test spec names.
+            std::env::set_var(
+                "OSH_FAKE_PROVIDERS",
+                r#"{"providers":[{"name":"npm","type":"npm","credential_keys":[]}]}"#,
+            );
             crate::cli::set_gateway("");
             Fake {
                 dir,
@@ -1643,6 +1781,106 @@ pub(crate) mod tests {
     }
 
     const URL: &str = "https://github.com/o/r";
+
+    fn with_image_and_profiles(f: &Fake) {
+        std::fs::create_dir_all(f.dir.join("images")).unwrap();
+        std::fs::write(
+            f.dir.join("images/Dockerfile-claude_code"),
+            "# syntax=docker/dockerfile:1\n\n# Claude Code and its tools.\nFROM scratch\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(f.dir.join("providers")).unwrap();
+        std::fs::write(
+            f.dir.join("providers/rust.yaml"),
+            "id: rust\ndisplay_name: Rust\ndescription: crates\nendpoints: []\n",
+        )
+        .unwrap();
+        std::fs::write(
+            f.dir.join("providers/github.yaml"),
+            "id: github\ndisplay_name: GitHub\ndescription: x\ncredentials:\n  - name: t\n    env_vars: [GITHUB_TOKEN]\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_kept_sandbox_defaults_to_the_claude_code_image_and_a_throwaway_does_not() {
+        let f = Fake::new("default-image");
+        with_image_and_profiles(&f);
+        let kept = json!({"name":"w1"});
+        let v = sandbox_create(&f.ctx(), &kept, true).unwrap();
+        let args = v["steps"].to_string();
+        assert!(
+            args.contains("--from") && args.contains("claude-code:latest"),
+            "{args}"
+        );
+        assert!(
+            v["note"].as_str().unwrap().contains("claude-code:latest"),
+            "{v}"
+        );
+        let own = json!({"name":"w1","image":"other:1"});
+        assert!(!sandbox_create(&f.ctx(), &own, true).unwrap()["steps"]
+            .to_string()
+            .contains("claude-code"));
+        let once = json!({"name":"w1","command":"true"});
+        assert!(!sandbox_create(&f.ctx(), &once, true).unwrap()["steps"]
+            .to_string()
+            .contains("claude-code"));
+    }
+
+    #[test]
+    fn a_provider_is_the_gateways_a_credential_free_profile_or_refused() {
+        let f = Fake::new("providers");
+        with_image_and_profiles(&f);
+        // Unknown: refused, and the answer names what would have worked.
+        let e = sandbox_create(&f.ctx(), &json!({"name":"w1","providers":["nope"]}), false)
+            .unwrap_err();
+        assert!(e.contains("sandbox_options") && e.contains("rust"), "{e}");
+        // A profile that wants a credential is the user's to add.
+        let e = sandbox_create(
+            &f.ctx(),
+            &json!({"name":"w1","providers":["github"]}),
+            false,
+        )
+        .unwrap_err();
+        assert!(e.contains("needs a credential"), "{e}");
+        assert!(!f.calls().contains("sandbox create"), "{}", f.calls());
+        // A credential-free profile is created, then the sandbox.
+        sandbox_create(&f.ctx(), &json!({"name":"w1","providers":["rust"]}), false).unwrap();
+        let calls = f.calls();
+        let made = calls
+            .find("provider create")
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(made < calls.find("sandbox create").unwrap(), "{calls}");
+    }
+
+    #[test]
+    fn sandbox_options_lists_images_providers_and_toolchains() {
+        let f = Fake::new("options");
+        with_image_and_profiles(&f);
+        let v = sandbox_options(&f.ctx()).unwrap();
+        let img = &v["images"][0];
+        assert_eq!(img["image"], "claude-code:latest");
+        assert_eq!(img["default_for_kept"], true);
+        assert_eq!(img["about"], "Claude Code and its tools.");
+        let by = |id: &str| {
+            v["providers_to_name"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["provider"] == id)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(by("rust")["needs_credential"], false);
+        assert_eq!(by("github")["needs_credential"], true);
+        assert!(v["toolchains"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["toolchain"] == "rust" && g["open_by_default"] == true));
+        assert!(v["providers_existing"].to_string().contains("npm"));
+        assert!(!v.to_string().contains("GITHUB_TOKEN"), "{v}");
+    }
 
     #[test]
     fn a_bare_token_name_is_replaced_by_one_for_the_repo() {
