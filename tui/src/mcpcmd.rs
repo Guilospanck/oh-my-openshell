@@ -19,6 +19,7 @@ const USAGE: &str = "usage: osh mcp [--gateway G]\n\
        osh mcp start|stop|remove [--yes]    install and turn on, turn off, or delete the service\n\
        osh mcp status   say whether the server is on\n\
        osh mcp secret set NAME|list|remove NAME    store a token (hidden prompt) a spec's repo.env_var may name\n\
+       osh mcp provider add NAME    create a provider that needs a credential (hidden prompt), for a spec's providers\n\
 Serves MCP over stdio (newline-delimited JSON-RPC). What agents may do is set in osh.toml \
 (see `osh config`): mcp.allow_share lets specs mount host folders inside the directories in \
 mcp.share_roots, and mcp.repo_vars lists the variables a spec's repo.env_var may name. \
@@ -35,6 +36,8 @@ enum Mode {
     Serve,
     Token,
     Secret(SecretAct),
+    /// `osh mcp provider add NAME`.
+    ProviderAdd(String),
     Status,
     /// `--yes` given: run the steps without asking.
     Service(Verb, bool),
@@ -75,6 +78,15 @@ fn mode(args: &[String]) -> Result<Mode, String> {
             [v, name] if v == "remove" => Ok(Mode::Secret(SecretAct::Remove(name.clone()))),
             [v] if v == "list" => Ok(Mode::Secret(SecretAct::List)),
             _ => Err("usage: osh mcp secret set NAME | list | remove NAME (the value is asked for, never an argument)".into()),
+        };
+    }
+    if args.first().map(String::as_str) == Some("provider") {
+        return match &args[1..] {
+            [v, name] if v == "add" => Ok(Mode::ProviderAdd(name.clone())),
+            _ => Err(
+                "usage: osh mcp provider add NAME (the credential is asked for, never an argument)"
+                    .into(),
+            ),
         };
     }
     match args.first().map(String::as_str) {
@@ -538,8 +550,58 @@ fn secret_cmd(act: SecretAct) -> i32 {
     }
 }
 
+/// Ask for each credential of provider `name` (hidden) and create it on the gateway the server
+/// uses, so the agent can then name it in a spec.
+fn provider_add_cmd(name: &str) -> i32 {
+    let dir = osh_core::assets::data_dir();
+    let snap = osh_core::settings::load(&dir, &|k| std::env::var_os(k));
+    let (ctx, warnings) = build_ctx(None, &snap);
+    for line in warnings {
+        eprintln!("{line}");
+    }
+    let keys = match osh_core::ops::provider_keys(&ctx, name) {
+        Ok(k) => k,
+        Err(e) => {
+            eprintln!("osh: mcp: {e}");
+            return 1;
+        }
+    };
+    let mut values = Vec::new();
+    for key in keys {
+        match read_hidden(&format!("{key} for {name} (input is hidden): ")) {
+            Ok(v) if !v.trim().is_empty() => values.push((key, v.trim().to_string())),
+            Ok(_) => {
+                eprintln!("osh: mcp: {key} is empty; nothing was created");
+                return 2;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                eprintln!("\nosh: mcp: cancelled; nothing was created");
+                return 130;
+            }
+            Err(e) => {
+                eprintln!("osh: mcp: cannot read the credential: {e}");
+                return 1;
+            }
+        }
+    }
+    match osh_core::ops::provider_add(&ctx, name, &values) {
+        Ok(msg) => {
+            println!(
+                "{msg}. An agent may now name {name} in a spec's providers; no restart is needed."
+            );
+            println!("Removing it later does not revoke the credential at the service: revoke it there too.");
+            0
+        }
+        Err(e) => {
+            eprintln!("osh: mcp: {e}");
+            1
+        }
+    }
+}
+
 pub fn run(args: &[String]) -> i32 {
     let gateway = match mode(args) {
+        Ok(Mode::ProviderAdd(name)) => return provider_add_cmd(&name),
         Ok(Mode::Stdio(g)) => g,
         Ok(Mode::Serve) => return serve_cmd(),
         Ok(Mode::Token) => return token_cmd(),
@@ -644,6 +706,22 @@ mod tests {
             &["secret", "set", "a", "b"],
             &["secret", "list", "x"],
             &["secret", "show", "T"],
+        ] {
+            assert!(mode(&a(bad)).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn mode_accepts_provider_add() {
+        assert_eq!(
+            mode(&a(&["provider", "add", "claude-code"])),
+            Ok(Mode::ProviderAdd("claude-code".into()))
+        );
+        for bad in [
+            &["provider"][..],
+            &["provider", "add"],
+            &["provider", "add", "a", "TOKEN"],
+            &["provider", "rm", "a"],
         ] {
             assert!(mode(&a(bad)).is_err(), "{bad:?}");
         }

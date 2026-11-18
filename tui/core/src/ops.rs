@@ -299,9 +299,7 @@ fn ensure_providers(ctx: &Ctx, names: &[String], dry_run: bool) -> Result<(), St
         }
         if profiles.contains(n) {
             if !cli::profile_env_keys(&ctx.dir, n).is_empty() {
-                return Err(format!(
-                    "provider {n} needs a credential, which only the user can add (the Providers tab of the osh dashboard); create the sandbox without it, or ask the user to add it first"
-                ));
+                return Err(provider_guidance(ctx, n));
             }
             if !dry_run {
                 cli::create_provider(&ctx.dir, n, &[])
@@ -319,6 +317,97 @@ fn ensure_providers(ctx: &Ctx, names: &[String], dry_run: bool) -> Result<(), St
         ));
     }
     Ok(())
+}
+
+/// `(variable, description)` of each credential a profile asks for.
+fn profile_credentials(body: &str) -> Vec<(String, String)> {
+    use saphyr::LoadableYamlNode;
+    let docs = saphyr::Yaml::load_from_str(body).unwrap_or_default();
+    let mut out = Vec::new();
+    if let Some(list) = docs
+        .first()
+        .and_then(|d| d.as_mapping_get("credentials"))
+        .and_then(|c| c.as_sequence())
+    {
+        for c in list {
+            let var = match c.as_mapping_get("env_vars") {
+                Some(saphyr::Yaml::Sequence(a)) => a.first().and_then(|v| v.as_str()),
+                Some(v) => v.as_str(),
+                None => None,
+            };
+            let desc = c
+                .as_mapping_get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if let Some(var) = var {
+                out.push((var.to_string(), desc.to_string()));
+            }
+        }
+    }
+    out
+}
+
+/// Where the user gets the credential of a shipped profile.
+fn credential_source(id: &str) -> &'static str {
+    match id {
+        "claude-code" => "run `claude setup-token` in a terminal of their own (it needs their Claude subscription) and copy the token it prints",
+        "github" => "create a fine-grained personal access token at https://github.com/settings/personal-access-tokens/new, limited to the repositories that are needed (for one repo, a repo grant is better: put `repo` in the spec instead)",
+        _ => "create it in the service the provider is for (the description below says what it is)",
+    }
+}
+
+/// What to tell the agent when a spec names a provider that needs a credential: how the user
+/// gets it, the one command they run in a terminal of their own, and how to take it away.
+fn provider_guidance(ctx: &Ctx, id: &str) -> String {
+    let body = std::fs::read_to_string(cli::profile_path(&ctx.dir, id)).unwrap_or_default();
+    let creds = profile_credentials(&body);
+    let what = creds
+        .iter()
+        .map(|(v, d)| {
+            if d.is_empty() {
+                v.clone()
+            } else {
+                format!("{v}: {d}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "Provider {id} needs a credential that only the user can add ({what}). Tell the user, in this order:\n\
+         A. Get the credential: {source}.\n\
+         B. In a terminal of their own (outside this chat) they run `osh mcp provider add {id}`; it asks for the credential with a hidden prompt, so it never appears in this session or in their shell history.\n\
+         C. They tell you it is done, and you create the sandbox again with providers [\"{id}\"]. For a sandbox that already exists, they attach {id} to it in the osh dashboard (Providers tab), or you create a new sandbox.\n\
+         D. To remove it later: in the dashboard's Providers tab (or `openshell provider delete {id}` once no sandbox uses it). That does NOT revoke the credential at the service: they must also revoke it there (for a token, on the page they created it).",
+        source = credential_source(id),
+    )
+}
+
+/// The variables `osh mcp provider add ID` asks for. Only a shipped profile that needs a
+/// credential and has no provider yet qualifies.
+pub fn provider_keys(ctx: &Ctx, id: &str) -> Result<Vec<String>, String> {
+    target(ctx)?;
+    if !cli::profile_ids(&ctx.dir).iter().any(|p| p == id) {
+        return Err(format!("no provider profile named {id:?}"));
+    }
+    let keys = cli::profile_env_keys(&ctx.dir, id);
+    if keys.is_empty() {
+        return Err(format!(
+            "{id} needs no credential: osh creates it when a spec names it"
+        ));
+    }
+    if cli::providers()?.iter().any(|p| p.name == id) {
+        return Err(format!(
+            "provider {id} already exists: change its credential in the osh dashboard (Providers tab)"
+        ));
+    }
+    Ok(keys)
+}
+
+/// Create the provider `id` with the credentials the user typed (one value per `provider_keys`
+/// name). The values reach `openshell` through its environment, never its arguments.
+pub fn provider_add(ctx: &Ctx, id: &str, values: &[(String, String)]) -> Result<String, String> {
+    provider_keys(ctx, id)?;
+    cli::create_provider(&ctx.dir, id, values)
 }
 
 /// What a spec may name, so an agent picks from facts instead of guessing: the images (and which
@@ -1843,6 +1932,18 @@ pub(crate) mod tests {
         )
         .unwrap_err();
         assert!(e.contains("needs a credential"), "{e}");
+        // The user's steps: where to get it, the command, no chat, how to remove it, no revoke.
+        assert!(e.contains("osh mcp provider add github"), "{e}");
+        assert!(e.contains("personal-access-tokens/new"), "{e}");
+        assert!(
+            e.contains("GITHUB_TOKEN") && e.contains("hidden prompt"),
+            "{e}"
+        );
+        assert!(e.contains("does NOT revoke"), "{e}");
+        let e = provider_keys(&f.ctx(), "rust").unwrap_err();
+        assert!(e.contains("needs no credential"), "{e}");
+        assert!(provider_keys(&f.ctx(), "nope").is_err());
+        assert_eq!(provider_keys(&f.ctx(), "github").unwrap(), ["GITHUB_TOKEN"]);
         assert!(!f.calls().contains("sandbox create"), "{}", f.calls());
         // A credential-free profile is created, then the sandbox.
         sandbox_create(&f.ctx(), &json!({"name":"w1","providers":["rust"]}), false).unwrap();

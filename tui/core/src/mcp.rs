@@ -23,7 +23,7 @@ the sandbox or stop and tell the user.\n\
 Before you create a sandbox, call sandbox_options. It lists the images, the providers and the \
 toolchain groups there are. Translate what the user wants into the spec: a language or tool \
 (rust, go, node, python, zig...) means that toolchain group in spec.toolchains plus the provider \
-of that name in spec.providers when sandbox_options lists one that needs no credential; a \
+of that name in spec.providers when sandbox_options lists one (one that needs a credential is refused with the user's steps: read them out, and never ask for the credential in the chat); a \
 specific environment means an image from the list. Without an image a kept sandbox gets \
 claude-code:latest; a throwaway one (spec.command) gets OpenShell's default. Name every \
 toolchain the work needs: giving spec.toolchains selects exactly those groups. Use sandbox_create \
@@ -39,8 +39,10 @@ to read to the user; never ask the user to paste a token into the chat, and neve
 for them.\n\
 \n\
 Long work. A command that may take over half a minute: sandbox_exec with wait_secs 0, then \
-job_status and job_output. Clean up with sandbox_delete when the user is done, and tell them that \
-removing a stored token does not revoke it on the forge.";
+job_status and job_output. Delete a sandbox only when it was a throwaway one (spec.command, which deletes \
+itself) or the user asks you to; never delete a sandbox that holds work, and never after long work. \
+When you do remove access, tell the user that removing a stored token does not revoke it on the \
+forge.";
 
 const SPEC_DOC: &str = "Sandbox spec; call sandbox_options for the names to use. Keys: name (required), \
 image (an image tag from sandbox_options; left out, a kept sandbox gets claude-code:latest and a \
