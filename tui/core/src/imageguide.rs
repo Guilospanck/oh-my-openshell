@@ -65,6 +65,7 @@ WRITING THE DOCKERFILE (image_build takes the whole text)
 
 BEFORE BUILDING
 
+osh runs the runtime's own parser and lint rules over it first (`build --check`): a syntax error comes back as an error to fix, lint warnings as a `note` to fix or explain.
 Show the user the Dockerfile (image_build with dry_run true) and the base and name you chose, and
 build only after they agree; a build takes minutes and downloads a lot. After it, create the
 sandbox with spec.image set to the new tag and check inside it (`cargo --version`, a compile) that

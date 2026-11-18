@@ -482,6 +482,87 @@ fn check_dockerfile(text: &str) -> Result<Option<String>, String> {
     })
 }
 
+/// Run the container runtime's own Dockerfile parser and lint rules (`build --check`, BuildKit)
+/// over `text` in an empty folder; it builds nothing and copies nothing. A syntax error is an
+/// `Err` for the agent to fix; lint warnings come back as a note. A runtime without `--check`
+/// (Podman, old Docker), no runtime, or a hang past 60 s means no verdict, not a failure.
+fn lint_dockerfile(text: &str) -> Result<Option<String>, String> {
+    let dir = std::env::temp_dir().join(format!("osh-lint-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let r = run_check(&dir, text);
+    let _ = std::fs::remove_dir_all(&dir);
+    match r {
+        Some((ok, stderr)) => lint_verdict(ok, &stderr),
+        None => Ok(None),
+    }
+}
+
+fn run_check(dir: &Path, text: &str) -> Option<(bool, String)> {
+    std::fs::write(dir.join("Dockerfile"), text).ok()?;
+    let log = dir.join("check.log");
+    let err = std::fs::File::create(&log).ok()?;
+    let mut child = Command::new(cli::runtime_bin())
+        .args(["build", "--check"])
+        .arg(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(err)
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(s) = child.try_wait().ok()? {
+            break s;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(60) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    Some((
+        status.success(),
+        std::fs::read_to_string(&log).unwrap_or_default(),
+    ))
+}
+
+/// Turn the output of `build --check` into a verdict: a parse error is an error; each
+/// `WARNING: Rule - url` plus its message line is a note; anything else (no such flag, daemon
+/// down) is no verdict.
+fn lint_verdict(ok: bool, stderr: &str) -> Result<Option<String>, String> {
+    if !ok {
+        if stderr.contains("dockerfile parse error")
+            || stderr.contains("failed to solve: dockerfile")
+        {
+            let msg: Vec<&str> = stderr
+                .lines()
+                .skip_while(|l| !l.starts_with("ERROR"))
+                .map(str::trim_end)
+                .filter(|l| !l.is_empty())
+                .take(8)
+                .collect();
+            return Err(format!(
+                "the Dockerfile does not parse: {}",
+                msg.join(" | ")
+            ));
+        }
+        return Ok(None);
+    }
+    let mut lines = stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+    let mut warnings = Vec::new();
+    while let Some(l) = lines.next() {
+        if let Some(rule) = l.strip_prefix("WARNING: ") {
+            let rule = rule.split(" - ").next().unwrap_or(rule);
+            let msg = lines.next().unwrap_or("");
+            warnings.push(format!("{rule}: {msg}"));
+        }
+    }
+    warnings.truncate(10);
+    Ok((!warnings.is_empty()).then(|| format!("lint: {}", warnings.join("; "))))
+}
+
 /// Make a new image `name` from the Dockerfile `dockerfile` (written by the agent, shown to the
 /// user first with `dry_run`): write `images/Dockerfile-NAME` in the data folder, so the
 /// dashboard's Images tab shows it, and build it. The build context is an empty folder, so
@@ -510,6 +591,10 @@ pub fn image_build(
         dockerfile.to_string()
     } else {
         format!("{dockerfile}\n")
+    };
+    let note = match (note, lint_dockerfile(&text)?) {
+        (Some(a), Some(b)) => Some(format!("{a} | {b}")),
+        (a, b) => a.or(b),
     };
     if dry_run {
         let mut v = json!({"image": tag, "dockerfile": text, "built": false});
@@ -1164,7 +1249,7 @@ pub(crate) mod tests {
                 std::fs::write(
                     &stub,
                     format!(
-                        "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1 $2\" = \"image inspect\" ]; then [ \"$3\" = \"--format\" ] && echo node && exit 0; exit 1; fi\nexit 0\n",
+                        "#!/bin/sh\necho \"$@\" >> '{}'\nif [ \"$1 $2\" = \"build --check\" ]; then if grep -q '^FORM' \"$3/Dockerfile\"; then echo 'ERROR: dockerfile parse error on line 2: unknown instruction: FORM' >&2; exit 1; fi; if grep -q LINTME \"$3/Dockerfile\"; then printf 'WARNING: StubRule - https://example.test/rule\\nlint me\\nDockerfile:1\\n' >&2; fi; exit 0; fi\nif [ \"$1 $2\" = \"image inspect\" ]; then [ \"$3\" = \"--format\" ] && echo node && exit 0; exit 1; fi\nexit 0\n",
                         runtime_log.display()
                     ),
                 )
@@ -2118,7 +2203,8 @@ pub(crate) mod tests {
             .contains("FROM claude-code:latest"));
         assert!(v.get("note").is_none(), "{v}");
         assert!(!f.dir.join("images/Dockerfile-claude-code-gcc").exists());
-        assert_eq!(f.runtime_calls().matches("build").count(), 0);
+        assert_eq!(f.runtime_calls().matches("build -f").count(), 0);
+        assert!(f.runtime_calls().contains("build --check"));
         // For real: written, then the base (osh's own, not built) and the image built, the image
         // in an empty folder rather than the data folder.
         let v = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, false).unwrap();
@@ -2141,6 +2227,47 @@ pub(crate) mod tests {
             .contains("claude-code-gcc:latest"));
         let e = image_build(&f.ctx(), "claude-code-gcc", ENV_IMAGE, false).unwrap_err();
         assert!(e.contains("already exists"), "{e}");
+    }
+
+    #[test]
+    fn the_runtimes_own_parser_vets_the_dockerfile() {
+        let f = Fake::new("image-lint");
+        with_image_and_profiles(&f);
+        // A syntax error is refused, before anything is written or built.
+        let e =
+            image_build(&f.ctx(), "bad", "FROM debian\nFORM x\nUSER node\n", false).unwrap_err();
+        assert!(e.contains("does not parse") && e.contains("FORM"), "{e}");
+        assert!(!f.dir.join("images/Dockerfile-bad").exists());
+        assert_eq!(f.runtime_calls().matches("build -f").count(), 0);
+        // A lint warning comes back as a note, on a dry run and on the real build.
+        let text = "FROM debian\n# LINTME\nUSER node\n";
+        let v = image_build(&f.ctx(), "warn", text, true).unwrap();
+        assert!(
+            v["note"].as_str().unwrap().contains("StubRule: lint me"),
+            "{v}"
+        );
+        let v = image_build(&f.ctx(), "warn", text, false).unwrap();
+        assert_eq!(v["built"], true);
+        assert!(v["note"].as_str().unwrap().contains("StubRule"), "{v}");
+    }
+
+    #[test]
+    fn lint_output_is_read_as_error_warnings_or_no_verdict() {
+        assert!(lint_verdict(true, "").unwrap().is_none());
+        let w = "WARNING: FromAsCasing - https://x\n'as' casing\nDockerfile:1\n";
+        assert_eq!(
+            lint_verdict(true, w).unwrap().unwrap(),
+            "lint: FromAsCasing: 'as' casing"
+        );
+        let e = "#1 x\nERROR: dockerfile parse error on line 4: unknown instruction: FORM\nDockerfile:4\n";
+        assert!(lint_verdict(false, e).unwrap_err().contains("FORM"));
+        // No `--check`, or a daemon that is down: no verdict, not a refusal.
+        assert!(lint_verdict(false, "unknown flag: --check")
+            .unwrap()
+            .is_none());
+        assert!(lint_verdict(false, "Cannot connect to the Docker daemon")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
