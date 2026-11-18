@@ -742,17 +742,16 @@ The token goes to `mcp-secrets/NAME` in the data folder (owner-only, like `mcp-t
 
 #### Connect Claude Code
 
-Start the server (`just mcp-serve`, or the service: `osh mcp start`), then register it once and start Claude Code with the token in its environment:
+Start the server (`just mcp-serve`, or the service: `osh mcp start`), then register it once:
 
 ```sh
-just mcp-claude-add     # claude mcp add-json osh ... (the entry names ${OSH_MCP_TOKEN}, never the token)
-just mcp-claude         # starts claude with OSH_MCP_TOKEN set from `osh mcp token`
+just mcp-claude-add     # claude mcp add-json osh ... with a headersHelper
 ```
 
-By hand, from any shell that starts `claude`: `export OSH_MCP_TOKEN="$(osh mcp token)"`, then, with single quotes so that Claude Code and not your shell expands the variable (the token must not land on a command line):
+No token is exported, stored in Claude's config or put on a command line: the entry holds a `headersHelper`, a command Claude Code runs on each connect that prints the `Authorization` header from `osh mcp token`. Claude Code runs a helper only in a folder whose trust dialog you accepted. By hand (with `osh` on the PATH):
 
 ```sh
-claude mcp add-json osh '{"type":"http","url":"http://127.0.0.1:17800/mcp","headers":{"Authorization":"Bearer ${OSH_MCP_TOKEN}"}}'
+claude mcp add-json osh '{"type":"http","url":"http://127.0.0.1:17800/mcp","headersHelper":"sh -c '\''printf \"{\\\"Authorization\\\":\\\"Bearer %s\\\"}\" \"$(osh mcp token)\"'\''"}'
 ```
 
 `claude mcp list` shows `osh` as connected, and `/mcp` inside Claude Code lists the ten tools. The URL uses `mcp.server_port` (17800 by default). To check that everything works, ask Claude Code, in a throwaway sandbox (replace `mcp-try`):

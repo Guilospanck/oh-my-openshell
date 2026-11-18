@@ -30,7 +30,7 @@ mcp-serve:
 	set -euo pipefail
 	exec "{{justfile_directory()}}/osh" mcp serve
 
-# Registers the MCP server with Claude Code as `osh` (needs the claude CLI); the entry names ${OSH_MCP_TOKEN}, never the token: `just mcp-claude` sets it
+# Registers the MCP server with Claude Code as `osh` (needs the claude CLI). Claude runs `osh mcp token` itself on each connect (headersHelper), so the token is never exported, stored in Claude's config or put in a command line. Claude only runs the helper in a workspace whose trust dialog you accepted
 mcp-claude-add:
 	#!/usr/bin/env bash
 	set -euo pipefail
@@ -40,16 +40,11 @@ mcp-claude-add:
 	host="$("$osh" config get mcp.server_bind)"
 	case "$host" in 0.0.0.0) host=127.0.0.1 ;; ::|"[::]") host="[::1]" ;; esac
 	url="http://${host}:${port}/mcp"
+	helper="sh -c 'printf \"{\\\"Authorization\\\":\\\"Bearer %s\\\"}\" \"\$(${osh} mcp token)\"'"
+	json="$(python3 -c 'import json,sys; print(json.dumps({"type":"http","url":sys.argv[1],"headersHelper":sys.argv[2]}))' "$url" "$helper")"
 	claude mcp remove osh >/dev/null 2>&1 || true
-	claude mcp add-json osh "{\"type\":\"http\",\"url\":\"${url}\",\"headers\":{\"Authorization\":\"Bearer \${OSH_MCP_TOKEN}\"}}"
-	echo "added osh -> ${url}; start claude with: just mcp-claude"
-
-# Starts Claude Code with the MCP token in its environment (never on a command line), so the `osh` server added by mcp-claude-add can authenticate
-mcp-claude *args:
-	#!/usr/bin/env bash
-	set -euo pipefail
-	command -v claude >/dev/null 2>&1 || { echo "the claude CLI is not on PATH"; exit 1; }
-	OSH_MCP_TOKEN="$("{{justfile_directory()}}/osh" mcp token)" exec claude {{args}}
+	claude mcp add-json osh "$json"
+	echo "added osh -> ${url}; run claude in a trusted folder"
 
 # Builds the TUI in release mode, finding Zig 0.15 itself (osh does this on its own)
 build:
