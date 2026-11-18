@@ -14,12 +14,14 @@ const SPEC_DOC: &str = "Sandbox spec. Keys: name (required), image, providers (a
 cpu, memory, command (run once, then the sandbox is deleted; its output is not returned; \
 leave it out for a sandbox to exec in), toolchains (array), repo {url, env_var} (env_var is \
 the NAME of an environment variable holding the access token, never the token itself, and \
-must be one the server operator allows or stored with `osh mcp secret set NAME`; when a call is \
+must be one the server operator allows or stored with `osh mcp secret set NAME`; pick a name for \
+this repo, such as ELYRIA_GITHUB_TOKEN, not a bare GITHUB_TOKEN, or use the name the user gives; when a call is \
 refused for that, tell the user to run that command themselves in a terminal outside this chat, \
 and never ask them to paste a token to you; for a sandbox that already exists use \
 sandbox_repo_grant instead, which needs no recreation), share {path, rw} (refused unless the server \
 operator enabled it; path must resolve, through symlinks, inside one of the operator's share \
-root folders; risky folders such as home, the disk or system folders are refused even there).";
+root folders; risky folders such as home, the disk or system folders are refused even there; when a share is \
+refused for the settings, the error lists the commands the user runs themselves; never edit osh.toml for them).";
 
 /// The tools with the optional `gateway` argument every one of them takes.
 fn tools() -> Value {

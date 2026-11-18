@@ -458,6 +458,34 @@ pub fn token_name(label: &str) -> String {
     name.trim_end_matches('-').to_string()
 }
 
+/// A variable name for a token of this repo that says what it is for, such as
+/// `ELYRIA_GITHUB_TOKEN`, so a user with several repos can tell the stored tokens apart.
+pub fn suggested_var(r: &GhRepo) -> String {
+    let word = match r.forge {
+        Forge::GitHub => "GITHUB",
+        Forge::GitLab => "GITLAB",
+        Forge::BitbucketCloud | Forge::BitbucketDc => "BITBUCKET",
+        Forge::Forgejo => "FORGEJO",
+    };
+    let repo: String = r
+        .repo
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let repo = if repo.starts_with(|c: char| c.is_ascii_digit()) {
+        format!("R_{repo}")
+    } else {
+        repo
+    };
+    format!("{repo}_{word}_TOKEN")
+}
+
 /// Where GitHub lists fine-grained tokens; it has no API to delete one.
 pub const TOKENS_PAGE: &str = "https://github.com/settings/personal-access-tokens";
 
@@ -498,7 +526,7 @@ pub fn steps_for(r: &GhRepo, url: &str, label: &str) -> String {
              1. Open {url} (the project's Settings > Access tokens > Add new token).\n\
              2. Token name: {name}. Role: Developer (Maintainer if the branch you push to is protected for Maintainers).\n\
              3. Scopes: read_api and write_repository, nothing else (read_api lets osh check the token, write_repository lets git pull and push).\n\
-             4. Expiration date: {TOKEN_DAYS} days from today. Create the token and copy it.\n\
+             4. Expiration date: {TOKEN_DAYS} days is a good default; any date works. Create the token and copy it.\n\
              On gitlab.com, project access tokens need Premium or Ultimate. On the Free tier create a personal access token at https://{host}/-/user_settings/personal_access_tokens with the same scopes and expiry instead: it reaches every project your account can, not only {full}."
         ),
         Forge::BitbucketCloud => format!(
@@ -506,7 +534,7 @@ pub fn steps_for(r: &GhRepo, url: &str, label: &str) -> String {
              1. Open {url} (or the repository's Repository settings > Security > Access tokens), then Create access token.\n\
              2. Name: {name}.\n\
              3. Permissions: Repositories Read and Write, nothing else.\n\
-             4. Expiry: {TOKEN_DAYS} days if your workspace lets you choose (osh warns after {TOKEN_DAYS} days either way). Create the token and copy it.\n\
+             4. Expiry: any your workspace allows ({TOKEN_DAYS} days is a good default; osh reminds you after {TOKEN_DAYS} days either way). Create the token and copy it.\n\
              App passwords no longer work on Bitbucket Cloud."
         ),
         Forge::BitbucketDc => format!(
@@ -535,7 +563,7 @@ pub fn steps(r: &GhRepo, url: &str) -> String {
          1. Open {url}\n\
          2. Resource owner: {owner}. Repository access: Only select repositories, then {full}.\n\
          3. Keep Contents, Pull requests and Workflows at Read and write (GitHub rejects a push that touches .github/workflows without Workflows).\n\
-         4. Expiration: {TOKEN_DAYS} days. Generate the token and copy it.\n\
+         4. Expiration: the page pre-fills {TOKEN_DAYS} days; any expiry you like works (osh reads the real one from GitHub). Generate the token and copy it.\n\
          An organization may need to approve the token before it works.",
         full = r.full(),
         owner = r.owner,
@@ -1200,6 +1228,25 @@ mod tests {
         let u = token_url(&repo("a", "b"), &"x".repeat(80));
         let name = u.split("name=").nth(1).unwrap().split('&').next().unwrap();
         assert!(name.len() <= 40, "{name}");
+    }
+
+    #[test]
+    fn suggested_var_names_the_repo_and_the_forge() {
+        assert_eq!(
+            suggested_var(&repo("acme", "elyria")),
+            "ELYRIA_GITHUB_TOKEN"
+        );
+        assert_eq!(
+            suggested_var(&repo("acme", "my-app.v2")),
+            "MY_APP_V2_GITHUB_TOKEN"
+        );
+        assert_eq!(suggested_var(&repo("acme", "3d")), "R_3D_GITHUB_TOKEN");
+    }
+
+    #[test]
+    fn github_steps_say_any_expiry_works() {
+        let s = steps(&repo("acme", "app"), "https://example.test/x");
+        assert!(s.contains("any expiry you like works"), "{s}");
     }
 
     #[test]

@@ -80,14 +80,12 @@ fn checked_spec(ctx: &Ctx, spec: &Value, home: &str) -> Result<Checked, String> 
     let mut note = None;
     if let Some(share) = &mut s.share {
         if !ctx.allow_share {
-            return Err(
-                "the spec shares a host folder (`share`), which needs the allow-share option"
-                    .into(),
-            );
+            return Err(share_guidance(&share.path, "sharing host folders is off"));
         }
         share.path = resolve_share_path(share)?;
         if let Some(roots) = &ctx.share_roots {
-            check_share_root(roots, &share.path)?;
+            check_share_root(roots, &share.path)
+                .map_err(|why| share_guidance(&share.path, &why))?;
         }
         // The home folder is resolved too, so a symlinked home still matches.
         let home = std::fs::canonicalize(home)
@@ -116,6 +114,19 @@ fn checked_spec(ctx: &Ctx, spec: &Value, home: &str) -> Result<Checked, String> 
     Ok(Checked { spec: s, note })
 }
 
+/// What to tell the agent when a share is refused for the server's settings: the two commands the
+/// user runs (outside this chat), that no restart is needed, and the way out without a share.
+fn share_guidance(path: &str, why: &str) -> String {
+    format!(
+        "Sharing {path} is refused: {why}. Only the user can change that, and never you. Tell the user, in this order:\n\
+         A. In a terminal of their own they run: `osh config set mcp.allow_share true` and `osh config set mcp.share_roots {parent}` (several folders are separated by `:`; the share must lie inside one of them; the folder itself works too).\n\
+         B. No restart is needed when osh runs as the MCP server service (`osh mcp start`): the settings apply to the next request. An osh started by the agent itself (stdio) reads them when it starts, so the agent client must be restarted.\n\
+         C. They tell you it is done and you create the sandbox again.\n\
+         Or skip the share: create the sandbox without it and let the code reach the host only through git (the repo grant).",
+        parent = path,
+    )
+}
+
 /// `repo.env_var` must be one the caller allows (`Ctx::repo_vars`). The refusal names the
 /// variable only, never a value.
 fn check_repo_var(ctx: &Ctx, var: &str) -> Result<(), String> {
@@ -126,12 +137,26 @@ fn check_repo_var(ctx: &Ctx, var: &str) -> Result<(), String> {
     allowed_by_list(ctx, var)
 }
 
+/// A token name that says nothing about what it is for (`GITHUB_TOKEN`).
+fn is_generic_var(var: &str) -> bool {
+    matches!(
+        var,
+        "GITHUB_TOKEN"
+            | "GH_TOKEN"
+            | "GITLAB_TOKEN"
+            | "BITBUCKET_TOKEN"
+            | "FORGEJO_TOKEN"
+            | "TOKEN"
+            | "GIT_TOKEN"
+    )
+}
+
 /// What the refusal tells the agent to ask for. The name is the agent's own text, so it only
 /// appears in a command line when it is a plain variable name.
 fn secret_hint(var: &str) -> String {
     // The names already stored are not listed: a misled agent would learn which ones to target.
     // The user names the one to use in their request.
-    if crate::secrets::valid_name(var) {
+    if crate::secrets::valid_name(var) && !is_generic_var(var) {
         format!(
             "to allow {var}, the user runs `osh mcp secret set {var}` in a terminal of their own, outside this chat (it asks for the token with a hidden prompt)"
         )
@@ -162,16 +187,14 @@ fn allowed_by_list(ctx: &Ctx, var: &str) -> Result<(), String> {
 /// is not inside `/a/b`. The refusal names the path and the variable, not the roots.
 fn check_share_root(roots: &[PathBuf], path: &str) -> Result<(), String> {
     if roots.is_empty() {
-        return Err(format!(
-            "sharing {path} is refused: shares are off until the server operator lists a root folder in OSH_MCP_SHARE_ROOT"
-        ));
+        return Err(
+            "no share root folder is listed (mcp.share_roots, or OSH_MCP_SHARE_ROOT)".into(),
+        );
     }
     if roots.iter().any(|r| Path::new(path).starts_with(r)) {
         return Ok(());
     }
-    Err(format!(
-        "sharing {path} is refused: it is outside the allowed share roots (OSH_MCP_SHARE_ROOT)"
-    ))
+    Err("it is outside the allowed share roots (mcp.share_roots, or OSH_MCP_SHARE_ROOT)".into())
 }
 
 /// The share path as an absolute, symlink-free path of an existing directory.
@@ -380,15 +403,19 @@ fn token_guidance(
     sandbox: &str,
     running: bool,
 ) -> String {
-    let name = if crate::secrets::valid_name(var) {
+    // A name that says nothing (`GITHUB_TOKEN`) is replaced by one for this repo, so the user can
+    // tell their stored tokens apart; any name they prefer works if they tell the agent.
+    let generic = is_generic_var(var);
+    let suggested = ghrepo::suggested_var(repo);
+    let name = if crate::secrets::valid_name(var) && !generic {
         var
     } else {
-        "NAME"
+        suggested.as_str()
     };
     format!(
         "Access to {repo} needs a token that only the user can create ({why}). Tell the user, in this order:\n\
          A. {steps}\n\
-         B. When they have it, in a terminal of their own (outside this chat) they run `osh mcp secret set {name}`; it asks for the token with a hidden prompt, so it never appears in this session or in their shell history.\n\
+         B. When they have it, in a terminal of their own (outside this chat) they run `osh mcp secret set {name}`; it asks for the token with a hidden prompt, so it never appears in this session or in their shell history. {name} is only a suggestion: any name that suits the user works, as long as you then use that same name as env_var.\n\
          C. {then}\n\
          D. {cut}",
         then = if running {
@@ -1381,6 +1408,14 @@ pub(crate) mod tests {
         // Shares on but no valid root: every share is refused, naming the variable.
         let e = create_in(&mcp(Vec::new()), &with_share(&root), true, h).unwrap_err();
         assert!(e.contains("OSH_MCP_SHARE_ROOT"), "{e}");
+        // The refusal is the user's steps: the commands, no restart, the way out without a share.
+        assert!(
+            e.contains("osh config set mcp.allow_share true")
+                && e.contains("osh config set mcp.share_roots")
+                && e.contains("No restart is needed")
+                && e.contains("without it"),
+            "{e}"
+        );
         // The CLI has no roots: a folder outside them is shared as before.
         create_in(
             &share_ctx(&f, false),
@@ -1574,6 +1609,19 @@ pub(crate) mod tests {
     }
 
     const URL: &str = "https://github.com/o/r";
+
+    #[test]
+    fn a_bare_token_name_is_replaced_by_one_for_the_repo() {
+        let f = Fake::new("generic-name");
+        let ctx = Ctx {
+            repo_vars: Some(Vec::new()),
+            ..f.ctx()
+        };
+        let e = repo_grant(&ctx, "w1", URL, "GITHUB_TOKEN").unwrap_err();
+        assert!(e.contains("osh mcp secret set R_GITHUB_TOKEN"), "{e}");
+        assert!(!e.contains("secret set GITHUB_TOKEN"), "{e}");
+        assert!(e.contains("any name that suits the user works"), "{e}");
+    }
 
     #[test]
     fn a_grant_without_a_token_tells_the_user_every_step() {
