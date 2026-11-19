@@ -285,16 +285,16 @@ jobs_checks() {
 
 # The pull request rules of a read/write repo grant (ghrepo::push_profile, `osh repo-profile`).
 # The profile osh generates must lint, import, create with a credential and attach; then, from
-# inside the sandbox $name, `gh api` must reach GitHub for the two allowed writes (the answer is
-# GitHub's own, the token being a fake one) while a neighbouring write is stopped by the sandbox
-# policy before it leaves. The token is a placeholder, so GitHub's reply is an error either way;
+# inside the sandbox $name, `gh api` must reach GitHub for the pull request writes (the answer is
+# GitHub's own, the token being a fake one), as do other writes under the repo (the token is the
+# limit there), while a write to another repo is stopped by the sandbox policy before it leaves. The token is a placeholder, so GitHub's reply is an error either way;
 # what is checked is whose error it is. Runs in the sandbox $name made by sandbox_checks.
 repo_pr_checks() {
   local out prov=prchk url=https://github.com/octocat/Hello-World
   echo "== a repo grant lets the sandbox open and update a pull request on that repo only"
   osh repo-profile "$url" github >"$HOME/pr-profile.yaml" 2>"$HOME/pr-profile.err" \
-    && grep -q 'path: "/repos/octocat/Hello-World/pulls"' "$HOME/pr-profile.yaml" \
-    && pass "osh generates the repo profile with the pull request rules" || { fail "osh generates the repo profile with the pull request rules" "$(cat "$HOME/pr-profile.err")"; return; }
+    && grep -q 'method: PATCH, path: "/repos/octocat/Hello-World/\*\*"' "$HOME/pr-profile.yaml" \
+    && pass "osh generates the repo profile with the repo API write rules" || { fail "osh generates the repo profile with the repo API write rules" "$(cat "$HOME/pr-profile.err")"; return; }
   openshell -g "$main" provider profile lint -f "$HOME/pr-profile.yaml" >"$HOME/pr-lint.log" 2>&1 \
     && pass "the generated repo profile passes provider profile lint" || { fail "the generated repo profile passes provider profile lint" "$(tail -5 "$HOME/pr-lint.log")"; return; }
   openshell -g "$main" provider profile import --file "$HOME/pr-profile.yaml" >"$HOME/pr-attach.log" 2>&1 \
@@ -311,9 +311,9 @@ repo_pr_checks() {
   out="$(ex 'gh api -X PATCH repos/octocat/Hello-World/pulls/1 -f title=t 2>&1')"
   grep -Eq "$gh_says" <<<"$out" && pass "updating a pull request on the granted repo reaches GitHub" || fail "updating a pull request on the granted repo reaches GitHub" "$out"
   out="$(ex 'gh api -X POST repos/octocat/Hello-World/issues -f title=t 2>&1')"
-  ! grep -Eq "$gh_says" <<<"$out" && pass "another write to the granted repo is stopped by the policy" || fail "another write to the granted repo is stopped by the policy" "$out"
+  grep -Eq "$gh_says" <<<"$out" && pass "another write under the granted repo reaches GitHub, which the token decides" || fail "another write under the granted repo reaches GitHub, which the token decides" "$out"
   out="$(ex 'gh api -X PUT repos/octocat/Hello-World/pulls/1/merge 2>&1')"
-  ! grep -Eq "$gh_says" <<<"$out" && pass "merging a pull request is stopped by the policy" || fail "merging a pull request is stopped by the policy" "$out"
+  grep -Eq "$gh_says" <<<"$out" && pass "merging a pull request reaches GitHub, which the token decides" || fail "merging a pull request reaches GitHub, which the token decides" "$out"
   out="$(ex 'gh api -X POST repos/octocat/Spoon-Knife/pulls -f title=t -f head=a -f base=b 2>&1')"
   ! grep -Eq "$gh_says" <<<"$out" && pass "a pull request on another repo is stopped by the policy" || fail "a pull request on another repo is stopped by the policy" "$out"
 

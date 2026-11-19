@@ -562,7 +562,7 @@ Providers tab, `n`, "Git repo, read/write" takes `OWNER/REPO` (GitHub) or
 | Provider | Token | Where osh sends you | Permissions | Expiry | Caveats |
 | --- | --- | --- | --- | --- | --- |
 | GitHub | fine-grained personal access token | prefilled `github.com/settings/personal-access-tokens/new` | Contents, Pull requests, Workflows: read and write; only the selected repo | 30 days, tracked | an organization may have to approve it |
-| GitLab (any host) | project access token, role Developer | `https://HOST/GROUP/.../REPO/-/settings/access_tokens` (name and scopes in the URL; the steps do not rely on it) | `read_api`, `write_repository` | 30 days, tracked | on gitlab.com project tokens need Premium or Ultimate; on Free use a personal access token with the same scopes, which reaches every project your account can |
+| GitLab (any host) | project access token, role Developer | `https://HOST/GROUP/.../REPO/-/settings/access_tokens` (name and scopes in the URL; the steps do not rely on it) | `api` (merge requests need it) | 30 days, tracked | on gitlab.com project tokens need Premium or Ultimate; on Free use a personal access token with the same scope, which reaches every project your account can |
 | Bitbucket Cloud | repository access token | `https://bitbucket.org/WS/REPO/admin/access-tokens` (Repository settings > Security > Access tokens) | Repositories: Read, Write | 30 days if the workspace lets you choose; tracked as 30 days | app passwords no longer work |
 | Bitbucket Data Center | repository HTTP access token | `https://HOST/projects/PROJ/repos/REPO/settings`, then HTTP access tokens | Repository write | 30 days if offered; tracked as 30 days | https on port 443 with no context path only: `https://HOST/scm/PROJ/REPO` or `ssh://git@HOST:PORT/PROJ/REPO` |
 | Forgejo | access token | `https://HOST/user/settings/applications/tokens/new` | Specific repositories: the repo; scope `write:repository` | none, not tracked | delete it yourself when no sandbox needs it |
@@ -575,12 +575,12 @@ all others as bearer; the token goes through a private header file, never
 argv). Read/write imports a profile `gl-`, `bb-` or `fj-<host>-<owner>-<repo>`:
 API reads (Bitbucket Cloud on `api.bitbucket.org`, read-only), git clone and
 fetch, and `POST .../git-receive-pack` for that repo only (under `/scm/` on
-Data Center), for `git` and `curl` only. Every read/write profile (GitHub too, for `git` and `gh`) also lets the
-sandbox open and update a pull or merge request on that repo, and nothing else of the API's writes: GitHub
-`POST /repos/O/R/pulls` and `PATCH .../pulls/N`, Forgejo the same under `/api/v1`, GitLab `POST` and `PUT`
-`/api/v4/projects/<encoded path>/merge_requests[/N]`, Bitbucket Cloud `POST` and `PUT`
-`/2.0/repositories/WS/R/pullrequests[/N]`, Data Center `.../projects/P/repos/R/pull-requests[/N]`. Merging,
-comments, reviews and closing stay denied. `osh repo-profile URL [github|gitlab|bitbucket|forgejo]` prints
+Data Center), for `git` and `curl` only. On every forge the profile lets the sandbox (`git`, `curl`, and `gh` on GitHub) make every API
+write under that repo's own API path, with any method: GitHub `/repos/O/R/`, Forgejo `/api/v1/repos/O/R/`,
+GitLab `/api/v4/projects/<encoded path>/`, Bitbucket Cloud `/2.0/repositories/WS/R/`, Data Center
+`/rest/api/1.0/projects/P/repos/R/`, plus GraphQL on GitHub. The access token is the limit: the forge
+refuses what its permissions do not cover (issues, with the prefilled GitHub ones), and no other repo is
+reachable. `osh repo-profile URL [github|gitlab|bitbucket|forgejo]` prints
 the profile a grant would import (read-only). A grant made before this existed keeps its old profile until it is
 made again. Providers are `gitlab-`,
 `bitbucket-` or `forgejo-<sandbox>-<repo>`, or `...-<repo>` when shared, with

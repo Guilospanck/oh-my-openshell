@@ -9798,7 +9798,7 @@ mod tests {
         match &a.modal {
             Some(Modal::Confirm { text, .. }) => {
                 assert!(text.contains("project access token for grp/sub/app on gitlab.com"));
-                assert!(text.contains("read_api and write_repository"));
+                assert!(text.contains("Scope: api, nothing else"));
                 assert!(text.contains("/grp/sub/app/-/settings/access_tokens"));
             }
             _ => panic!("no steps"),
