@@ -135,7 +135,7 @@ just mcp-serve   # osh mcp serve in the foreground; just mcp-claude-add connects
   commit too. Do not bypass with `--no-verify`.
 - Ask first before running anything that changes the host or running
   OpenShell state: `osh setup|upgrade|uninstall|gateway-docker|gateway add|gateway remove` (and the `just`
-  wrappers), `just release` (runs `just release-gate` first, in containers, and stops on any failure; never skip or edit the gate; pushes a commit, a tag, a GitHub release and the Homebrew tap; `release-dry-run` is fine), `osh gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
+  wrappers), `just release` (runs `just check-gateway-limits` and then `just release-gate` first, the gate in containers, and stops on any failure; never skip or edit the gate; pushes a commit, a tag, a GitHub release and the Homebrew tap; `release-dry-run` is fine), `osh gateway-reset` (wipes a gateway's sandboxes and providers), `osh` itself
   (it is interactive and talks to the live gateway), and any
   `openshell sandbox|provider|policy` write command. Read-only ones
   (`openshell status`, `... list`, `provider profile lint`) are fine.

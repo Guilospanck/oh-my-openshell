@@ -82,7 +82,7 @@ and prints the `gh release create` command; it never uploads. Pushing a `v*` tag
 
 Releasing from this machine, the same steps as the workflow plus the Homebrew formula: `just release-setup`
 (read-only check of `gh` login, push access to the tap, Docker, Zig), then `just release-dry-run vX.Y.Z` (check,
-`just release-gate`, version bump, archives, formula lint; pushes nothing, reverts the bump), then `just release vX.Y.Z ["notes"]`
+`just check-gateway-limits`, `just release-gate`, version bump, archives, formula lint; pushes nothing, reverts the bump), then `just release vX.Y.Z ["notes"]`
 (commits the `tui/Cargo.toml` bump, tags, pushes, `gh release create`, pushes `Formula/oh-my-openshell.rb` to
 `Guilospanck/homebrew-tap`). It needs a clean `main` level with `origin`, and never runs `osh` or `osh setup`.
 On Apple Silicon the Linux archives build in a separate Colima instance (`scripts/release-colima`; needs

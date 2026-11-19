@@ -6,6 +6,7 @@
 #
 #   1. preflight   clean tree, on main and level with origin, tag and release free, tools, tap access
 #   2. just check  fmt, clippy, tests
+#      just check-gateway-limits  osh's copies of the gateway limits still match the latest OpenShell
 #      just release-gate  the container suites: distro build and setup, real Linux with podman and docker
 #                 (sandbox terminal, tmux, gateways, uninstall). Any failure stops the release; there is no flag to skip it.
 #   3. bump        tui/Cargo.toml and Cargo.lock to the version (committed only after the build works)
@@ -102,6 +103,11 @@ echo "ok"
 
 say "just check"
 just --justfile "$repo/.justfile" check
+
+# Quick and network-only, so before the slow gate: a limit OpenShell changed would make osh
+# refuse specs the gateway accepts, or let through ones it refuses.
+say "just check-gateway-limits"
+just --justfile "$repo/.justfile" check-gateway-limits
 
 say "just release-gate (container suites; slow)"
 just --justfile "$repo/.justfile" release-gate
