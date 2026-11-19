@@ -2905,14 +2905,20 @@ impl App {
         self.input(&title, true, flow);
     }
 
-    /// The gateway rejects sandbox names over 19 characters on every driver.
-    fn name_too_long(&self, name: &str) -> Option<String> {
-        (name.chars().count() > SANDBOX_NAME_MAX).then(|| {
-            format!(
+    /// Why the gateway would refuse this sandbox name, on every driver; empty means generated.
+    fn name_error(&self, name: &str) -> Option<String> {
+        if name.is_empty() {
+            return None;
+        }
+        if name.chars().count() > SANDBOX_NAME_MAX {
+            return Some(format!(
                 "Error: a sandbox name has at most {SANDBOX_NAME_MAX} characters ({} given)",
                 name.chars().count()
-            )
-        })
+            ));
+        }
+        osh_core::sandbox::validate_name(name)
+            .err()
+            .map(|e| format!("Error: {e}"))
     }
 
     fn ask_name(&mut self, plan: Plan) {
@@ -4936,7 +4942,7 @@ impl App {
             }
             InKind::Name(mut plan) => {
                 plan.name = text.trim().into();
-                if let Some(msg) = self.name_too_long(&plan.name) {
+                if let Some(msg) = self.name_error(&plan.name) {
                     self.ask_name(plan);
                     // The popup hides the footer, so the reason goes in the popup's title too.
                     if let Some(Modal::Input { title, .. }) = &mut self.modal {
@@ -9334,8 +9340,12 @@ mod tests {
             })
         ));
         a.snap.driver = "docker".into();
-        assert!(a.name_too_long("factory-unnamed-project").is_some());
-        assert!(a.name_too_long("exactly-19-chars-xx").is_none());
+        assert!(a.name_error("factory-unnamed-project").is_some());
+        assert!(a.name_error("exactly-19-chars-xx").is_none());
+        assert!(a.name_error("").is_none());
+        for bad in ["My-Box", "a--b", "a b", "-a"] {
+            assert!(a.name_error(bad).is_some(), "{bad:?}");
+        }
     }
 
     #[test]

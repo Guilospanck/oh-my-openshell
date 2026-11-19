@@ -151,13 +151,24 @@ impl SandboxSpec {
 /// `MAX_ROUTABLE_NAME_LEN`, so workspace, sandbox and service fit one 63-character DNS label.
 pub const NAME_MAX: usize = 19;
 
+/// The most providers the gateway attaches to one sandbox (`MAX_PROVIDERS`).
+pub const PROVIDERS_MAX: usize = 32;
+/// The longest image reference the gateway takes (`MAX_TEMPLATE_STRING_LEN`, bytes).
+pub const IMAGE_MAX: usize = 1024;
+/// The longest single command argument the gateway takes, for `exec` and for a sandbox's own
+/// command (`MAX_EXEC_ARG_LEN`, bytes).
+pub const ARG_MAX: usize = 32 * 1024;
+/// The most arguments one `exec` may carry (`MAX_EXEC_COMMAND_ARGS`).
+pub const EXEC_ARGS_MAX: usize = 1024;
+
 /// Lowercase letters, digits and `-`, 1 to `NAME_MAX` characters, starting and ending with a
-/// letter or digit.
+/// letter or digit, with no `--` (the gateway's DNS-1123 check refuses consecutive dashes).
 pub fn validate_name(name: &str) -> Result<(), String> {
     let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
     let ok = (1..=NAME_MAX).contains(&name.len())
         && name.starts_with(alnum)
         && name.ends_with(alnum)
+        && !name.contains("--")
         && name
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
@@ -165,9 +176,56 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "invalid sandbox name {name:?}: use 1 to {NAME_MAX} lowercase letters, digits or `-`, starting and ending with a letter or digit"
+            "invalid sandbox name {name:?}: use 1 to {NAME_MAX} lowercase letters, digits or single `-`, starting and ending with a letter or digit"
         ))
     }
+}
+
+/// The gateway's size limits on a create, checked before osh builds an image or makes a
+/// provider for it: otherwise the refusal comes at the very end, after that work is done.
+/// A repo grant counts as one more provider, the one osh adds for it.
+pub fn check_limits(spec: &SandboxSpec) -> Result<(), String> {
+    let providers = spec.providers.len() + usize::from(spec.repo.is_some());
+    if providers > PROVIDERS_MAX {
+        return Err(format!(
+            "a sandbox takes at most {PROVIDERS_MAX} providers ({providers} given{})",
+            if spec.repo.is_some() {
+                ", counting the one for the repo grant"
+            } else {
+                ""
+            }
+        ));
+    }
+    if spec.image.len() > IMAGE_MAX {
+        return Err(format!(
+            "field `image` is at most {IMAGE_MAX} bytes ({} given)",
+            spec.image.len()
+        ));
+    }
+    if spec.command.len() > ARG_MAX {
+        return Err(format!(
+            "field `command` is at most {ARG_MAX} bytes ({} given): put a longer script in a file in the image or the share and run that",
+            spec.command.len()
+        ));
+    }
+    Ok(())
+}
+
+/// The gateway's limits on an `exec` command line (the full argv osh sends).
+pub fn check_exec_argv(argv: &[String]) -> Result<(), String> {
+    if argv.len() > EXEC_ARGS_MAX {
+        return Err(format!(
+            "a command takes at most {EXEC_ARGS_MAX} arguments ({} given)",
+            argv.len()
+        ));
+    }
+    if let Some((i, a)) = argv.iter().enumerate().find(|(_, a)| a.len() > ARG_MAX) {
+        return Err(format!(
+            "command argument {i} is {} bytes, over the gateway's {ARG_MAX}-byte limit per argument: write the input to a file in the sandbox and pass its path",
+            a.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Folders under `$HOME` that hold secrets or tool configuration the host trusts.
@@ -587,6 +645,34 @@ mod tests {
         assert!(validate_name("factory-1").is_ok());
         assert!(validate_name("a").is_ok());
         assert!(validate_name(&"a".repeat(NAME_MAX)).is_ok());
+        assert!(validate_name("a--b").is_err());
+        assert!(validate_name("a-b-c").is_ok());
+    }
+
+    #[test]
+    fn limits_match_the_gateways() {
+        let mut s = SandboxSpec {
+            name: "a".into(),
+            providers: vec!["p".into(); PROVIDERS_MAX],
+            image: "i".repeat(IMAGE_MAX),
+            command: "c".repeat(ARG_MAX),
+            ..Default::default()
+        };
+        assert!(check_limits(&s).is_ok());
+        s.repo = Some(RepoGrant::default());
+        let e = check_limits(&s).unwrap_err();
+        assert!(e.contains("repo grant") && e.contains("33 given"), "{e}");
+        s.repo = None;
+        s.image.push('i');
+        assert!(check_limits(&s).unwrap_err().contains("`image`"));
+        s.image.pop();
+        s.command.push('c');
+        assert!(check_limits(&s).unwrap_err().contains("`command`"));
+
+        assert!(check_exec_argv(&vec!["a".into(); EXEC_ARGS_MAX]).is_ok());
+        assert!(check_exec_argv(&vec!["a".into(); EXEC_ARGS_MAX + 1]).is_err());
+        let e = check_exec_argv(&["sh".into(), "x".repeat(ARG_MAX + 1)]).unwrap_err();
+        assert!(e.contains("argument 1"), "{e}");
     }
 
     #[test]

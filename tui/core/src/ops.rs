@@ -71,6 +71,7 @@ fn home() -> String {
 fn checked_spec(ctx: &Ctx, spec: &Value, home: &str) -> Result<Checked, String> {
     let mut s = SandboxSpec::from_json(spec)?;
     check_name(&s.name)?;
+    sandbox::check_limits(&s)?;
     if let Some(g) = &s.repo {
         check_repo_var(ctx, &g.env_var).map_err(|why| match sandbox::grant_repo(&g.url) {
             Ok(r) => token_guidance(&r, &g.env_var, &why, &s.name, false),
@@ -1179,6 +1180,7 @@ pub(crate) fn run_in_sandbox(
     if argv.is_empty() {
         return Err("no command to run".into());
     }
+    sandbox::check_exec_argv(argv)?;
     target(ctx)?;
     let mut args: Vec<String> = ["sandbox", "exec", "-n", name, "--timeout"]
         .map(String::from)

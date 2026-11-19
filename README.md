@@ -680,9 +680,9 @@ A spec is a JSON object; unknown fields and wrong types are refused. Only `name`
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | 1 to 19 lowercase letters (the gateway refuses longer names), digits or `-`, starting and ending with a letter or digit |
+| `name` | string | 1 to 19 lowercase letters, digits or single `-` (no `--`), starting and ending with a letter or digit: the gateway refuses anything else |
 | `image` | string | Sandbox image; a tag built from one of the Dockerfiles is built first when it does not exist yet (an outdated image is not rebuilt headless; rebuild it from the dashboard's Images tab), any other value is passed to `openshell` unchanged (`--from`) |
-| `providers` | array of strings | Provider names to attach |
+| `providers` | array of strings | Provider names to attach; at most 32, counting the one a `repo` grant adds |
 | `cpu`, `memory` | string | For example `"2"` and `"4Gi"` |
 | `command` | string | Run once, then the sandbox is deleted: the sandbox runs `sh -c COMMAND` and is removed when it exits (`--no-keep`). Its output is not returned, and a repo provider made for it is removed afterwards. Leave it out for a sandbox that stays up for `exec` |
 | `toolchains` | array of strings | Toolchain groups whose hosts the policy opens (`[]` opens none); left out, the saved default applies |
@@ -709,7 +709,7 @@ The `repo` variable must be set in the environment of the process that runs `osh
 - Success: one JSON line on stdout, exit 0. `list` gives `[{"name","phase","created"}]`; `create` gives `{"name","phase"}` (plus `"note"` when the policy or a risky share needs one), or with `--dry-run` `{"name","steps":[{"prog","args"}]}` and nothing is created (the `--policy` path in those steps names a file that has already been removed again); `delete` gives `{"name","deleted":true}` and also removes the repo provider osh made for that sandbox, or `{"name","deleted":false,"already_gone":true}` when the sandbox is not listed any more (a one-shot `command` sandbox deletes itself), still removing its repo providers; `apply` gives `{"action":"created"|"unchanged","name"}` (plus the create's `"note"`).
 - Failure: `{"ok":false,"error":"..."}` on stdout, exit 1.
 - Usage errors (bad flags) print the usage on stderr, exit 2.
-- `sandbox exec` prints `{"exit_code","stdout","stderr"}` and then exits with the same code. The code is that of the `openshell sandbox exec` process: normally the command's own, but a missing sandbox or an `openshell` error also gives `{"exit_code":N,...}` and exit N rather than `{"ok":false,...}`. Only a failure to start `openshell` (or a bad name, an empty command or a gateway name starting with `-`) gives the `ok:false` form.
+- `sandbox exec` prints `{"exit_code","stdout","stderr"}` and then exits with the same code. The code is that of the `openshell sandbox exec` process: normally the command's own, but a missing sandbox or an `openshell` error also gives `{"exit_code":N,...}` and exit N rather than `{"ok":false,...}`. Only a failure to start `openshell` (or a bad name, an empty command, a command over the gateway's limits or a gateway name starting with `-`) gives the `ok:false` form.
 
 `apply` creates the sandbox when none of that name exists. An existing name returns `unchanged` and is left as it is: there is no reconcile of image, providers or any other field.
 
@@ -777,6 +777,7 @@ Press `6` in the dashboard meanwhile: the server's address, Claude Code as a cli
 
 - A headless create does not register the read-write share alert and does not upload config files; use the dashboard for those.
 - `sandbox exec` has a fixed 600 second timeout.
+- The gateway's own limits are checked before anything runs: `image` at most 1024 bytes, `command` at most 32 KiB, and an `exec` (or job) command line at most 1024 arguments of at most 32 KiB each.
 - `exec` output is returned whole and not bounded.
 - The logic lives in `osh-core` (`tui/core/`), a library crate with no TUI; `cargo test -p osh-core` in `tui/` does not need Zig.
 
