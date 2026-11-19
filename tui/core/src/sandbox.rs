@@ -147,11 +147,15 @@ impl SandboxSpec {
     }
 }
 
-/// Lowercase letters, digits and `-`, 1 to 63 characters, starting and ending with a letter or
-/// digit.
+/// The longest sandbox name the gateway accepts, whatever the driver: OpenShell's
+/// `MAX_ROUTABLE_NAME_LEN`, so workspace, sandbox and service fit one 63-character DNS label.
+pub const NAME_MAX: usize = 19;
+
+/// Lowercase letters, digits and `-`, 1 to `NAME_MAX` characters, starting and ending with a
+/// letter or digit.
 pub fn validate_name(name: &str) -> Result<(), String> {
     let alnum = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
-    let ok = (1..=63).contains(&name.len())
+    let ok = (1..=NAME_MAX).contains(&name.len())
         && name.starts_with(alnum)
         && name.ends_with(alnum)
         && name
@@ -161,7 +165,7 @@ pub fn validate_name(name: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "invalid sandbox name {name:?}: use 1 to 63 lowercase letters, digits or `-`, starting and ending with a letter or digit"
+            "invalid sandbox name {name:?}: use 1 to {NAME_MAX} lowercase letters, digits or `-`, starting and ending with a letter or digit"
         ))
     }
 }
@@ -568,12 +572,21 @@ mod tests {
 
     #[test]
     fn validate_name_rejects_path_and_long() {
-        for bad in ["", "a b", "../x", &"a".repeat(64), "-a", "A", "a-", "-"] {
+        for bad in [
+            "",
+            "a b",
+            "../x",
+            &"a".repeat(NAME_MAX + 1),
+            "-a",
+            "A",
+            "a-",
+            "-",
+        ] {
             assert!(validate_name(bad).is_err(), "{bad:?}");
         }
         assert!(validate_name("factory-1").is_ok());
         assert!(validate_name("a").is_ok());
-        assert!(validate_name(&"a".repeat(63)).is_ok());
+        assert!(validate_name(&"a".repeat(NAME_MAX)).is_ok());
     }
 
     #[test]

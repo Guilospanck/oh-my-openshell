@@ -680,7 +680,7 @@ A spec is a JSON object; unknown fields and wrong types are refused. Only `name`
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `name` | string | 1 to 63 lowercase letters, digits or `-`, starting and ending with a letter or digit |
+| `name` | string | 1 to 19 lowercase letters (the gateway refuses longer names), digits or `-`, starting and ending with a letter or digit |
 | `image` | string | Sandbox image; a tag built from one of the Dockerfiles is built first when it does not exist yet (an outdated image is not rebuilt headless; rebuild it from the dashboard's Images tab), any other value is passed to `openshell` unchanged (`--from`) |
 | `providers` | array of strings | Provider names to attach |
 | `cpu`, `memory` | string | For example `"2"` and `"4Gi"` |

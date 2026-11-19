@@ -1,6 +1,5 @@
 //! Application state, modal flows and key handling.
-/// The longest sandbox name the gateway accepts, whatever the driver (probed on vm and docker).
-const SANDBOX_NAME_MAX: usize = 19;
+use osh_core::sandbox::NAME_MAX as SANDBOX_NAME_MAX;
 /// The longest provider name the gateway accepts (probed: 100 passed, 300 failed at 253).
 const PROVIDER_NAME_MAX: usize = 253;
 
