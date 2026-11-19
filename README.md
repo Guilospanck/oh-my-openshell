@@ -575,7 +575,14 @@ all others as bearer; the token goes through a private header file, never
 argv). Read/write imports a profile `gl-`, `bb-` or `fj-<host>-<owner>-<repo>`:
 API reads (Bitbucket Cloud on `api.bitbucket.org`, read-only), git clone and
 fetch, and `POST .../git-receive-pack` for that repo only (under `/scm/` on
-Data Center), for `git` and `curl` only. Providers are `gitlab-`,
+Data Center), for `git` and `curl` only. Every read/write profile (GitHub too, for `git` and `gh`) also lets the
+sandbox open and update a pull or merge request on that repo, and nothing else of the API's writes: GitHub
+`POST /repos/O/R/pulls` and `PATCH .../pulls/N`, Forgejo the same under `/api/v1`, GitLab `POST` and `PUT`
+`/api/v4/projects/<encoded path>/merge_requests[/N]`, Bitbucket Cloud `POST` and `PUT`
+`/2.0/repositories/WS/R/pullrequests[/N]`, Data Center `.../projects/P/repos/R/pull-requests[/N]`. Merging,
+comments, reviews and closing stay denied. `osh repo-profile URL [github|gitlab|bitbucket|forgejo]` prints
+the profile a grant would import (read-only). A grant made before this existed keeps its old profile until it is
+made again. Providers are `gitlab-`,
 `bitbucket-` or `forgejo-<sandbox>-<repo>`, or `...-<repo>` when shared, with
 the token in `GITLAB_TOKEN`, `BITBUCKET_TOKEN` or `FORGEJO_TOKEN`. GitLab and
 Bitbucket tokens are tracked and renewed like GitHub's (`u`, `t`, banner).

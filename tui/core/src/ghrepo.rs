@@ -202,6 +202,56 @@ impl GhRepo {
         make(Forge::from_key(key, host)?, host, owner, repo)
     }
 
+    /// The two API writes that let an agent open and update a pull (merge) request on this repo
+    /// and nothing else: `(method, path)` for the create call and the update of one request.
+    /// Merging, closing a repo, comments, reviews and every other write stay denied. GitLab names
+    /// the project by its URL-encoded path; the update path ends in one `*` segment (the number).
+    fn pr_writes(&self) -> [(&'static str, String); 2] {
+        let full = self.full();
+        match self.forge {
+            Forge::GitHub => [
+                ("POST", format!("/repos/{full}/pulls")),
+                ("PATCH", format!("/repos/{full}/pulls/*")),
+            ],
+            Forge::Forgejo => [
+                ("POST", format!("/api/v1/repos/{full}/pulls")),
+                ("PATCH", format!("/api/v1/repos/{full}/pulls/*")),
+            ],
+            Forge::GitLab => {
+                let enc = full.replace('/', "%2F");
+                [
+                    ("POST", format!("/api/v4/projects/{enc}/merge_requests")),
+                    ("PUT", format!("/api/v4/projects/{enc}/merge_requests/*")),
+                ]
+            }
+            Forge::BitbucketCloud => [
+                ("POST", format!("/2.0/repositories/{full}/pullrequests")),
+                ("PUT", format!("/2.0/repositories/{full}/pullrequests/*")),
+            ],
+            Forge::BitbucketDc => {
+                let (key, repo) = (&self.owner, &self.repo);
+                [
+                    (
+                        "POST",
+                        format!("/rest/api/1.0/projects/{key}/repos/{repo}/pull-requests"),
+                    ),
+                    (
+                        "PUT",
+                        format!("/rest/api/1.0/projects/{key}/repos/{repo}/pull-requests/*"),
+                    ),
+                ]
+            }
+        }
+    }
+
+    /// `pr_writes` as profile rule lines, indented under `rules:`.
+    fn pr_rules(&self) -> String {
+        self.pr_writes()
+            .iter()
+            .map(|(m, p)| format!("\x20     - allow: {{ method: {m}, path: \"{p}\" }}\n"))
+            .collect()
+    }
+
     /// Paths of `POST git-receive-pack` for this repo, with and without `.git`.
     fn push_paths(&self) -> [String; 2] {
         let base = match self.forge {
@@ -646,6 +696,7 @@ pub fn push_profile(r: &GhRepo) -> String {
         "\x20     - allow: {{ method: POST, path: \"{push_git}\" }}\n\
 \x20     - allow: {{ method: POST, path: \"{push_bare}\" }}\n"
     );
+    let pr = r.pr_rules();
     let full = r.full();
     let host = &r.host;
     let curl_git =
@@ -656,8 +707,12 @@ pub fn push_profile(r: &GhRepo) -> String {
 \x20 - host: api.github.com\n\
 \x20   port: 443\n\
 \x20   protocol: rest\n\
-\x20   access: read-only\n\
 \x20   enforcement: enforce\n\
+\x20   rules:\n\
+\x20     - allow: {{ method: GET, path: \"**\" }}\n\
+\x20     - allow: {{ method: HEAD, path: \"**\" }}\n\
+\x20     - allow: {{ method: OPTIONS, path: \"**\" }}\n\
+{pr}\
 \x20 - host: api.github.com\n\
 \x20   port: 443\n\
 \x20   path: /graphql\n\
@@ -677,8 +732,8 @@ pub fn push_profile(r: &GhRepo) -> String {
 binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n",
             head = profile_head(
                 r,
-                &format!("Read access as in providers/github.yaml, plus git push to {full} only."),
-                &format!("GitHub API reads, git clone/fetch, and git push to {full}"),
+                &format!("Read access as in providers/github.yaml, plus git push to {full} and opening or updating its pull requests only."),
+                &format!("GitHub API reads, git clone/fetch, git push and pull requests on {full}"),
                 "Fine-grained GitHub token",
                 "GITHUB_TOKEN, GH_TOKEN",
             ),
@@ -687,13 +742,13 @@ binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n",
             let (api, comment, kind) = if r.forge == Forge::Forgejo {
                 (
                     "/api/v1/**",
-                    format!("Read access as in providers/forgejo.yaml, plus git push to {full} on {host} only."),
+                    format!("Read access as in providers/forgejo.yaml, plus git push to {full} on {host} and opening or updating its pull requests only."),
                     "Forgejo access token",
                 )
             } else {
                 (
                     "/api/v4/**",
-                    format!("GitLab API reads and git clone/fetch on {host}, plus git push to {full} only."),
+                    format!("GitLab API reads and git clone/fetch on {host}, plus git push to {full} and opening or updating its merge requests only."),
                     "GitLab project access token",
                 )
             };
@@ -708,13 +763,14 @@ binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n",
 \x20     - allow: {{ method: HEAD, path: \"{api}\" }}\n\
 \x20     - allow: {{ method: GET, path: \"/**/info/refs\" }}\n\
 \x20     - allow: {{ method: POST, path: \"/**/git-upload-pack\" }}\n\
+{pr}\
 {push}\
 {curl_git}",
                 head = profile_head(
                     r,
                     &comment,
                     &format!(
-                        "{} API reads, git clone/fetch, and git push to {full} on {host}",
+                        "{} API reads, git clone/fetch, git push and pull or merge requests on {full} on {host}",
                         r.forge.label()
                     ),
                     kind,
@@ -727,8 +783,12 @@ binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n",
 \x20 - host: {BITBUCKET_API_HOST}\n\
 \x20   port: 443\n\
 \x20   protocol: rest\n\
-\x20   access: read-only\n\
 \x20   enforcement: enforce\n\
+\x20   rules:\n\
+\x20     - allow: {{ method: GET, path: \"**\" }}\n\
+\x20     - allow: {{ method: HEAD, path: \"**\" }}\n\
+\x20     - allow: {{ method: OPTIONS, path: \"**\" }}\n\
+{pr}\
 \x20 - host: {host}\n\
 \x20   port: 443\n\
 \x20   protocol: rest\n\
@@ -740,8 +800,8 @@ binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n",
 {curl_git}",
             head = profile_head(
                 r,
-                &format!("Bitbucket Cloud API reads and git clone/fetch, plus git push to {full} only."),
-                &format!("Bitbucket API reads, git clone/fetch, and git push to {full}"),
+                &format!("Bitbucket Cloud API reads and git clone/fetch, plus git push to {full} and opening or updating its pull requests only."),
+                &format!("Bitbucket API reads, git clone/fetch, git push and pull requests on {full}"),
                 "Bitbucket repository access token",
                 r.forge.token_env(),
             ),
@@ -757,12 +817,13 @@ binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n",
 \x20     - allow: {{ method: HEAD, path: \"/rest/api/1.0/**\" }}\n\
 \x20     - allow: {{ method: GET, path: \"/scm/**/info/refs\" }}\n\
 \x20     - allow: {{ method: POST, path: \"/scm/**/git-upload-pack\" }}\n\
+{pr}\
 {push}\
 {curl_git}",
             head = profile_head(
                 r,
-                &format!("Bitbucket Data Center API reads and git clone/fetch on {host}, plus git push to {full} only."),
-                &format!("Bitbucket Data Center API reads, git clone/fetch, and git push to {full} on {host}"),
+                &format!("Bitbucket Data Center API reads and git clone/fetch on {host}, plus git push to {full} and opening or updating its pull requests only."),
+                &format!("Bitbucket Data Center API reads, git clone/fetch, git push and pull requests on {full} on {host}"),
                 "Bitbucket repository HTTP access token",
                 r.forge.token_env(),
             ),
@@ -1270,7 +1331,10 @@ mod tests {
         assert!(!y.contains("/**/git-receive-pack"));
         assert!(y.contains("/**/git-upload-pack"));
         assert!(y.contains("env_vars: [GITHUB_TOKEN, GH_TOKEN]"));
-        assert!(y.contains("access: read-only"));
+        assert!(y.contains("{ method: POST, path: \"/repos/acme/app/pulls\" }"));
+        assert!(y.contains("{ method: PATCH, path: \"/repos/acme/app/pulls/*\" }"));
+        assert_eq!(y.matches("/pulls").count(), 2);
+        assert!(y.contains("path: /graphql\n    protocol: graphql\n    access: read-only"));
         assert!(y.ends_with(
             "binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n"
         ));
@@ -1806,8 +1870,14 @@ GIT_CONFIG_VALUE_2='!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN
 
     fn assert_safe(y: &str) {
         assert!(!y.contains("/**/git-receive-pack"), "{y}");
-        assert!(!y.contains("method: PUT") && !y.contains("method: DELETE"));
-        assert!(!y.contains("method: PATCH") && !y.contains("/usr/bin/gh"));
+        assert!(!y.contains("method: DELETE") && !y.contains("/usr/bin/gh"));
+        // Only the create and the update of a request: never a merge, a comment or a review.
+        assert!(!y.contains("merge\"") && !y.contains("comments") && !y.contains("approve"));
+        assert_eq!(
+            y.matches("method: PUT").count() + y.matches("method: PATCH").count(),
+            1,
+            "{y}"
+        );
         assert!(hosts_of(y).iter().all(|h| !h.contains('*')));
         assert_eq!(y.matches("git-receive-pack").count(), 2, "{y}");
     }
@@ -1820,6 +1890,8 @@ GIT_CONFIG_VALUE_2='!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN
         assert!(y.contains("port: 443"));
         assert!(y.contains("\"/acme/app.git/git-receive-pack\""));
         assert!(y.contains("\"/acme/app/git-receive-pack\""));
+        assert!(y.contains("{ method: POST, path: \"/api/v1/repos/acme/app/pulls\" }"));
+        assert!(y.contains("{ method: PATCH, path: \"/api/v1/repos/acme/app/pulls/*\" }"));
         assert!(y.contains("\"/**/git-upload-pack\"") && y.contains("\"/api/v1/**\""));
         assert!(y.contains("env_vars: [FORGEJO_TOKEN]") && y.contains("auth_style: bearer"));
         assert!(!y.contains("GITHUB"));
@@ -1832,6 +1904,12 @@ GIT_CONFIG_VALUE_2='!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN
         assert!(y.contains("id: gl-example-com-a-b-app\n"));
         assert_eq!(hosts_of(&y), ["example.com"]);
         assert!(y.contains("{ method: GET, path: \"/api/v4/**\" }"));
+        assert!(
+            y.contains("{ method: POST, path: \"/api/v4/projects/a%2Fb%2Fapp/merge_requests\" }")
+        );
+        assert!(
+            y.contains("{ method: PUT, path: \"/api/v4/projects/a%2Fb%2Fapp/merge_requests/*\" }")
+        );
         assert!(y.contains("\"/a/b/app.git/git-receive-pack\""));
         assert!(y.contains("\"/a/b/app/git-receive-pack\""));
         assert!(y.contains("env_vars: [GITLAB_TOKEN]"));
@@ -1844,7 +1922,10 @@ GIT_CONFIG_VALUE_2='!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN
         let y = push_profile(&other(Forge::BitbucketCloud, "bitbucket.org", "ws", "app"));
         assert_eq!(hosts_of(&y), ["api.bitbucket.org", "bitbucket.org"]);
         let api = y.split("- host: bitbucket.org").next().unwrap();
-        assert!(api.contains("access: read-only") && !api.contains("rules:"));
+        assert!(!api.contains("access: read-only") && api.contains("rules:"));
+        assert!(api.contains("{ method: GET, path: \"**\" }"));
+        assert!(api.contains("{ method: POST, path: \"/2.0/repositories/ws/app/pullrequests\" }"));
+        assert!(api.contains("{ method: PUT, path: \"/2.0/repositories/ws/app/pullrequests/*\" }"));
         assert!(y.contains("\"/ws/app.git/git-receive-pack\""));
         assert!(y.contains("env_vars: [BITBUCKET_TOKEN]"));
         assert_safe(&y);
@@ -1855,6 +1936,12 @@ GIT_CONFIG_VALUE_2='!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN
         let y = push_profile(&other(Forge::BitbucketDc, "example.net", "PROJ", "app"));
         assert_eq!(hosts_of(&y), ["example.net"]);
         assert!(y.contains("\"/rest/api/1.0/**\""));
+        assert!(y.contains(
+            "{ method: POST, path: \"/rest/api/1.0/projects/PROJ/repos/app/pull-requests\" }"
+        ));
+        assert!(y.contains(
+            "{ method: PUT, path: \"/rest/api/1.0/projects/PROJ/repos/app/pull-requests/*\" }"
+        ));
         assert!(y.contains("\"/scm/**/info/refs\"") && y.contains("\"/scm/**/git-upload-pack\""));
         assert!(y.contains("\"/scm/PROJ/app.git/git-receive-pack\""));
         assert!(y.contains("\"/scm/PROJ/app/git-receive-pack\""));

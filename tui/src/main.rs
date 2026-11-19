@@ -419,6 +419,9 @@ fn subcommand(args: &[String]) -> Option<i32> {
             Some(mcpcmd::run(&args[1..]))
         }
         "sync-agents" => Some(agents::cli_main(&args[1..], &assets::data_dir())),
+        // Read-only: prints the profile a read/write repo grant would import. No token, no host
+        // change; `tests/sandbox/checks.sh` feeds it to a real gateway.
+        "repo-profile" => Some(repo_profile(&args[1..])),
         "upgrade" | "uninstall" | "gateway-reset" | "gateway-service" => {
             Some(gateway_command(args))
         }
@@ -1884,5 +1887,26 @@ mod shell_bar_colours {
         let branch = (0..60).find(|x| b[(*x, 19)].symbol() == "z").map(fg);
         assert_eq!(branch, Some(ratatui::style::Color::Indexed(176)), "branch");
         assert_eq!(fg(59), ratatui::style::Color::Indexed(244), "menu hint");
+    }
+}
+
+/// `osh repo-profile URL [FORGE]`: the generated profile of a repo grant on stdout. FORGE is
+/// `github` (the default), `gitlab`, `bitbucket` or `forgejo`.
+fn repo_profile(args: &[String]) -> i32 {
+    let Some(remote) = args.first().and_then(|u| osh_core::ghrepo::parse_url(u)) else {
+        eprintln!("usage: osh repo-profile URL [github|gitlab|bitbucket|forgejo]");
+        return 2;
+    };
+    let key = args.get(1).map_or("github", String::as_str);
+    let repo = osh_core::ghrepo::Forge::from_key(key, &remote.host).and_then(|f| remote.repo(f));
+    match repo {
+        Some(r) => {
+            print!("{}", osh_core::ghrepo::push_profile(&r));
+            0
+        }
+        None => {
+            eprintln!("osh repo-profile: that URL does not fit {key}");
+            2
+        }
     }
 }
