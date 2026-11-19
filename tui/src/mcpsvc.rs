@@ -137,6 +137,18 @@ pub fn install_steps(f: &Facts, p: &Paths) -> Vec<Step> {
     chain(steps, None)
 }
 
+/// Whether the installed unit or agent differs from what this binary would write: a service
+/// installed by another build (a dev checkout, an older release) runs that build and keeps its
+/// data folder, so this binary's `status` never sees it. `start` then reinstalls instead of
+/// restarting the old text.
+pub fn is_stale(os: Os, h: &dyn Host, p: &Paths) -> bool {
+    let (path, want) = match os {
+        Os::Linux => (unit_path(p), systemd_unit(p)),
+        Os::MacOs => (plist_path(p), launchd_plist(p, &logs_dir(p))),
+    };
+    h.read(&path).is_some_and(|have| have != want)
+}
+
 /// Turn an installed service on (and keep it on at the next login).
 pub fn start_steps(f: &Facts, p: &Paths) -> Vec<Step> {
     let steps = match f.os {
@@ -465,5 +477,25 @@ mod tests {
         assert_eq!(status(Os::MacOs, &FakeHost::default(), &p), Svc::External);
         assert_eq!(status(Os::Linux, &FakeHost::default(), &p), Svc::External);
         let _ = std::fs::remove_dir_all(&p.data);
+    }
+
+    #[test]
+    fn an_agent_written_by_another_build_is_stale() {
+        let p = paths();
+        let mut h = FakeHost::default();
+        assert!(!is_stale(Os::MacOs, &h, &p), "nothing installed");
+        h.files.insert(
+            plist_path(&p).to_string_lossy().into_owned(),
+            launchd_plist(&p, &logs_dir(&p)),
+        );
+        assert!(!is_stale(Os::MacOs, &h, &p), "same text");
+        let mut dev = paths();
+        dev.data = "/checkout".into();
+        dev.exe = "/checkout/tui/target/release/osh-tui".into();
+        h.files.insert(
+            plist_path(&p).to_string_lossy().into_owned(),
+            launchd_plist(&dev, &logs_dir(&dev)),
+        );
+        assert!(is_stale(Os::MacOs, &h, &p), "dev checkout pinned");
     }
 }

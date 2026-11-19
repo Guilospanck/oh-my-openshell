@@ -394,6 +394,9 @@ fn service_cmd(m: &Mode) -> i32 {
             return 1;
         }
         (Verb::Start, Svc::NotInstalled) => mcpsvc::install_steps(&f, &p),
+        (Verb::Start, Svc::Stopped) if mcpsvc::is_stale(f.os, &h, &p) => {
+            mcpsvc::install_steps(&f, &p)
+        }
         (Verb::Start, Svc::Stopped) => mcpsvc::start_steps(&f, &p),
         (Verb::Stop, Svc::NotInstalled) => {
             println!("The MCP server is not installed.");
