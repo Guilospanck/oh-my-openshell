@@ -577,7 +577,7 @@ API reads (Bitbucket Cloud on `api.bitbucket.org`, read-only), git clone and
 fetch, and `POST .../git-receive-pack` for that repo only (under `/scm/` on
 Data Center), for `git` and `curl` only. On every forge the profile lets the sandbox (`git`, `curl`, and `gh` on GitHub) make every API
 write under that repo's own API path, with any method: GitHub `/repos/O/R/`, Forgejo `/api/v1/repos/O/R/`,
-GitLab `/api/v4/projects/<encoded path>/`, Bitbucket Cloud `/2.0/repositories/WS/R/`, Data Center
+GitLab `/api/v4/projects/<encoded path>/` (the endpoint sets `allow_encoded_slash`, which the proxy needs for `%2F`), Bitbucket Cloud `/2.0/repositories/WS/R/`, Data Center
 `/rest/api/1.0/projects/P/repos/R/`, plus GraphQL on GitHub. The access token is the limit: the forge
 refuses what its permissions do not cover (issues, with the prefilled GitHub ones), and no other repo is
 reachable. `osh repo-profile URL [github|gitlab|bitbucket|forgejo]` prints

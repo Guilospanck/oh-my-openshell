@@ -719,6 +719,13 @@ binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n",
             ),
         ),
         Forge::Forgejo | Forge::GitLab => {
+            // GitLab names a project by its URL-encoded path, so its API paths carry `%2F`, which
+            // the proxy refuses on any endpoint that does not opt in (and then matches literally).
+            let encoded = if r.forge == Forge::GitLab {
+                "\x20   allow_encoded_slash: true\n"
+            } else {
+                ""
+            };
             let (api, comment, kind) = if r.forge == Forge::Forgejo {
                 (
                     "/api/v1/**",
@@ -738,6 +745,7 @@ binaries: [/usr/bin/gh, /usr/local/bin/gh, /usr/bin/git, /usr/local/bin/git]\n",
 \x20   port: 443\n\
 \x20   protocol: rest\n\
 \x20   enforcement: enforce\n\
+{encoded}\
 \x20   rules:\n\
 \x20     - allow: {{ method: GET, path: \"{api}\" }}\n\
 \x20     - allow: {{ method: HEAD, path: \"{api}\" }}\n\
@@ -1887,6 +1895,7 @@ GIT_CONFIG_VALUE_2='!f() { [ "$1" = get ] || exit 0; t=${GITHUB_TOKEN:-$GH_TOKEN
         assert!(y.contains("id: gl-example-com-a-b-app\n"));
         assert_eq!(hosts_of(&y), ["example.com"]);
         assert!(y.contains("{ method: GET, path: \"/api/v4/**\" }"));
+        assert!(y.contains("    enforcement: enforce\n    allow_encoded_slash: true\n    rules:"));
         assert!(y.contains("\"/a/b/app.git/git-receive-pack\""));
         assert!(y.contains("\"/a/b/app/git-receive-pack\""));
         assert!(y.contains("env_vars: [GITLAB_TOKEN]"));

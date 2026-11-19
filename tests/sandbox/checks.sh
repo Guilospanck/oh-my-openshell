@@ -160,6 +160,7 @@ sandbox_checks() {
     && pass "the meter reads df for /sandbox or /" || fail "the meter reads df for /sandbox or /" "$out"
 
   repo_pr_checks
+  gitlab_encoded_checks
 
   openshell -g "$main" sandbox delete "$name" >/dev/null 2>&1 && pass "the sandbox is deleted" || fail "the sandbox is deleted"
 
@@ -317,6 +318,32 @@ repo_pr_checks() {
   out="$(ex 'gh api -X POST repos/octocat/Spoon-Knife/pulls -f title=t -f head=a -f base=b 2>&1')"
   ! grep -Eq "$gh_says" <<<"$out" && pass "a pull request on another repo is stopped by the policy" || fail "a pull request on another repo is stopped by the policy" "$out"
 
+  openshell -g "$main" sandbox provider detach "$name" "$prov" >/dev/null 2>&1
+  openshell -g "$main" provider delete "$prov" >/dev/null 2>&1
+}
+
+# GitLab names a project by its URL-encoded path (`grp%2Fproj`), and OpenShell's proxy refuses
+# `%2F` unless the endpoint sets allow_encoded_slash (l7/path.rs). The generated GitLab profile must
+# set it, so that the write rule for the granted project matches: a request for that project
+# reaches gitlab.com (which answers 401 to the placeholder token), a request for another project
+# is stopped by the policy. Runs in the sandbox $name made by sandbox_checks.
+gitlab_encoded_checks() {
+  local out prov id url=https://gitlab.com/gitlab-org/gitlab
+  echo "== a GitLab repo grant matches the encoded project path in the API rules"
+  osh repo-profile "$url" gitlab >"$HOME/gl-profile.yaml" 2>"$HOME/gl-profile.err" \
+    && grep -q 'allow_encoded_slash: true' "$HOME/gl-profile.yaml" \
+    && pass "osh generates the GitLab profile with allow_encoded_slash" || { fail "osh generates the GitLab profile with allow_encoded_slash" "$(cat "$HOME/gl-profile.err")"; return; }
+  id="$(sed -n 's/^id: //p' "$HOME/gl-profile.yaml")"; prov=glchk
+  openshell -g "$main" provider profile import --file "$HOME/gl-profile.yaml" >"$HOME/gl-attach.log" 2>&1 \
+    && GITLAB_TOKEN="$(od -An -N12 -tx1 /dev/urandom | tr -d " \n")" openshell -g "$main" provider create --name "$prov" --type "$id" --credential GITLAB_TOKEN >>"$HOME/gl-attach.log" 2>&1 \
+    && openshell -g "$main" sandbox provider attach "$name" "$prov" --wait --timeout 60 >>"$HOME/gl-attach.log" 2>&1 \
+    && ! grep -q 'did not complete' "$HOME/gl-attach.log" \
+    && pass "the GitLab profile imports, creates and attaches" || { fail "the GitLab profile imports, creates and attaches" "$(tail -5 "$HOME/gl-attach.log")"; return; }
+  local gl_says='401|Unauthorized'
+  out="$(ex 'curl -s --max-time 30 -X POST https://gitlab.com/api/v4/projects/gitlab-org%2Fgitlab/merge_requests 2>&1')"
+  grep -Eq "$gl_says" <<<"$out" && pass "a write for the granted project, with %2F, reaches GitLab" || fail "a write for the granted project, with %2F, reaches GitLab" "$out"
+  out="$(ex 'curl -s --max-time 30 -X POST https://gitlab.com/api/v4/projects/gitlab-org%2Fgitlab-foss/merge_requests 2>&1')"
+  ! grep -Eq "$gl_says" <<<"$out" && pass "a write for another project is stopped by the policy" || fail "a write for another project is stopped by the policy" "$out"
   openshell -g "$main" sandbox provider detach "$name" "$prov" >/dev/null 2>&1
   openshell -g "$main" provider delete "$prov" >/dev/null 2>&1
 }
