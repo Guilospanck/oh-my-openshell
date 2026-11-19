@@ -649,7 +649,9 @@ podman|docker|vm` in a systemd container with nothing stubbed (vm needs /dev/kvm
 on the Docker host and is skipped without it); they have not run on a real Linux
 host. `just test-macos` runs the macOS paths on a Mac against recording stand-ins
 for Homebrew, launchd, Colima and Podman without changing the Mac, and
-`just test-release` runs the release workflow's Linux jobs with act. On a Mac,
+`just test-release` runs the release workflow's Linux jobs with act.
+`just check-gateway-limits [vX.Y.Z]` compares the gateway limits osh checks before a create or
+an `exec` with OpenShell's source for that release (default: the latest). On a Mac,
 with disposable VMs that are deleted afterwards: `just test-linux-kvm` runs the
 VM gateway scenario on real KVM (a separate Colima instance with nested
 virtualization, M3 or later; its sandbox checks show as KNOWN-FAIL while OpenShell

@@ -62,6 +62,10 @@ test:
 	osh_use_zig || { echo "Zig 0.15 is required; run: just doctor" >&2; exit 1; }
 	cargo test --workspace --manifest-path "{{justfile_directory()}}/tui/Cargo.toml"
 
+# Read-only, needs network: osh's copies of the gateway's limits (tui/core/src/sandbox.rs) against OpenShell's source for a release (default: the latest)
+check-gateway-limits *args:
+	@"{{justfile_directory()}}/scripts/check-gateway-limits" {{args}}
+
 # Format check, clippy, and tests: run before every commit
 check:
 	#!/usr/bin/env bash

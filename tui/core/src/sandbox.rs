@@ -147,6 +147,9 @@ impl SandboxSpec {
     }
 }
 
+// These limits are copies of OpenShell's; `just check-gateway-limits` compares them with its
+// source for a release. Run it when OpenShell has a new release.
+
 /// The longest sandbox name the gateway accepts, whatever the driver: OpenShell's
 /// `MAX_ROUTABLE_NAME_LEN`, so workspace, sandbox and service fit one 63-character DNS label.
 pub const NAME_MAX: usize = 19;

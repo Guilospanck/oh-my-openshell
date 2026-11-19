@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# scripts/check-gateway-limits [vX.Y.Z]
+#
+# Compares the gateway limits osh copies into tui/core/src/sandbox.rs with OpenShell's own
+# source for one release (default: the latest). osh refuses a spec over these limits before it
+# builds an image or makes a provider, so a limit OpenShell changes must change here too.
+# Read-only: downloads two source files from GitHub and writes nothing.
+#
+# Exit 0: all match. 1: a limit differs or is gone upstream. 2: usage or download error.
+set -euo pipefail
+
+repo="NVIDIA/OpenShell"
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+osh_file="$here/tui/core/src/sandbox.rs"
+
+[[ $# -le 1 ]] || { echo "usage: $0 [vX.Y.Z]" >&2; exit 2; }
+fetch() { curl -fsSL --max-time 30 "$@"; }
+
+tag="${1:-}"
+if [[ -z "$tag" ]]; then
+  tag="$(fetch "https://api.github.com/repos/$repo/releases/latest" \
+    | sed -n 's/^ *"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)" \
+    || { echo "could not ask GitHub for the latest $repo release" >&2; exit 2; }
+fi
+[[ "$tag" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || { echo "version must look like v1.2.3 (got '$tag')" >&2; exit 2; }
+
+base="https://raw.githubusercontent.com/$repo/$tag/crates/openshell-server/src/grpc"
+mod_rs="$(fetch "$base/mod.rs")" || { echo "could not download grpc/mod.rs at $tag" >&2; exit 2; }
+validation_rs="$(fetch "$base/validation.rs")" || { echo "could not download grpc/validation.rs at $tag" >&2; exit 2; }
+
+# The value of `const NAME: usize = EXPR;` in the text on stdin, evaluated. EXPR may only be
+# digits, `_`, `*` and spaces: the text is downloaded, so nothing else reaches the shell's
+# arithmetic (which would run a command hidden in an array subscript).
+value() {
+  local expr
+  expr="$(sed -n "s/^[^/]*const $1: usize = \([^;]*\);.*/\1/p" | head -n 1)"
+  [[ -n "$expr" && "$expr" =~ ^[0-9_\ *]+$ ]] || return 1
+  echo $(( ${expr//_/} ))
+}
+
+fail=0
+# osh constant, OpenShell constant, the OpenShell file it is in.
+while read -r osh_name os_name os_file; do
+  want="$(value "$os_name" <<<"$([[ "$os_file" == mod.rs ]] && echo "$mod_rs" || echo "$validation_rs")")" || {
+    echo "GONE  $os_name is not in $os_file at $tag: find what replaced it and update $osh_name"
+    fail=1
+    continue
+  }
+  have="$(value "$osh_name" <"$osh_file")" || { echo "osh constant $osh_name not found in $osh_file" >&2; exit 2; }
+  if [[ "$have" == "$want" ]]; then
+    echo "ok    $osh_name = $have ($os_name)"
+  else
+    echo "DIFF  $osh_name = $have in osh, $os_name = $want in OpenShell $tag"
+    fail=1
+  fi
+done <<'EOF'
+NAME_MAX MAX_ROUTABLE_NAME_LEN mod.rs
+PROVIDERS_MAX MAX_PROVIDERS mod.rs
+IMAGE_MAX MAX_TEMPLATE_STRING_LEN mod.rs
+ARG_MAX MAX_EXEC_ARG_LEN validation.rs
+EXEC_ARGS_MAX MAX_EXEC_COMMAND_ARGS validation.rs
+EOF
+
+# The name rule osh copies besides its length: no consecutive dashes.
+if ! grep -q 'name.contains("--")' <<<"$validation_rs"; then
+  echo "DIFF  OpenShell $tag no longer refuses \`--\` in names: check validate_dns1123_label and sandbox::validate_name"
+  fail=1
+fi
+
+if [[ "$fail" -eq 0 ]]; then
+  echo "osh's gateway limits match OpenShell $tag"
+fi
+exit "$fail"
