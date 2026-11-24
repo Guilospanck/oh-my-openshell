@@ -960,7 +960,10 @@ fn drop_made(provider: &str) {
 
 /// Create the repo provider (when granted), then run the steps. When a step fails after the
 /// provider was made, the provider is deleted and untracked again (best effort), so a retry
-/// does not trip over it; one that could not be made (it may already exist) is left alone.
+/// does not trip over it; one that could not be made is left alone. When the sandbox's own
+/// provider (that exact name) is already on the gateway, left over from a sandbox deleted
+/// outside osh, it is reused: its token is renewed and the plan attaches it. A reused provider
+/// pre-dates this call, so a failed step leaves it be.
 /// A `one_shot` create (`--no-keep`) has deleted its sandbox by the time it returns, so the
 /// provider made for it is dropped the same way whether the command succeeded or not.
 fn run_plan(
@@ -969,10 +972,20 @@ fn run_plan(
     grant: Option<(&ghrepo::GhRepo, &str)>,
     one_shot: bool,
 ) -> Result<Value, String> {
+    let mut reused = false;
     let made = match grant {
         Some((repo, secret)) => {
             let provider = ghrepo::provider_name(name, repo);
-            cli::create_repo_provider(repo, &provider, secret)?;
+            // A failed list is treated as "absent": the create then reports the real problem.
+            let exists = cli::providers()
+                .map(|l| l.iter().any(|p| p.name == provider))
+                .unwrap_or(false);
+            if exists {
+                cli::renew_repo_token(repo, &provider, secret)?;
+                reused = true;
+            } else {
+                cli::create_repo_provider(repo, &provider, secret)?;
+            }
             Some(provider)
         }
         None => None,
@@ -980,7 +993,7 @@ fn run_plan(
     for st in steps {
         // The plan's `openshell` args already carry the gateway, so `run`, not `exec`.
         if let Err(e) = cli::run(&st.prog, &st.args, &[]) {
-            if let Some(p) = &made {
+            if let Some(p) = made.as_ref().filter(|_| !reused) {
                 drop_made(p);
             }
             return Err(format!("{}: {e}", st.label()));
@@ -1612,6 +1625,49 @@ pub(crate) mod tests {
             .position(|l| *l == "provider delete github-w1-r")
             .unwrap_or_else(|| panic!("{calls}"));
         assert!(made < failed && failed < gone, "{calls}");
+    }
+
+    #[test]
+    fn an_existing_sandbox_provider_is_renewed_and_attached_not_created() {
+        let f = Fake::new("repo-reuse");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        std::env::set_var(
+            "OSH_FAKE_PROVIDERS",
+            r#"{"providers":[{"name":"npm","type":"npm","credential_keys":[]},{"name":"github-w1-r","type":"x","credential_keys":[]}]}"#,
+        );
+        let r = sandbox_create(&f.ctx(), &with_repo("OSH_TEST_TOK"), false);
+        std::env::remove_var("OSH_TEST_TOK");
+        r.unwrap();
+        let calls = f.calls();
+        assert!(!calls.contains("provider create"), "{calls}");
+        assert!(calls.contains("provider update github-w1-r"), "{calls}");
+        let lines: Vec<&str> = calls.lines().collect();
+        let upd = lines
+            .iter()
+            .position(|l| l.starts_with("provider update github-w1-r"))
+            .unwrap();
+        let sb = lines
+            .iter()
+            .position(|l| l.starts_with("sandbox create"))
+            .unwrap_or_else(|| panic!("{calls}"));
+        assert!(upd < sb, "{calls}");
+        assert!(lines[sb].contains("--provider github-w1-r"), "{calls}");
+        assert!(!calls.contains(&secret_value()), "{calls}");
+    }
+
+    #[test]
+    fn a_reused_provider_survives_a_failed_create() {
+        let f = Fake::new("repo-reuse-fail");
+        std::env::set_var("OSH_TEST_TOK", secret_value());
+        std::env::set_var(
+            "OSH_FAKE_PROVIDERS",
+            r#"{"providers":[{"name":"github-w1-r","type":"x","credential_keys":[]}]}"#,
+        );
+        std::env::set_var("OSH_FAKE_FAIL", "sandbox create");
+        let r = sandbox_create(&f.ctx(), &with_repo("OSH_TEST_TOK"), false);
+        std::env::remove_var("OSH_TEST_TOK");
+        assert!(r.is_err());
+        assert!(!f.calls().contains("provider delete"), "{}", f.calls());
     }
 
     #[test]
