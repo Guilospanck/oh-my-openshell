@@ -816,13 +816,17 @@ fn scan(env: &Env, stage: &Path) -> Result<Option<Vec<Value>>, String> {
         return Ok(None);
     };
     let report = stage.join(".gitleaks-report.json");
-    let mut c = Command::new(gitleaks);
-    c.arg("dir").arg(stage);
-    if env.gitleaks_config.is_file() {
-        c.arg("--config").arg(&env.gitleaks_config);
-    }
-    let out = c
-        .args([
+    let run = |dir_cmd: bool| {
+        let mut c = Command::new(gitleaks);
+        if dir_cmd {
+            c.arg("dir").arg(stage);
+        } else {
+            c.args(["detect", "--no-git", "--source"]).arg(stage);
+        }
+        if env.gitleaks_config.is_file() {
+            c.arg("--config").arg(&env.gitleaks_config);
+        }
+        c.args([
             "--no-banner",
             "--no-color",
             "--log-level",
@@ -833,7 +837,14 @@ fn scan(env: &Env, stage: &Path) -> Result<Option<Vec<Value>>, String> {
         .arg(&report)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("{SCAN_FAILED}{}: {e}", gitleaks.display()))?;
+        .map_err(|e| format!("{SCAN_FAILED}{}: {e}", gitleaks.display()))
+    };
+    let mut out = run(true)?;
+    // `dir` arrived in gitleaks 8.19; distro packages (Debian, Ubuntu) ship older ones, which
+    // scan a plain directory with `detect --no-git`.
+    if String::from_utf8_lossy(&out.stderr).contains("unknown command \"dir\"") {
+        out = run(false)?;
+    }
     // gitleaks exits 1 when it found leaks; anything else non-zero is an error.
     let code = out.status.code();
     let parsed = load(&report).and_then(|v| v.as_array().cloned());
@@ -2022,6 +2033,14 @@ mod tests {
         assert!(e.starts_with(SCAN_FAILED) && e.contains("oops"), "{e}");
         // Exit 0 without a report.
         assert!(scan(&script("exit 0"), &stage).is_err());
+        // A gitleaks older than 8.19 has no `dir`: the scan reruns as `detect --no-git`.
+        let found = scan(
+            &script("[ \"$1\" = dir ] && { echo 'Error: unknown command \"dir\" for \"gitleaks\"' >&2; exit 1; }; [ \"$1 $2\" = 'detect --no-git' ] || exit 2; while [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '[]' > \"$2\"; shift; done; exit 0"),
+            &stage,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(found.is_empty());
         // Exit 1 with a report is "leaks found", not an error.
         let found = scan(
             &script("while [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '[{\"RuleID\":\"r\",\"File\":\"f\",\"StartLine\":3}]' > \"$2\"; shift; done; exit 1"),
