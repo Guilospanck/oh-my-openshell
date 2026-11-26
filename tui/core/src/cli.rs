@@ -2104,7 +2104,12 @@ pub fn drop_generated(sandbox: &str, name: &str) -> Result<String, String> {
 
 /// `agent` is `claude-code`, `pi` or `both`.
 pub fn sync_manifest(dir: &Path, sandbox: &str, agent: &str) -> Result<SyncManifest, String> {
-    let env = agents::Env::detect(dir, &sandbox_home(sandbox));
+    sync_manifest_at(dir, &sandbox_home(sandbox), agent)
+}
+
+/// The same, for a sandbox whose `$HOME` is already known.
+fn sync_manifest_at(dir: &Path, home: &str, agent: &str) -> Result<SyncManifest, String> {
+    let env = agents::Env::detect(dir, home);
     agents::manifest(&env, agent).and_then(|t| parse_manifest(&t))
 }
 
@@ -2305,18 +2310,20 @@ fn tail_lines(text: &str) -> Vec<String> {
 /// Install the owner's agent setup into `sandbox` without asking anything: the default items (or
 /// `only`), minus uploads the secret scan flagged, once the policy allows what they need. Stops
 /// at the first failed step. `gateway` empty means the active gateway. Nothing is attached or
-/// generated, so a `Policy` result changes nothing.
+/// generated, so a `Policy` result changes nothing. `home` is the sandbox's `$HOME` when the
+/// caller knows it; `None` asks the sandbox.
 pub fn sync_apply(
     dir: &Path,
     sandbox: &str,
     agent: &str,
     only: Option<&[String]>,
     gateway: &str,
+    home: Option<&str>,
 ) -> SyncApply {
     set_thread_gateway(Some(gateway));
     let known = sandboxes().map(|l| l.iter().any(|s| s.name == sandbox));
     let r = match known {
-        Ok(true) => apply_to(dir, sandbox, agent, only),
+        Ok(true) => apply_to(dir, sandbox, agent, only, home),
         Ok(false) => SyncApply::new(sandbox, ApplyStatus::NoSandbox),
         Err(e) => SyncApply::failed(sandbox, "list sandboxes", e),
     };
@@ -2324,8 +2331,15 @@ pub fn sync_apply(
     r
 }
 
-fn apply_to(dir: &Path, sandbox: &str, agent: &str, only: Option<&[String]>) -> SyncApply {
-    let manifest = match sync_manifest(dir, sandbox, agent) {
+fn apply_to(
+    dir: &Path,
+    sandbox: &str,
+    agent: &str,
+    only: Option<&[String]>,
+    home: Option<&str>,
+) -> SyncApply {
+    let home = home.map_or_else(|| sandbox_home(sandbox), str::to_string);
+    let manifest = match sync_manifest_at(dir, &home, agent) {
         Ok(m) => m,
         Err(e) => return SyncApply::failed(sandbox, "read the agent setup", e),
     };
@@ -2905,7 +2919,7 @@ mod apply_tests {
         }
 
         fn apply(&self, only: Option<&[String]>) -> SyncApply {
-            sync_apply(&self.data(), "sb", "claude-code", only, "")
+            sync_apply(&self.data(), "sb", "claude-code", only, "", None)
         }
 
         /// The upload and install calls the fake saw, in order.
@@ -3076,9 +3090,21 @@ mod apply_tests {
     }
 
     #[test]
+    fn apply_uses_the_given_home() {
+        let s = Setup::new("apply-home", Some("clean"));
+        let r = sync_apply(&s.data(), "sb", "claude-code", None, "", Some("/sandbox"));
+        assert_eq!(r.status, ApplyStatus::Applied, "{}", r.to_json());
+        let log = s.step_log();
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert!(log[1].contains(" /sandbox/.claude/skills "), "{log:?}");
+        assert!(log[2].contains(" /sandbox/.claude/CLAUDE.md "), "{log:?}");
+        assert!(!s._fake.calls().contains("printf %s"), "no HOME probe");
+    }
+
+    #[test]
     fn apply_unknown_sandbox_is_no_sandbox() {
         let s = Setup::new("apply-nosb", Some("clean"));
-        let r = sync_apply(&s.data(), "other", "claude-code", None, "");
+        let r = sync_apply(&s.data(), "other", "claude-code", None, "", None);
         assert_eq!(r.status, ApplyStatus::NoSandbox);
         assert_eq!(r.exit_code(), 4);
         assert!(s.step_log().is_empty());

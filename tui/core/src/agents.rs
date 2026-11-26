@@ -1472,8 +1472,7 @@ pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
         String::new(),
         "both".to_string(),
     );
-    let (mut gateway, mut home, mut only) =
-        (String::new(), "/workspace".to_string(), None::<Vec<String>>);
+    let (mut gateway, mut home, mut only) = (String::new(), String::new(), None::<Vec<String>>);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut next = || it.next().cloned().unwrap_or_default();
@@ -1505,12 +1504,14 @@ pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
     }
     let only = only.as_deref();
     if mode == "--apply" {
-        // The sandbox's own HOME decides the upload targets; `--home` does not apply here.
-        let r = crate::cli::sync_apply(data_dir, &sandbox, &agent, only, &gateway);
+        // Without `--home` the sandbox's own HOME decides the upload targets.
+        let home = Some(home.as_str()).filter(|h| !h.is_empty());
+        let r = crate::cli::sync_apply(data_dir, &sandbox, &agent, only, &gateway, home);
         println!("{}", r.to_json());
         return r.exit_code();
     }
-    let env = Env::detect(data_dir, &home);
+    let home = if home.is_empty() { "/workspace" } else { &home };
+    let env = Env::detect(data_dir, home);
     let res = match mode.as_str() {
         "--dry-run" => dry_run(&env, &agent),
         "--json" => manifest(&env, &agent),
