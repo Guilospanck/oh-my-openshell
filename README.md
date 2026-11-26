@@ -406,6 +406,20 @@ If the sandbox's policy blocks an install, `K` offers to create (if needed) and 
 skills` and `pi install`). You can also create them from the Providers tab. Preview the list
 with `osh sync-agents --dry-run`.
 
+For scripts, `osh sync-agents --apply SANDBOX [--agent claude-code|pi|both] [--only ID,ID]
+[--gateway NAME]` runs the same installs without asking anything and prints one JSON object on
+stdout. It installs the default items (or `--only`), skips uploads the secret scan flagged, and
+stops at the first failed step. It checks the policy first and, when access is missing,
+changes nothing (no profile is attached or generated: use `--preflight` and `--gen-profile`).
+Running it again is safe. Keys: `sandbox`, `status` (`applied`, `nothing`, `policy`, `failed`,
+`no-sandbox`), `applied` (item ids), `skipped` (`[{"id","reason"}]`, reason `secret-scan` or
+`host-only`), `missing`, `unfixed` (`[{"host","binary"}]`), `fixes` (profile ids),
+`secret_fixes` (`[{"profile","keys"}]`), `failed_step` (`null` or `{"index","label","status",
+"tail"}`; `index` counts from 1, and is 0 when the setup or the policy could not be read) and
+`scan` (`clean`, `flagged`, or `skipped` when gitleaks is missing; the apply goes on). Exit
+codes: 0 applied or nothing to do, 1 failed, 2 usage error, 3 policy blocks an install, 4 no such
+sandbox.
+
 Opt-in profiles, attached on purpose from the Providers tab (never by `K`):
 `rust` (cargo and rustup: both the launcher in `~/.cargo/bin` and the real toolchain
 binaries, crates.io, rust-lang.org, git dependencies), `go` (module proxy and checksum

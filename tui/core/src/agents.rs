@@ -1462,7 +1462,7 @@ pub fn dry_run(env: &Env, agent: &str) -> Result<String, String> {
     Ok(out)
 }
 
-const USAGE: &str = "usage: osh sync-agents (--dry-run | --json | --preflight SANDBOX [--gateway NAME] | --gen-profile SANDBOX --name ID [--gateway NAME]) [--agent claude-code|pi|both] [--only ID,ID] [--home DIR]";
+const USAGE: &str = "usage: osh sync-agents (--dry-run | --json | --preflight SANDBOX [--gateway NAME] | --gen-profile SANDBOX --name ID [--gateway NAME] | --apply SANDBOX [--gateway NAME]) [--agent claude-code|pi|both] [--only ID,ID] [--home DIR]";
 
 /// `osh sync-agents ...`; returns the exit code.
 pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
@@ -1479,7 +1479,7 @@ pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
         let mut next = || it.next().cloned().unwrap_or_default();
         match a.as_str() {
             "--dry-run" | "--json" if mode.is_empty() => mode = a.clone(),
-            "--preflight" | "--gen-profile" => {
+            "--preflight" | "--gen-profile" | "--apply" => {
                 mode = a.clone();
                 sandbox = next();
             }
@@ -1496,13 +1496,21 @@ pub fn cli_main(args: &[String], data_dir: &Path) -> i32 {
             }
         }
     }
-    if mode.is_empty() || (mode.starts_with("--p") || mode == "--gen-profile") && sandbox.is_empty()
+    if mode.is_empty()
+        || (mode.starts_with("--p") || mode == "--gen-profile" || mode == "--apply")
+            && sandbox.is_empty()
     {
         eprintln!("{USAGE}");
         return 2;
     }
-    let env = Env::detect(data_dir, &home);
     let only = only.as_deref();
+    if mode == "--apply" {
+        // The sandbox's own HOME decides the upload targets; `--home` does not apply here.
+        let r = crate::cli::sync_apply(data_dir, &sandbox, &agent, only, &gateway);
+        println!("{}", r.to_json());
+        return r.exit_code();
+    }
+    let env = Env::detect(data_dir, &home);
     let res = match mode.as_str() {
         "--dry-run" => dry_run(&env, &agent),
         "--json" => manifest(&env, &agent),
@@ -1950,6 +1958,14 @@ mod tests {
             Value::Null,
             "no gitleaks: scan skipped"
         );
+    }
+
+    #[test]
+    fn cli_apply_without_sandbox_is_usage_error() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let dir = repo();
+        assert_eq!(cli_main(&args(&["--apply"]), &dir), 2);
+        assert_eq!(cli_main(&args(&["--apply", "--agent", "pi"]), &dir), 2);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 #   OSH_FAKE_GATEWAYS     stdout of `gateway list -o json` (default [])
 #   OSH_FAKE_GATEWAY_INFO stdout of `gateway info -o json`
 #                         (default {"compute_drivers":[{"name":"docker"}]})
+#   OSH_FAKE_POLICY       stdout of `policy get` (default {"policy":{}})
 #   OSH_FAKE_FAIL         when the joined argv contains this text, print "fake failure" on
 #                         stderr and exit 1 (the call is still logged)
 #   OSH_FAKE_FAIL_ONCE    the same, for the first matching call only (a marker file next to
@@ -50,6 +51,7 @@ fi
 
 no_sandboxes='{"sandboxes":[]}'
 no_providers='{"providers":[]}'
+no_policy='{"policy":{}}'
 docker_info='{"compute_drivers":[{"name":"docker"}]}'
 
 if [ "${1:-}" = "-g" ]; then
@@ -62,6 +64,9 @@ case "${1:-} ${2:-}" in
     ;;
 "provider list")
     printf '%s\n' "${OSH_FAKE_PROVIDERS:-$no_providers}"
+    ;;
+"policy get")
+    printf '%s\n' "${OSH_FAKE_POLICY:-$no_policy}"
     ;;
 "gateway list")
     printf '%s\n' "${OSH_FAKE_GATEWAYS:-[]}"

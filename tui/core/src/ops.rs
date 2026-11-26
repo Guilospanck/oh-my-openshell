@@ -1352,6 +1352,7 @@ pub(crate) mod tests {
     const FAKE_VARS: &[&str] = &[
         "OSH_FAKE_SANDBOXES",
         "OSH_FAKE_PROVIDERS",
+        "OSH_FAKE_POLICY",
         "OSH_FAKE_GATEWAYS",
         "OSH_FAKE_GATEWAY_INFO",
         "OSH_FAKE_FAIL",

@@ -2184,6 +2184,241 @@ pub fn sync_steps(
     steps.into_iter().skip(skip).collect()
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ApplyStatus {
+    Applied,
+    Nothing,
+    Policy,
+    Failed,
+    NoSandbox,
+}
+
+impl ApplyStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApplyStatus::Applied => "applied",
+            ApplyStatus::Nothing => "nothing",
+            ApplyStatus::Policy => "policy",
+            ApplyStatus::Failed => "failed",
+            ApplyStatus::NoSandbox => "no-sandbox",
+        }
+    }
+}
+
+/// The step an apply stopped at. `index` is 1-based, as the terminal app shows it; 0 means the
+/// apply failed before any step (the manifest or the policy could not be read).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FailedStep {
+    pub index: usize,
+    pub label: String,
+    pub status: String,
+    pub tail: Vec<String>,
+}
+
+/// What `osh sync-agents --apply` did.
+#[derive(Clone, Debug)]
+pub struct SyncApply {
+    pub sandbox: String,
+    pub status: ApplyStatus,
+    /// Ids of the items fully installed.
+    pub applied: Vec<String>,
+    /// `(id, reason)`; the reason is `secret-scan` or `host-only`.
+    pub skipped: Vec<(String, String)>,
+    pub check: Option<SyncCheck>,
+    pub failed_step: Option<FailedStep>,
+    /// `clean`, `flagged`, or `skipped` (gitleaks is not installed).
+    pub scan: String,
+}
+
+impl SyncApply {
+    fn new(sandbox: &str, status: ApplyStatus) -> SyncApply {
+        SyncApply {
+            sandbox: sandbox.into(),
+            status,
+            applied: vec![],
+            skipped: vec![],
+            check: None,
+            failed_step: None,
+            scan: "skipped".into(),
+        }
+    }
+
+    fn failed(sandbox: &str, label: &str, error: String) -> SyncApply {
+        let mut r = SyncApply::new(sandbox, ApplyStatus::Failed);
+        r.failed_step = Some(FailedStep {
+            index: 0,
+            label: label.into(),
+            status: "failed".into(),
+            tail: tail_lines(&error),
+        });
+        r
+    }
+
+    /// Millhouse parses these keys; keep them as they are.
+    pub fn to_json(&self) -> String {
+        let pairs = |p: &[(String, String)]| -> Vec<Value> {
+            p.iter()
+                .map(|(h, b)| serde_json::json!({"host": h, "binary": b}))
+                .collect()
+        };
+        let c = self.check.clone().unwrap_or_default();
+        serde_json::json!({
+            "sandbox": self.sandbox,
+            "status": self.status.as_str(),
+            "applied": self.applied,
+            "skipped": self.skipped.iter()
+                .map(|(id, why)| serde_json::json!({"id": id, "reason": why}))
+                .collect::<Vec<_>>(),
+            "missing": pairs(&c.missing),
+            "fixes": c.fixes,
+            "secret_fixes": c.secret_fixes.iter()
+                .map(|(p, k)| serde_json::json!({"profile": p, "keys": k}))
+                .collect::<Vec<_>>(),
+            "unfixed": pairs(&c.unfixed),
+            "failed_step": self.failed_step.as_ref().map(|f| serde_json::json!({
+                "index": f.index, "label": f.label, "status": f.status, "tail": f.tail,
+            })),
+            "scan": self.scan,
+        })
+        .to_string()
+    }
+
+    pub fn exit_code(&self) -> i32 {
+        match self.status {
+            ApplyStatus::Applied | ApplyStatus::Nothing => 0,
+            ApplyStatus::Failed => 1,
+            ApplyStatus::Policy => 3,
+            ApplyStatus::NoSandbox => 4,
+        }
+    }
+}
+
+/// The last lines of a command's output.
+fn tail_lines(text: &str) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(10)..]
+        .iter()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+/// Install the owner's agent setup into `sandbox` without asking anything: the default items (or
+/// `only`), minus uploads the secret scan flagged, once the policy allows what they need. Stops
+/// at the first failed step. `gateway` empty means the active gateway. Nothing is attached or
+/// generated, so a `Policy` result changes nothing.
+pub fn sync_apply(
+    dir: &Path,
+    sandbox: &str,
+    agent: &str,
+    only: Option<&[String]>,
+    gateway: &str,
+) -> SyncApply {
+    set_thread_gateway(Some(gateway));
+    let known = sandboxes().map(|l| l.iter().any(|s| s.name == sandbox));
+    let r = match known {
+        Ok(true) => apply_to(dir, sandbox, agent, only),
+        Ok(false) => SyncApply::new(sandbox, ApplyStatus::NoSandbox),
+        Err(e) => SyncApply::failed(sandbox, "list sandboxes", e),
+    };
+    set_thread_gateway(None);
+    r
+}
+
+fn apply_to(dir: &Path, sandbox: &str, agent: &str, only: Option<&[String]>) -> SyncApply {
+    let manifest = match sync_manifest(dir, sandbox, agent) {
+        Ok(m) => m,
+        Err(e) => return SyncApply::failed(sandbox, "read the agent setup", e),
+    };
+    let r = apply_manifest(dir, sandbox, agent, &manifest, only);
+    let _ = std::fs::remove_dir_all(&manifest.stage_dir);
+    r
+}
+
+fn apply_manifest(
+    dir: &Path,
+    sandbox: &str,
+    agent: &str,
+    manifest: &SyncManifest,
+    only: Option<&[String]>,
+) -> SyncApply {
+    let mut r = SyncApply::new(sandbox, ApplyStatus::Nothing);
+    r.scan = match (manifest.findings, manifest.flagged.is_empty()) {
+        (None, _) => "skipped",
+        (_, true) => "clean",
+        _ => "flagged",
+    }
+    .into();
+    let flagged = manifest.flagged_ids();
+    let mut ids = Vec::new();
+    for item in &manifest.items {
+        let wanted = match only {
+            Some(o) => o.contains(&item.id),
+            None => item.default,
+        };
+        if !wanted {
+            continue;
+        }
+        if item.kind == "host-only" {
+            if only.is_some() {
+                r.skipped.push((item.id.clone(), "host-only".into()));
+            }
+        } else if flagged.contains(&item.id) {
+            r.skipped.push((item.id.clone(), "secret-scan".into()));
+        } else {
+            ids.push(item.id.clone());
+        }
+    }
+    if ids.is_empty() {
+        return r;
+    }
+    match sync_check(dir, sandbox, agent, &ids) {
+        Ok(c) if c.ok => r.check = Some(c),
+        Ok(c) => {
+            r.check = Some(c);
+            r.status = ApplyStatus::Policy;
+            return r;
+        }
+        Err(e) => {
+            let mut f = SyncApply::failed(sandbox, "check the policy", e);
+            f.skipped = r.skipped;
+            f.scan = r.scan;
+            return f;
+        }
+    }
+    let steps = sync_steps(sandbox, agent, manifest, &ids, 0);
+    let mut done = 0;
+    for (n, step) in steps.iter().enumerate() {
+        if let Err(e) = run(&step.prog, &step.args, &[]) {
+            r.status = ApplyStatus::Failed;
+            r.failed_step = Some(FailedStep {
+                index: n + 1,
+                label: step.label(),
+                status: "failed".into(),
+                tail: tail_lines(&e),
+            });
+            break;
+        }
+        done = n + 1;
+    }
+    // An item counts once all its steps ran; ids run in manifest order, as the steps do.
+    let mut used = 0;
+    for id in &ids {
+        let count = sync_steps(sandbox, agent, manifest, std::slice::from_ref(id), 0).len();
+        if count > 0 && used + count <= done {
+            r.applied.push(id.clone());
+        }
+        used += count;
+    }
+    if r.failed_step.is_none() {
+        r.status = if r.applied.is_empty() {
+            ApplyStatus::Nothing
+        } else {
+            ApplyStatus::Applied
+        };
+    }
+    r
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -2586,5 +2821,290 @@ mod tests {
         std::fs::write(d.join("a/b/x.tar"), "t").unwrap();
         assert!(find_file(&d, "x.tar").is_some() && find_file(&d, "y.tar").is_none());
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    use crate::ops::tests::Fake;
+    use std::os::unix::fs::PermissionsExt;
+
+    const ALLOW_ALL: &str = r#"{"policy":{"network_policies":{"all":{"endpoints":[{"host":"*","port":443}],"binaries":[{"path":"*"}]}}}}"#;
+    const NPM_ONLY: &str = r#"{"policy":{"network_policies":{"npm":{"endpoints":[{"host":"registry.npmjs.org","port":443}],"binaries":[{"path":"*"}]}}}}"#;
+
+    /// A host agent setup, a stand-in gitleaks and a sandbox named `sb`, all private to the test.
+    struct Setup {
+        _fake: Fake,
+        root: PathBuf,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl Setup {
+        fn new(tag: &str, scan: Option<&str>) -> Setup {
+            let fake = Fake::new(tag);
+            let root = fake.dir.parent().unwrap().join("host");
+            let w = |p: PathBuf, c: &str| {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+                std::fs::write(p, c).unwrap();
+            };
+            let claude = root.join(".claude");
+            w(claude.join("skills/own-one/SKILL.md"), "# one\n");
+            w(claude.join("CLAUDE.md"), "# global\n");
+            w(
+                claude.join("plugins/installed_plugins.json"),
+                r#"{"plugins":{"superpowers@official":[{"version":"1.2","gitCommitSha":"0123456789abcdef0123456789abcdef01234567"}]}}"#,
+            );
+            w(
+                claude.join("plugins/known_marketplaces.json"),
+                r#"{"official":{"source":{"source":"github","repo":"acme/plugins"}}}"#,
+            );
+            let bin = root.join("bin");
+            if let Some(report) = scan {
+                // The stand-in reports `report` ("clean" or "flagged") for the staged files.
+                let body = if report == "flagged" {
+                    "f=$(find \"$2\" -name SKILL.md | head -1); r=\"[{\\\"RuleID\\\":\\\"k\\\",\\\"File\\\":\\\"$f\\\",\\\"StartLine\\\":1}]\""
+                } else {
+                    "r='[]'"
+                };
+                w(
+                    bin.join("gitleaks"),
+                    &format!("#!/bin/sh\n{body}\nwhile [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '%s' \"$r\" > \"$2\"; shift; done\n"),
+                );
+                std::fs::set_permissions(
+                    bin.join("gitleaks"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }
+            let keys = ["HOME", "CLAUDE_CONFIG_DIR", "PATH"];
+            let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+            std::env::set_var("HOME", &root);
+            std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
+            let mut dirs = vec![bin];
+            dirs.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+            std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+            std::env::set_var(
+                "OSH_FAKE_SANDBOXES",
+                r#"{"sandboxes":[{"name":"sb","phase":"Ready"}]}"#,
+            );
+            std::env::set_var("OSH_FAKE_POLICY", ALLOW_ALL);
+            Setup {
+                _fake: fake,
+                root,
+                saved,
+            }
+        }
+
+        fn data(&self) -> PathBuf {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .unwrap()
+                .to_path_buf()
+        }
+
+        fn apply(&self, only: Option<&[String]>) -> SyncApply {
+            sync_apply(&self.data(), "sb", "claude-code", only, "")
+        }
+
+        /// The upload and install calls the fake saw, in order.
+        fn step_log(&self) -> Vec<String> {
+            self._fake
+                .calls()
+                .lines()
+                .filter(|l| l.starts_with("sandbox upload") || l.contains("plugin install"))
+                .map(String::from)
+                .collect()
+        }
+    }
+
+    impl Drop for Setup {
+        fn drop(&mut self) {
+            for (k, v) in &self.saved {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+            let _ = &self.root;
+        }
+    }
+
+    fn default_ids(s: &Setup) -> Vec<String> {
+        let m = sync_manifest(&s.data(), "sb", "claude-code").unwrap();
+        let ids = m
+            .items
+            .iter()
+            .filter(|i| i.default && i.kind != "host-only")
+            .map(|i| i.id.clone())
+            .collect();
+        let _ = std::fs::remove_dir_all(&m.stage_dir);
+        ids
+    }
+
+    #[test]
+    fn apply_policy_missing_runs_no_step() {
+        let s = Setup::new("apply-policy", Some("clean"));
+        std::env::set_var("OSH_FAKE_POLICY", NPM_ONLY);
+        let r = s.apply(None);
+        assert_eq!(r.status, ApplyStatus::Policy);
+        assert!(r
+            .check
+            .as_ref()
+            .unwrap()
+            .missing
+            .iter()
+            .any(|(h, _)| h == "github.com"));
+        assert_eq!(r.exit_code(), 3);
+        assert!(s.step_log().is_empty());
+        let calls = s._fake.calls();
+        assert!(!calls.contains("sandbox upload"));
+        // Only the home-directory probe may exec.
+        assert!(calls
+            .lines()
+            .filter(|l| l.starts_with("sandbox exec"))
+            .all(|l| l.contains("printf %s")));
+        let j: Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(j["status"], "policy");
+        assert_eq!(j["missing"][0]["host"], "github.com");
+        assert!(j["failed_step"].is_null());
+    }
+
+    #[test]
+    fn apply_runs_default_items_in_order_and_is_applied() {
+        let s = Setup::new("apply-run", Some("clean"));
+        let want = default_ids(&s);
+        assert!(want.len() >= 3, "{want:?}");
+        let r = s.apply(None);
+        assert_eq!(r.status, ApplyStatus::Applied, "{}", r.to_json());
+        assert_eq!(r.applied, want);
+        assert_eq!(r.scan, "clean");
+        assert_eq!(r.exit_code(), 0);
+        let log = s.step_log();
+        assert_eq!(log.len(), 3, "{log:?}");
+        assert!(log[0].contains("plugin install"));
+        assert!(
+            log[1].starts_with("sandbox upload sb") && log[1].contains("skills/own-one"),
+            "{log:?}"
+        );
+        assert!(log[2].starts_with("sandbox upload sb") && log[2].contains("CLAUDE.md"));
+    }
+
+    #[test]
+    fn apply_twice_gives_the_same_report() {
+        let s = Setup::new("apply-twice", Some("clean"));
+        let (a, b) = (s.apply(None), s.apply(None));
+        assert_eq!(a.to_json(), b.to_json());
+        let log = s.step_log();
+        assert_eq!(log.len(), 6);
+        assert_eq!(log[..3].len(), log[3..].len());
+        for (x, y) in log[..3].iter().zip(&log[3..]) {
+            // The staging directory differs per run; the command and the target do not.
+            assert_eq!(x.rsplit('/').next(), y.rsplit('/').next());
+        }
+    }
+
+    #[test]
+    fn apply_skips_flagged_uploads() {
+        let s = Setup::new("apply-flag", Some("flagged"));
+        let r = s.apply(None);
+        assert_eq!(r.scan, "flagged");
+        assert_eq!(r.status, ApplyStatus::Applied, "{}", r.to_json());
+        let skipped: Vec<_> = r
+            .skipped
+            .iter()
+            .map(|(i, why)| (i.as_str(), why.as_str()))
+            .collect();
+        assert_eq!(skipped, vec![("own-skills:own-one", "secret-scan")]);
+        assert!(!r.applied.contains(&"own-skills:own-one".to_string()));
+        assert!(r.applied.contains(&"context:CLAUDE.md".to_string()));
+        assert_eq!(s.step_log().len(), 2);
+    }
+
+    #[test]
+    fn apply_without_gitleaks_reports_scan_skipped_and_goes_on() {
+        let s = Setup::new("apply-noscan", None);
+        // Hide any gitleaks on the machine.
+        std::env::set_var(
+            "PATH",
+            format!(
+                "{}:/bin:/usr/bin",
+                s._fake.dir.parent().unwrap().join("bin").display()
+            ),
+        );
+        let r = s.apply(None);
+        assert_eq!(r.scan, "skipped");
+        assert_eq!(r.status, ApplyStatus::Applied, "{}", r.to_json());
+    }
+
+    #[test]
+    fn apply_stops_at_the_first_failed_step() {
+        let s = Setup::new("apply-fail", Some("clean"));
+        // Step 1 adds the marketplace, step 2 installs the plugin.
+        std::env::set_var("OSH_FAKE_FAIL", "plugin install");
+        let r = s.apply(None);
+        assert_eq!(r.status, ApplyStatus::Failed);
+        let f = r.failed_step.as_ref().unwrap();
+        assert_eq!(f.index, 2);
+        assert!(f.label.contains("plugin install"), "{}", f.label);
+        assert!(
+            f.tail.iter().any(|l| l.contains("fake failure")),
+            "{:?}",
+            f.tail
+        );
+        assert!(
+            !s._fake.calls().contains("sandbox upload"),
+            "later steps must not run"
+        );
+        assert!(r.applied.is_empty());
+        assert_eq!(r.exit_code(), 1);
+        let j: Value = serde_json::from_str(&r.to_json()).unwrap();
+        assert_eq!(j["failed_step"]["index"], 2);
+        assert_eq!(j["status"], "failed");
+    }
+
+    #[test]
+    fn apply_failure_keeps_the_items_done_before_it() {
+        let s = Setup::new("apply-partial", Some("clean"));
+        std::env::set_var("OSH_FAKE_FAIL", "skills/own-one");
+        let r = s.apply(None);
+        assert_eq!(r.status, ApplyStatus::Failed);
+        assert_eq!(r.failed_step.as_ref().unwrap().index, 3);
+        assert_eq!(r.applied, vec!["plugins:superpowers".to_string()]);
+        assert!(!s._fake.calls().contains("CLAUDE.md"));
+    }
+
+    #[test]
+    fn apply_unknown_sandbox_is_no_sandbox() {
+        let s = Setup::new("apply-nosb", Some("clean"));
+        let r = sync_apply(&s.data(), "other", "claude-code", None, "");
+        assert_eq!(r.status, ApplyStatus::NoSandbox);
+        assert_eq!(r.exit_code(), 4);
+        assert!(s.step_log().is_empty());
+        assert!(!s._fake.calls().contains("sandbox exec"));
+    }
+
+    #[test]
+    fn apply_removes_stage_dir_on_failure() {
+        let s = Setup::new("apply-stage", Some("clean"));
+        std::env::set_var("OSH_FAKE_FAIL", "skills/own-one");
+        let stages = || -> usize {
+            std::fs::read_dir(std::env::temp_dir())
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(&format!("sync-agents-{}-", std::process::id()))
+                })
+                .count()
+        };
+        let before = stages();
+        assert_eq!(s.apply(None).status, ApplyStatus::Failed);
+        std::env::set_var("OSH_FAKE_FAIL", "");
+        std::env::set_var("OSH_FAKE_POLICY", NPM_ONLY);
+        assert_eq!(s.apply(None).status, ApplyStatus::Policy);
+        assert_eq!(stages(), before);
     }
 }
