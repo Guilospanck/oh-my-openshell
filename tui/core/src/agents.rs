@@ -819,25 +819,20 @@ fn scan(env: &Env, stage: &Path) -> Result<Option<Vec<Value>>, String> {
     let run = |dir_cmd: bool| {
         let mut c = Command::new(gitleaks);
         if dir_cmd {
-            c.arg("dir").arg(stage);
+            // `--no-color` is as new as `dir`: the older `detect` rejects it.
+            c.arg("dir").arg(stage).arg("--no-color");
         } else {
             c.args(["detect", "--no-git", "--source"]).arg(stage);
         }
         if env.gitleaks_config.is_file() {
             c.arg("--config").arg(&env.gitleaks_config);
         }
-        c.args([
-            "--no-banner",
-            "--no-color",
-            "--log-level",
-            "error",
-            "--redact",
-        ])
-        .args(["--report-format", "json", "--report-path"])
-        .arg(&report)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("{SCAN_FAILED}{}: {e}", gitleaks.display()))
+        c.args(["--no-banner", "--log-level", "error", "--redact"])
+            .args(["--report-format", "json", "--report-path"])
+            .arg(&report)
+            .stdin(Stdio::null())
+            .output()
+            .map_err(|e| format!("{SCAN_FAILED}{}: {e}", gitleaks.display()))
     };
     let mut out = run(true)?;
     // `dir` arrived in gitleaks 8.19; distro packages (Debian, Ubuntu) ship older ones, which
@@ -2033,9 +2028,10 @@ mod tests {
         assert!(e.starts_with(SCAN_FAILED) && e.contains("oops"), "{e}");
         // Exit 0 without a report.
         assert!(scan(&script("exit 0"), &stage).is_err());
-        // A gitleaks older than 8.19 has no `dir`: the scan reruns as `detect --no-git`.
+        // A gitleaks older than 8.19 has no `dir`: the scan reruns as `detect --no-git`, without
+        // `--no-color`, which it does not know either.
         let found = scan(
-            &script("[ \"$1\" = dir ] && { echo 'Error: unknown command \"dir\" for \"gitleaks\"' >&2; exit 1; }; [ \"$1 $2\" = 'detect --no-git' ] || exit 2; while [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '[]' > \"$2\"; shift; done; exit 0"),
+            &script("[ \"$1\" = dir ] && { echo 'Error: unknown command \"dir\" for \"gitleaks\"' >&2; exit 1; }; [ \"$1 $2\" = 'detect --no-git' ] || exit 2; case \"$*\" in *--no-color*) echo 'Error: unknown flag: --no-color' >&2; exit 126;; esac; while [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '[]' > \"$2\"; shift; done; exit 0"),
             &stage,
         )
         .unwrap()
