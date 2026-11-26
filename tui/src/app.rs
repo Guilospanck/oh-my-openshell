@@ -12,8 +12,8 @@ use crate::preload;
 use crate::settingsview::Act;
 use crate::term::{self, Session};
 use crate::watch::{self, Blocked, Denial, Follow, Prompt, State, Watch};
+use osh_core::sandbox;
 pub use osh_core::sandbox::Step;
-use osh_core::sandbox::{self, SANDBOX_PATH};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 use std::{
     io::Write,
@@ -920,67 +920,15 @@ fn sync_label(i: &cli::SyncItem) -> String {
     format!("{:<11} {}  [{}]{tag}", i.group, i.name, agents.join(", "))
 }
 
-/// Commands run in the sandbox with `~/.local/bin` on PATH: uv installs there and the
-/// sandbox PATH lacks it.
-fn in_sandbox(sandbox: &str, command: &str) -> Step {
-    Step {
-        prog: "openshell".into(),
-        args: cli::with_gateway(vec![
-            "sandbox".into(),
-            "exec".into(),
-            "-n".into(),
-            sandbox.into(),
-            "--timeout".into(),
-            "900".into(),
-            "--".into(),
-            "sh".into(),
-            "-c".into(),
-            format!("{SANDBOX_PATH}{command}"),
-        ]),
-    }
-}
-
 /// Steps for the chosen items, in manifest order, for the chosen agents.
 pub fn sync_steps(plan: &SyncPlan) -> Vec<Step> {
-    let wanted: &[&str] = match plan.agent.as_str() {
-        "both" => &["claude-code", "pi"],
-        "pi" => &["pi"],
-        _ => &["claude-code"],
-    };
-    let mut steps = Vec::new();
-    for item in plan
-        .manifest
-        .items
-        .iter()
-        .filter(|i| plan.ids.contains(&i.id))
-    {
-        for (_, spec) in item
-            .agents
-            .iter()
-            .filter(|(a, _)| wanted.contains(&a.as_str()))
-        {
-            if let Some(cmds) = spec.as_array() {
-                steps.extend(
-                    cmds.iter()
-                        .filter_map(|c| c.as_str())
-                        .map(|c| in_sandbox(&plan.sandbox, c)),
-                );
-            } else if let (Some(src), Some(dest)) = (spec["src"].as_str(), spec["dest"].as_str()) {
-                steps.push(Step {
-                    prog: "openshell".into(),
-                    args: cli::with_gateway(vec![
-                        "sandbox".into(),
-                        "upload".into(),
-                        plan.sandbox.clone(),
-                        src.into(),
-                        dest.into(),
-                        "--no-git-ignore".into(),
-                    ]),
-                });
-            }
-        }
-    }
-    steps.into_iter().skip(plan.skip).collect()
+    cli::sync_steps(
+        &plan.sandbox,
+        &plan.agent,
+        &plan.manifest,
+        &plan.ids,
+        plan.skip,
+    )
 }
 
 /// Choices when the gateway refuses to attach `profile`: detach one of the others (only

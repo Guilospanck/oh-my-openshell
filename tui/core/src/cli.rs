@@ -2,6 +2,7 @@
 use crate::agents;
 use crate::ghrepo::{self, Forge, GhRepo, Tracked};
 use crate::platform::{self, Runtime};
+use crate::sandbox::{Step, SANDBOX_PATH};
 use saphyr::LoadableYamlNode;
 use serde_json::Value;
 use std::{
@@ -2118,8 +2119,119 @@ pub fn sync_check(
     agents::check(&env, agent, sandbox, &gateway(), Some(ids)).and_then(|t| parse_check(&t))
 }
 
+/// Commands run in the sandbox with `~/.local/bin` on PATH: uv installs there and the
+/// sandbox PATH lacks it.
+fn in_sandbox(sandbox: &str, command: &str) -> Step {
+    Step {
+        prog: "openshell".into(),
+        args: with_gateway(vec![
+            "sandbox".into(),
+            "exec".into(),
+            "-n".into(),
+            sandbox.into(),
+            "--timeout".into(),
+            "900".into(),
+            "--".into(),
+            "sh".into(),
+            "-c".into(),
+            format!("{SANDBOX_PATH}{command}"),
+        ]),
+    }
+}
+
+/// Steps for the chosen items, in manifest order, for the chosen agents (`claude-code`,
+/// `pi` or `both`); `skip` drops that many leading steps.
+pub fn sync_steps(
+    sandbox: &str,
+    agent: &str,
+    manifest: &SyncManifest,
+    ids: &[String],
+    skip: usize,
+) -> Vec<Step> {
+    let wanted: &[&str] = match agent {
+        "both" => &["claude-code", "pi"],
+        "pi" => &["pi"],
+        _ => &["claude-code"],
+    };
+    let mut steps = Vec::new();
+    for item in manifest.items.iter().filter(|i| ids.contains(&i.id)) {
+        for (_, spec) in item
+            .agents
+            .iter()
+            .filter(|(a, _)| wanted.contains(&a.as_str()))
+        {
+            if let Some(cmds) = spec.as_array() {
+                steps.extend(
+                    cmds.iter()
+                        .filter_map(|c| c.as_str())
+                        .map(|c| in_sandbox(sandbox, c)),
+                );
+            } else if let (Some(src), Some(dest)) = (spec["src"].as_str(), spec["dest"].as_str()) {
+                steps.push(Step {
+                    prog: "openshell".into(),
+                    args: with_gateway(vec![
+                        "sandbox".into(),
+                        "upload".into(),
+                        sandbox.into(),
+                        src.into(),
+                        dest.into(),
+                        "--no-git-ignore".into(),
+                    ]),
+                });
+            }
+        }
+    }
+    steps.into_iter().skip(skip).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sync_steps_orders_uploads_and_runs_per_agent() {
+        use serde_json::json;
+        let item = |id: &str, kind: &str, agents: Vec<(&str, serde_json::Value)>| super::SyncItem {
+            id: id.into(),
+            group: "g".into(),
+            name: id.into(),
+            default: true,
+            kind: kind.into(),
+            agents: agents
+                .into_iter()
+                .map(|(a, v)| (a.to_string(), v))
+                .collect(),
+        };
+        let m = super::SyncManifest {
+            items: vec![
+                item(
+                    "r",
+                    "run",
+                    vec![
+                        ("claude-code", json!(["echo a"])),
+                        ("pi", json!(["echo b"])),
+                    ],
+                ),
+                item(
+                    "u",
+                    "upload",
+                    vec![("claude-code", json!({"src": "/s", "dest": "/d"}))],
+                ),
+            ],
+            ..Default::default()
+        };
+        let ids = vec!["r".to_string(), "u".to_string()];
+        let steps = super::sync_steps("sb", "claude-code", &m, &ids, 0);
+        assert_eq!(steps.len(), 2);
+        assert!(steps[0].args.iter().any(|a| a.ends_with("echo a")));
+        assert!(steps
+            .iter()
+            .all(|s| !s.args.iter().any(|a| a.ends_with("echo b"))));
+        assert!(steps[1].args.contains(&"upload".to_string()));
+        assert!(steps[1].args.contains(&"--no-git-ignore".to_string()));
+        let skipped = super::sync_steps("sb", "claude-code", &m, &ids, 1);
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].args.contains(&"upload".to_string()));
+    }
+
     #[test]
     fn gateway_choice_is_per_thread() {
         use std::sync::{Arc, Barrier};
