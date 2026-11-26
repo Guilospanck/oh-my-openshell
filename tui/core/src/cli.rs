@@ -1421,6 +1421,27 @@ impl SyncManifest {
         ids
     }
 
+    /// Files with a finding that lie in no item's staged files (a path form `flagged_ids`
+    /// cannot place, say). Nothing tells which upload holds them.
+    pub fn unmatched_findings(&self) -> Vec<String> {
+        let stage = Path::new(&self.stage_dir);
+        let mut files: Vec<String> = Vec::new();
+        for (file, _, _) in &self.flagged {
+            let at = stage.join(file);
+            let placed = self.items.iter().any(|i| {
+                i.agents.iter().any(|(_, spec)| {
+                    spec["src"]
+                        .as_str()
+                        .is_some_and(|src| at.starts_with(stage.join(src)))
+                })
+            });
+            if !placed && !files.contains(file) {
+                files.push(file.clone());
+            }
+        }
+        files
+    }
+
     /// The findings as lines for a viewer: which file, which rule, which line (values redacted).
     pub fn findings_text(&self) -> String {
         let mut out = String::from(
@@ -2307,9 +2328,10 @@ fn tail_lines(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Install the owner's agent setup into `sandbox` without asking anything: the default items (or
-/// `only`), minus uploads the secret scan flagged, once the policy allows what they need. Stops
-/// at the first failed step. `gateway` empty means the active gateway. Nothing is attached or
+/// Install the owner's agent setup into `sandbox` without asking anything: the default items
+/// but the repo memory (or `only`), minus uploads the secret scan flagged, once the policy allows
+/// what they need. A finding that belongs to no item fails the apply before anything is
+/// uploaded. Stops at the first failed step. `gateway` empty means the active gateway. Nothing is attached or
 /// generated, so a `Policy` result changes nothing. `home` is the sandbox's `$HOME` when the
 /// caller knows it; `None` asks the sandbox.
 pub fn sync_apply(
@@ -2355,6 +2377,11 @@ fn apply_to(
     r
 }
 
+/// The repo memory item: it holds the notes of the checkout osh runs in, so an unattended
+/// apply, whose caller's working directory is no checkout of the sandbox's project, installs
+/// it only when `--only` names it.
+pub const MEMORY_ITEM: &str = "context:memory";
+
 fn apply_manifest(
     dir: &Path,
     sandbox: &str,
@@ -2369,12 +2396,26 @@ fn apply_manifest(
         _ => "flagged",
     }
     .into();
+    // A finding no item owns could be in any upload: upload none.
+    let stray = manifest.unmatched_findings();
+    if !stray.is_empty() {
+        let mut f = SyncApply::failed(
+            sandbox,
+            "secret scan",
+            format!(
+                "the secret scan flagged files that belong to no item, so nothing was uploaded:\n{}",
+                stray.join("\n")
+            ),
+        );
+        f.scan = r.scan;
+        return f;
+    }
     let flagged = manifest.flagged_ids();
     let mut ids = Vec::new();
     for item in &manifest.items {
         let wanted = match only {
             Some(o) => o.contains(&item.id),
-            None => item.default,
+            None => item.default && item.id != MEMORY_ITEM,
         };
         if !wanted {
             continue;
@@ -2882,15 +2923,17 @@ mod apply_tests {
             );
             let bin = root.join("bin");
             if let Some(report) = scan {
-                // The stand-in reports `report` ("clean" or "flagged") for the staged files.
-                let body = if report == "flagged" {
-                    "f=$(find \"$2\" -name SKILL.md | head -1); r=\"[{\\\"RuleID\\\":\\\"k\\\",\\\"File\\\":\\\"$f\\\",\\\"StartLine\\\":1}]\""
-                } else {
-                    "r='[]'"
+                // The stand-in reports `report` for the staged files: "clean", "flagged" (a
+                // finding in a skill) or "stray" (a finding whose path, given in another form,
+                // matches no item).
+                let body = match report {
+                    "flagged" => "f=$(find \"$2\" -name SKILL.md | head -1); r=\"[{\\\"RuleID\\\":\\\"k\\\",\\\"File\\\":\\\"$f\\\",\\\"StartLine\\\":1}]\"",
+                    "stray" => "r=\"[{\\\"RuleID\\\":\\\"k\\\",\\\"File\\\":\\\"/private$2/skills/own-one/SKILL.md\\\",\\\"StartLine\\\":1}]\"",
+                    _ => "r='[]'",
                 };
                 w(
                     bin.join("gitleaks"),
-                    &format!("#!/bin/sh\n{body}\nwhile [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '%s' \"$r\" > \"$2\"; shift; done\n"),
+                    &format!("#!/bin/sh\n{}\n{body}\nwhile [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '%s' \"$r\" > \"$2\"; shift; done\n", record_stage(&root)),
                 );
                 std::fs::set_permissions(
                     bin.join("gitleaks"),
@@ -2898,7 +2941,7 @@ mod apply_tests {
                 )
                 .unwrap();
             }
-            let keys = ["HOME", "CLAUDE_CONFIG_DIR", "PATH"];
+            let keys = ["HOME", "CLAUDE_CONFIG_DIR", "PATH", "OSH_DIR"];
             let saved = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
             std::env::set_var("HOME", &root);
             std::env::set_var("CLAUDE_CONFIG_DIR", &claude);
@@ -2952,17 +2995,27 @@ mod apply_tests {
         }
     }
 
-    /// How many staging directories this process has left in the temp dir.
-    fn stage_dirs() -> usize {
-        std::fs::read_dir(std::env::temp_dir())
-            .unwrap()
-            .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with(&format!("sync-agents-{}-", std::process::id()))
-            })
-            .count()
+    /// The shell line a stand-in gitleaks starts with: it notes the directory it scans
+    /// (`gitleaks dir <stage> ...`) in `<root>/stages`.
+    fn record_stage(root: &Path) -> String {
+        format!("echo \"$2\" >> '{}'", root.join("stages").display())
+    }
+
+    /// The staging directories the stand-in gitleaks scanned, asserting it scanned one.
+    fn scanned_stages(s: &Setup) -> Vec<PathBuf> {
+        let dirs: Vec<PathBuf> = std::fs::read_to_string(s.root.join("stages"))
+            .unwrap_or_default()
+            .lines()
+            .map(PathBuf::from)
+            .collect();
+        assert!(!dirs.is_empty(), "gitleaks scanned no stage dir");
+        dirs
+    }
+
+    fn assert_stages_removed(s: &Setup) {
+        for d in scanned_stages(s) {
+            assert!(!d.exists(), "{} was left behind", d.display());
+        }
     }
 
     fn default_ids(s: &Setup) -> Vec<String> {
@@ -3127,10 +3180,12 @@ mod apply_tests {
         // gitleaks is installed but breaks: exit 2, no report.
         std::fs::write(
             s.root.join("bin/gitleaks"),
-            "#!/bin/sh\necho 'config error: boom' >&2\nexit 2\n",
+            format!(
+                "#!/bin/sh\n{}\necho 'config error: boom' >&2\nexit 2\n",
+                record_stage(&s.root)
+            ),
         )
         .unwrap();
-        let before = stage_dirs();
         let r = s.apply(None);
         assert_eq!(r.status, ApplyStatus::Failed, "{}", r.to_json());
         let f = r.failed_step.as_ref().unwrap();
@@ -3143,7 +3198,7 @@ mod apply_tests {
         assert_eq!(r.exit_code(), 1);
         assert!(!s._fake.calls().contains("sandbox upload"));
         assert!(s.step_log().is_empty());
-        assert_eq!(stage_dirs(), before);
+        assert_stages_removed(&s);
     }
 
     #[test]
@@ -3160,11 +3215,76 @@ mod apply_tests {
     fn apply_removes_stage_dir_on_failure() {
         let s = Setup::new("apply-stage", Some("clean"));
         std::env::set_var("OSH_FAKE_FAIL", "skills/own-one");
-        let before = stage_dirs();
         assert_eq!(s.apply(None).status, ApplyStatus::Failed);
+        assert_stages_removed(&s);
         std::env::set_var("OSH_FAKE_FAIL", "");
         std::env::set_var("OSH_FAKE_POLICY", NPM_ONLY);
+        let _ = std::fs::remove_file(s.root.join("stages"));
         assert_eq!(s.apply(None).status, ApplyStatus::Policy);
-        assert_eq!(stage_dirs(), before);
+        assert_stages_removed(&s);
+    }
+
+    /// Gives the host Claude memory for the repo at `OSH_DIR`, as osh run from that checkout
+    /// would see it.
+    fn with_memory(s: &Setup) {
+        let repo = s.root.join("some-repo");
+        std::env::set_var("OSH_DIR", &repo);
+        let slug: String = repo
+            .to_string_lossy()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let mem = s.root.join(".claude/projects").join(slug).join("memory");
+        std::fs::create_dir_all(&mem).unwrap();
+        std::fs::write(mem.join("MEMORY.md"), "- private notes of some-repo\n").unwrap();
+    }
+
+    #[test]
+    fn apply_skips_memory_by_default() {
+        let s = Setup::new("apply-nomem", Some("clean"));
+        with_memory(&s);
+        // The terminal app offers it by default; an unattended apply must not.
+        assert!(default_ids(&s).contains(&MEMORY_ITEM.to_string()));
+        let r = s.apply(None);
+        assert_eq!(r.status, ApplyStatus::Applied, "{}", r.to_json());
+        assert!(
+            !r.applied.contains(&MEMORY_ITEM.to_string()),
+            "{:?}",
+            r.applied
+        );
+        assert!(!s._fake.calls().contains("projects/-workspace"));
+        assert_eq!(s.step_log().len(), 3, "{:?}", s.step_log());
+    }
+
+    #[test]
+    fn apply_includes_memory_when_named() {
+        let s = Setup::new("apply-mem", Some("clean"));
+        with_memory(&s);
+        let r = s.apply(Some(&[MEMORY_ITEM.to_string()]));
+        assert_eq!(r.status, ApplyStatus::Applied, "{}", r.to_json());
+        assert_eq!(r.applied, vec![MEMORY_ITEM.to_string()]);
+        let log = s.step_log();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert!(log[0].contains("/.claude/projects/-workspace"), "{log:?}");
+    }
+
+    #[test]
+    fn apply_fails_when_a_finding_matches_no_item() {
+        let s = Setup::new("apply-stray", Some("stray"));
+        let r = s.apply(None);
+        assert_eq!(r.status, ApplyStatus::Failed, "{}", r.to_json());
+        assert_eq!(r.scan, "flagged");
+        let f = r.failed_step.as_ref().unwrap();
+        assert_eq!((f.index, f.label.as_str()), (0, "secret scan"));
+        assert!(
+            f.tail.iter().any(|l| l.contains("skills/own-one/SKILL.md")),
+            "{:?}",
+            f.tail
+        );
+        assert!(r.applied.is_empty());
+        assert_eq!(r.exit_code(), 1);
+        assert!(!s._fake.calls().contains("sandbox upload"));
+        assert!(s.step_log().is_empty());
+        assert_stages_removed(&s);
     }
 }

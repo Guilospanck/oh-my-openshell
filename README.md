@@ -407,9 +407,12 @@ skills` and `pi install`). You can also create them from the Providers tab. Prev
 with `osh sync-agents --dry-run`.
 
 For scripts, `osh sync-agents --apply SANDBOX [--agent claude-code|pi|both] [--only ID,ID]
-[--gateway NAME]` runs the same installs without asking anything and prints one JSON object on
-stdout. It installs the default items (or `--only`), skips uploads the secret scan flagged, and
-stops at the first failed step. It checks the policy first and, when access is missing,
+[--gateway NAME] [--home DIR]` runs the same installs without asking anything and prints one
+JSON object on stdout. `--home` gives the sandbox's `$HOME` (otherwise the sandbox is asked). It
+installs the default items (or `--only`), skips uploads the secret scan flagged, and stops at the
+first failed step. The repo memory (`context:memory`, the notes of the checkout osh runs in) is
+left out unless `--only` names it. A scan finding that belongs to no item fails the apply
+(`failed_step` index 0, label `secret scan`) before anything is uploaded. It checks the policy first and, when access is missing,
 changes nothing (no profile is attached or generated: use `--preflight` and `--gen-profile`).
 Running it again is safe. Keys: `sandbox`, `status` (`applied`, `nothing`, `policy`, `failed`,
 `no-sandbox`), `applied` (item ids), `skipped` (`[{"id","reason"}]`, reason `secret-scan` or
