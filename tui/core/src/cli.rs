@@ -2341,7 +2341,14 @@ fn apply_to(
     let home = home.map_or_else(|| sandbox_home(sandbox), str::to_string);
     let manifest = match sync_manifest_at(dir, &home, agent) {
         Ok(m) => m,
-        Err(e) => return SyncApply::failed(sandbox, "read the agent setup", e),
+        Err(e) => {
+            let label = if e.starts_with(agents::SCAN_FAILED) {
+                "secret scan"
+            } else {
+                "read the agent setup"
+            };
+            return SyncApply::failed(sandbox, label, e);
+        }
     };
     let r = apply_manifest(dir, sandbox, agent, &manifest, only);
     let _ = std::fs::remove_dir_all(&manifest.stage_dir);
@@ -2945,6 +2952,19 @@ mod apply_tests {
         }
     }
 
+    /// How many staging directories this process has left in the temp dir.
+    fn stage_dirs() -> usize {
+        std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("sync-agents-{}-", std::process::id()))
+            })
+            .count()
+    }
+
     fn default_ids(s: &Setup) -> Vec<String> {
         let m = sync_manifest(&s.data(), "sb", "claude-code").unwrap();
         let ids = m
@@ -3102,6 +3122,31 @@ mod apply_tests {
     }
 
     #[test]
+    fn apply_scan_error_fails_closed() {
+        let s = Setup::new("apply-scanerr", Some("clean"));
+        // gitleaks is installed but breaks: exit 2, no report.
+        std::fs::write(
+            s.root.join("bin/gitleaks"),
+            "#!/bin/sh\necho 'config error: boom' >&2\nexit 2\n",
+        )
+        .unwrap();
+        let before = stage_dirs();
+        let r = s.apply(None);
+        assert_eq!(r.status, ApplyStatus::Failed, "{}", r.to_json());
+        let f = r.failed_step.as_ref().unwrap();
+        assert_eq!((f.index, f.label.as_str()), (0, "secret scan"));
+        assert!(
+            f.tail.iter().any(|l| l.contains("config error: boom")),
+            "{:?}",
+            f.tail
+        );
+        assert_eq!(r.exit_code(), 1);
+        assert!(!s._fake.calls().contains("sandbox upload"));
+        assert!(s.step_log().is_empty());
+        assert_eq!(stage_dirs(), before);
+    }
+
+    #[test]
     fn apply_unknown_sandbox_is_no_sandbox() {
         let s = Setup::new("apply-nosb", Some("clean"));
         let r = sync_apply(&s.data(), "other", "claude-code", None, "", None);
@@ -3115,22 +3160,11 @@ mod apply_tests {
     fn apply_removes_stage_dir_on_failure() {
         let s = Setup::new("apply-stage", Some("clean"));
         std::env::set_var("OSH_FAKE_FAIL", "skills/own-one");
-        let stages = || -> usize {
-            std::fs::read_dir(std::env::temp_dir())
-                .unwrap()
-                .flatten()
-                .filter(|e| {
-                    e.file_name()
-                        .to_string_lossy()
-                        .starts_with(&format!("sync-agents-{}-", std::process::id()))
-                })
-                .count()
-        };
-        let before = stages();
+        let before = stage_dirs();
         assert_eq!(s.apply(None).status, ApplyStatus::Failed);
         std::env::set_var("OSH_FAKE_FAIL", "");
         std::env::set_var("OSH_FAKE_POLICY", NPM_ONLY);
         assert_eq!(s.apply(None).status, ApplyStatus::Policy);
-        assert_eq!(stages(), before);
+        assert_eq!(stage_dirs(), before);
     }
 }

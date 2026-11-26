@@ -311,7 +311,7 @@ pub fn workmux_conf_for_new_sandbox(data_dir: &Path) -> Result<(PathBuf, bool), 
         let _ = fs::remove_dir_all(&stage);
         return Err(e);
     }
-    if env.workmux_conf.is_some() && !scan(&env, &stage).unwrap_or_default().is_empty() {
+    if env.workmux_conf.is_some() && scan_flags(&env, &stage) {
         let _ = fs::remove_dir_all(&stage);
         return Err("the secret scan flagged your workmux config".into());
     }
@@ -340,7 +340,7 @@ pub fn tmux_conf_for_new_sandbox(
     let clean = fs::read_to_string(&conf)
         .and_then(|t| fs::write(&copy, sandbox_tmux_conf(&t, known)))
         .map_err(|e| e.to_string())
-        .map(|_| scan(&env, &stage).unwrap_or_default().is_empty());
+        .map(|_| !scan_flags(&env, &stage));
     match clean {
         Ok(true) => Ok(Some(copy)),
         Ok(false) => {
@@ -451,7 +451,7 @@ pub fn gitconfig_for_new_sandbox(data_dir: &Path) -> Result<Option<PathBuf>, Str
             return fail(format!("git could not write {k}"));
         }
     }
-    if scan(&env, &stage).unwrap_or_default().is_empty() {
+    if !scan_flags(&env, &stage) {
         Ok(Some(file))
     } else {
         fail("the secret scan flagged your git config".into())
@@ -805,16 +805,23 @@ fn stage_and_describe(env: &Env, own: &[PathBuf], stage: &Path) -> io::Result<Ve
     Ok(items)
 }
 
-/// Secret-scan findings in the staged files; `None` when gitleaks is missing.
-fn scan(env: &Env, stage: &Path) -> Option<Vec<Value>> {
-    let gitleaks = env.gitleaks.as_ref()?;
+/// Start of the error `manifest` returns when the secret scan itself failed.
+pub const SCAN_FAILED: &str = "the secret scan failed: ";
+
+/// Secret-scan findings in the staged files: `Ok(None)` when gitleaks is not installed, `Err`
+/// when it is but failed (spawn error, an exit status other than 0 or 1, or no readable report),
+/// so a broken scan never reads as clean.
+fn scan(env: &Env, stage: &Path) -> Result<Option<Vec<Value>>, String> {
+    let Some(gitleaks) = env.gitleaks.as_ref() else {
+        return Ok(None);
+    };
     let report = stage.join(".gitleaks-report.json");
     let mut c = Command::new(gitleaks);
     c.arg("dir").arg(stage);
     if env.gitleaks_config.is_file() {
         c.arg("--config").arg(&env.gitleaks_config);
     }
-    let _ = c
+    let out = c
         .args([
             "--no-banner",
             "--no-color",
@@ -825,23 +832,49 @@ fn scan(env: &Env, stage: &Path) -> Option<Vec<Value>> {
         .args(["--report-format", "json", "--report-path"])
         .arg(&report)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    let found = load(&report)
-        .and_then(|v| v.as_array().cloned())
-        .unwrap_or_default()
-        .iter()
-        .map(|f| {
-            let file = f["File"].as_str().unwrap_or("");
-            let rel = Path::new(file)
-                .strip_prefix(stage)
-                .unwrap_or(Path::new(file));
-            json!({"rule": f["RuleID"], "file": rel.to_string_lossy(), "line": f["StartLine"]})
-        })
-        .collect();
+        .output()
+        .map_err(|e| format!("{SCAN_FAILED}{}: {e}", gitleaks.display()))?;
+    // gitleaks exits 1 when it found leaks; anything else non-zero is an error.
+    let code = out.status.code();
+    let parsed = load(&report).and_then(|v| v.as_array().cloned());
     let _ = fs::remove_file(&report);
-    Some(found)
+    let found = match (code, parsed) {
+        (Some(0 | 1), Some(f)) => f,
+        _ => {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let tail: Vec<&str> = err.lines().rev().take(10).collect();
+            let tail = tail.into_iter().rev().collect::<Vec<_>>().join("\n");
+            let what = match code {
+                Some(c) => format!("gitleaks exited {c} without a usable report"),
+                None => "gitleaks was stopped without a usable report".into(),
+            };
+            return Err(format!("{SCAN_FAILED}{what}\n{tail}")
+                .trim_end()
+                .to_string());
+        }
+    };
+    Ok(Some(
+        found
+            .iter()
+            .map(|f| {
+                let file = f["File"].as_str().unwrap_or("");
+                let rel = Path::new(file)
+                    .strip_prefix(stage)
+                    .unwrap_or(Path::new(file));
+                json!({"rule": f["RuleID"], "file": rel.to_string_lossy(), "line": f["StartLine"]})
+            })
+            .collect(),
+    ))
+}
+
+/// True when the staged files hold a finding or the scan could not run: for configs that must
+/// never be uploaded unchecked.
+fn scan_flags(env: &Env, stage: &Path) -> bool {
+    match scan(env, stage) {
+        Ok(None) => false,
+        Ok(Some(found)) => !found.is_empty(),
+        Err(_) => true,
+    }
 }
 
 /// Python's `fnmatch.fnmatchcase`: `*` (any run, `/` included), `?`, `[seq]`, `[!seq]`.
@@ -1260,7 +1293,13 @@ pub fn manifest(env: &Env, agent: &str) -> Result<String, String> {
     let built = build(env, &agents, &stage).inspect_err(|_| {
         let _ = fs::remove_dir_all(&stage);
     })?;
-    let findings = scan(env, &stage);
+    let findings = match scan(env, &stage) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = fs::remove_dir_all(&stage);
+            return Err(e);
+        }
+    };
     Ok(json!({
         "agents": agents, "stage_dir": stage.to_string_lossy(),
         "items": built.items.iter().map(Item::to_json).collect::<Vec<_>>(),
@@ -1399,7 +1438,7 @@ pub fn dry_run(env: &Env, agent: &str) -> Result<String, String> {
     let agents = agent_list(agent)?;
     let stage = mkdtemp()?;
     let built = build(env, &agents, &stage);
-    let findings = built.as_ref().ok().and_then(|_| scan(env, &stage));
+    let findings = built.as_ref().ok().map(|_| scan(env, &stage));
     let _ = fs::remove_dir_all(&stage);
     let b = built?;
     let mut out = String::from("Dry run: nothing is installed, copied or uploaded.\n");
@@ -1437,9 +1476,10 @@ pub fn dry_run(env: &Env, agent: &str) -> Result<String, String> {
         out.push_str(&format!("  {host:<28} {binary}\n"));
     }
     out.push_str("\nSecret scan of staged uploads\n");
-    match findings {
-        None => out.push_str("  gitleaks not installed: skipped\n"),
-        Some(f) => {
+    match findings.unwrap_or(Ok(None)) {
+        Err(e) => out.push_str(&format!("  {e}\n")),
+        Ok(None) => out.push_str("  gitleaks not installed: skipped\n"),
+        Ok(Some(f)) => {
             for x in &f {
                 out.push_str(&format!(
                     "  {}  {}:{}\n",
@@ -1959,6 +1999,44 @@ mod tests {
             Value::Null,
             "no gitleaks: scan skipped"
         );
+    }
+
+    #[test]
+    fn a_failing_gitleaks_is_an_error_not_a_clean_scan() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tmp("scanerr");
+        let claude = fixture(&root);
+        let script = |body: &str| {
+            let g = root.join("gitleaks");
+            fs::write(&g, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&g, fs::Permissions::from_mode(0o755)).unwrap();
+            Env {
+                gitleaks: Some(g),
+                ..env_with(&claude)
+            }
+        };
+        let stage = root.join("stage");
+        fs::create_dir_all(&stage).unwrap();
+        // Exit 2 without a report.
+        let e = scan(&script("echo oops >&2; exit 2"), &stage).unwrap_err();
+        assert!(e.starts_with(SCAN_FAILED) && e.contains("oops"), "{e}");
+        // Exit 0 without a report.
+        assert!(scan(&script("exit 0"), &stage).is_err());
+        // Exit 1 with a report is "leaks found", not an error.
+        let found = scan(
+            &script("while [ $# -gt 0 ]; do [ \"$1\" = --report-path ] && printf '[{\"RuleID\":\"r\",\"File\":\"f\",\"StartLine\":3}]' > \"$2\"; shift; done; exit 1"),
+            &stage,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        // The manifest carries the error, and the sensitive-config checks treat it as flagged.
+        let env = script("exit 2");
+        assert!(manifest(&env, "claude-code")
+            .unwrap_err()
+            .starts_with(SCAN_FAILED));
+        assert!(scan_flags(&env, &stage));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
